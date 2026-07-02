@@ -1,0 +1,84 @@
+# =============================================================================
+# Cargo Configuration for Production-Grade Rust
+# =============================================================================
+
+[build]
+# Default target platform
+target = "x86_64-unknown-linux-gnu"
+# Number of parallel jobs (use all cores)
+jobs = 8
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    # --- Performance ---
+    "-C", "target-cpu=native",
+    "-C", "link-arg=-s",
+    
+    # --- Safety: Deny all warnings as errors in CI ---
+    # Uncomment for stricter CI builds:
+    # "-D", "warnings",
+    
+    # --- Overflow checks (even in release) ---
+    "-C", "overflow-checks=on",
+]
+
+[env]
+RUST_BACKTRACE = "0"
+RUST_LOG = "info"
+
+# =============================================================================
+# Profile Configurations
+# =============================================================================
+
+[profile.dev]
+# Faster incremental builds
+incremental = true
+# Some optimizations for dev (faster runtime, slightly slower compile)
+opt-level = 1
+
+[profile.dev.package."*"]
+# Optimize dependencies even in dev mode
+opt-level = 2
+
+[profile.release]
+# Maximum optimization
+opt-level = 3
+# Link-time optimization for smaller/faster binary
+lto = "thin"
+# Single codegen unit for better optimization
+codegen-units = 1
+# Remove panic unwinding (smaller binary)
+panic = "abort"
+# Strip symbols
+strip = true
+# Enable debug info for profiling (optional)
+debug = false
+
+[profile.test]
+# Faster test compilation
+opt-level = 1
+debug = true
+
+[profile.bench]
+# Same as release for accurate benchmarks
+opt-level = 3
+lto = "thin"
+debug = false
+
+# =============================================================================
+# Alias Commands
+# =============================================================================
+
+[alias]
+# Quick check without building
+c = "check"
+# Build release
+br = "build --release"
+# Run all tests
+t = "test"
+# Run clippy with all features
+cl = "clippy --all-targets --all-features -- -D warnings"
+# Format check
+fc = "fmt -- --check"
+# Full pre-PR check
+prepr = ["fc", "cl", "t", "br"]

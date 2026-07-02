@@ -1,0 +1,47 @@
+# Git
+.git
+.gitignore
+.gitmodules
+
+# Build artifacts
+target/
+**/target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Documentation (keep essential ones)
+*.md
+!README.md
+!ARCHITECTURE.md
+
+# CI/CD
+.github/
+
+# Deploy artifacts
+deploy/
+
+# Local config overrides
+config/*.local.toml
+.env
+
+# Gemini artifacts
+.gemini/
+
+# Rust
+**/*.rs.bk
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+tmp/
+temp/

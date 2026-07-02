@@ -1,0 +1,16 @@
+<type>(<scope>): <short summary>
+
+why:
+- context: why was this change made?
+- painpoint / requirement addressed
+
+what:
+- technical changes made
+- behavior changes (if any)
+
+impact:
+- affected modules
+- breaking / non-breaking
+
+refs:
+- issue / spec / doc
