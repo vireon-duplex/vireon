@@ -1,0 +1,17 @@
+# =============================================================================
+# Rust Toolchain — pinned for reproducible builds across dev & CI
+# =============================================================================
+# Docs: https://rust-lang.github.io/rustup/overrides.html#the-toolchain-file
+
+[toolchain]
+# Use the latest stable release. Bump deliberately.
+channel = "stable"
+
+# Components every contributor needs
+components = ["rustfmt", "clippy", "rust-src"]
+
+# Include docs locally (rustdoc, rustc book)
+profile = "default"
+
+# Explicit target matches .cargo/config.toml
+targets = ["x86_64-unknown-linux-gnu"]

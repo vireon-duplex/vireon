@@ -1,0 +1,21 @@
+# Clippy configuration
+disallowed-names = ["toto", "tata"]
+cognitive-complexity-threshold = 30
+too-many-arguments-threshold = 10
+type-complexity-threshold = 500
+single-char-binding-names-threshold = 5
+too-many-lines-threshold = 150
+large-error-threshold = 256
+trivial-copy-size-limit = 256
+pass-by-value-size-limit = 512
+avoid-breaking-exported-api = true
+
+# Allowed lints
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-print-in-tests = true
+allow-dbg-in-tests = true
+
+# MSRV (Minimum Supported Rust Version)
+msrv = "1.85"
