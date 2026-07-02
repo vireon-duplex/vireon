@@ -1,0 +1,36 @@
+# =============================================================================
+# Git Attributes — line endings, diff, linguist, export-ignore
+# =============================================================================
+# Docs: https://git-scm.com/docs/gitattributes
+
+# --- Normalize line endings to LF on commit, checkout native ---
+* text=auto eol=lf
+
+# --- Language-specific text handling & diff ---
+*.rs   text eol=lf diff=rust
+*.toml text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.json text eol=lf
+*.sh   text eol=lf
+*.md   text eol=lf
+
+# --- Cargo.lock: treat as text (this is an application, commit it) ---
+Cargo.lock text eol=lf
+
+# --- Binary assets ---
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+
+# --- Exclude non-essential files from release archives ---
+#     (used by `git archive`)
+.gitattributes export-ignore
+.gitignore export-ignore
+.github export-ignore
+.vscode export-ignore
+.editorconfig export-ignore

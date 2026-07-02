@@ -1,6 +1,70 @@
-[package]
-name = "vireon"
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+repository = "https://github.com/pinyoothotaboot/vireon.git"
+authors = ["pinyoothotaboot"]
+license = "GNU AFFERO GENERAL PUBLIC LICENSE v3.0"
+
+
+[package]
+name = "vireon"
+version = { workspace = true }
+edition = { workspace = true }
+description = "A high-performance realtime runtime built on QUIC and io_uring for multi-stream, full-duplex communication at massive scale."
+repository = { workspace = true }
+readme = "README.md"
+license = { workspace = true }
+keywords = ["quic", "io_uring", "async", "networking", "realtime", "high-performance"]
+categories = ["network-programming","asynchronous","command-line-utilities","data-processing","development-tools","embedded","file-formats","parsing","protocols","serialization","system-programming"]
+authors = { workspace = true }
+
+
+[lib]
+name = "vireon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vireon"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
+debug = false
+split-debuginfo = 'off'
+debug-assertions = false
+overflow-checks = true
+lto = true
+panic = 'abort'
+incremental = false
+codegen-units = 1
+rpath = false
+strip = false
+
+[workspace]
+members = []
+resolver = "2"
+exclude = []
+
+[workspace.lints]
+rust = {}
+clippy = { "unwrap_used" = "deny", "expect_used" = "deny", "panic" = "deny", "todo" = "deny", "unimplemented" = "deny", "unreachable" = "deny", "dbg_macro" = "deny", "print_stdout" = "deny", "print_stderr" = "deny" }
+
+[workspace.dependencies]
+# Curated catalog for workspace members. Only reference what each crate needs.
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+lazy_static = "1.5.0"
+dotenv = "0.15.0"
 
 [dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true
