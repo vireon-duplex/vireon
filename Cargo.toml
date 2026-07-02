@@ -44,7 +44,7 @@ rpath = false
 strip = false
 
 [workspace]
-members = []
+members = ["libs/buffer-pool","message-layer/frame"]
 resolver = "2"
 exclude = []
 
