@@ -1,4 +1,4 @@
-//! A high-performance realtime runtime built on QUIC and io_uring for multi-stream, full-duplex communication at massive scale..
+//! A high-performance realtime runtime built on QUIC and `io_uring` for multi-stream, full-duplex communication at massive scale.
 
 // =============================================================================
 // Production Safety Lints for Rust
