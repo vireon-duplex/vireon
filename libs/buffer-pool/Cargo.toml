@@ -6,7 +6,25 @@ repository.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Telemetry export backends (Layer 15). Counters and histograms are always
+# captured; a feature only pulls in the matching export crate.
+prometheus = ["dep:prometheus"]
+otel = ["dep:opentelemetry"]
+# Linux NUMA awareness (Layer 22). Compiles to a single-node no-op when off.
+numa = ["dep:libc"]
+# Allocation-site backtrace capture for the leak detector (Layer 20). Uses
+# `std::backtrace`, so this feature only flips runtime capture on.
+leak = []
+
 [dependencies]
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+prometheus = { version = "0.13", optional = true }
+opentelemetry = { version = "0.27", optional = true }
+libc = { version = "0.2", optional = true }
 
 [lints]
 workspace = true
