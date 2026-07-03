@@ -7,6 +7,15 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+bytes = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "frame_bench"
+harness = false
 
 [lints]
 workspace = true
