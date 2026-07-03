@@ -248,5 +248,74 @@ it are marked `// TODO(buffer-pool)` in the source. Until then, the `Vec`-backed
 
 ## Quality gates
 
-`cargo fmt`, `cargo clippy -p frame --lib --tests -- -D warnings`,
-`cargo test -p frame`.
+All commands below run from the repo root. Add `-p frame` to scope them to
+this crate (the workspace pins the toolchain, lint level and `RUSTFLAGS`).
+
+### Format
+
+```sh
+cargo fmt -p frame                  # apply
+cargo fmt -p frame -- --check       # CI gate (non-zero on diff)
+```
+
+### Lint
+
+The workspace denies warnings. Check lib, tests **and** benches together so a
+new benchmark cannot regress under clippy unnoticed:
+
+```sh
+cargo clippy -p frame --lib --tests --benches -- -D warnings
+```
+
+### Test
+
+Unit tests live inline (`#[cfg(test)] mod tests` in each `src/` module);
+`header.rs` and `codec.rs` carry the bulk of the coverage. The crate has no
+doctests (the README snippets are illustrative).
+
+```sh
+cargo test -p frame                          # all targets
+cargo test -p frame --lib                    # unit tests only
+cargo test -p frame header::tests            # one module's tests
+cargo test -p frame -- --nocapture           # show println! output
+cargo test -p frame --no-fail-fast           # keep going after a failure
+```
+
+### Benchmark
+
+Benchmarks are gated behind `criterion` (see
+[`benches/frame_bench.rs`](benches/frame_bench.rs) for the full group table and
+the anti-optimisation strategy). They are **not** compiled by a plain
+`cargo test`/`cargo build` — pass `--benches`.
+
+```sh
+# All 20 groups (≈5–8 min on a quiet box; criterion runs warm-up + 100 samples)
+cargo bench -p frame
+
+# Build the harness without running — catches compile regressions in CI
+cargo bench -p frame --no-run
+
+# One group (criterion treats the string as a regex / substring filter)
+cargo bench -p frame -- encode                # all encode/* groups
+cargo bench -p frame -- decode/per_type       # one specific group
+cargo bench -p frame -- "throughput/decode"   # quote if it contains '/'
+
+# One specific bench inside a group: <group>/<bench_id>
+cargo bench -p frame -- "decode/per_type_touch/AudioFrame"
+```
+
+Save a baseline, change code, then compare — this is how regressions are
+flagged rather than eyeballing absolute ns:
+
+```sh
+cargo bench -p frame -- --save-baseline main
+# ... edit code ...
+cargo bench -p frame -- --baseline main       # criterion prints % deltas
+```
+
+Regressions vs. throughput: the `*_touch` benches and `throughput/*` are the
+ones to watch for end-to-end codec cost; the header-only `decode/per_type`,
+`decode/batch_all`, `decode/random_pool`, `decode/cache_cold`,
+`decode/mixed_sizes` and `frame_layer/decode` benches intentionally report
+**no `thrpt:`** figure — they parse the 40-byte header only, so any
+bytes-per-second number would be fictional.
