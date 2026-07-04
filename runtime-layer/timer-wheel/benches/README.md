@@ -1,7 +1,7 @@
 # timer-wheel benchmarks
 
-Production-grade benchmark suite for `libs/timer-wheel`. Mirrors the layout
-and conventions of `libs/buffer-pool/benches/` — one `[[bench]]` binary per
+Production-grade benchmark suite for `runtime-layer/timer-wheel`. Mirrors the layout
+and conventions of `runtime-layer/buffer-pool/benches/` — one `[[bench]]` binary per
 concern, a shared `common.rs`, and a standalone soak binary for stability
 metrics that Criterion cannot capture.
 

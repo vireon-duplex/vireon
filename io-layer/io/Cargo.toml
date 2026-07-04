@@ -1,0 +1,45 @@
+[package]
+name = "io"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+autobenches = false
+
+[dependencies]
+io-uring = "0.7"
+libc = "0.2"
+socket2 = { version = "0.6", features = ["all"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "ring_init"
+harness = false
+
+[[bench]]
+name = "buffer_pool"
+harness = false
+
+[[bench]]
+name = "timer_ops"
+harness = false
+
+[[bench]]
+name = "connection"
+harness = false
+
+[[bench]]
+name = "metrics"
+harness = false
+
+[[bench]]
+name = "udp_roundtrip"
+harness = false
+
+[lints]
+workspace = true
