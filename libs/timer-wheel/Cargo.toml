@@ -1,0 +1,48 @@
+[package]
+name = "timer-wheel"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+# We have explicit [[bench]] entries; prevent Cargo from auto-detecting
+# non-entry-point files like benches/common.rs as standalone bench binaries.
+autobenches = false
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "insert"
+harness = false
+
+[[bench]]
+name = "cancel"
+harness = false
+
+[[bench]]
+name = "tick"
+harness = false
+
+[[bench]]
+name = "expire"
+harness = false
+
+[[bench]]
+name = "mixed"
+harness = false
+
+[[bench]]
+name = "latency"
+harness = false
+
+[[bench]]
+name = "stress"
+harness = false
+
+[lints]
+workspace = true
