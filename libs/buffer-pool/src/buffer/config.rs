@@ -120,45 +120,58 @@ mod tests {
 
     #[test]
     fn zero_batch_rejected() {
-        let mut c = BufferPoolConfig::default();
-        c.batch = 0;
+        let c = BufferPoolConfig {
+            batch: 0,
+            ..Default::default()
+        };
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn batch_exceeding_local_rejected() {
-        let mut c = BufferPoolConfig::default();
-        c.batch = c.local_cache + 1;
+        let default = BufferPoolConfig::default();
+        let c = BufferPoolConfig {
+            batch: default.local_cache + 1,
+            ..default
+        };
         let err = c.validate().unwrap_err();
         assert!(err.contains("must be <= local_cache"));
     }
 
     #[test]
     fn tiny_huge_threshold_rejected() {
-        let mut c = BufferPoolConfig::default();
-        c.huge_threshold = 512;
+        let c = BufferPoolConfig {
+            huge_threshold: 512,
+            ..Default::default()
+        };
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn budget_below_huge_threshold_rejected() {
-        let mut c = BufferPoolConfig::default();
-        c.huge_threshold = 1 << 20;
-        c.max_memory = (1 << 20) - 1;
+        let c = BufferPoolConfig {
+            huge_threshold: 1 << 20,
+            max_memory: (1 << 20) - 1,
+            ..Default::default()
+        };
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn zero_shards_rejected() {
-        let mut c = BufferPoolConfig::default();
-        c.shards = 0;
+        let c = BufferPoolConfig {
+            shards: 0,
+            ..Default::default()
+        };
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn busy_loop_interval_rejected() {
-        let mut c = BufferPoolConfig::default();
-        c.maintenance_interval_ms = 1;
+        let c = BufferPoolConfig {
+            maintenance_interval_ms: 1,
+            ..Default::default()
+        };
         assert!(c.validate().is_err());
     }
 }
