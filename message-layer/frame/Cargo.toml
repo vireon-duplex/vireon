@@ -6,12 +6,23 @@ repository.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = ["buffer-pool"]
+# Pull in the in-tree `buffer-pool` crate to enable pool-backed encode paths
+# (`FrameEncoder::encode_buffer_pooled`, `Frame::encode_pooled`, …). When off,
+# the crate depends only on `bytes` + `thiserror`, matching its original
+# zero-dep-encoded-bytes footprint.
+buffer-pool = ["dep:buffer-pool"]
+
 [dependencies]
 bytes = { workspace = true }
 thiserror = { workspace = true }
+buffer-pool = { path = "../../libs/buffer-pool", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+# Pull the pool in for tests / benches of the pool-backed paths.
+buffer-pool = { path = "../../libs/buffer-pool" }
 
 [[bench]]
 name = "frame_bench"
