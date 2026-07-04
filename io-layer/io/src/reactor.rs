@@ -1,9 +1,9 @@
 //! Thread-per-core reactor event loop.
 //!
 //! A [`Reactor`] owns one [`IoUringCtx`], one [`BufferPool`], one
-//! [`Connection`], one [`TimerWheel`], and one [`MetricsCollector`]. The
-//! `run` loop submits SQEs, blocks for CQEs, and dispatches every
-//! completion to the appropriate subsystem.
+//! [`Socket`] + [`Receiver`] + [`Sender`], one [`TimerWheel`], and one
+//! [`MetricsCollector`]. The `run` loop submits SQEs, blocks for CQEs,
+//! and dispatches every completion via [`CompletionDecoder`].
 //!
 //! # Lifecycle
 //!
@@ -11,20 +11,25 @@
 //! init(core_id, port, queue_depth)
 //!   1. sched_setaffinity(0, {core_id})
 //!   2. IoUringCtx::init_ring(queue_depth, sqpoll=false)
-//!   3. BufferPool::with_defaults(submitter, bgid=1)
-//!   4. Connection::setup_socket_with_reuseport(port, core_id)
-//!   5. arm_multishot_recv(ring, bgid=1, user_data=RECV_TOKEN)
+//!   3. BufferPool::init_buffer_ring(ring, bgid=1)
+//!   4. Socket::bind_with_reuseport(port, core_id)
+//!   5. socket.receiver(bgid).arm(ring, id=0)
 //! ```
 //!
 //! # Dispatch (per CQE)
 //!
-//! | Condition | Action |
-//! |-----------|--------|
-//! | `res == -libc::ECANCELED` | timer/recv cancelled; retire & re-arm |
-//! | `res == -libc::EBUSY`     | backpressure; drain CQ, retry submit |
-//! | `flags & IORING_CQE_F_NOTIF` | buffer reclaimable (send_zc done) |
-//! | `flags & IORING_CQE_F_BUFFER` | decode `buf_id`, refill pool |
-//! | `flags & IORING_CQE_F_MORE`   | multishot still armed; do nothing |
+//! The [`CompletionDecoder`] maps each CQE to a [`Completion`] variant.
+//! The reactor matches on variants — no raw flag inspection:
+//!
+//! | Completion | Action |
+//! |------------|--------|
+//! | [`Receive`](Completion::Receive) | decode `buf_id`, refill pool, re-arm if `!more` |
+//! | [`ReceiveError`](Completion::ReceiveError) | record errno, re-arm if `!more` |
+//! | [`Send`](Completion::Send) | upper layer tracks in-flight buffers |
+//! | [`SendBufferReclaim`](Completion::SendBufferReclaim) | buffer recyclable |
+//! | [`Timeout`](Completion::Timeout) | retire from timer wheel |
+//! | [`Cancel`](Completion::Cancel) | informational (cancel result) |
+//! | [`Error`](Completion::Error) | record and continue |
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,29 +37,29 @@ use std::time::Duration;
 
 use io_uring::cqueue;
 
-use crate::buffer_pool::BufferPool;
 use crate::common::{DEFAULT_BUF_COUNT, DEFAULT_BUF_SIZE, QUEUE_DEPTH};
-use crate::connection::Connection;
+use crate::completion::{Completion, CompletionDecoder};
+use crate::context::IoUringCtx;
 use crate::error::IoError;
-use crate::io_uring_ctx::IoUringCtx;
+use crate::memory::BufferPool;
 use crate::metrics::MetricsCollector;
 use crate::metrics::MetricsSnapshot;
+use crate::ops::{OpKind, Receiver, Sender, encode};
+use crate::socket::Socket;
 use crate::timer_wheel::TimerWheel;
 
-/// Reserved `user_data` value marking the multishot RX arm. Anything
-/// else is a send_zc or timer completion.
-const RECV_USER_DATA: u64 = u64::MAX;
-
-/// Negated errno constants, usable in `match` patterns.
-const ECANCELED: i32 = -libc::ECANCELED;
+/// Negated errno constant, usable in `match` patterns.
 const ENOBUFS: i32 = -libc::ENOBUFS;
 
 /// Thread-per-core reactor.
 pub struct Reactor {
     ctx: IoUringCtx,
     pool: BufferPool,
-    conn: Connection,
+    socket: Socket,
+    receiver: Receiver,
+    sender: Sender,
     timers: TimerWheel,
+    decoder: CompletionDecoder,
     metrics: MetricsCollector,
     core_id: u32,
     stop: Arc<AtomicBool>,
@@ -74,25 +79,23 @@ impl Reactor {
         } else {
             queue_depth
         };
-        let ctx = IoUringCtx::init_ring(entries, /* sqpoll */ false)?;
+        let mut ctx = IoUringCtx::init_ring(entries, /* sqpoll */ false)?;
         // SAFETY: we register a brand-new pool whose backing storage will
         // outlive the ring (pool is stored in the reactor, which is
         // dropped before the ring). Construct iovecs after the pool.
         let pool = BufferPool::init_buffer_ring(
-            &ctx.ring().submitter(),
+            ctx.ring(),
             /* bgid */ 1,
             DEFAULT_BUF_COUNT,
             DEFAULT_BUF_SIZE,
         )?;
 
-        let conn = Connection::setup_socket_with_reuseport(port, core_id)?;
+        let socket = Socket::bind_with_reuseport(port, core_id)?;
+        let receiver = socket.receiver(pool.bgid());
+        let sender = socket.sender();
 
         // Build a single iovec spanning the whole backing store so
-        // `SendZc` can reference it by `buf_index`. (For simplicity we
-        // register one iovec per buffer; a real deployment may prefer a
-        // single span and use buf_index math.)
-        // SAFETY: `pool`'s backing storage lives as long as the reactor,
-        // which outlives the ring registration.
+        // `SendZc` can reference it by `buf_index`.
         // SAFETY: `pool`'s backing storage lives as long as the reactor,
         // which outlives the ring registration.
         unsafe {
@@ -110,26 +113,26 @@ impl Reactor {
                 })
                 .collect::<Result<Vec<_>, IoError>>()?;
             if !iovecs.is_empty() {
-                ctx.register_fixed_buffers(&iovecs)?;
+                ctx.register_buffers(&iovecs)?;
             }
         }
 
         let mut reactor = Self {
             ctx,
             pool,
-            conn,
+            socket,
+            receiver,
+            sender,
             timers: TimerWheel::new(),
+            decoder: CompletionDecoder::new(),
             metrics: MetricsCollector::new(),
             core_id,
             stop: Arc::new(AtomicBool::new(false)),
         };
 
-        // Arm the initial multishot RX.
-        reactor.conn.arm_multishot_recv(
-            reactor.ctx.ring_mut(),
-            reactor.pool.bgid(),
-            RECV_USER_DATA,
-        )?;
+        // Arm the initial multishot RX. ID 0 encodes as
+        // `encode(OpKind::Recv, 0)` in user_data.
+        reactor.receiver.arm(reactor.ctx.ring_mut(), 0)?;
 
         Ok(reactor)
     }
@@ -173,10 +176,25 @@ impl Reactor {
         &mut self.timers
     }
 
-    /// Mutable access to the connection (for sends, re-arm, etc.).
+    /// Immutable access to the socket.
+    #[inline]
     #[must_use]
-    pub fn connection_mut(&mut self) -> &mut Connection {
-        &mut self.conn
+    pub fn socket(&self) -> &Socket {
+        &self.socket
+    }
+
+    /// Immutable access to the receiver.
+    #[inline]
+    #[must_use]
+    pub fn receiver(&self) -> &Receiver {
+        &self.receiver
+    }
+
+    /// Immutable access to the sender.
+    #[inline]
+    #[must_use]
+    pub fn sender(&self) -> &Sender {
+        &self.sender
     }
 
     /// Mutable access to the buffer pool (for refills from outside the
@@ -219,84 +237,74 @@ impl Reactor {
         Ok(())
     }
 
-    /// Reaps every CQE currently in the completion queue and dispatches it.
+    /// Reaps every CQE currently in the completion queue and dispatches it
+    /// via the [`CompletionDecoder`].
     fn drain_cq(&mut self) {
         // Collect entries into a Vec so the mutable borrow of the ring
-        // ends before we call `arm_multishot_recv` (which needs another
-        // mutable borrow) inside the dispatch loop.
+        // ends before we call `receiver.arm` (which needs another mutable
+        // borrow) inside the dispatch loop.
         let entries: Vec<cqueue::Entry> = {
             let mut cq = self.ctx.ring_mut().completion();
             cq.by_ref().collect()
         };
         for entry in entries {
-            let user_data = entry.user_data();
             let res = entry.result();
-            let flags = entry.flags();
+            let completion = self.decoder.decode(&entry);
 
-            // Record the completion broadly.
-            let is_rx = user_data == RECV_USER_DATA;
+            let is_rx = matches!(
+                completion,
+                Completion::Receive { .. } | Completion::ReceiveError { .. }
+            );
             self.metrics.record_cqe_completion(res, is_rx);
 
-            // 1. Notifications from send_zc — buffer reclaimable.
-            if cqueue::notif(flags) {
-                // Nothing else to do; the upper layer will recycle.
-                continue;
-            }
-
-            // 2. Negative results — error or cancellation.
-            if res < 0 {
-                match res {
-                    ECANCELED => {
-                        // Timer fired-then-cancelled, or multishot
-                        // terminated. Retire from the timer wheel if it
-                        // was a timer; re-arm RX if it was the recv.
-                        if user_data != RECV_USER_DATA {
-                            self.timers.retire(user_data);
-                        }
+            match completion {
+                // ── Recv success: decode buf_id, refill, re-arm if done ──
+                Completion::Receive {
+                    buf_id, len, more, ..
+                } => {
+                    if let Some(bid) = buf_id {
+                        self.metrics.record_bytes_rx(len as u64);
+                        self.pool.refill_buffer(bid);
                     }
-                    ENOBUFS => {
-                        // Provided-buffer group ran dry.
+                    if !more {
+                        let _ = self.receiver.arm(self.ctx.ring_mut(), 0);
+                    }
+                }
+
+                // ── Recv error: buffer exhaustion or multishot termination ──
+                Completion::ReceiveError { errno, more, .. } => {
+                    if errno == ENOBUFS {
                         self.metrics.track_buffer_exhaustion(self.pool.bgid());
                     }
-                    _ => {
-                        // Other errors: record but keep running.
+                    if !more {
+                        let _ = self.receiver.arm(self.ctx.ring_mut(), 0);
                     }
                 }
-                // If RX multishot terminated, re-arm.
-                if is_rx && !cqueue::more(flags) {
-                    let _ = self.conn.arm_multishot_recv(
-                        self.ctx.ring_mut(),
-                        self.pool.bgid(),
-                        RECV_USER_DATA,
-                    );
-                }
-                continue;
-            }
 
-            // 3. Multishot recv completion — decode buf_id.
-            if is_rx {
-                if let Some(buf_id) = cqueue::buffer_select(flags) {
-                    // The upper layer would consume the payload here; for
-                    // now we record bytes and refill immediately.
-                    self.metrics
-                        .record_bytes_rx(u64::try_from(res).unwrap_or(0));
-                    self.pool.refill_buffer(buf_id);
+                // ── Send notification: buffer reclaimable ──
+                Completion::SendBufferReclaim { .. } => {
+                    // Upper layer recycles the buffer.
                 }
-                // If the kernel says no more completions are pending,
-                // re-arm the multishot RX.
-                if !cqueue::more(flags) {
-                    let _ = self.conn.arm_multishot_recv(
-                        self.ctx.ring_mut(),
-                        self.pool.bgid(),
-                        RECV_USER_DATA,
-                    );
-                }
-                continue;
-            }
 
-            // 4. Timer fire — retire from active map.
-            if self.timers.is_active(user_data) {
-                self.timers.retire(user_data);
+                // ── Send success: kernel accepted the send ──
+                Completion::Send { .. } => {
+                    // Buffer still in flight (NIC DMA pending).
+                }
+
+                // ── Timeout fired (naturally or cancelled) ──
+                Completion::Timeout { id } => {
+                    self.timers.retire(encode(OpKind::Timeout, id));
+                }
+
+                // ── Cancel result: informational ──
+                Completion::Cancel { .. } => {}
+
+                // ── Other errors (send failure, etc.) ──
+                Completion::Error { errno, .. } => {
+                    if errno == ENOBUFS {
+                        self.metrics.track_buffer_exhaustion(self.pool.bgid());
+                    }
+                }
             }
         }
     }
@@ -391,18 +399,8 @@ mod tests {
             Err(e) => panic!("init failed: {e:?}"),
         };
 
-        // Read the bound port back through the connection's socket.
-        let local_addr = {
-            use std::os::unix::io::FromRawFd;
-            let fd = reactor.connection_mut().raw_fd();
-            // SAFETY: the fd is owned by `conn` for the lifetime of the
-            // reactor; we only borrow it here for a `local_addr` query
-            // and never close it.
-            let borrowed = unsafe { UdpSocket::from_raw_fd(fd) };
-            let addr = borrowed.local_addr().expect("local_addr");
-            std::mem::forget(borrowed); // don't close the fd
-            addr
-        };
+        // Read the bound port back through the socket.
+        let local_addr = reactor.socket().local_addr().expect("local_addr");
 
         // Capture the stop handle so the sender thread can signal exit
         // without a `&Reactor` borrow.

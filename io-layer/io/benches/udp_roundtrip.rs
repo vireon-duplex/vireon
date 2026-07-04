@@ -20,8 +20,9 @@ use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use io_uring::cqueue;
 
-use io::buffer_pool::BufferPool;
-use io::connection::Connection;
+use io::memory::BufferPool;
+use io::ops::Receiver;
+use io::socket::Socket;
 
 /// Frame header: 1-byte opcode + 8-byte stream_id.
 const FRAME_HDR: usize = 9;
@@ -66,18 +67,14 @@ fn bench_udp_roundtrip(c: &mut Criterion) {
                                     std::slice::from_raw_parts(addr.as_ptr(), res as usize)
                                 };
                                 // Parse the io_uring_recvmsg_out layout.
-                                let _ = ctx.conn.parse_received_buffer(raw);
+                                let _ = ctx.receiver.parse(raw);
                             }
                             ctx.pool.refill_buffer(buf_id);
                         }
 
                         // Re-arm if multishot terminated.
                         if !cqueue::more(flags) {
-                            let _ = ctx.conn.arm_multishot_recv(
-                                &mut ctx.ring,
-                                ctx.pool.bgid(),
-                                0xFFFF_FFFF_FFFF_FFFF,
-                            );
+                            let _ = ctx.receiver.arm(&mut ctx.ring, 0);
                         }
                     }
 
@@ -93,9 +90,11 @@ fn bench_udp_roundtrip(c: &mut Criterion) {
 
 // ─── Setup ────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 struct RoundtripCtx {
     ring: io_uring::IoUring,
-    conn: Connection,
+    socket: Socket,
+    receiver: Receiver,
     pool: BufferPool,
     sender: UdpSocket,
     dest: std::net::SocketAddr,
@@ -106,21 +105,14 @@ fn setup_roundtrip(pkt_size: usize) -> RoundtripCtx {
 
     let mut ring = common::fresh_ring(256);
     let pool = common::fresh_pool(&ring, 1, 256, 2048);
-    let conn = common::fresh_connection(0);
+    let socket = common::fresh_socket(0);
+    let receiver = socket.receiver(pool.bgid());
 
     // Discover the bound port.
-    let dest = {
-        use std::os::unix::io::FromRawFd;
-        let fd = conn.raw_fd();
-        let borrowed = unsafe { UdpSocket::from_raw_fd(fd) };
-        let addr = borrowed.local_addr().expect("local_addr");
-        std::mem::forget(borrowed);
-        addr
-    };
+    let dest = socket.local_addr().expect("local_addr");
 
     // Arm multishot recv.
-    conn.arm_multishot_recv(&mut ring, pool.bgid(), 0xFFFF_FFFF_FFFF_FFFF)
-        .expect("arm");
+    receiver.arm(&mut ring, 0).expect("arm");
 
     // Sender socket.
     let sender = UdpSocket::bind("0.0.0.0:0").expect("sender bind");
@@ -139,7 +131,8 @@ fn setup_roundtrip(pkt_size: usize) -> RoundtripCtx {
 
     RoundtripCtx {
         ring,
-        conn,
+        socket,
+        receiver,
         pool,
         sender,
         dest,

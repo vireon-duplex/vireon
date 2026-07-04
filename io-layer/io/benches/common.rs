@@ -8,8 +8,8 @@
 
 use std::hint::black_box;
 
-use io::buffer_pool::BufferPool;
-use io::connection::Connection;
+use io::memory::BufferPool;
+use io::socket::Socket;
 use io_uring::IoUring;
 
 /// Packet sizes used across benches (bytes). Covers the typical UDP MTU
@@ -38,13 +38,13 @@ pub fn fresh_ring(entries: u32) -> IoUring {
 }
 
 /// Binds a UDP socket on `0.0.0.0:{port}` (port 0 = ephemeral).
-pub fn fresh_connection(port: u16) -> Connection {
-    Connection::setup_socket(port).expect("socket setup")
+pub fn fresh_socket(port: u16) -> Socket {
+    Socket::bind(port).expect("socket bind")
 }
 
 /// Creates a provided-buffer ring with the given parameters.
 pub fn fresh_pool(ring: &IoUring, bgid: u16, count: u32, size: usize) -> BufferPool {
-    BufferPool::init_buffer_ring(&ring.submitter(), bgid, count, size).expect("buffer pool")
+    BufferPool::init_buffer_ring(ring, bgid, count, size).expect("buffer pool")
 }
 
 // ─── PRNG ─────────────────────────────────────────────────────────

@@ -21,7 +21,7 @@
 //! |   sparse files)                       CANCEL)                    |
 //! |       │                                                          |
 //! |       ▼                                                          |
-//! |  Connection (UDP SO_REUSEPORT, recvmsg_multishot, send_zc)       |
+//! |  Socket + Receiver + Sender (UDP SO_REUSEPORT, multishot, zc)    |
 //! +-------------------------------------------------------------------+
 //! ```
 //!
@@ -41,12 +41,13 @@
 //! |-------|--------|---------------|
 //! | 1 | [`common`] | Constants, protocol opcodes |
 //! | 2 | [`error`] | `IoError` thiserror enum |
-//! | 3 | [`io_uring_ctx`] | `IoUringCtx` ring setup + registrations |
-//! | 4 | [`buffer_pool`] | Provided-buffer ring manager |
+//! | 3 | [`context`] | `IoUringCtx` ring setup + registrations |
+//! | 4 | [`memory`] | Provided-buffer ring manager (`MemoryRegion` + `BufferPool`) |
 //! | 5 | [`timer_wheel`] | Kernel-side io_uring timeouts |
-//! | 6 | [`connection`] | UDP socket + multishot RX + send_zc TX |
-//! | 7 | [`metrics`] | Atomic counters + snapshot |
-//! | 8 | [`reactor`] | Thread-per-core event loop |
+//! | 6 | [`socket`] | UDP socket bind + fd ownership |
+//! | 7 | [`ops`] | `Receiver` (multishot RX) + `Sender` (send_zc) + SQE builders |
+//! | 8 | [`metrics`] | Atomic counters + snapshot |
+//! | 9 | [`reactor`] | Thread-per-core event loop |
 //!
 //! # Feature flags
 //!
@@ -70,29 +71,39 @@
 //!
 //! [`common`]: crate::common
 //! [`error`]: crate::error
-//! [`io_uring_ctx`]: crate::io_uring_ctx
-//! [`buffer_pool`]: crate::buffer_pool
+//! [`context`]: crate::context
+//! [`memory`]: crate::memory
 //! [`timer_wheel`]: crate::timer_wheel
-//! [`connection`]: crate::connection
+//! [`socket`]: crate::socket
+//! [`ops`]: crate::ops
 //! [`metrics`]: crate::metrics
 //! [`reactor`]: crate::reactor
 
 #![allow(clippy::module_inception)]
 
-pub mod buffer_pool;
 pub mod common;
-pub mod connection;
+pub mod completion;
+pub mod context;
 pub mod error;
-pub mod io_uring_ctx;
+pub mod features;
+pub mod memory;
 pub mod metrics;
+pub mod ops;
 pub mod reactor;
+pub mod registry;
+pub mod socket;
 pub mod timer_wheel;
 
-pub use buffer_pool::BufferPool;
 pub use common::{ControlPlane, DataPlane};
-pub use connection::{Connection, ParsedFrame, TxNotification};
+pub use completion::{Completion, CompletionDecoder};
+pub use context::IoUringCtx;
 pub use error::IoError;
-pub use io_uring_ctx::IoUringCtx;
+pub use features::IoFeatures;
+pub use memory::BufferPool;
+pub use memory::MemoryRegion;
 pub use metrics::{MetricsCollector, MetricsSnapshot};
+pub use ops::{OpKind, ParsedFrame, Receiver, Sender, decode_id, decode_kind, encode};
 pub use reactor::Reactor;
+pub use registry::IoRegistry;
+pub use socket::Socket;
 pub use timer_wheel::TimerWheel;
