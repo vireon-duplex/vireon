@@ -17,12 +17,12 @@ buffer-pool = ["dep:buffer-pool"]
 [dependencies]
 bytes = { workspace = true }
 thiserror = { workspace = true }
-buffer-pool = { path = "../../libs/buffer-pool", optional = true }
+buffer-pool = { path = "../../runtime-layer/buffer-pool", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 # Pull the pool in for tests / benches of the pool-backed paths.
-buffer-pool = { path = "../../libs/buffer-pool" }
+buffer-pool = { path = "../../runtime-layer/buffer-pool" }
 
 [[bench]]
 name = "frame_bench"
