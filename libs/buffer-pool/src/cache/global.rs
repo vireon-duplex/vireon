@@ -190,7 +190,7 @@ mod tests {
         let total: usize = cache.shards[0].iter().map(|s| s.len()).sum();
         assert_eq!(total, 64);
         // At least two shards received data (probabilistic but reliable with 4 threads).
-        let nonempty = cache.shards[0].iter().filter(|s| s.len() > 0).count();
+        let nonempty = cache.shards[0].iter().filter(|s| !s.is_empty()).count();
         assert!(
             nonempty >= 2,
             "expected sharding to spread load, got {nonempty}"

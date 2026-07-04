@@ -11,6 +11,7 @@
 //! Fresh allocations are stamped by [`stamp_magic`] so that [`validate`] has
 //! something to check.
 
+#[cfg(debug_assertions)]
 use core::ptr;
 
 use crate::buffer::policy::ZeroingPolicy;

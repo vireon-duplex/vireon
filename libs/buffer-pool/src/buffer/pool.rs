@@ -460,8 +460,10 @@ mod tests {
 
     #[test]
     fn zeroing_clear_wipes_data_on_release() {
-        let mut config = BufferPoolConfig::default();
-        config.zeroing = ZeroingPolicy::Clear;
+        let config = BufferPoolConfig {
+            zeroing: ZeroingPolicy::Clear,
+            ..Default::default()
+        };
         let pool = BufferPool::new(config);
 
         let mut buf = pool.get(128).unwrap();
@@ -582,8 +584,10 @@ mod tests {
 
     #[test]
     fn try_get_rejects_under_pressure() {
-        let mut config = BufferPoolConfig::default();
-        config.max_memory = 1024;
+        let config = BufferPoolConfig {
+            max_memory: 1024,
+            ..Default::default()
+        };
         let pool = BufferPool::new(config);
 
         // Hold a buffer to consume some of the budget.
@@ -598,8 +602,10 @@ mod tests {
 
     #[test]
     fn try_get_succeeds_after_release_frees_capacity() {
-        let mut config = BufferPoolConfig::default();
-        config.max_memory = 1024;
+        let config = BufferPoolConfig {
+            max_memory: 1024,
+            ..Default::default()
+        };
         let pool = BufferPool::new(config);
 
         let held = pool.get(512).unwrap();
@@ -611,8 +617,10 @@ mod tests {
 
     #[test]
     fn get_wakes_when_capacity_freed() {
-        let mut config = BufferPoolConfig::default();
-        config.max_memory = 128;
+        let config = BufferPoolConfig {
+            max_memory: 128,
+            ..Default::default()
+        };
         let pool = BufferPool::new(config);
 
         // Fill to capacity.
