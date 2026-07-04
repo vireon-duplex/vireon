@@ -1,8 +1,8 @@
-//! Benchmark: UDP connection setup, recv arming, buffer parsing, and
-//! send_zc submission.
+//! Benchmark: Socket setup, recv arming, buffer parsing, send_zc, and
+//! completion decoding.
 //!
 //! Measures both kernel-interaction paths (socket setup, SQE submit) and
-//! pure-compute paths (CQE flag decode, buffer parsing).
+//! pure-compute paths (CQE decode, buffer parsing).
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -15,14 +15,16 @@ use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
-use io::connection::{Connection, TxNotification};
+use io::completion::CompletionDecoder;
+use io::ops::{OpKind, Sender, decode_id, decode_kind, encode};
+use io::socket::Socket;
 
 // ─── Synthetic buffer builder ─────────────────────────────────────
 
 /// Size of the `io_uring_recvmsg_out` header (`{u32,u32,u32,u32}` = 16 B).
 const RECVMSG_OUT_HDR: usize = 16;
 
-/// `PEER_ADDR_LEN` used by `Connection::setup` (must match).
+/// `PEER_ADDR_LEN` used by `Receiver::new` (must match).
 const NAME_FIELD_LEN: usize = 128;
 
 /// Builds a synthetic buffer matching the layout the kernel would fill
@@ -67,14 +69,14 @@ fn build_recv_buffer(payload_len: usize) -> Vec<u8> {
 // ─── Benches ──────────────────────────────────────────────────────
 
 fn bench_setup_socket(c: &mut Criterion) {
-    let mut g = c.benchmark_group("setup_socket");
+    let mut g = c.benchmark_group("socket_bind");
 
     g.bench_function("ephemeral_port", |b| {
         b.iter_batched(
             || (),
             |()| {
-                let conn = Connection::setup_socket(0).expect("setup");
-                black_box(conn);
+                let sock = Socket::bind(0).expect("bind");
+                black_box(sock);
             },
             BatchSize::PerIteration,
         )
@@ -84,8 +86,8 @@ fn bench_setup_socket(c: &mut Criterion) {
         b.iter_batched(
             || (),
             |()| {
-                let conn = Connection::setup_socket_with_reuseport(0, 0).expect("setup");
-                black_box(conn);
+                let sock = Socket::bind_with_reuseport(0, 0).expect("bind");
+                black_box(sock);
             },
             BatchSize::PerIteration,
         )
@@ -95,14 +97,15 @@ fn bench_setup_socket(c: &mut Criterion) {
 }
 
 fn bench_arm_multishot_recv(c: &mut Criterion) {
-    let conn = common::fresh_connection(0);
-    let mut g = c.benchmark_group("arm_multishot_recv");
+    let socket = common::fresh_socket(0);
+    let receiver = socket.receiver(1);
+    let mut g = c.benchmark_group("receiver_arm");
 
     g.bench_function("submit", |b| {
         b.iter_batched(
             || common::fresh_ring(64),
             |mut ring| {
-                conn.arm_multishot_recv(&mut ring, 1, 0xDEAD).expect("arm");
+                receiver.arm(&mut ring, 0xDEAD).expect("arm");
                 black_box(&ring);
             },
             BatchSize::PerIteration,
@@ -113,8 +116,9 @@ fn bench_arm_multishot_recv(c: &mut Criterion) {
 }
 
 fn bench_parse_received_buffer(c: &mut Criterion) {
-    let conn = common::fresh_connection(0);
-    let mut g = c.benchmark_group("parse_received_buffer");
+    let socket = common::fresh_socket(0);
+    let receiver = socket.receiver(1);
+    let mut g = c.benchmark_group("receiver_parse");
 
     // Payload lengths to sweep (excludes the 9-byte frame header).
     for &payload_len in &[55usize, 247, 1015, 2039] {
@@ -123,7 +127,7 @@ fn bench_parse_received_buffer(c: &mut Criterion) {
 
         g.bench_function(label, |b| {
             b.iter(|| {
-                let frame = conn.parse_received_buffer(&buf).expect("parse");
+                let frame = receiver.parse(&buf).expect("parse");
                 black_box(frame);
             })
         });
@@ -132,32 +136,44 @@ fn bench_parse_received_buffer(c: &mut Criterion) {
     g.finish();
 }
 
-fn bench_handle_tx_notification(c: &mut Criterion) {
-    let mut g = c.benchmark_group("handle_tx_notification");
+fn bench_completion_decode(c: &mut Criterion) {
+    let decoder = CompletionDecoder;
+    let mut g = c.benchmark_group("completion_decode");
 
-    const NOTIF: u32 = 1 << 3; // IORING_CQE_F_NOTIF
+    // Simulate a recv success CQE: user_data = encode(Recv, 42), res=128.
+    let recv_ud = encode(OpKind::Recv, 42);
 
-    g.bench_function("send_completed", |b| {
+    g.bench_function("recv_success", |b| {
         b.iter(|| {
-            let r = Connection::handle_tx_notification(0, 1024, 42);
-            black_box(r);
+            let ud = black_box(recv_ud);
+            let kind = decode_kind(ud);
+            let id = decode_id(ud);
+            black_box((kind, id));
         })
     });
 
-    g.bench_function("buffer_reclaimable", |b| {
+    // Simulate a send notification CQE: user_data = encode(Send, 99).
+    let send_ud = encode(OpKind::Send, 99);
+
+    g.bench_function("send_notif", |b| {
         b.iter(|| {
-            let r = Connection::handle_tx_notification(NOTIF, 0, 42);
-            black_box(r);
+            let ud = black_box(send_ud);
+            let kind = decode_kind(ud);
+            let id = decode_id(ud);
+            black_box((kind, id));
         })
     });
+
+    let _ = decoder; // suppress unused warning
 
     g.finish();
 }
 
-fn bench_send_packet_zc(c: &mut Criterion) {
-    let conn = common::fresh_connection(0);
+fn bench_send_zc(c: &mut Criterion) {
+    let socket = common::fresh_socket(0);
+    let sender: Sender = socket.sender();
     let dest = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 9999));
-    let mut g = c.benchmark_group("send_packet_zc");
+    let mut g = c.benchmark_group("send_zc");
 
     for &pkt_size in common::PKT_SIZES {
         g.bench_function(format!("{pkt_size}B"), |b| {
@@ -167,7 +183,7 @@ fn bench_send_packet_zc(c: &mut Criterion) {
                     // SQE build + submit path (kernel will fail with
                     // -EFAULT since no fixed buffers are registered, but
                     // we measure the submission overhead only).
-                    let _ = conn.send_packet_zc(&mut ring, 0, pkt_size as u32, dest, 0xBEEF);
+                    let _ = sender.send_zc(&mut ring, 0, pkt_size as u32, dest, 0xBEEF);
                     black_box(&ring);
                 },
                 BatchSize::PerIteration,
@@ -184,16 +200,12 @@ fn _duration_marker() -> Duration {
     Duration::from_millis(0)
 }
 
-// Suppress unused import.
-#[allow(dead_code)]
-const _TX_NOTIF_MARKER: Option<TxNotification> = None;
-
 criterion_group!(
     benches,
     bench_setup_socket,
     bench_arm_multishot_recv,
     bench_parse_received_buffer,
-    bench_handle_tx_notification,
-    bench_send_packet_zc,
+    bench_completion_decode,
+    bench_send_zc,
 );
 criterion_main!(benches);

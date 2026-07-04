@@ -21,15 +21,15 @@ cargo bench -p io --bench udp_roundtrip -- \
 
 | Binary | Level | What it measures |
 |--------|-------|------------------|
-| `ring_init`     | Kernel  | `IoUring` ring setup cost (entries=4…1024), SQPOLL path, `register_fixed_buffers` (16/64/256 iovecs), `register_sparse_files` (64/256/1024 fds). |
+| `ring_init`     | Kernel  | `IoUring` ring setup cost (entries=4…1024), SQPOLL path, `register_buffers` (16/64/256 iovecs), `register_files_sparse` (64/256/1024 fds). |
 | `buffer_pool`   | Kernel  | `BufferPool::init_buffer_ring` (count=16…1024, size=64…4096), `refill_buffer` hot path, `get_buffer_address` lookup, `with_defaults` convenience path. |
 | `timer_ops`     | Kernel  | `TimerWheel::add_timeout` (1ms…10s), `add_periodic_tick`, `cancel_timeout` SQE submit, `retire` HashMap remove, `is_active` HashMap lookup. |
-| `connection`    | Kernel  | `setup_socket` (ephemeral, REUSEPORT), `arm_multishot_recv`, `parse_received_buffer` (64B…2048B synthetic `io_uring_recvmsg_out`), `handle_tx_notification` flag decode, `send_packet_zc` SQE submit. |
+| `connection`    | Kernel  | `Socket::bind` (ephemeral, REUSEPORT), `Receiver::arm`, `Receiver::parse` (64B…2048B synthetic `io_uring_recvmsg_out`), `CompletionDecoder` decode, `Sender::send_zc` SQE submit. |
 | `metrics`       | Compute | `MetricsCollector` atomic-counter overhead: `record_cqe_completion`, `record_bytes_{rx,tx}`, `record_*` backpressure paths, `snapshot` (fresh + after 10k ops). |
-| `udp_roundtrip` | E2E     | End-to-end UDP latency: `send_to` → `submit_and_wait(1)` → drain CQE → `parse_received_buffer` → refill, at 73B…2057B packet sizes. |
+| `udp_roundtrip` | E2E     | End-to-end UDP latency: `send_to` → `submit_and_wait(1)` → drain CQE → `Receiver::parse` → refill, at 73B…2057B packet sizes. |
 
 `common.rs` is the shared helper module (PRNG, packet-size constants,
-ring/connection/pool fixture builders). Every bench pulls it in via
+ring/socket/pool fixture builders). Every bench pulls it in via
 `#[path = "common.rs"] mod common;`.
 
 ## Headline numbers
@@ -46,8 +46,8 @@ Measured on the development host with `--sample-size 20
 | `buffer_pool/get_buffer_address/random`  | ~1.8 ns |
 | `timer_ops/retire/hit`                   | ~66 ns |
 | `timer_ops/is_active/active`             | ~8 ns  |
-| `connection/handle_tx_notification/send_completed` | ~232 ps |
-| `connection/send_packet_zc/2048B`        | ~3.7 µs |
+| `connection/completion_decode/recv_success` | ~232 ps |
+| `connection/send_zc/2048B`              | ~3.7 µs |
 | `metrics/record_cqe_completion/rx_success` | ~4 ns |
 | `metrics/snapshot/after_10k_ops`         | ~930 ps |
 | `udp_roundtrip/1033B`                    | ~10 µs |
