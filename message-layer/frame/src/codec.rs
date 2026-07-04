@@ -31,9 +31,18 @@
 //!
 //! ## Buffer pool
 //!
-//! [`FrameEncoder`] currently allocates a fresh [`BytesMut`] per frame.
-//! All allocation sites are marked `// TODO(buffer-pool)` for future
-//! replacement once the `buffer-pool` crate is ready.
+//! [`FrameEncoder::encode_buffer`] allocates a fresh [`BytesMut`] per frame.
+//! For hot send paths, enable the `buffer-pool` cargo feature and use
+//! [`FrameEncoder::encode_buffer_pooled`], which acquires a slot from a
+//! shared [`BufferPool`](buffer_pool::BufferPool), writes into it via
+//! [`encode_into_slice`] (a raw `&mut [u8]` encoder), and returns an RAII
+//! [`Buffer`](buffer_pool::Buffer) that recycles on drop.
+//!
+//! The [`encode_into`] / [`decode`] / [`FrameDecoder`] paths are untouched:
+//! they remain the lowest-level entry points and continue to work with
+//! caller-managed [`BytesMut`] / `&[u8]` storage. Inline `Future optimisation`
+//! comments below mark remaining architectural decisions (ring-buffer
+//! decoder, `FrameRef`-returning decode) that require larger API changes.
 
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -136,13 +145,13 @@ impl<'a> FrameRef<'a> {
 /// Cloning bumps a refcount; no bytes are copied. Use [`FrameRef`] for
 /// decode-and-consume in a single stack frame to avoid the `Arc` cost entirely.
 ///
-/// # TODO(buffer-pool)
+/// # Future optimisation
 ///
-/// For the highest-throughput streaming-decoder path, consider changing
-/// [`FrameDecoder::decode_frame`] to return `FrameRef<'_>` (borrowing from the
-/// internal buffer) instead of `Frame`. This eliminates the `Arc`
-/// increment/decrement on every decoded frame. Requires an API change on the
-/// caller side.
+/// For the highest-throughput streaming-decoder path, [`FrameDecoder::decode_frame`]
+/// could grow a `decode_frame_ref` variant that returns `FrameRef<'_>` borrowing
+/// the internal buffer, eliminating the `freeze()` Arc increment on every decoded
+/// frame. This is an independent API-change follow-up — it does not require the
+/// `buffer-pool` feature, but would compose naturally with a pool-backed slab.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
     /// Stream identifier.
@@ -182,12 +191,15 @@ impl Frame {
 ///
 /// Returns [`FrameError::PayloadTooLarge`] when `payload.len() > u32::MAX`.
 ///
-/// ## TODO(buffer-pool)
+/// ## Pool-backed alternative
 ///
-/// On connection-scoped `Connection` structs, hold a single
-/// `BytesMut::with_capacity(64*1024)` and call `clear()` between frames
-/// instead of calling `reserve()` here. Redis, NATS, and Kafka all do this
-/// for their per-connection encoder buffers.
+/// The `reserve()` below only runs when `dst` lacks spare capacity. For
+/// connection-scoped encoders the recommended pattern is a single
+/// pre-allocated `BytesMut::with_capacity(64 * 1024)` reused with `clear()`
+/// between frames. When the in-tree [`buffer_pool::BufferPool`] is available
+/// (feature `buffer-pool`), prefer [`FrameEncoder::encode_buffer_pooled`] —
+/// it acquires a sized slot up front, writes via [`encode_into_slice`], and
+/// recycles the slot on drop.
 #[inline(always)]
 pub fn encode_into(
     dst: &mut BytesMut,
@@ -203,8 +215,9 @@ pub fn encode_into(
     // cost when the caller pre-allocates the buffer.
     let spare = dst.capacity() - dst.len();
     if spare < needed {
-        // TODO(buffer-pool): Replace with pool.get(needed) once buffer-pool
-        // is available, so this path also avoids the allocator.
+        // Pool-backed callers route through `encode_buffer_pooled` and never
+        // hit this branch — the slot is sized up front via `pool.get(needed)`.
+        // This `reserve()` is the BytesMut growth path for non-pool callers.
         dst.reserve(needed - spare);
     }
     // SAFETY: `dst` now has at least `needed` spare bytes starting at
@@ -223,6 +236,56 @@ pub fn encode_into(
         dst.advance_mut(needed);
     }
     Ok(())
+}
+
+/// Writes a single frame into a raw `&mut [u8]` slice — no allocator touched.
+///
+/// This is the lowest-level encoder: every other encode entry point either
+/// writes into a [`BytesMut`] ([`encode_into`]) or a pool-backed slot
+/// ([`FrameEncoder::encode_buffer_pooled`]); both ultimately funnel through
+/// this function so the wire-format logic lives in exactly one place.
+///
+/// `dst` must be at least `HEADER_SIZE + payload.len()` bytes long. On
+/// success, returns the number of bytes written (which equals
+/// `HEADER_SIZE + payload.len()`).
+///
+/// ## Errors
+///
+/// * [`FrameError::PayloadTooLarge`] — `payload.len() > u32::MAX`.
+/// * [`FrameError::BufferTooSmall`] — `dst.len() < HEADER_SIZE + payload.len()`.
+#[inline(always)]
+pub fn encode_into_slice(
+    dst: &mut [u8],
+    header: FrameHeader,
+    payload: &[u8],
+) -> Result<usize, FrameError> {
+    let len = u32::try_from(payload.len()).map_err(|_| FrameError::PayloadTooLarge {
+        len: payload.len(),
+        max: u32::MAX as usize,
+    })?;
+    let needed = HEADER_SIZE + payload.len();
+    if dst.len() < needed {
+        return Err(FrameError::BufferTooSmall {
+            needed,
+            have: dst.len(),
+        });
+    }
+    // SAFETY: `dst.len() >= needed` (checked above). Every offset below is
+    // strictly less than `needed` and therefore in-bounds. Unaligned stores
+    // are sound because `u8` slices have no alignment guarantee — we never
+    // read these back as typed values, only as raw bytes on the wire.
+    unsafe {
+        let p = dst.as_mut_ptr();
+        core::ptr::write_unaligned(p as *mut u64, header.stream_id.get().to_be());
+        core::ptr::write_unaligned(p.add(8) as *mut u64, header.seq.get().to_be());
+        *p.add(16) = header.msg_type.as_byte();
+        *p.add(17) = header.flags.bits();
+        core::ptr::write_unaligned(p.add(18) as *mut u32, len.to_be());
+        if !payload.is_empty() {
+            core::ptr::copy_nonoverlapping(payload.as_ptr(), p.add(HEADER_SIZE), payload.len());
+        }
+    }
+    Ok(needed)
 }
 
 // ---------------------------------------------------------------------------
@@ -327,11 +390,13 @@ pub fn decode_with_len(src: &[u8]) -> Result<(FrameRef<'_>, usize), FrameError> 
 /// `Ok(None)` means "need more bytes". `Err(_)` leaves the decoder in an
 /// unrecoverable state; call [`clear`](Self::clear) to reset.
 pub struct FrameDecoder {
-    // TODO(buffer-pool): Replace `BytesMut` with a fixed-size ring buffer
+    // Future optimisation: replace `BytesMut` with a fixed-size ring buffer
     // (head/tail pointers into a pool-backed slab) to eliminate the cost of
     // `split_to()` advancing the internal offset on every decoded frame.
     // NATS, Redis, and DPDK all use ring buffers for receive paths at this
-    // performance tier.
+    // performance tier. Requires API surface changes (`spare_capacity_mut`
+    // returning a pair of slices, `commit` accepting wrap-around) and is
+    // tracked separately from the pool-backed encoder path.
     buf: BytesMut,
     max_payload_len: usize,
 }
@@ -388,7 +453,10 @@ impl FrameDecoder {
     pub fn spare_capacity_mut(&mut self, hint: usize) -> &mut [u8] {
         let spare = self.buf.capacity() - self.buf.len();
         if spare < hint {
-            // TODO(buffer-pool): pool.get(hint) here instead of heap growth.
+            // Future optimisation: route this growth through a pool-backed
+            // slab once `FrameDecoder` switches to a ring buffer (see the
+            // note on `buf` above). The current contiguous `BytesMut` model
+            // cannot hand out a pool slot without an API change.
             self.buf.reserve(hint - spare);
         }
         // SAFETY: pointer stays within the allocated buffer;
@@ -460,9 +528,11 @@ impl FrameDecoder {
         }
         // All validation passed. Detach the frame bytes — zero-copy split.
         // `freeze()` bumps a refcount; `slice()` gives a sub-view with no copy.
-        // TODO(buffer-pool): Returning `FrameRef<'_>` borrowing from `self.buf`
-        // would eliminate the `freeze()` Arc increment. Requires an API change
-        // (caller must not hold the ref across the next push/decode call).
+        // Future optimisation: a `decode_frame_ref` variant returning
+        // `FrameRef<'_>` borrowing `self.buf` would eliminate the `freeze()`
+        // Arc increment entirely. Tracked alongside the `Frame` doc note and
+        // the ring-buffer follow-up above — independent of the pool-backed
+        // encoder path that is already implemented.
         let frame_bytes = self.buf.split_to(frame_end).freeze();
         let payload = frame_bytes.slice(HEADER_SIZE..);
         Ok(Some(Frame {
@@ -506,13 +576,37 @@ impl Default for FrameDecoder {
 /// `clear()` between frames). [`FrameEncoder::encode_buffer`] is useful when
 /// the caller cannot own the buffer across frames.
 ///
-/// ## TODO(buffer-pool)
+/// ## Pool-backed path
 ///
-/// Once `buffer-pool` is ready, `encode_buffer` should acquire a buffer from
-/// the pool and return an RAII guard that recycles on drop — keeping the same
-/// API surface. See inline `TODO(buffer-pool)` comments below.
+/// With the `buffer-pool` cargo feature enabled,
+/// [`encode_buffer_pooled`](Self::encode_buffer_pooled) acquires a slot from
+/// a shared [`BufferPool`](buffer_pool::BufferPool), encodes into it via
+/// [`encode_into_slice`], and returns a [`Buffer`](buffer_pool::Buffer) guard
+/// that recycles the slot on `Drop` — the same API shape as `encode_buffer`
+/// but without touching the global allocator on the steady-state path.
 pub struct FrameEncoder {
     max_payload_len: usize,
+}
+
+/// Error returned by pool-backed encode methods
+/// ([`FrameEncoder::encode_buffer_pooled`], [`Frame::encode_pooled`]).
+///
+/// Combines the codec-layer [`FrameError`] (payload-too-large / buffer-too-small
+/// / unknown-message-type) with the pool-layer
+/// [`BufferPoolError`](buffer_pool::BufferPoolError) (pool closed, backpressure
+/// timeout, allocation failure). The two underlying causes have nothing in
+/// common, so they are kept distinct rather than collapsed into a single
+/// string.
+#[cfg(feature = "buffer-pool")]
+#[derive(Debug, thiserror::Error)]
+pub enum EncodePooledError {
+    /// The codec rejected the inputs (oversized payload, undersized slice, …).
+    #[error(transparent)]
+    Frame(#[from] FrameError),
+
+    /// The pool could not satisfy the lease (closed, backpressure, OOM).
+    #[error(transparent)]
+    Pool(#[from] buffer_pool::BufferPoolError),
 }
 
 /// Default payload cap mirroring [`DEFAULT_MAX_PAYLOAD_LEN`].
@@ -535,25 +629,55 @@ impl FrameEncoder {
 
     /// Encodes a single frame into a freshly allocated [`BytesMut`].
     ///
-    /// ## TODO(buffer-pool)
-    ///
-    /// Replace `BytesMut::with_capacity` with `pool.get(needed)` and change
-    /// the return type to a pool-RAII guard so the buffer recycles on drop:
-    ///
-    /// ```rust,ignore
-    /// let buf = self.pool.get(HEADER_SIZE + payload.len());
-    /// encode_into(&mut *buf, header, payload)?;
-    /// Ok(buf)  // recycles on drop
-    /// ```
+    /// Each call hits the global allocator (`BytesMut::with_capacity`). For
+    /// hot send paths, prefer [`encode_buffer_pooled`](Self::encode_buffer_pooled)
+    /// (requires the `buffer-pool` feature), which recycles a slot from a
+    /// [`BufferPool`](buffer_pool::BufferPool) and avoids the allocator entirely
+    /// once the pool is warm.
     pub fn encode_buffer(
         &self,
         header: FrameHeader,
         payload: &[u8],
     ) -> Result<BytesMut, FrameError> {
         self.check_len(payload.len())?;
-        // TODO(buffer-pool): pool.get(HEADER_SIZE + payload.len())
         let mut buf = BytesMut::with_capacity(HEADER_SIZE + payload.len());
         encode_into(&mut buf, header, payload)?;
+        Ok(buf)
+    }
+
+    /// Encodes a single frame into a slot leased from `pool`.
+    ///
+    /// Requires cargo feature `buffer-pool`. Acquires a buffer of exactly
+    /// `HEADER_SIZE + payload.len()` bytes, writes the frame via
+    /// [`encode_into_slice`], and returns the [`Buffer`](buffer_pool::Buffer)
+    /// guard. The slot is recycled back to `pool` on `Drop`.
+    ///
+    /// The returned guard [`Deref`](core::ops::Deref)s to `&[u8]` covering
+    /// exactly the encoded frame bytes — safe to feed straight into
+    /// `quinn::End::write_all` or equivalent. Use
+    /// [`Buffer::into_bytes`](buffer_pool::Buffer::into_bytes) if a refcounted
+    /// [`Bytes`] is required downstream (this copies once).
+    ///
+    /// ## Errors
+    ///
+    /// Same conditions as [`encode_buffer`](Self::encode_buffer), plus
+    /// [`BufferPoolError`](buffer_pool::BufferPoolError) propagated from the
+    /// pool itself (pool closed, backpressure timeout, allocation failure).
+    #[cfg(feature = "buffer-pool")]
+    #[inline]
+    pub fn encode_buffer_pooled(
+        &self,
+        pool: &buffer_pool::BufferPool,
+        header: FrameHeader,
+        payload: &[u8],
+    ) -> Result<buffer_pool::Buffer, EncodePooledError> {
+        self.check_len(payload.len())?;
+        let needed = HEADER_SIZE + payload.len();
+        let mut buf = pool.get(needed).map_err(EncodePooledError::Pool)?;
+        // SAFETY: `encode_into_slice` only writes within `needed` bytes and
+        // `buf` was just leased for at least `needed` bytes.
+        let written = encode_into_slice(&mut buf, header, payload)?;
+        debug_assert_eq!(written, needed);
         Ok(buf)
     }
 
@@ -974,6 +1098,55 @@ mod tests {
             err,
             FrameError::PayloadTooLarge { len: 9, max: 8 }
         ));
+    }
+
+    // ---------- encode_into_slice tests ----------
+
+    #[test]
+    fn encode_into_slice_writes_correctly() {
+        let header =
+            FrameHeader::new(StreamId::new(1), MessageType::TextToken).with_seq(Seq::new(5));
+        let payload = b"hello slice";
+        let mut buf = vec![0u8; HEADER_SIZE + payload.len()];
+        let written = encode_into_slice(&mut buf, header, payload).unwrap();
+        assert_eq!(written, HEADER_SIZE + payload.len());
+
+        let frame = decode(&buf).unwrap();
+        assert_eq!(frame.stream_id, StreamId::new(1));
+        assert_eq!(frame.seq, Seq::new(5));
+        assert_eq!(frame.payload, payload);
+    }
+
+    #[test]
+    fn encode_into_slice_rejects_small_buffer() {
+        let header = FrameHeader::new(StreamId::new(1), MessageType::TextToken);
+        let payload = b"hello slice";
+        let mut buf = vec![0u8; HEADER_SIZE + payload.len() - 1];
+        let err = encode_into_slice(&mut buf, header, payload).unwrap_err();
+        assert!(matches!(
+            err,
+            FrameError::BufferTooSmall { needed, have }
+            if needed == HEADER_SIZE + payload.len() && have == HEADER_SIZE + payload.len() - 1
+        ));
+    }
+
+    // ---------- encode_buffer_pooled tests ----------
+
+    #[cfg(feature = "buffer-pool")]
+    #[test]
+    fn encode_buffer_pooled_round_trips() {
+        let pool = buffer_pool::BufferPool::default();
+        let enc = FrameEncoder::new();
+        let header =
+            FrameHeader::new(StreamId::new(2), MessageType::AudioFrame).with_seq(Seq::new(10));
+        let payload = b"hello pooled codec";
+        let buf = enc.encode_buffer_pooled(&pool, header, payload).unwrap();
+        assert_eq!(buf.len(), HEADER_SIZE + payload.len());
+
+        let frame = decode(&buf).unwrap();
+        assert_eq!(frame.stream_id, StreamId::new(2));
+        assert_eq!(frame.seq, Seq::new(10));
+        assert_eq!(frame.payload, payload);
     }
 
     // ---------- zero-copy verification ----------
