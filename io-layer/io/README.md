@@ -21,7 +21,7 @@ targeting 1 M+ concurrent connections with sub-ms tail latency.
 |   sparse files)                       CANCEL)                    |
 |       │                                                          |
 |       ▼                                                          |
-|  Connection (UDP SO_REUSEPORT, recvmsg_multishot, send_zc)       |
+|  Socket + Receiver + Sender (UDP SO_REUSEPORT, multishot, send_zc)|
 +-------------------------------------------------------------------+
 ```
 
@@ -41,21 +41,25 @@ reactor.run()?;
 |-------|--------|----------------|
 | 1 | [`common`]        | Constants, protocol opcodes |
 | 2 | [`error`]         | `IoError` thiserror enum |
-| 3 | [`io_uring_ctx`]  | `IoUringCtx` ring setup + registrations |
-| 4 | [`buffer_pool`]   | Provided-buffer ring manager (`PBUF_RING`) |
-| 5 | [`timer_wheel`]   | Kernel-side io_uring timeouts (`TIMEOUT` + `CANCEL`) |
-| 6 | [`connection`]    | UDP socket + multishot RX + `send_zc` TX |
-| 7 | [`metrics`]       | Atomic counters + snapshot |
-| 8 | [`reactor`]       | Thread-per-core event loop |
+| 3 | [`features`]      | `IoFeatures` bitmask + kernel version detection |
+| 4 | [`context`]       | `IoUringCtx` ring setup + `IoRegistry` |
+| 5 | [`memory`]        | `MemoryRegion` + `BufferPool` (`PBUF_RING`) |
+| 6 | [`ops`]           | `OpKind` user_data encoding + `Receiver`/`Sender` + SQE builders |
+| 7 | [`socket`]        | UDP socket bind + fd ownership |
+| 8 | [`completion`]    | `Completion` enum + `CompletionDecoder` |
+| 9 | [`registry`]      | Explicit resource unregister + `Drop` cleanup |
+| 10 | [`timer_wheel`]  | Kernel-side io_uring timeouts (`TIMEOUT` + `CANCEL`) |
+| 11 | [`metrics`]      | Atomic counters + snapshot |
+| 12 | [`reactor`]      | Thread-per-core event loop |
 
 ## Relationship to `runtime-layer/`
 
-The `buffer_pool` and `timer_wheel` modules here are **kernel-interface
+The `memory::BufferPool` and `timer_wheel` modules here are **kernel-interface
 adapters**, not duplicates of `runtime-layer/buffer-pool` and `runtime-layer/timer-wheel`:
 
 | `runtime-layer/` crate | `io` module | Difference |
 |---------------|-------------|------------|
-| `buffer-pool`  | `io::buffer_pool`  | `runtime-layer/` is a userspace object pool; `io::buffer_pool` registers a kernel `PBUF_RING` so the kernel posts recv'd datagrams directly. |
+| `buffer-pool`  | `io::memory::BufferPool`  | `runtime-layer/` is a userspace object pool; `io` registers a kernel `PBUF_RING` so the kernel posts recv'd datagrams directly. |
 | `timer-wheel`  | `io::timer_wheel`  | `runtime-layer/` is a userspace hierarchical wheel with worker threads; `io::timer_wheel` submits `IORING_OP_TIMEOUT` / `TIMEOUT_REMOVE` SQEs and tracks active kernel timers. |
 
 Both `runtime-layer/` crates will be used **on top of** the reactor for
@@ -76,6 +80,11 @@ the kernel ring.
   per-SQE buffer pointer.
 - **`SEND_ZC`** for zero-copy TX with a two-CQE lifecycle (send status
   + buffer-reclaim notification).
+- **High-bit `user_data` tagging** — bits `[63:60]` encode `OpKind`,
+  bits `[59:0]` encode caller ID. The `CompletionDecoder` classifies
+  CQEs with zero-overhead shift+match, no HashMap lookup.
+- **Explicit resource lifetime** — `IoRegistry` and `BufferPool` both
+  unregister kernel resources in `Drop` before freeing memory.
 
 ## Kernel requirements
 
@@ -116,15 +125,19 @@ cargo bench -p io --bench udp_roundtrip -- \
 | `ring_init`     | Ring setup, fixed-buffer/file registration |
 | `buffer_pool`   | `PBUF_RING` init, refill, address lookup |
 | `timer_ops`     | Timeout SQE submit, retire/is_active HashMap ops |
-| `connection`    | Socket setup, multishot recv, buffer parse, `send_zc` |
+| `connection`    | Socket bind, recv arm, buffer parse, `send_zc`, completion decode |
 | `metrics`       | Atomic-counter overhead + snapshot |
 | `udp_roundtrip` | End-to-end UDP latency (send → recv → parse) |
 
 [`common`]: src/common.rs
 [`error`]: src/error.rs
-[`io_uring_ctx`]: src/io_uring_ctx.rs
-[`buffer_pool`]: src/buffer_pool.rs
+[`features`]: src/features.rs
+[`context`]: src/context.rs
+[`memory`]: src/memory/mod.rs
+[`ops`]: src/ops/mod.rs
+[`socket`]: src/socket.rs
+[`completion`]: src/completion.rs
+[`registry`]: src/registry.rs
 [`timer_wheel`]: src/timer_wheel.rs
-[`connection`]: src/connection.rs
 [`metrics`]: src/metrics.rs
 [`reactor`]: src/reactor.rs

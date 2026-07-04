@@ -11,7 +11,7 @@ mod common;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
-use io::buffer_pool::BufferPool;
+use io::memory::BufferPool;
 use io_uring::IoUring;
 
 fn bench_init_buffer_ring_count(c: &mut Criterion) {
@@ -22,8 +22,7 @@ fn bench_init_buffer_ring_count(c: &mut Criterion) {
             b.iter_batched(
                 || common::fresh_ring(64),
                 |ring| {
-                    let pool = BufferPool::init_buffer_ring(&ring.submitter(), 1, count, 2048)
-                        .expect("pool");
+                    let pool = BufferPool::init_buffer_ring(&ring, 1, count, 2048).expect("pool");
                     black_box(pool);
                 },
                 BatchSize::PerIteration,
@@ -41,8 +40,7 @@ fn bench_init_buffer_ring_size(c: &mut Criterion) {
             b.iter_batched(
                 || common::fresh_ring(64),
                 |ring| {
-                    let pool =
-                        BufferPool::init_buffer_ring(&ring.submitter(), 1, 64, size).expect("pool");
+                    let pool = BufferPool::init_buffer_ring(&ring, 1, 64, size).expect("pool");
                     black_box(pool);
                 },
                 BatchSize::PerIteration,
@@ -58,7 +56,7 @@ fn bench_with_defaults(c: &mut Criterion) {
         b.iter_batched(
             || common::fresh_ring(64),
             |ring| {
-                let pool = BufferPool::with_defaults(&ring.submitter(), 1).expect("pool");
+                let pool = BufferPool::with_defaults(&ring, 1).expect("pool");
                 black_box(pool);
             },
             BatchSize::PerIteration,
