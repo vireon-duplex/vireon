@@ -24,6 +24,14 @@ pub enum FrameError {
     #[error("payload length {len} exceeds maximum {max}")]
     PayloadTooLarge { len: usize, max: usize },
 
+    /// The destination slice was smaller than the encoded frame needed.
+    ///
+    /// Returned by [`encode_into_slice`](super::encode_into_slice) (and the
+    /// pool-backed encoders that build on it) when the caller hands in a
+    /// buffer shorter than `HEADER_SIZE + payload.len()`.
+    #[error("destination buffer too small: need {needed} bytes, have {have}")]
+    BufferTooSmall { needed: usize, have: usize },
+
     /// The message-type byte does not map to any known
     /// [`MessageType`](super::MessageType).
     #[error("unknown message type byte: 0x{value:02X}")]
@@ -59,6 +67,15 @@ mod tests {
                 .to_string()
                 .as_str(),
             "payload length 999 exceeds maximum 256"
+        );
+        assert_eq!(
+            FrameError::BufferTooSmall {
+                needed: 64,
+                have: 32
+            }
+            .to_string()
+            .as_str(),
+            "destination buffer too small: need 64 bytes, have 32"
         );
         assert_eq!(
             FrameError::UnknownMessageType { value: 0xFF }
