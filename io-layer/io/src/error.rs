@@ -57,6 +57,16 @@ pub enum IoError {
     /// The caller may map it to a `libc::E*` constant for handling.
     #[error("negated errno from kernel: {0}")]
     Kernel(i32),
+
+    /// `io_uring_register(2)` failed during resource registration
+    /// (fixed buffers, sparse files, buffer rings, etc.).
+    #[error("io_uring resource registration failed: {0}")]
+    RegistrationFailed(#[source] std::io::Error),
+
+    /// `io_uring_register(2)` failed during resource unregistration.
+    /// Usually best-effort in Drop — the error is logged but ignored.
+    #[error("io_uring resource unregistration failed: {0}")]
+    UnregistrationFailed(std::io::Error),
 }
 
 #[cfg(test)]

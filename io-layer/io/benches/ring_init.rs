@@ -11,7 +11,7 @@ mod common;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
-use io::io_uring_ctx::IoUringCtx;
+use io::context::IoUringCtx;
 use io_uring::IoUring;
 
 fn bench_init_ring(c: &mut Criterion) {
