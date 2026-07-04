@@ -5,8 +5,85 @@ edition.workspace = true
 repository.workspace = true
 authors.workspace = true
 license.workspace = true
+# We have explicit [[bench]] entries; prevent Cargo from auto-detecting
+# non-entry-point files like benches/common.rs as standalone bench binaries.
+autobenches = false
+
+[features]
+default = []
+# Telemetry export backends (Layer 15). Counters and histograms are always
+# captured; a feature only pulls in the matching export crate.
+prometheus = ["dep:prometheus"]
+otel = ["dep:opentelemetry"]
+# Linux NUMA awareness (Layer 22). Compiles to a single-node no-op when off.
+numa = ["dep:libc"]
+# Allocation-site backtrace capture for the leak detector (Layer 20). Uses
+# `std::backtrace`, so this feature only flips runtime capture on.
+leak = []
 
 [dependencies]
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+prometheus = { version = "0.13", optional = true }
+opentelemetry = { version = "0.27", optional = true }
+libc = { version = "0.2", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "pool_bench"
+harness = false
+
+[[bench]]
+name = "alloc_paths"
+harness = false
+
+[[bench]]
+name = "batch"
+harness = false
+
+[[bench]]
+name = "size_class"
+harness = false
+
+[[bench]]
+name = "latency"
+harness = false
+
+[[bench]]
+name = "mixed_workload"
+harness = false
+
+[[bench]]
+name = "scalability"
+harness = false
+
+[[bench]]
+name = "pressure"
+harness = false
+
+[[bench]]
+name = "zeroing"
+harness = false
+
+[[bench]]
+name = "huge"
+harness = false
+
+[[bench]]
+name = "workload"
+harness = false
+
+[[bench]]
+name = "stress"
+harness = false
+
+[[bench]]
+name = "numa"
+harness = false
+required-features = ["numa"]
 
 [lints]
 workspace = true
