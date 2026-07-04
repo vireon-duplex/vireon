@@ -84,12 +84,6 @@ impl<'a> FrameRef<'a> {
     /// Convenience wrapper over [`Self::encode_into`]. Use [`encode_into`] when
     /// writing into a pre-allocated buffer or a transport layer that supplies
     /// its own memory.
-    ///
-    /// # TODO(buffer-pool)
-    ///
-    /// When a `Connection`-scoped encoder buffer is available, callers should
-    /// pass a pool-backed `ByteWriter` to [`encode_into`] directly instead of
-    /// relying on this `Vec` growth path.
     #[inline]
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), FrameError> {
         let wire = self.wire_size();
@@ -97,6 +91,41 @@ impl<'a> FrameRef<'a> {
         out.resize(start + wire, 0);
         let mut writer = ByteWriter::new(&mut out[start..]);
         self.encode_into(&mut writer)
+    }
+
+    /// Encodes this frame (header + payload) into a slot leased from `pool`.
+    ///
+    /// Requires cargo feature `buffer-pool`. Acquires a buffer of exactly
+    /// `HEADER_SIZE + payload.len()` bytes, writes the frame via
+    /// [`encode_into`], and returns the [`Buffer`](buffer_pool::Buffer)
+    /// guard. The slot is recycled back to `pool` on `Drop`.
+    ///
+    /// ## Errors
+    ///
+    /// Returns [`EncodePooledError`](crate::codec::EncodePooledError) if the payload is too
+    /// large or the pool cannot satisfy the lease.
+    #[cfg(feature = "buffer-pool")]
+    #[inline]
+    pub fn encode_pooled(
+        &self,
+        pool: &buffer_pool::BufferPool,
+    ) -> Result<buffer_pool::Buffer, crate::codec::EncodePooledError> {
+        if self.payload.len() > MAX_PAYLOAD_LEN {
+            return Err(crate::codec::EncodePooledError::Frame(
+                FrameError::PayloadTooLarge {
+                    len: self.payload.len(),
+                    max: MAX_PAYLOAD_LEN,
+                },
+            ));
+        }
+        let needed = self.wire_size();
+        let mut buf = pool
+            .get(needed)
+            .map_err(crate::codec::EncodePooledError::Pool)?;
+        let mut writer = ByteWriter::new(&mut buf);
+        self.encode_into(&mut writer)
+            .map_err(crate::codec::EncodePooledError::Frame)?;
+        Ok(buf)
     }
 }
 
@@ -205,12 +234,6 @@ impl Frame {
     /// Convenience wrapper over [`Self::encode_into`]. Use [`encode_into`] when
     /// writing into a pre-allocated buffer or a transport layer that supplies
     /// its own memory.
-    ///
-    /// # TODO(buffer-pool)
-    ///
-    /// When a `Connection`-scoped encoder buffer is available, callers should
-    /// pass a pool-backed `ByteWriter` to [`encode_into`] directly instead of
-    /// relying on this `Vec` growth path.
     #[inline]
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), FrameError> {
         let wire = self.wire_size();
@@ -218,6 +241,26 @@ impl Frame {
         out.resize(start + wire, 0);
         let mut writer = ByteWriter::new(&mut out[start..]);
         self.encode_into(&mut writer)
+    }
+
+    /// Encodes this frame (header + payload) into a slot leased from `pool`.
+    ///
+    /// Requires cargo feature `buffer-pool`. Acquires a buffer of exactly
+    /// `HEADER_SIZE + payload.len()` bytes, writes the frame via
+    /// [`encode_into`], and returns the [`Buffer`](buffer_pool::Buffer)
+    /// guard. The slot is recycled back to `pool` on `Drop`.
+    ///
+    /// ## Errors
+    ///
+    /// Returns [`EncodePooledError`](crate::codec::EncodePooledError) if the payload is too
+    /// large or the pool cannot satisfy the lease.
+    #[cfg(feature = "buffer-pool")]
+    #[inline]
+    pub fn encode_pooled(
+        &self,
+        pool: &buffer_pool::BufferPool,
+    ) -> Result<buffer_pool::Buffer, crate::codec::EncodePooledError> {
+        self.as_ref().encode_pooled(pool)
     }
 }
 
@@ -251,17 +294,26 @@ pub fn encode_into(
     Ok(())
 }
 
+/// Encodes a whole frame (header + payload).
+///
+/// When `buffer-pool` feature is enabled, this leases a buffer from the pool, writes
+/// the frame, and returns it. Otherwise, it appends the frame to `out`.
+#[cfg(feature = "buffer-pool")]
+#[inline]
+pub fn encode_pooled(
+    header: FrameHeader,
+    payload: &[u8],
+    pool: &buffer_pool::BufferPool,
+) -> Result<buffer_pool::Buffer, crate::codec::EncodePooledError> {
+    let view = FrameRef { header, payload };
+    view.encode_pooled(pool)
+}
+
 /// Encodes a whole frame (header + payload) by appending to `out`.
 ///
 /// Convenience wrapper over [`encode_into`]. `header.payload_len` is
 /// overwritten with `payload.len()`. Payloads larger than [`MAX_PAYLOAD_LEN`]
 /// return [`FrameError::PayloadTooLarge`] without writing anything.
-///
-/// # TODO(buffer-pool)
-///
-/// When a `Connection`-scoped encoder buffer is available, callers should
-/// pass a pool-backed `ByteWriter` to [`encode_into`] directly. This `Vec`
-/// resize path exists only for convenience in tests and one-shot use.
 #[inline]
 pub fn encode(header: FrameHeader, payload: &[u8], out: &mut Vec<u8>) -> Result<(), FrameError> {
     // Validate before touching `out` so a failed call leaves it unchanged.
@@ -438,6 +490,31 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "buffer-pool")]
+    fn encode_decode_pooled_round_trip() -> Result<(), crate::codec::EncodePooledError> {
+        let pool = buffer_pool::BufferPool::default();
+        let original = Frame::new(
+            SessionId::new(42),
+            StreamId::new(7),
+            MessageType::AudioFrame,
+            Bytes::from_static(b"hello frame world"),
+        )
+        .with_flags(FrameFlags::COMPRESSED)
+        .with_priority(Priority::HIGH)
+        .with_seq(Seq::new(100))
+        .with_timestamp(Timestamp::new(5_000_000));
+
+        let buf = encode_pooled(original.header, &original.payload, &pool)?;
+        assert_eq!(buf.len(), HEADER_SIZE + original.payload.len());
+
+        let decoded = decode(&buf)?;
+        assert_eq!(decoded.header, original.header);
+        assert_eq!(decoded.payload, original.payload.as_ref());
+        assert_eq!(decoded.wire_size(), buf.len());
+        Ok(())
+    }
+
+    #[test]
     fn decode_rejects_truncated_payload() -> Result<(), FrameError> {
         let header = FrameHeader::new(SessionId::ZERO, StreamId::ZERO, MessageType::TextToken)
             .with_payload_len(100);
@@ -475,6 +552,20 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "buffer-pool")]
+    fn encode_pooled_free_fn_rejects_oversized_payload() {
+        let pool = buffer_pool::BufferPool::default();
+        let header = FrameHeader::new(SessionId::ZERO, StreamId::ZERO, MessageType::TextToken);
+        let ptr = std::ptr::NonNull::dangling().as_ptr();
+        let dummy_slice = unsafe { std::slice::from_raw_parts(ptr, MAX_PAYLOAD_LEN + 1) };
+        let err = encode_pooled(header, dummy_slice, &pool).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::codec::EncodePooledError::Frame(FrameError::PayloadTooLarge { .. })
+        ));
+    }
+
+    #[test]
     fn encode_reconciles_declared_payload_len() -> Result<(), FrameError> {
         // Caller declares a wrong length; encode must fix it from the payload.
         let header = FrameHeader::new(SessionId::ZERO, StreamId::ZERO, MessageType::TextToken)
@@ -483,6 +574,22 @@ mod tests {
         let mut out = Vec::new();
         encode(header, payload, &mut out)?;
         let decoded = decode(&out)?;
+        assert_eq!(decoded.payload.len(), payload.len());
+        assert_eq!(decoded.payload, payload);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "buffer-pool")]
+    fn encode_pooled_reconciles_declared_payload_len() -> Result<(), crate::codec::EncodePooledError>
+    {
+        let pool = buffer_pool::BufferPool::default();
+        // Caller declares a wrong length; encode must fix it from the payload.
+        let header = FrameHeader::new(SessionId::ZERO, StreamId::ZERO, MessageType::TextToken)
+            .with_payload_len(999);
+        let payload = b"abc";
+        let buf = encode_pooled(header, payload, &pool)?;
+        let decoded = decode(&buf)?;
         assert_eq!(decoded.payload.len(), payload.len());
         assert_eq!(decoded.payload, payload);
         Ok(())
@@ -507,5 +614,96 @@ mod tests {
         assert_eq!(decoded.header, owned.header);
         assert_eq!(decoded.payload, owned.payload.as_ref());
         Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "buffer-pool")]
+    fn into_owned_then_decode_pooled_still_matches() -> Result<(), crate::codec::EncodePooledError>
+    {
+        let pool = buffer_pool::BufferPool::default();
+        let backing: Vec<u8> = (0..32u8).collect();
+        let view = FrameRef {
+            header: FrameHeader::new(
+                SessionId::new(1),
+                StreamId::new(9),
+                MessageType::StateUpdate,
+            )
+            .with_seq(Seq::new(4)),
+            payload: &backing,
+        };
+        let owned = view.into_owned();
+        let buf = owned.encode_pooled(&pool)?;
+        let decoded = decode(&buf)?;
+        assert_eq!(decoded.header, owned.header);
+        assert_eq!(decoded.payload, owned.payload.as_ref());
+        Ok(())
+    }
+
+    #[cfg(feature = "buffer-pool")]
+    #[test]
+    fn frame_encode_pooled_round_trip() {
+        let pool = buffer_pool::BufferPool::default();
+        let original = Frame::new(
+            SessionId::new(42),
+            StreamId::new(7),
+            MessageType::AudioFrame,
+            Bytes::from_static(b"hello pooled world"),
+        )
+        .with_flags(FrameFlags::COMPRESSED)
+        .with_priority(Priority::HIGH)
+        .with_seq(Seq::new(100))
+        .with_timestamp(Timestamp::new(5_000_000));
+
+        let buf = original.encode_pooled(&pool).unwrap();
+        assert_eq!(buf.len(), HEADER_SIZE + original.payload.len());
+
+        let decoded = decode(&buf).unwrap();
+        assert_eq!(decoded.header, original.header);
+        assert_eq!(decoded.payload, original.payload.as_ref());
+    }
+
+    #[cfg(feature = "buffer-pool")]
+    #[test]
+    fn frame_ref_encode_pooled_round_trip() {
+        let pool = buffer_pool::BufferPool::default();
+        let payload = b"hello pooled world ref";
+        let original = FrameRef {
+            header: FrameHeader::new(
+                SessionId::new(42),
+                StreamId::new(7),
+                MessageType::AudioFrame,
+            )
+            .with_flags(FrameFlags::COMPRESSED)
+            .with_priority(Priority::HIGH)
+            .with_seq(Seq::new(100))
+            .with_timestamp(Timestamp::new(5_000_000)),
+            payload,
+        };
+
+        let buf = original.encode_pooled(&pool).unwrap();
+        assert_eq!(buf.len(), HEADER_SIZE + payload.len());
+
+        let decoded = decode(&buf).unwrap();
+        let mut expected_header = original.header;
+        expected_header.payload_len = payload.len() as u32;
+        assert_eq!(decoded.header, expected_header);
+        assert_eq!(decoded.payload, payload);
+    }
+
+    #[cfg(feature = "buffer-pool")]
+    #[test]
+    fn encode_pooled_rejects_oversized_payload() {
+        let pool = buffer_pool::BufferPool::default();
+        let ptr = std::ptr::NonNull::dangling().as_ptr();
+        let dummy_slice = unsafe { std::slice::from_raw_parts(ptr, MAX_PAYLOAD_LEN + 1) };
+        let original = FrameRef {
+            header: FrameHeader::new(SessionId::ZERO, StreamId::ZERO, MessageType::TextToken),
+            payload: dummy_slice,
+        };
+        let err = original.encode_pooled(&pool).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::codec::EncodePooledError::Frame(FrameError::PayloadTooLarge { .. })
+        ));
     }
 }

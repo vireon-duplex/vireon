@@ -1055,6 +1055,15 @@ fn bench_frame_layer_encode(c: &mut Criterion) {
         assert_eq!(out.len(), frame::header::HEADER_SIZE + payload_bytes.len());
     });
 
+    #[cfg(feature = "buffer-pool")]
+    group.bench_function("Frame_encode_pooled", |b| {
+        let pool = buffer_pool::BufferPool::default();
+        b.iter(|| {
+            let buf = owned_frame.encode_pooled(&pool).unwrap();
+            sink_encoded(&buf);
+        });
+    });
+
     group.bench_function("FrameRef_encode_into", |b| {
         let frame_ref = owned_frame.as_ref();
         let mut out = Vec::with_capacity(frame::header::HEADER_SIZE + payload_bytes.len());
@@ -1064,6 +1073,16 @@ fn bench_frame_layer_encode(c: &mut Criterion) {
             sink_encoded(&out);
         });
         assert_eq!(out.len(), frame::header::HEADER_SIZE + payload_bytes.len());
+    });
+
+    #[cfg(feature = "buffer-pool")]
+    group.bench_function("FrameRef_encode_pooled", |b| {
+        let frame_ref = owned_frame.as_ref();
+        let pool = buffer_pool::BufferPool::default();
+        b.iter(|| {
+            let buf = frame_ref.encode_pooled(&pool).unwrap();
+            sink_encoded(&buf);
+        });
     });
 
     group.finish();
