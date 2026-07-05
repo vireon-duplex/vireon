@@ -1,0 +1,52 @@
+[package]
+name = "kernel-nic"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# We have explicit [[bench]] entries; prevent Cargo from auto-detecting
+# non-entry-point files like benches/common.rs as standalone bench binaries.
+autobenches = false
+
+[dependencies]
+libc = "0.2"
+socket2 = { version = "0.5", features = ["all"] }
+io-uring = "0.7"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+
+# ── Benchmarks ─────────────────────────────────────────────────────
+
+[[bench]]
+name = "topology"
+path = "benches/topology.rs"
+harness = false
+
+[[bench]]
+name = "features_detect"
+path = "benches/features_detect.rs"
+harness = false
+
+[[bench]]
+name = "nic_scan"
+path = "benches/nic_scan.rs"
+harness = false
+
+[[bench]]
+name = "socket_create"
+path = "benches/socket_create.rs"
+harness = false
+
+[[bench]]
+name = "cpuset"
+path = "benches/cpuset.rs"
+harness = false
+
+[lints]
+workspace = true
