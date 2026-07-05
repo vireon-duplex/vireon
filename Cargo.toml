@@ -44,7 +44,7 @@ rpath = false
 strip = false
 
 [workspace]
-members = ["io-layer/io","runtime-layer/buffer-pool", "runtime-layer/timer-wheel","message-layer/frame", "runtime-layer/send-queue", "runtime-layer/task-queue", "runtime-layer/cqe-processor", "kernel-layer/kernel-nic", "runtime-layer/connection-shard"]
+members = ["io-layer/io","runtime-layer/buffer-pool", "runtime-layer/timer-wheel","message-layer/frame", "runtime-layer/send-queue", "runtime-layer/task-queue", "runtime-layer/cqe-processor", "kernel-layer/kernel-nic", "runtime-layer/connection-shard", "transport-layer/quic-engine"]
 resolver = "2"
 exclude = []
 
@@ -61,6 +61,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 lazy_static = "1.5.0"
 dotenv = "0.15.0"
+
+# QUIC transport layer (consumed by transport-layer/quic-engine).
+quiche  = "0.22"
+libc    = "0.2"
+socket2 = { version = "0.5", features = ["all"] }
 
 [dependencies]
 anyhow = { workspace = true }
