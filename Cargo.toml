@@ -44,7 +44,7 @@ rpath = false
 strip = false
 
 [workspace]
-members = ["io-layer/io","runtime-layer/buffer-pool", "runtime-layer/timer-wheel","message-layer/frame"]
+members = ["io-layer/io","runtime-layer/buffer-pool", "runtime-layer/timer-wheel","message-layer/frame", "runtime-layer/send-queue"]
 resolver = "2"
 exclude = []
 

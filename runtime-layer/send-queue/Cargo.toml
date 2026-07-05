@@ -1,0 +1,61 @@
+[package]
+name = "send-queue"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+autobenches = false
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "submit"
+harness = false
+
+[[bench]]
+name = "flush"
+harness = false
+
+[[bench]]
+name = "lifecycle"
+harness = false
+
+[[bench]]
+name = "backpressure"
+harness = false
+
+[[bench]]
+name = "stats"
+harness = false
+
+[[bench]]
+name = "saturation"
+harness = false
+
+[[bench]]
+name = "retry"
+harness = false
+
+[[bench]]
+name = "cache"
+harness = false
+
+[[bench]]
+name = "mpsc"
+harness = false
+
+[[bench]]
+name = "soak"
+harness = false
+
+[[bench]]
+name = "scheduler"
+harness = false
+
+[lints]
+workspace = true
