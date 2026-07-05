@@ -1,0 +1,50 @@
+[package]
+name = "reactor"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Thread-per-core reactor orchestrator that owns one io_uring ring and drives all Vireon runtime-layer primitives per tick."
+autobenches = false
+
+[dependencies]
+# io_uring core (owned by the reactor).
+io = { path = "../../io-layer/io", package = "io" }
+
+# Vireon runtime-layer primitives — driven by the reactor per-tick.
+cqe-processor    = { path = "../cqe-processor" }
+timer-wheel      = { path = "../timer-wheel" }
+buffer-pool      = { path = "../buffer-pool" }
+connection-shard = { path = "../connection-shard" }
+send-queue       = { path = "../send-queue" }
+task-queue       = { path = "../task-queue" }
+
+# libc for sched_setaffinity, eventfd, NUMA bindings.
+libc = { workspace = true }
+
+# Error handling + structured logging.
+thiserror = { workspace = true }
+tracing  = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "event_loop"
+harness = false
+
+[[bench]]
+name = "submission"
+harness = false
+
+[[bench]]
+name = "wake"
+harness = false
+
+[[bench]]
+name = "pin"
+harness = false
+
+[lints]
+workspace = true
