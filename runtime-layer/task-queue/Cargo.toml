@@ -1,0 +1,52 @@
+[package]
+name = "task-queue"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+crossbeam-queue = "0.3"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[lints]
+workspace = true
+
+# ── Benchmarks ─────────────────────────────────────────────────────
+# Each bench binary is declared explicitly so `cargo bench -p task-queue`
+# runs them all, while `cargo bench -p task-queue --bench <name>` runs one.
+# Mirrors the io / send-queue crate pattern.
+
+[[bench]]
+name = "spawn"
+path = "benches/spawn.rs"
+harness = false
+
+[[bench]]
+name = "tick"
+path = "benches/tick.rs"
+harness = false
+
+[[bench]]
+name = "scheduler"
+path = "benches/scheduler.rs"
+harness = false
+
+[[bench]]
+name = "saturation"
+path = "benches/saturation.rs"
+harness = false
+
+[[bench]]
+name = "mpsc"
+path = "benches/mpsc.rs"
+harness = false
+
+[[bench]]
+name = "soak"
+path = "benches/soak.rs"
+harness = false
