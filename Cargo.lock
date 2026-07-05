@@ -729,6 +729,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "reactor"
+version = "0.1.0"
+dependencies = [
+ "buffer-pool",
+ "connection-shard",
+ "cqe-processor",
+ "criterion",
+ "io",
+ "libc",
+ "send-queue",
+ "task-queue",
+ "thiserror 2.0.18",
+ "timer-wheel",
+ "tracing",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
