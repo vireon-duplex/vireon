@@ -1,0 +1,52 @@
+[package]
+name = "cqe-processor"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+# We have explicit [[bench]] entries; prevent Cargo from auto-detecting
+# non-entry-point files like benches/common.rs as standalone bench binaries.
+autobenches = false
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+io-uring = "0.7"
+libc = "0.2"
+io = { path = "../../io-layer/io" }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# ── Benchmarks ─────────────────────────────────────────────────────
+# Each bench binary is declared explicitly so `cargo bench -p cqe-processor`
+# runs them all, while `cargo bench -p cqe-processor --bench <name>` runs one.
+
+[[bench]]
+name = "drain"
+path = "benches/drain.rs"
+harness = false
+
+[[bench]]
+name = "dispatch"
+path = "benches/dispatch.rs"
+harness = false
+
+[[bench]]
+name = "recycle"
+path = "benches/recycle.rs"
+harness = false
+
+[[bench]]
+name = "stats"
+path = "benches/stats.rs"
+harness = false
+
+[[bench]]
+name = "batch"
+path = "benches/batch.rs"
+harness = false
+
+[lints]
+workspace = true
