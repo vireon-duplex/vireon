@@ -1,0 +1,34 @@
+[package]
+name = "connection-shard"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+autobenches = false
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "lookup"
+harness = false
+
+[[bench]]
+name = "lifecycle"
+harness = false
+
+[[bench]]
+name = "slot_map"
+harness = false
+
+[[bench]]
+name = "migration"
+harness = false
+
+[lints]
+workspace = true
