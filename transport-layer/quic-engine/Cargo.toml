@@ -1,0 +1,60 @@
+[package]
+name = "quic-engine"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+autobenches = false
+
+[dependencies]
+# QUIC protocol core (RFC 9000/9001/9002 + extensions).
+quiche = { workspace = true }
+
+# Socket / FD construction and cross-thread wakeup. The bulk of I/O
+# flows through io_uring via `cqe-processor` and `send-queue`; mio is
+# used only for socket setup and the Waker used by the engine's
+# reactor-integration layer.
+mio = { version = "1.2.1", features = ["os-poll", "net"] }
+libc = { workspace = true }
+socket2 = { workspace = true }
+
+# Error handling + structured logging.
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Bytes abstraction (used by stream read/write API).
+bytes = { workspace = true }
+
+# Vireon runtime-layer primitives. These provide the io_uring-native,
+# thread-per-core, NUMA-aware substrate the engine runs on.
+connection-shard = { path = "../../runtime-layer/connection-shard" }
+cqe-processor = { path = "../../runtime-layer/cqe-processor" }
+send-queue = { path = "../../runtime-layer/send-queue" }
+buffer-pool = { path = "../../runtime-layer/buffer-pool" }
+timer-wheel = { path = "../../runtime-layer/timer-wheel" }
+task-queue = { path = "../../runtime-layer/task-queue" }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# Bench entries. Bodies land in their respective implementation phases
+# (Phase 1+); Phase 0 only ships skeletons that compile.
+[[bench]]
+name = "cid_lookup"
+harness = false
+[[bench]]
+name = "packet"
+harness = false
+[[bench]]
+name = "stream"
+harness = false
+[[bench]]
+name = "scheduler"
+harness = false
+[[bench]]
+name = "migration"
+harness = false
+
+[lints]
+workspace = true
