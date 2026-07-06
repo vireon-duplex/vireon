@@ -1,0 +1,40 @@
+[package]
+name = "stream-scheduler"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Per-tick stream selection: RFC 9218 prioritization, fair queuing, starvation prevention."
+autobenches = false
+
+[dependencies]
+stream-manager = { path = "../stream-manager" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Phase 1+ will add:
+# send-queue = { path = "../../runtime-layer/send-queue" }
+# task-queue = { path = "../../runtime-layer/task-queue" }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "select"
+harness = false
+
+[[bench]]
+name = "queue"
+harness = false
+
+[[bench]]
+name = "fairness"
+harness = false
+
+[[bench]]
+name = "incremental"
+harness = false
+
+[lints]
+workspace = true
