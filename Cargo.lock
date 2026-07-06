@@ -883,6 +883,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "session-manager"
+version = "0.1.0"
+dependencies = [
+ "connection-shard",
+ "criterion",
+ "stream-manager",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

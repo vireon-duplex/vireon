@@ -1,0 +1,37 @@
+[package]
+name = "session-manager"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Session orchestrator: binds application sessions to QUIC connections, streams, and reactor cores."
+autobenches = false
+
+[dependencies]
+stream-manager   = { path = "../../stream-layer/stream-manager" }
+connection-shard = { path = "../../runtime-layer/connection-shard" }
+thiserror = { workspace = true }
+tracing  = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "lookup"
+harness = false
+
+[[bench]]
+name = "lifecycle"
+harness = false
+
+[[bench]]
+name = "quota"
+harness = false
+
+[[bench]]
+name = "routing"
+harness = false
+
+[lints]
+workspace = true
