@@ -1,0 +1,40 @@
+[package]
+name = "stream-manager"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Owner of every QUIC stream: lifecycle, FSM, stream table, ID allocation, send/recv buffers, per-stream flow control."
+autobenches = false
+
+[dependencies]
+thiserror = { workspace = true }
+tracing  = { workspace = true }
+
+# Phase 1+ will add:
+# bytes = { workspace = true }
+# buffer-pool = { path = "../../runtime-layer/buffer-pool" }
+# frame       = { path = "../../message-layer/frame", package = "frame" }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "table"
+harness = false
+
+[[bench]]
+name = "flow_control"
+harness = false
+
+[[bench]]
+name = "slab"
+harness = false
+
+[[bench]]
+name = "fsm"
+harness = false
+
+[lints]
+workspace = true
