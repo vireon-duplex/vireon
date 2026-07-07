@@ -44,7 +44,7 @@ rpath = false
 strip = false
 
 [workspace]
-members = ["io-layer/io","runtime-layer/buffer-pool", "runtime-layer/timer-wheel","message-layer/frame", "runtime-layer/send-queue", "runtime-layer/task-queue", "runtime-layer/cqe-processor", "kernel-layer/kernel-nic", "runtime-layer/connection-shard", "transport-layer/quic-engine", "runtime-layer/reactor", "stream-layer/stream-manager", "stream-layer/stream-scheduler", "session-layer/session-manager"]
+members = ["io-layer/io","runtime-layer/buffer-pool", "runtime-layer/timer-wheel","message-layer/frame", "runtime-layer/send-queue", "runtime-layer/task-queue", "runtime-layer/cqe-processor", "kernel-layer/kernel-nic", "runtime-layer/connection-shard", "transport-layer/quic-engine", "runtime-layer/reactor", "stream-layer/stream-manager", "stream-layer/stream-scheduler", "session-layer/session-manager", "session-layer/session-registry", "session-layer/session-router", "session-layer/session-migration-manager", "session-layer/session-replication-service"]
 resolver = "2"
 exclude = []
 

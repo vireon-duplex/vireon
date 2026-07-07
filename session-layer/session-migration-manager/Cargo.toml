@@ -1,0 +1,38 @@
+[package]
+name = "session-migration-manager"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Cross-node session migration coordinator: snapshot → transfer → restore → finalize with zero message loss for the Vireon QUIC runtime."
+autobenches = false
+
+[dependencies]
+session-manager   = { path = "../session-manager" }
+session-registry  = { path = "../session-registry" }
+connection-shard  = { path = "../../runtime-layer/connection-shard" }
+thiserror = { workspace = true }
+tracing  = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "plan"
+harness = false
+
+[[bench]]
+name = "phase"
+harness = false
+
+[[bench]]
+name = "snapshot"
+harness = false
+
+[[bench]]
+name = "coordinator"
+harness = false
+
+[lints]
+workspace = true
