@@ -1,0 +1,38 @@
+[package]
+name = "session-router"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Session routing layer for the Vireon QUIC runtime: resolves SessionId to a routing decision (Local, Remote, Anycast, Broadcast, Multicast) with TTL-based cache, health-aware selection, and observability."
+autobenches = false
+
+[dependencies]
+session-manager   = { path = "../session-manager" }
+session-registry  = { path = "../session-registry" }
+connection-shard  = { path = "../../runtime-layer/connection-shard" }
+thiserror = { workspace = true }
+tracing  = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "resolve"
+harness = false
+
+[[bench]]
+name = "cache"
+harness = false
+
+[[bench]]
+name = "anycast"
+harness = false
+
+[[bench]]
+name = "endpoint"
+harness = false
+
+[lints]
+workspace = true
