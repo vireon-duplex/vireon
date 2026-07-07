@@ -1,0 +1,37 @@
+[package]
+name = "session-replication-service"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Metadata replication for HA session-layer: Gossip, Raft, CRDT, and Sync strategies with conflict detection and quorum management."
+autobenches = false
+
+[dependencies]
+session-manager   = { path = "../session-manager" }
+session-registry  = { path = "../session-registry" }
+thiserror = { workspace = true }
+tracing  = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "replicate"
+harness = false
+
+[[bench]]
+name = "consensus"
+harness = false
+
+[[bench]]
+name = "conflict"
+harness = false
+
+[[bench]]
+name = "gossip"
+harness = false
+
+[lints]
+workspace = true

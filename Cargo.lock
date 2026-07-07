@@ -894,6 +894,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "session-migration-manager"
+version = "0.1.0"
+dependencies = [
+ "connection-shard",
+ "criterion",
+ "session-manager",
+ "session-registry",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "session-registry"
+version = "0.1.0"
+dependencies = [
+ "connection-shard",
+ "criterion",
+ "session-manager",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "session-replication-service"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "session-manager",
+ "session-registry",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "session-router"
+version = "0.1.0"
+dependencies = [
+ "connection-shard",
+ "criterion",
+ "session-manager",
+ "session-registry",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
