@@ -1,0 +1,36 @@
+[package]
+name = "resource-quotas"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Per-tenant resource quotas and enforcement: session/stream/bandwidth/memory/request limits with atomic usage tracking."
+autobenches = false
+
+[dependencies]
+session-manager = { path = "../../session-layer/session-manager" }
+thiserror = { workspace = true }
+tracing  = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "check_quota"
+harness = false
+
+[[bench]]
+name = "reserve"
+harness = false
+
+[[bench]]
+name = "release"
+harness = false
+
+[[bench]]
+name = "snapshot"
+harness = false
+
+[lints]
+workspace = true
