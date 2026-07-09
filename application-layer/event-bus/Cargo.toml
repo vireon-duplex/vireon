@@ -1,0 +1,38 @@
+[package]
+name = "event-bus"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Event bus: partitioned topics, consumer groups, offset tracking, and partition rebalancing."
+autobenches = false
+
+[dependencies]
+configuration-system = { path = "../configuration-system" }
+middleware-pipeline  = { path = "../middleware-pipeline" }
+session-manager      = { path = "../../session-layer/session-manager" }
+thiserror = { workspace = true }
+tracing  = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "publish"
+harness = false
+
+[[bench]]
+name = "consume"
+harness = false
+
+[[bench]]
+name = "rebalance"
+harness = false
+
+[[bench]]
+name = "ack"
+harness = false
+
+[lints]
+workspace = true

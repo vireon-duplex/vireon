@@ -3,12 +3,39 @@
 version = 4
 
 [[package]]
+name = "agent-runtime"
+version = "0.1.0"
+dependencies = [
+ "ai-streaming",
+ "configuration-system",
+ "criterion",
+ "event-bus",
+ "rpc-framework",
+ "session-manager",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ddd31a130427c27518df266943a5308ed92d4b226cc639f5a8f1002816174301"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "ai-streaming"
+version = "0.1.0"
+dependencies = [
+ "configuration-system",
+ "criterion",
+ "middleware-pipeline",
+ "rpc-framework",
+ "session-manager",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -28,6 +55,51 @@ name = "anyhow"
 version = "1.0.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
+
+[[package]]
+name = "application-runtime"
+version = "0.1.0"
+dependencies = [
+ "agent-runtime",
+ "ai-streaming",
+ "auth-framework",
+ "configuration-system",
+ "connection-shard",
+ "criterion",
+ "dependency-injection",
+ "event-bus",
+ "feature-flags",
+ "graceful-startup-shutdown",
+ "media-streaming",
+ "middleware-pipeline",
+ "module-lifecycle",
+ "observability-sdk",
+ "ops-dashboard",
+ "plugin-manager",
+ "pubsub-engine",
+ "reactor",
+ "resource-quotas",
+ "rpc-framework",
+ "scheduler-hooks",
+ "service-registry",
+ "session-manager",
+ "session-registry",
+ "stream-manager",
+ "thiserror 2.0.18",
+ "tracing",
+ "version-negotiation",
+]
+
+[[package]]
+name = "auth-framework"
+version = "0.1.0"
+dependencies = [
+ "configuration-system",
+ "criterion",
+ "session-manager",
+ "thiserror 2.0.18",
+ "tracing",
+]
 
 [[package]]
 name = "autocfg"
@@ -150,6 +222,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "configuration-system"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "connection-shard"
 version = "0.1.0"
 dependencies = [
@@ -247,6 +328,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
+name = "dependency-injection"
+version = "0.1.0"
+dependencies = [
+ "configuration-system",
+ "criterion",
+ "service-registry",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -263,10 +355,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "event-bus"
+version = "0.1.0"
+dependencies = [
+ "configuration-system",
+ "criterion",
+ "middleware-pipeline",
+ "session-manager",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
+
+[[package]]
+name = "feature-flags"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "thiserror 2.0.18",
+ "tracing",
+]
 
 [[package]]
 name = "find-msvc-tools"
@@ -340,6 +453,19 @@ dependencies = [
  "cfg-if",
  "libc",
  "r-efi",
+]
+
+[[package]]
+name = "graceful-startup-shutdown"
+version = "0.1.0"
+dependencies = [
+ "configuration-system",
+ "criterion",
+ "module-lifecycle",
+ "scheduler-hooks",
+ "service-registry",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -490,6 +616,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "media-streaming"
+version = "0.1.0"
+dependencies = [
+ "configuration-system",
+ "criterion",
+ "middleware-pipeline",
+ "resource-quotas",
+ "session-manager",
+ "stream-manager",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -505,6 +645,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "middleware-pipeline"
+version = "0.1.0"
+dependencies = [
+ "configuration-system",
+ "criterion",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -514,6 +664,16 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "module-lifecycle"
+version = "0.1.0"
+dependencies = [
+ "configuration-system",
+ "criterion",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -532,6 +692,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "observability-sdk"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "session-manager",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -563,6 +733,18 @@ dependencies = [
  "js-sys",
  "pin-project-lite",
  "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
+name = "ops-dashboard"
+version = "0.1.0"
+dependencies = [
+ "configuration-system",
+ "criterion",
+ "observability-sdk",
+ "service-registry",
+ "thiserror 2.0.18",
  "tracing",
 ]
 
@@ -624,6 +806,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin-manager"
+version = "0.1.0"
+dependencies = [
+ "configuration-system",
+ "criterion",
+ "thiserror 2.0.18",
+ "tracing",
+ "version-negotiation",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -652,6 +845,17 @@ name = "protobuf"
 version = "2.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "106dd99e98437432fed6519dedecfade6a06a73bb7b2a1e019fdd2bee5778d94"
+
+[[package]]
+name = "pubsub-engine"
+version = "0.1.0"
+dependencies = [
+ "configuration-system",
+ "criterion",
+ "event-bus",
+ "thiserror 2.0.18",
+ "tracing",
+]
 
 [[package]]
 name = "quic-engine"
@@ -784,6 +988,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "resource-quotas"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "session-manager",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -795,6 +1009,20 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rpc-framework"
+version = "0.1.0"
+dependencies = [
+ "configuration-system",
+ "criterion",
+ "middleware-pipeline",
+ "session-manager",
+ "stream-manager",
+ "thiserror 2.0.18",
+ "tracing",
+ "version-negotiation",
 ]
 
 [[package]]
@@ -823,6 +1051,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "scheduler-hooks"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "reactor",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -880,6 +1118,19 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "service-registry"
+version = "0.1.0"
+dependencies = [
+ "configuration-system",
+ "connection-shard",
+ "criterion",
+ "session-manager",
+ "session-registry",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -1200,6 +1451,15 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "version-negotiation"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "thiserror 2.0.18",
+ "tracing",
+]
 
 [[package]]
 name = "vireon"
