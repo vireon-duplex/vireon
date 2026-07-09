@@ -1,0 +1,39 @@
+[package]
+name = "graceful-startup-shutdown"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Orchestrated startup and shutdown: phase-ordered boot sequence, connection draining, and crash-safe shutdown with rollback."
+autobenches = false
+
+[dependencies]
+module-lifecycle     = { path = "../module-lifecycle" }
+configuration-system = { path = "../configuration-system" }
+service-registry     = { path = "../service-registry" }
+scheduler-hooks      = { path = "../scheduler-hooks" }
+thiserror = { workspace = true }
+tracing  = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "phase_transition"
+harness = false
+
+[[bench]]
+name = "drain_check"
+harness = false
+
+[[bench]]
+name = "barrier_wait"
+harness = false
+
+[[bench]]
+name = "full_startup"
+harness = false
+
+[lints]
+workspace = true

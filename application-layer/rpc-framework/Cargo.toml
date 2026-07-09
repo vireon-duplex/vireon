@@ -1,0 +1,40 @@
+[package]
+name = "rpc-framework"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "RPC framework: unary, server-streaming, client-streaming, and bidirectional RPC on QUIC streams."
+autobenches = false
+
+[dependencies]
+configuration-system = { path = "../configuration-system" }
+middleware-pipeline  = { path = "../middleware-pipeline" }
+version-negotiation  = { path = "../version-negotiation" }
+session-manager      = { path = "../../session-layer/session-manager" }
+stream-manager       = { path = "../../stream-layer/stream-manager" }
+thiserror = { workspace = true }
+tracing  = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "dispatch_unary"
+harness = false
+
+[[bench]]
+name = "open_stream"
+harness = false
+
+[[bench]]
+name = "round_trip"
+harness = false
+
+[[bench]]
+name = "cancel"
+harness = false
+
+[lints]
+workspace = true

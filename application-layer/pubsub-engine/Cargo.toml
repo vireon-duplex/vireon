@@ -1,0 +1,37 @@
+[package]
+name = "pubsub-engine"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Pub/Sub engine: topic pattern matching, subscription management, and message delivery."
+autobenches = false
+
+[dependencies]
+configuration-system = { path = "../configuration-system" }
+event-bus            = { path = "../event-bus" }
+thiserror = { workspace = true }
+tracing  = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "publish"
+harness = false
+
+[[bench]]
+name = "subscribe"
+harness = false
+
+[[bench]]
+name = "match_pattern"
+harness = false
+
+[[bench]]
+name = "deliver"
+harness = false
+
+[lints]
+workspace = true
