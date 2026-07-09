@@ -1,0 +1,36 @@
+[package]
+name = "observability-sdk"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Observability SDK: metrics (counter/gauge/histogram), distributed tracing, structured logging."
+autobenches = false
+
+[dependencies]
+session-manager = { path = "../../session-layer/session-manager" }
+thiserror = { workspace = true }
+tracing  = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "record_metric"
+harness = false
+
+[[bench]]
+name = "span_enter"
+harness = false
+
+[[bench]]
+name = "export"
+harness = false
+
+[[bench]]
+name = "snapshot"
+harness = false
+
+[lints]
+workspace = true

@@ -1,0 +1,60 @@
+[package]
+name = "application-runtime"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Application runtime: top-level composition root for the Vireon application layer."
+autobenches = false
+
+[dependencies]
+configuration-system         = { path = "../configuration-system" }
+version-negotiation          = { path = "../version-negotiation" }
+feature-flags                = { path = "../feature-flags" }
+scheduler-hooks              = { path = "../scheduler-hooks" }
+observability-sdk            = { path = "../observability-sdk" }
+resource-quotas              = { path = "../resource-quotas" }
+module-lifecycle             = { path = "../module-lifecycle" }
+middleware-pipeline          = { path = "../middleware-pipeline" }
+plugin-manager               = { path = "../plugin-manager" }
+service-registry             = { path = "../service-registry" }
+auth-framework               = { path = "../auth-framework" }
+dependency-injection         = { path = "../dependency-injection" }
+graceful-startup-shutdown    = { path = "../graceful-startup-shutdown" }
+rpc-framework                = { path = "../rpc-framework" }
+event-bus                    = { path = "../event-bus" }
+pubsub-engine                = { path = "../pubsub-engine" }
+media-streaming              = { path = "../media-streaming" }
+ai-streaming                 = { path = "../ai-streaming" }
+agent-runtime                = { path = "../agent-runtime" }
+ops-dashboard                = { path = "../ops-dashboard" }
+session-manager              = { path = "../../session-layer/session-manager" }
+session-registry             = { path = "../../session-layer/session-registry" }
+connection-shard             = { path = "../../runtime-layer/connection-shard" }
+stream-manager               = { path = "../../stream-layer/stream-manager" }
+reactor                      = { path = "../../runtime-layer/reactor" }
+thiserror = { workspace = true }
+tracing  = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "startup"
+harness = false
+
+[[bench]]
+name = "shutdown"
+harness = false
+
+[[bench]]
+name = "composition"
+harness = false
+
+[[bench]]
+name = "health_check"
+harness = false
+
+[lints]
+workspace = true

@@ -1,0 +1,36 @@
+[package]
+name = "middleware-pipeline"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Request/response middleware pipeline: ordered chain execution with stage-based dispatch."
+autobenches = false
+
+[dependencies]
+configuration-system = { path = "../configuration-system" }
+thiserror = { workspace = true }
+tracing  = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "execute_chain"
+harness = false
+
+[[bench]]
+name = "insert"
+harness = false
+
+[[bench]]
+name = "remove"
+harness = false
+
+[[bench]]
+name = "stage_dispatch"
+harness = false
+
+[lints]
+workspace = true
