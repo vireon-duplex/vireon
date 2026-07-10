@@ -93,20 +93,14 @@ pub mod shard_binding;
 pub mod state;
 pub mod stats;
 pub mod stream;
+pub mod stream_bridge;
 pub mod stream_scheduler;
 pub mod timer_binding;
 pub mod token;
 
-// ── Re-exports (Phase 0 — minimal surface) ───────────────────────
+// ── Re-exports ───────────────────────────────────────────────────
 pub use builder::QuicEngineBuilder;
 pub use config::{Preset as QuicPreset, QuicConfig};
-pub use engine::QuicEngine;
+pub use crypto::build_quiche_config;
+pub use engine::{QuicEngine, QuicEvent};
 pub use error::QuicError;
-
-// Re-exports for the target API surface (added incrementally in
-// Phases 1–14). Commented out until each type exists.
-// pub use cid::QuicCid;
-// pub use connection::QuicConnection;
-// pub use state::QuicConnState;
-// pub use stats::{StatsCollector, StatsSnapshot};
-// pub use stream::{Stream, StreamId};

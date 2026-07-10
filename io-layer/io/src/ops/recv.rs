@@ -34,6 +34,19 @@ pub struct ParsedFrame<'a> {
     pub peer_addr: SocketAddr,
 }
 
+/// Raw datagram payload + peer address — no application-level header decode.
+///
+/// Used by upper layers (e.g. QUIC engine) that need the full UDP payload
+/// without the 9-byte `(opcode, stream_id)` interpretation that
+/// [`ParsedFrame`] applies.
+#[derive(Debug, Clone, Copy)]
+pub struct DatagramMeta<'a> {
+    /// Full UDP datagram payload (no io_uring header).
+    pub payload: &'a [u8],
+    /// Source address the kernel decoded from the buffer's name field.
+    pub peer_addr: SocketAddr,
+}
+
 /// Multishot-recv handle. Borrows the socket fd (never closes it).
 ///
 /// Created by [`Socket::receiver`](crate::socket::Socket::receiver). Stores
@@ -96,19 +109,27 @@ impl Receiver {
         push_entry(ring, entry)
     }
 
-    /// Parses a provided buffer filled by the kernel into a [`ParsedFrame`].
+    /// Parses a provided buffer into raw payload + peer address — no
+    /// application-level header decode.
     ///
-    /// `raw` is the whole buffer the kernel posted (header + name +
-    /// control + payload). Uses [`RecvMsgOut::parse`] with `self.msg_hdr`
-    /// to slice it, then decodes the first 9 payload bytes as
-    /// `(opcode:u8, stream_id:u64_le)`.
-    pub fn parse<'a>(&self, raw: &'a [u8]) -> Result<ParsedFrame<'a>, IoError> {
+    /// Unlike [`parse`](Self::parse), this returns the **full** UDP payload
+    /// without stripping the first 9 bytes. Upper layers that interpret the
+    /// payload themselves (e.g. QUIC engine feeding to quiche) should use
+    /// this method.
+    pub fn parse_raw<'a>(&self, raw: &'a [u8]) -> Result<DatagramMeta<'a>, IoError> {
+        let (payload, name) = self.split_buffer(raw)?;
+        let peer_addr = decode_peer_addr(name);
+        Ok(DatagramMeta { payload, peer_addr })
+    }
+
+    /// Splits a kernel-filled provided buffer into (payload, name) slices.
+    ///
+    /// Shared helper for [`parse`](Self::parse) and
+    /// [`parse_raw`](Self::parse_raw).
+    fn split_buffer<'a>(&self, raw: &'a [u8]) -> Result<(&'a [u8], &'a [u8]), IoError> {
         let out = RecvMsgOut::parse(raw, &self.msg_hdr)
             .map_err(|()| IoError::InvalidConfig("truncated io_uring_recvmsg_out buffer".into()))?;
 
-        // `RecvMsgOut::payloadData()` returns a slice tied to `&out`, not
-        // to `raw`'s lifetime. Derive offsets from the borrow and re-slice
-        // `raw` so the returned frame outlives `out`.
         let payload_view = out.payload_data();
         let payload_off = payload_view.as_ptr() as usize - raw.as_ptr() as usize;
         let payload_len = payload_view.len();
@@ -132,6 +153,18 @@ impl Receiver {
                         .ok_or_else(|| IoError::InvalidConfig("name range overflow".into()))?,
             )
             .ok_or_else(|| IoError::InvalidConfig("name slice out of bounds".into()))?;
+
+        Ok((payload, name))
+    }
+
+    /// Parses a provided buffer filled by the kernel into a [`ParsedFrame`].
+    ///
+    /// `raw` is the whole buffer the kernel posted (header + name +
+    /// control + payload). Uses [`RecvMsgOut::parse`] with `self.msg_hdr`
+    /// to slice it, then decodes the first 9 payload bytes as
+    /// `(opcode:u8, stream_id:u64_le)`.
+    pub fn parse<'a>(&self, raw: &'a [u8]) -> Result<ParsedFrame<'a>, IoError> {
+        let (payload, name) = self.split_buffer(raw)?;
 
         if payload.len() < 9 {
             return Err(IoError::InvalidConfig(format!(

@@ -1,61 +1,58 @@
 //! [`QuicEngineBuilder`] — fluent builder + `from_preset`.
 //!
-//! Phase 13 — Runtime Integration. See `DESIGN.md` §4.13.
+//! Constructs a real [`QuicEngine`] backed by quiche. The builder
+//! accepts a [`QuicConfig`] (or one materialized from a [`Preset`]),
+//! a TLS certificate / key path, and the local socket address the
+//! engine's reactor is bound to.
 //!
-//! Mirrors the pattern of
-//! [`connection_shard::ConnectionShardBuilder`](../../connection-shard/src/builder.rs).
-//!
-//! ## Target API (Phase 13+)
+//! ## Example
 //!
 //! ```no_run
 //! use quic_engine::{QuicEngineBuilder, QuicPreset};
+//! use std::net::SocketAddr;
 //!
+//! let local_addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
 //! let mut engine = QuicEngineBuilder::from_preset(QuicPreset::BareMetal)
 //!     .reactor_id(0)
-//!     .max_connections(8192)
+//!     .cert_path("cert.pem")
+//!     .key_path("key.pem")
+//!     .local_addr(local_addr)
 //!     .build()
 //!     .expect("engine");
 //! ```
 
+use std::net::SocketAddr;
+
 use crate::config::{Preset, QuicConfig};
+use crate::crypto::build_quiche_config;
 use crate::engine::QuicEngine;
 use crate::error::QuicError;
 
-/// Phase-0 skeleton. Phase 13 will add the full fluent surface
-/// (numa_node, cert_chain, key, alpn, etc.).
+/// Fluent builder for [`QuicEngine`].
+///
+/// Start with [`QuicEngineBuilder::new`] or
+/// [`QuicEngineBuilder::from_preset`], then set the mandatory
+/// `reactor_id`, `cert_path`, `key_path`, and `local_addr` before
+/// calling [`build`](Self::build).
 #[derive(Debug, Default)]
 pub struct QuicEngineBuilder {
     reactor_id: Option<u32>,
+    local_addr: Option<SocketAddr>,
+    cert_path: Option<String>,
+    key_path: Option<String>,
     config: QuicConfig,
 }
 
 impl QuicEngineBuilder {
+    /// Create an empty builder seeded with [`QuicConfig::default`].
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             reactor_id: None,
-            config: QuicConfig {
-                // Use `Default::default()` semantics via `new` to
-                // keep the const-eval happy; the actual `Default`
-                // implementation fills in the rest.
-                max_connections: 0, // replaced by `default()` call in `from_preset`
-                max_streams_bidi: 0,
-                max_streams_uni: 0,
-                initial_max_data: 0,
-                initial_max_stream_data: 0,
-                idle_timeout: std::time::Duration::ZERO,
-                handshake_timeout: std::time::Duration::ZERO,
-                congestion: crate::config::CongestionAlgorithm::Bbr,
-                initial_congestion_window_packets: 0,
-                extensions: crate::config::ExtensionFlags {
-                    datagram: false,
-                    ack_frequency: false,
-                    multipath: false,
-                    bbr2: false,
-                    grease_bit: false,
-                },
-                shutting_down: false,
-            },
+            local_addr: None,
+            cert_path: None,
+            key_path: None,
+            config: QuicConfig::default(),
         }
     }
 
@@ -64,7 +61,22 @@ impl QuicEngineBuilder {
     pub fn from_preset(preset: Preset) -> Self {
         Self {
             reactor_id: None,
+            local_addr: None,
+            cert_path: None,
+            key_path: None,
             config: preset.to_config(),
+        }
+    }
+
+    /// Construct from an explicit [`QuicConfig`].
+    #[must_use]
+    pub fn from_config(config: QuicConfig) -> Self {
+        Self {
+            reactor_id: None,
+            local_addr: None,
+            cert_path: None,
+            key_path: None,
+            config,
         }
     }
 
@@ -75,6 +87,28 @@ impl QuicEngineBuilder {
         self
     }
 
+    /// Set the local socket address the engine's reactor is bound to.
+    /// Mandatory before `build()`.
+    #[must_use]
+    pub const fn local_addr(mut self, addr: SocketAddr) -> Self {
+        self.local_addr = Some(addr);
+        self
+    }
+
+    /// Set the PEM certificate chain path. Mandatory before `build()`.
+    #[must_use]
+    pub fn cert_path(mut self, path: impl Into<String>) -> Self {
+        self.cert_path = Some(path.into());
+        self
+    }
+
+    /// Set the PEM private key path. Mandatory before `build()`.
+    #[must_use]
+    pub fn key_path(mut self, path: impl Into<String>) -> Self {
+        self.key_path = Some(path.into());
+        self
+    }
+
     /// Override `max_connections`.
     #[must_use]
     pub const fn max_connections(mut self, n: usize) -> Self {
@@ -82,18 +116,39 @@ impl QuicEngineBuilder {
         self
     }
 
-    /// Build the engine. Validates config and returns the engine
-    /// or the first validation error.
+    /// Build the engine. Validates config, constructs the
+    /// `quiche::Config` from cert/key paths, and returns the engine.
     ///
-    /// TODO(phase-13): will accept `&mut connection_shard::ConnectionShard`
-    /// (or build one) and wire all subsystems. For Phase 0 it
-    /// constructs a placeholder.
+    /// # Errors
+    ///
+    /// Returns [`QuicError`] if:
+    /// - config validation fails (see [`QuicConfig::validate`])
+    /// - `reactor_id`, `local_addr`, `cert_path`, or `key_path` is unset
+    /// - `quiche::Config` construction fails (cert/key load, ALPN, etc.)
     pub fn build(self) -> Result<QuicEngine, QuicError> {
         self.config.validate()?;
+
         let reactor_id = self
             .reactor_id
             .ok_or_else(|| QuicError::InvalidConfig("reactor_id must be set".into()))?;
-        Ok(QuicEngine::placeholder(reactor_id))
+        let local_addr = self
+            .local_addr
+            .ok_or_else(|| QuicError::InvalidConfig("local_addr must be set".into()))?;
+        let cert_path = self
+            .cert_path
+            .ok_or_else(|| QuicError::InvalidConfig("cert_path must be set".into()))?;
+        let key_path = self
+            .key_path
+            .ok_or_else(|| QuicError::InvalidConfig("key_path must be set".into()))?;
+
+        let quiche_config = build_quiche_config(&self.config, &cert_path, &key_path)?;
+
+        Ok(QuicEngine::new(
+            self.config,
+            quiche_config,
+            reactor_id,
+            local_addr,
+        ))
     }
 }
 
@@ -102,19 +157,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn from_preset_then_reactor_id_then_build() {
-        let engine = QuicEngineBuilder::from_preset(Preset::BareMetal)
-            .reactor_id(0)
+    fn build_without_reactor_id_fails() {
+        let err = QuicEngineBuilder::from_preset(Preset::BareMetal)
+            .cert_path("cert.pem")
+            .key_path("key.pem")
+            .local_addr("127.0.0.1:0".parse().unwrap())
             .build()
-            .expect("build");
-        assert_eq!(engine.reactor_id, 0);
+            .expect_err("should require reactor_id");
+        assert!(matches!(err, QuicError::InvalidConfig(_)));
     }
 
     #[test]
-    fn build_without_reactor_id_fails() {
+    fn build_without_cert_path_fails() {
         let err = QuicEngineBuilder::from_preset(Preset::BareMetal)
+            .reactor_id(0)
+            .key_path("key.pem")
+            .local_addr("127.0.0.1:0".parse().unwrap())
             .build()
-            .expect_err("should require reactor_id");
+            .expect_err("should require cert_path");
         assert!(matches!(err, QuicError::InvalidConfig(_)));
     }
 
@@ -122,6 +182,9 @@ mod tests {
     fn invalid_max_connections_rejected() {
         let err = QuicEngineBuilder::from_preset(Preset::BareMetal)
             .reactor_id(0)
+            .cert_path("cert.pem")
+            .key_path("key.pem")
+            .local_addr("127.0.0.1:0".parse().unwrap())
             .max_connections(0)
             .build()
             .expect_err("0 should fail");

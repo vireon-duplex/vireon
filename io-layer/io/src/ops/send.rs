@@ -43,6 +43,50 @@ impl Sender {
         self.fd
     }
 
+    /// Sends a UDP datagram via `libc::sendto` (blocking syscall).
+    ///
+    /// This is a simple, safe send path that does **not** require
+    /// pre-registered buffers. It copies `buf` into kernel space at
+    /// call time. For high-throughput paths, prefer
+    /// [`send_zc`](Self::send_zc).
+    ///
+    /// Returns the number of bytes sent.
+    pub fn send_blocking(&self, buf: &[u8], dest: SocketAddr) -> Result<usize, IoError> {
+        match dest {
+            SocketAddr::V4(v4) => {
+                let sin = libc::sockaddr_in {
+                    sin_family: libc::AF_INET as u16,
+                    sin_port: v4.port().to_be(),
+                    sin_addr: libc::in_addr {
+                        s_addr: u32::from(*v4.ip()).to_be(),
+                    },
+                    sin_zero: [0; 8],
+                };
+                // SAFETY: `buf` is a valid slice; `sin` is stack-local
+                // and valid for the duration of the call. The fd is
+                // owned by the Socket and valid.
+                let sent = unsafe {
+                    libc::sendto(
+                        self.fd,
+                        buf.as_ptr() as *const libc::c_void,
+                        buf.len(),
+                        0,
+                        &sin as *const _ as *const libc::sockaddr,
+                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                    )
+                };
+                if sent < 0 {
+                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+                    return Err(IoError::Submit(std::io::Error::from_raw_os_error(errno)));
+                }
+                Ok(sent as usize)
+            }
+            SocketAddr::V6(_) => Err(IoError::Unsupported(
+                "IPv6 send path not implemented; use IPv4".into(),
+            )),
+        }
+    }
+
     /// Queues a zero-copy send of `len` bytes from registered fixed
     /// buffer `buf_index`.
     ///

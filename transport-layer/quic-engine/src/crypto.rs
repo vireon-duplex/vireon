@@ -1,60 +1,84 @@
-//! [`CryptoContext`] — TLS 1.3 secrets handoff, keylog, 0-RTT,
-//! key update.
+//! Crypto / TLS configuration — builds `quiche::Config` from `QuicConfig`.
 //!
-//! Phase 3 — Crypto Engine. See `DESIGN.md` §4.3.
+//! Wraps quiche's TLS 1.3 stack (BoringSSL) configuration into a single
+//! entry point: [`build_quiche_config`]. The caller provides certificate
+//! and private-key PEM paths plus a [`QuicConfig`]; the function returns
+//! a ready-to-use `quiche::Config`.
 //!
-//! Vireon **delegates all crypto** to `quiche` (which uses
-//! BoringSSL by default). This module's job is to:
-//!
-//! - Configure the TLS context (certificate chain, ALPN, SNI)
-//! - Export keying material for observability (`SSLKEYLOGFILE` /
-//!   Wireshark decoding)
-//! - Surface handshake progress events (EarlyData, KeyUpdate,
-//!   HandshakeDone) so the engine can drive state transitions
-//! - Hook 0-RTT acceptance (anti-replay window policy)
-//! - Future: hand off application secrets to kernel TLS (kTLS) or
-//!   hardware offload — `DESIGN.md` §4.3 "Hardware acceleration"
-//!
-//! RFC 9001 §5 defines the four key spaces: Initial, Handshake Early
-//! Data (0-RTT), Application. Key update (RFC 9001 §6) is driven by
-//! quiche; this module observes and reports.
+//! See `DESIGN.md` §4.3 for the full crypto architecture.
 
-/// Phase-0 skeleton. Phase 3 will own:
-/// - `TlsConfig` (cert chain, key, ALPN list, SNI)
-/// - `KeyLog` (sink for `SSLKEYLOGFILE` — file or tracing span)
-/// - `ZeroRttPolicy` (accept / reject / bounded anti-replay)
-#[derive(Default)]
-pub struct CryptoContext {
-    /// Whether 0-RTT is currently enabled for new connections.
-    zero_rtt_enabled: bool,
-}
+use std::time::Duration;
 
-impl CryptoContext {
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            zero_rtt_enabled: false,
-        }
+use crate::config::{CongestionAlgorithm, QuicConfig};
+use crate::error::QuicError;
+
+/// Builds a [`quiche::Config`] from the engine's [`QuicConfig`] plus
+/// certificate / key file paths.
+///
+/// # Errors
+///
+/// Returns [`QuicError`] if:
+/// - `quiche::Config::new` fails (unsupported version)
+/// - cert / key loading fails (file not found, malformed PEM)
+/// - ALPN or congestion-control configuration fails
+pub fn build_quiche_config(
+    quic_cfg: &QuicConfig,
+    cert_path: &str,
+    key_path: &str,
+) -> Result<quiche::Config, QuicError> {
+    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
+
+    // TLS identity.
+    config.load_cert_chain_from_pem_file(cert_path)?;
+    config.load_priv_key_from_pem_file(key_path)?;
+
+    // ALPN — advertise common protocols.
+    config.set_application_protos(&[b"hq-interop", b"http/1.1", b"h3-29"])?;
+
+    // Flow control (RFC 9000 §18.2).
+    config.set_max_idle_timeout(quic_cfg.idle_timeout.as_millis() as u64);
+    config.set_initial_max_data(quic_cfg.initial_max_data);
+    config.set_initial_max_stream_data_bidi_local(quic_cfg.initial_max_stream_data);
+    config.set_initial_max_stream_data_bidi_remote(quic_cfg.initial_max_stream_data);
+    config.set_initial_max_stream_data_uni(quic_cfg.initial_max_stream_data);
+    config.set_initial_max_streams_bidi(quic_cfg.max_streams_bidi);
+    config.set_initial_max_streams_uni(quic_cfg.max_streams_uni);
+
+    // Congestion control.
+    let cc_algo = match quic_cfg.congestion {
+        CongestionAlgorithm::Reno => quiche::CongestionControlAlgorithm::Reno,
+        CongestionAlgorithm::Cubic => quiche::CongestionControlAlgorithm::CUBIC,
+        CongestionAlgorithm::Bbr => quiche::CongestionControlAlgorithm::BBR,
+        CongestionAlgorithm::Bbr2 => quiche::CongestionControlAlgorithm::BBR2,
+    };
+    config.set_cc_algorithm(cc_algo);
+
+    // DATAGRAM extension (RFC 9221).
+    if quic_cfg.extensions.datagram {
+        config.enable_dgram(true, 64, 64);
     }
 
-    /// TODO(phase-3): `fn wrap_quiche_config(&self, cfg: &mut quiche::Config)`
-    /// to apply TLS settings into a freshly-built quiche config.
-    pub fn _placeholder_apply(&self) {}
+    // Disable active migration unless explicitly enabled.
+    config.set_disable_active_migration(!quic_cfg.extensions.multipath);
+
+    // Pacing helps reduce burstiness on high-throughput links.
+    config.enable_pacing(true);
+
+    Ok(config)
 }
 
-/// Phase-3 hook fired by quiche when new traffic secrets are derived.
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum SecretEvent {
-    /// Initial secrets derived (quiche derives these internally; we
-    /// observe for stats only).
-    Initial,
-    /// Handshake secrets derived — endpoint can send 1-RTT.
-    HandshakeDone,
-    /// Application secrets derived — handshake complete.
-    Application,
-    /// Key update initiated (RFC 9001 §6).
-    KeyUpdate,
+/// Default idle-check interval derived from the config's idle timeout.
+///
+/// The engine calls `conn.timeout()` on each tick; if `None`, no timer
+/// is needed. This helper returns a reasonable poll interval for the
+/// timer-wheel.
+#[must_use]
+pub fn idle_poll_interval(idle_timeout: Duration) -> Duration {
+    // Poll at 1/4 the idle timeout, clamped to [100ms, 5s].
+    let quarter = idle_timeout
+        .checked_div(4)
+        .unwrap_or(Duration::from_millis(500));
+    quarter.clamp(Duration::from_millis(100), Duration::from_secs(5))
 }
 
 #[cfg(test)]
@@ -62,10 +86,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn placeholder() {
-        let c = CryptoContext::new();
-        c._placeholder_apply();
-        // TODO(phase-3): cert loading, ALPN negotiation, keylog sink,
-        // 0-RTT anti-replay.
+    fn idle_poll_clamps() {
+        // Very short timeout → 100ms floor.
+        let d = idle_poll_interval(Duration::from_millis(10));
+        assert_eq!(d, Duration::from_millis(100));
+
+        // Normal timeout (30s) → 7.5s → clamped to 5s.
+        let d = idle_poll_interval(Duration::from_secs(30));
+        assert_eq!(d, Duration::from_secs(5));
+
+        // 2s timeout → 500ms.
+        let d = idle_poll_interval(Duration::from_secs(2));
+        assert_eq!(d, Duration::from_millis(500));
     }
 }

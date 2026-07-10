@@ -1,0 +1,42 @@
+[package]
+name = "quic-server"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+autobenches = false
+
+[dependencies]
+# Vireon crates — one per architectural layer
+io = { path = "../io-layer/io" }                                       # io-layer
+quic-engine = { path = "../transport-layer/quic-engine" }              # transport-layer
+frame = { path = "../message-layer/frame" }                            # message-layer
+session-manager = { path = "../session-layer/session-manager" }        # session-layer
+stream-manager = { path = "../stream-layer/stream-manager" }           # stream-layer
+connection-shard = { path = "../runtime-layer/connection-shard" }      # runtime-layer
+timer-wheel = { path = "../runtime-layer/timer-wheel" }                # runtime-layer
+buffer-pool = { path = "../runtime-layer/buffer-pool" }               # runtime-layer
+kernel-nic = { path = "../kernel-layer/kernel-nic" }                  # kernel-layer
+ai-streaming = { path = "../application-layer/ai-streaming" }         # application-layer
+
+# QUIC protocol
+quiche = { workspace = true }
+
+# CLI parsing
+clap = { version = "4.5", features = ["derive"] }
+
+# Signal handling
+ctrlc = "3.4"
+
+# Error handling + logging
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Concurrency
+libc = { workspace = true }
+
+[lints]
+workspace = true

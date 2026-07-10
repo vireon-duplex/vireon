@@ -160,6 +160,26 @@ impl BufferPool {
         self.publish_entry(buf_id, addr, self.buf_size);
     }
 
+    /// Returns a raw `*const u8` to buffer `buf_id`'s data area.
+    ///
+    /// Unlike [`get_buffer_address`](Self::get_buffer_address), the returned
+    /// pointer carries **no lifetime** — the caller may build a `&[u8]` from
+    /// it via `std::slice::from_raw_parts` without borrowing `self`.
+    /// This is essential for the reactor's `run_with_handler` loop, which
+    /// must call `refill_buffer` immediately after the handler returns.
+    ///
+    /// # Safety invariant
+    ///
+    /// The caller must ensure the slice is not used after `refill_buffer`
+    /// or any other operation that may overwrite the buffer's contents.
+    #[must_use]
+    pub fn buffer_ptr(&self, buf_id: u16) -> Option<*const u8> {
+        if u32::from(buf_id) >= self.buf_count {
+            return None;
+        }
+        Some(self.backing_address_of(buf_id).as_ptr())
+    }
+
     /// Returns the raw address of `buf_id`'s backing storage, or `None`
     /// if `buf_id` is out of range.
     #[must_use]

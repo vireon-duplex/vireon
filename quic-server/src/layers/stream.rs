@@ -1,0 +1,217 @@
+//! Stream layer — stream lifecycle management.
+//!
+//! Owns the `MessageLayer` (frame classification) and `StreamSlab`
+//! (slot allocation). Tracks per-connection logical stream IDs so
+//! that all streams can be released when a connection closes.
+
+use std::collections::{HashMap, HashSet};
+
+use frame::codec::Frame;
+use frame::header::MessageType;
+use stream_manager::StreamSlab;
+
+use super::message::{FrameAction, MessageLayer};
+
+/// Stream layer — manages stream lifecycle and delegates frame
+/// classification to the message layer.
+pub struct StreamLayer {
+    /// Message layer (owned — sits below stream in the stack).
+    message: MessageLayer,
+    /// Stream slab — allocates/tracks stream slots.
+    slab: StreamSlab,
+    /// Per-connection logical stream IDs.
+    conn_streams: HashMap<usize, HashSet<u64>>,
+}
+
+impl StreamLayer {
+    /// Creates a new stream layer with default capacity.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            message: MessageLayer::new(),
+            slab: StreamSlab::default(),
+            conn_streams: HashMap::new(),
+        }
+    }
+
+    /// Initializes stream-tracking state for a new connection.
+    pub fn on_connect(&mut self, conn_idx: usize) {
+        self.conn_streams.insert(conn_idx, HashSet::new());
+    }
+
+    /// Processes a frame: classifies via message layer, then handles
+    /// stream lifecycle for control frames.
+    ///
+    /// Returns `FrameAction::DispatchToApp` for data frames so the
+    /// caller (session → application) can dispatch them.
+    pub fn on_frame(&mut self, conn_idx: usize, frame: &Frame) -> FrameAction {
+        let action = self.message.classify(frame);
+
+        if action == FrameAction::Consumed {
+            // Control-plane frame — handle stream lifecycle.
+            let logical_stream = frame.stream_id.get();
+            match frame.msg_type {
+                MessageType::StreamOpen => match self.slab.try_reserve() {
+                    Ok(_) => {
+                        self.conn_streams
+                            .entry(conn_idx)
+                            .or_default()
+                            .insert(logical_stream);
+                        tracing::info!(
+                            conn_idx,
+                            stream_id = logical_stream,
+                            open_streams = self.conn_streams.get(&conn_idx).map_or(0, HashSet::len),
+                            stream_occupancy = self.slab.occupancy(),
+                            "stream opened"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            conn_idx,
+                            stream_id = logical_stream,
+                            error = ?e,
+                            "stream slab full — cannot open stream"
+                        );
+                    }
+                },
+                MessageType::StreamClose | MessageType::StreamReset => {
+                    if self
+                        .conn_streams
+                        .entry(conn_idx)
+                        .or_default()
+                        .remove(&logical_stream)
+                    {
+                        self.slab.release();
+                        tracing::info!(
+                            conn_idx,
+                            stream_id = logical_stream,
+                            msg_type = ?frame.msg_type,
+                            "stream closed"
+                        );
+                    }
+                }
+                MessageType::Handshake => {
+                    tracing::info!(
+                        conn_idx,
+                        len = frame.payload.len(),
+                        "handshake control frame"
+                    );
+                }
+                MessageType::Fragment => {
+                    tracing::debug!(
+                        conn_idx,
+                        stream_id = logical_stream,
+                        seq = frame.seq.get(),
+                        "fragment"
+                    );
+                }
+                MessageType::Ack => {
+                    tracing::debug!(
+                        conn_idx,
+                        stream_id = logical_stream,
+                        seq = frame.seq.get(),
+                        "ack"
+                    );
+                }
+                // Data-plane types are handled above.
+                _ => {
+                    tracing::warn!(
+                        conn_idx,
+                        msg_type = ?frame.msg_type,
+                        "unexpected type in control dispatch"
+                    );
+                }
+            }
+        }
+
+        action
+    }
+
+    /// Releases all streams for a closing connection.
+    ///
+    /// Returns the number of streams released.
+    pub fn on_close(&mut self, conn_idx: usize) -> usize {
+        if let Some(streams) = self.conn_streams.remove(&conn_idx) {
+            let count = streams.len();
+            for _ in &streams {
+                self.slab.release();
+            }
+            count
+        } else {
+            0
+        }
+    }
+
+    // ── Introspection ──────────────────────────────────────────────
+
+    /// Returns the number of streams open for `conn_idx`.
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn stream_count(&self, conn_idx: usize) -> usize {
+        self.conn_streams.get(&conn_idx).map_or(0, HashSet::len)
+    }
+
+    /// Returns the stream slab occupancy (total across all connections).
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn occupancy(&self) -> usize {
+        self.slab.occupancy() as usize
+    }
+}
+
+impl Default for StreamLayer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use frame::codec::{FrameHeader, decode, encode_into_slice};
+    use frame::header::{MessageType, StreamId};
+
+    fn make_frame(msg_type: MessageType, stream_id: u64) -> Frame {
+        let header = FrameHeader::new(StreamId::new(stream_id), msg_type);
+        let payload = b"x";
+        let mut buf = vec![0u8; frame::codec::HEADER_SIZE + payload.len()];
+        let _ = encode_into_slice(&mut buf, header, payload);
+        decode(&buf).unwrap().to_owned()
+    }
+
+    #[test]
+    fn stream_open_close_lifecycle() {
+        let mut sl = StreamLayer::new();
+        sl.on_connect(0);
+
+        let open = make_frame(MessageType::StreamOpen, 42);
+        assert_eq!(sl.on_frame(0, &open), FrameAction::Consumed);
+        assert_eq!(sl.stream_count(0), 1);
+
+        let close = make_frame(MessageType::StreamClose, 42);
+        assert_eq!(sl.on_frame(0, &close), FrameAction::Consumed);
+        assert_eq!(sl.stream_count(0), 0);
+    }
+
+    #[test]
+    fn data_frame_dispatches_to_app() {
+        let mut sl = StreamLayer::new();
+        sl.on_connect(0);
+        let frame = make_frame(MessageType::TextToken, 1);
+        assert_eq!(sl.on_frame(0, &frame), FrameAction::DispatchToApp);
+    }
+
+    #[test]
+    fn on_close_releases_all_streams() {
+        let mut sl = StreamLayer::new();
+        sl.on_connect(0);
+        sl.on_frame(0, &make_frame(MessageType::StreamOpen, 1));
+        sl.on_frame(0, &make_frame(MessageType::StreamOpen, 2));
+        sl.on_frame(0, &make_frame(MessageType::StreamOpen, 3));
+        assert_eq!(sl.stream_count(0), 3);
+
+        let released = sl.on_close(0);
+        assert_eq!(released, 3);
+        assert_eq!(sl.stream_count(0), 0);
+    }
+}
