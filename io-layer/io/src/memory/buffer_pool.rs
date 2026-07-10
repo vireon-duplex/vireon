@@ -255,6 +255,10 @@ impl BufferPool {
         }
 
         let new_tail = tail.wrapping_add(1);
+        // Update our local tail so the next publish_entry advances to the
+        // next ring slot. Without this, every entry overwrites slot 0 and
+        // only one buffer is ever visible to the kernel.
+        self.tail.store(new_tail, Ordering::Relaxed);
         // SAFETY: `tail_ptr` is the overloaded `resv` field of entry 0
         // (see `BufRingEntry::tail`); it points inside our valid ring
         // allocation. We view it as an `AtomicU16` and release-store so
