@@ -5,7 +5,7 @@
 //! that the stream layer uses to decide whether to dispatch upward
 //! to the application layer or consume it internally.
 
-use frame::codec::Frame;
+use frame::codec::FrameRef;
 
 /// Routing action returned by the message layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,7 +38,7 @@ impl MessageLayer {
     /// StreamReset, Handshake, Fragment, Ack) are consumed by lower
     /// layers.
     #[must_use]
-    pub fn classify(&self, frame: &Frame) -> FrameAction {
+    pub fn classify(&self, frame: &FrameRef<'_>) -> FrameAction {
         if frame.msg_type.is_data() {
             FrameAction::DispatchToApp
         } else {
@@ -59,19 +59,22 @@ mod tests {
     use frame::codec::{FrameHeader, decode, encode_into_slice};
     use frame::header::{MessageType, StreamId};
 
-    fn make_frame(msg_type: MessageType) -> Frame {
+    fn classify_msg_type(ml: &MessageLayer, msg_type: MessageType) -> FrameAction {
         let header = FrameHeader::new(StreamId::new(1), msg_type);
         let payload = b"x";
         let mut buf = vec![0u8; frame::codec::HEADER_SIZE + payload.len()];
         let _ = encode_into_slice(&mut buf, header, payload);
-        decode(&buf).unwrap().to_owned()
+        let frame = decode(&buf).unwrap();
+        ml.classify(&frame)
     }
 
     #[test]
     fn data_frames_dispatch_to_app() {
         let ml = MessageLayer::new();
-        let frame = make_frame(MessageType::TextToken);
-        assert_eq!(ml.classify(&frame), FrameAction::DispatchToApp);
+        assert_eq!(
+            classify_msg_type(&ml, MessageType::TextToken),
+            FrameAction::DispatchToApp
+        );
     }
 
     #[test]
@@ -85,8 +88,7 @@ mod tests {
             MessageType::Ack,
             MessageType::Fragment,
         ] {
-            let frame = make_frame(mt);
-            assert_eq!(ml.classify(&frame), FrameAction::Consumed, "{mt:?}");
+            assert_eq!(classify_msg_type(&ml, mt), FrameAction::Consumed, "{mt:?}");
         }
     }
 }

@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use frame::codec::Frame;
+use frame::codec::FrameRef;
 use frame::header::MessageType;
 use stream_manager::StreamSlab;
 
@@ -44,7 +44,7 @@ impl StreamLayer {
     ///
     /// Returns `FrameAction::DispatchToApp` for data frames so the
     /// caller (session → application) can dispatch them.
-    pub fn on_frame(&mut self, conn_idx: usize, frame: &Frame) -> FrameAction {
+    pub fn on_frame(&mut self, conn_idx: usize, frame: &FrameRef<'_>) -> FrameAction {
         let action = self.message.classify(frame);
 
         if action == FrameAction::Consumed {
@@ -171,12 +171,20 @@ mod tests {
     use frame::codec::{FrameHeader, decode, encode_into_slice};
     use frame::header::{MessageType, StreamId};
 
-    fn make_frame(msg_type: MessageType, stream_id: u64) -> Frame {
+    /// Helper: encode a frame and call `on_frame` in one step so the
+    /// buffer lives long enough for the FrameRef borrow.
+    fn send_frame(
+        sl: &mut StreamLayer,
+        conn_idx: usize,
+        msg_type: MessageType,
+        stream_id: u64,
+    ) -> FrameAction {
         let header = FrameHeader::new(StreamId::new(stream_id), msg_type);
         let payload = b"x";
         let mut buf = vec![0u8; frame::codec::HEADER_SIZE + payload.len()];
         let _ = encode_into_slice(&mut buf, header, payload);
-        decode(&buf).unwrap().to_owned()
+        let frame = decode(&buf).unwrap();
+        sl.on_frame(conn_idx, &frame)
     }
 
     #[test]
@@ -184,12 +192,16 @@ mod tests {
         let mut sl = StreamLayer::new();
         sl.on_connect(0);
 
-        let open = make_frame(MessageType::StreamOpen, 42);
-        assert_eq!(sl.on_frame(0, &open), FrameAction::Consumed);
+        assert_eq!(
+            send_frame(&mut sl, 0, MessageType::StreamOpen, 42),
+            FrameAction::Consumed
+        );
         assert_eq!(sl.stream_count(0), 1);
 
-        let close = make_frame(MessageType::StreamClose, 42);
-        assert_eq!(sl.on_frame(0, &close), FrameAction::Consumed);
+        assert_eq!(
+            send_frame(&mut sl, 0, MessageType::StreamClose, 42),
+            FrameAction::Consumed
+        );
         assert_eq!(sl.stream_count(0), 0);
     }
 
@@ -197,17 +209,19 @@ mod tests {
     fn data_frame_dispatches_to_app() {
         let mut sl = StreamLayer::new();
         sl.on_connect(0);
-        let frame = make_frame(MessageType::TextToken, 1);
-        assert_eq!(sl.on_frame(0, &frame), FrameAction::DispatchToApp);
+        assert_eq!(
+            send_frame(&mut sl, 0, MessageType::TextToken, 1),
+            FrameAction::DispatchToApp
+        );
     }
 
     #[test]
     fn on_close_releases_all_streams() {
         let mut sl = StreamLayer::new();
         sl.on_connect(0);
-        sl.on_frame(0, &make_frame(MessageType::StreamOpen, 1));
-        sl.on_frame(0, &make_frame(MessageType::StreamOpen, 2));
-        sl.on_frame(0, &make_frame(MessageType::StreamOpen, 3));
+        send_frame(&mut sl, 0, MessageType::StreamOpen, 1);
+        send_frame(&mut sl, 0, MessageType::StreamOpen, 2);
+        send_frame(&mut sl, 0, MessageType::StreamOpen, 3);
         assert_eq!(sl.stream_count(0), 3);
 
         let released = sl.on_close(0);
