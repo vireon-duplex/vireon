@@ -195,6 +195,12 @@ impl QuicEngine {
             self.feed_existing(idx, len, peer);
         } else if is_initial {
             self.accept_new(&dcid, peer);
+            // Feed the Initial packet to the newly created connection so
+            // quiche processes the ClientHello and generates a ServerHello
+            // on the next flush_sends.
+            if let Some(&idx) = self.dcid_to_idx.get(&dcid) {
+                self.feed_existing(idx, len, peer);
+            }
         }
         // Non-Initial from unknown DCID → drop (stateless reset or garbage).
     }
