@@ -31,7 +31,11 @@ impl Worker {
     /// # Errors
     ///
     /// Returns [`ServerError`] if reactor or engine initialization fails.
-    pub fn create(config: &ServerConfig, core_id: u32) -> Result<Self, ServerError> {
+    pub fn create(
+        config: &ServerConfig,
+        core_id: u32,
+        shutdown_requested: Arc<AtomicBool>,
+    ) -> Result<Self, ServerError> {
         tracing::info!(core_id, port = config.port, "initializing reactor");
 
         let reactor = Reactor::init(core_id, config.port, config.queue_depth)
@@ -53,7 +57,7 @@ impl Worker {
             .build()
             .map_err(|e| ServerError::EngineInit(format!("{e:?}")))?;
 
-        let handler = VireonStack::new(engine, core_id)?;
+        let handler = VireonStack::new(engine, core_id, shutdown_requested)?;
 
         Ok(Self {
             core_id,
@@ -69,6 +73,9 @@ impl Worker {
     /// Returns [`ServerError`] if the io_uring loop fails.
     pub fn run(mut self) -> Result<(), ServerError> {
         tracing::info!(core_id = self.core_id, "worker started");
+        // Wire the reactor's stop handle into the handler so it can
+        // signal reactor exit after the graceful-drain period.
+        self.handler.set_reactor_stop(self.reactor.stop_handle());
         self.reactor
             .run_with_handler(&mut self.handler)
             .map_err(|e| ServerError::EventLoop(format!("{e:?}")))?;
@@ -100,6 +107,7 @@ impl Worker {
     pub fn spawn(
         config: ServerConfig,
         core_id: u32,
+        shutdown_requested: Arc<AtomicBool>,
     ) -> Result<
         (
             thread::JoinHandle<Result<(), ServerError>>,
@@ -111,7 +119,7 @@ impl Worker {
         let builder = thread::Builder::new().name(format!("vireon-reactor-{core_id}"));
         let handle = builder
             .spawn(move || {
-                let worker = match Worker::create(&config, core_id) {
+                let worker = match Worker::create(&config, core_id, shutdown_requested) {
                     Ok(w) => w,
                     Err(e) => {
                         tracing::error!(core_id, error = %e, "failed to create worker");
@@ -127,15 +135,19 @@ impl Worker {
     }
 }
 
-/// Installs a Ctrl-C handler that sets `stop` to true.
+/// Installs a Ctrl-C handler that sets `shutdown_requested` to true.
+///
+/// Unlike the old behavior (which set the reactor stop flag directly),
+/// this triggers the graceful drain: connections receive CONNECTION_CLOSE
+/// frames, and the reactor exits after [`DRAIN_TIMEOUT`](crate::stack::DRAIN_TIMEOUT).
 ///
 /// # Errors
 ///
 /// Returns an error if the signal handler cannot be installed.
-pub fn install_signal_handler(stop: Arc<AtomicBool>) -> Result<(), ServerError> {
+pub fn install_signal_handler(shutdown_requested: Arc<AtomicBool>) -> Result<(), ServerError> {
     ctrlc::set_handler(move || {
-        tracing::info!("received SIGINT/SIGTERM, shutting down...");
-        stop.store(true, Ordering::Release);
+        tracing::info!("received SIGINT/SIGTERM, initiating graceful shutdown...");
+        shutdown_requested.store(true, Ordering::Release);
     })
     .map_err(|e| ServerError::SignalHandler(format!("{e}")))
 }

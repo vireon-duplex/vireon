@@ -37,9 +37,9 @@ impl QuicServer {
     // ── Single Worker ──────────────────────────────────────────────
 
     fn run_single(&self) -> Result<(), ServerError> {
-        let worker = Worker::create(&self.config, 0)?;
-        let stop = worker.stop_handle();
-        install_signal_handler(stop)?;
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let worker = Worker::create(&self.config, 0, shutdown_requested.clone())?;
+        install_signal_handler(shutdown_requested)?;
 
         tracing::info!("starting single-worker server (core 0)");
         worker.run()
@@ -51,11 +51,15 @@ impl QuicServer {
         let num_workers = self.config.num_workers();
         tracing::info!(workers = num_workers, "starting multi-worker server");
 
+        // One shared shutdown flag for all workers + signal handler.
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+
         let mut handles = Vec::with_capacity(num_workers);
         let mut stop_rx_list = Vec::with_capacity(num_workers);
 
         for core_id in 0..num_workers as u32 {
-            let (handle, stop_rx) = Worker::spawn(self.config.clone(), core_id)?;
+            let (handle, stop_rx) =
+                Worker::spawn(self.config.clone(), core_id, shutdown_requested.clone())?;
             handles.push(handle);
             stop_rx_list.push(stop_rx);
         }
@@ -77,12 +81,12 @@ impl QuicServer {
             "all workers initialised, installing signal handler"
         );
 
-        // Install signal handler that sets ALL reactor stop flags.
+        // Signal handler sets the shared shutdown flag. Each worker's
+        // VireonStack detects it in on_tick and drives graceful drain.
+        let shutdown_for_handler = shutdown_requested;
         ctrlc::set_handler(move || {
-            tracing::info!("received SIGINT/SIGTERM, shutting down...");
-            for sh in &stop_handles {
-                sh.store(true, Ordering::Release);
-            }
+            tracing::info!("received SIGINT/SIGTERM, initiating graceful shutdown...");
+            shutdown_for_handler.store(true, Ordering::Release);
         })
         .map_err(|e| ServerError::SignalHandler(format!("{e}")))?;
 
