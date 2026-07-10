@@ -23,6 +23,9 @@
 //! `IoHandler::on_datagram` / `IoHandler::on_tick` on this struct.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use buffer_pool::Buffer;
 use frame::codec::{FrameHeader, FrameRef};
@@ -32,6 +35,11 @@ use quic_engine::{QuicEngine, QuicEvent};
 use crate::connection::{ConnState, ConnectionRegistry};
 use crate::error::ServerError;
 use crate::layers::{ApplicationLayer, RuntimeLayer};
+
+/// Drain timeout — how long to wait for connections to close cleanly
+/// before forcing reactor exit. 2 seconds covers 3 × PTO (Probe Timeout)
+/// for typical RTTs and retransmitted CONNECTION_CLOSE.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The full multi-layer stack — owns the application chain, the
 /// runtime infrastructure, the QUIC engine, and the cross-layer
@@ -55,6 +63,30 @@ pub struct VireonStack {
     // ── Reusable scratch ────────────────────────────────────────
     /// Pre-allocated scratch for `reap_idle` (avoids per-tick Vec alloc).
     reap_buf: Vec<(usize, SocketAddr)>,
+
+    // ── Graceful shutdown ────────────────────────────────────────
+    /// Set by the signal handler to request graceful shutdown.
+    shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
+    /// Reactor stop handle — set by VireonStack after drain completes.
+    reactor_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Current shutdown phase.
+    shutdown_state: ShutdownState,
+}
+
+/// Graceful shutdown state machine.
+///
+/// ```text
+/// Running → Draining { deadline } → Done
+/// ```
+///
+/// Transitions are driven by `on_tick` checking `shutdown_requested`.
+enum ShutdownState {
+    /// Normal operation.
+    Running,
+    /// Connections closed; waiting for drain timeout or all-clear.
+    Draining { deadline: Instant },
+    /// Drain complete — reactor stop signaled.
+    Done,
 }
 
 impl VireonStack {
@@ -64,14 +96,28 @@ impl VireonStack {
     ///
     /// Returns [`ServerError`] if the runtime layer (ConnectionShard,
     /// TimerWheel) cannot be constructed.
-    pub fn new(engine: QuicEngine, reactor_id: u32) -> Result<Self, ServerError> {
+    pub fn new(
+        engine: QuicEngine,
+        reactor_id: u32,
+        shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Self, ServerError> {
         Ok(Self {
             application: ApplicationLayer::new(),
             runtime: RuntimeLayer::new(reactor_id)?,
             engine,
             connections: ConnectionRegistry::new(),
             reap_buf: Vec::with_capacity(16),
+            shutdown_requested,
+            reactor_stop: None,
+            shutdown_state: ShutdownState::Running,
         })
+    }
+
+    /// Wires the reactor's stop handle so VireonStack can signal reactor
+    /// exit after the drain period completes. Called by `Worker::run`
+    /// before entering the event loop.
+    pub fn set_reactor_stop(&mut self, stop: Arc<std::sync::atomic::AtomicBool>) {
+        self.reactor_stop = Some(stop);
     }
 
     // ── Event processing ──────────────────────────────────────────
@@ -258,11 +304,25 @@ impl VireonStack {
 impl IoHandler for VireonStack {
     fn on_datagram(&mut self, data: &[u8], peer: SocketAddr) {
         // [transport-layer] Feed raw datagram to QUIC engine.
+        // During shutdown, existing connections still receive packets
+        // (needed for CONNECTION_CLOSE acks). Only new Initial packets
+        // are rejected inside process_datagram.
         self.engine.on_datagram(data, peer);
     }
 
     fn on_tick(&mut self, ctx: &mut TickContext) {
-        // [transport-layer] Flush outgoing packets + cleanup.
+        // ── Shutdown phase transition: Running → Draining ─────────
+        if self.shutdown_requested.load(Ordering::Acquire)
+            && matches!(self.shutdown_state, ShutdownState::Running)
+        {
+            self.engine.begin_shutdown();
+            self.shutdown_state = ShutdownState::Draining {
+                deadline: Instant::now() + DRAIN_TIMEOUT,
+            };
+        }
+
+        // [transport-layer] Flush outgoing packets + cleanup closed.
+        // During drain, this sends CONNECTION_CLOSE frames.
         self.engine.on_tick(ctx);
 
         // [transport-layer] Drain structured events.
@@ -273,7 +333,26 @@ impl IoHandler for VireonStack {
             self.process_events(events);
         }
 
-        // [runtime-layer] Reap idle-timed-out connections.
-        self.reap_idle();
+        // ── Shutdown drain check ──────────────────────────────────
+        match self.shutdown_state {
+            ShutdownState::Running => {
+                // Normal operation: reap idle-timed-out connections.
+                self.reap_idle();
+            }
+            ShutdownState::Draining { deadline } => {
+                let all_closed = self.engine.active_connections() == 0;
+                let timed_out = Instant::now() >= deadline;
+                if all_closed || timed_out {
+                    tracing::info!(all_closed, timed_out, "drain complete — stopping reactor");
+                    self.shutdown_state = ShutdownState::Done;
+                    if let Some(stop) = &self.reactor_stop {
+                        stop.store(true, Ordering::Release);
+                    }
+                }
+            }
+            ShutdownState::Done => {
+                // Keep flushing sends (CONNECTION_CLOSE retransmissions).
+            }
+        }
     }
 }

@@ -226,7 +226,7 @@ impl QuicEngine {
         // Route by DCID (zero-alloc: dcid_key is a stack array).
         if let Some(&idx) = self.dcid_to_idx.get(&dcid_key) {
             self.feed_existing(idx, len, peer);
-        } else if is_initial {
+        } else if is_initial && !self.is_shutting_down() {
             self.accept_new(&dcid_key[..dcid_len], peer);
             // Feed the Initial packet to the newly created connection so
             // quiche processes the ClientHello and generates a ServerHello
@@ -395,13 +395,30 @@ impl QuicEngine {
     fn is_shutting_down(&self) -> bool {
         self.config.shutting_down
     }
+
+    /// Initiates graceful shutdown: marks the engine as shutting down
+    /// and calls `conn.close()` on every active connection. The actual
+    /// CONNECTION_CLOSE frames are sent on the next `flush_sends`.
+    ///
+    /// After this call, new Initial packets are rejected. Existing
+    /// connections continue to receive packets until quiche marks them
+    /// as `is_closed()`.
+    pub fn begin_shutdown(&mut self) {
+        self.config.shutting_down = true;
+        let reason = b"server shutting down";
+        for entry in self.connections.iter_mut().flatten() {
+            let _ = entry.conn.close(true, 0x00, reason);
+        }
+        tracing::info!(
+            reactor_id = self.reactor_id,
+            active_count = self.active_count,
+            "graceful shutdown initiated — closing all connections"
+        );
+    }
 }
 
 impl IoHandler for QuicEngine {
     fn on_datagram(&mut self, data: &[u8], peer: SocketAddr) {
-        if self.is_shutting_down() {
-            return;
-        }
         self.process_datagram(data, peer);
     }
 
