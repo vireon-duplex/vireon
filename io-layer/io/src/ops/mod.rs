@@ -17,7 +17,7 @@ pub mod recv;
 pub mod send;
 pub mod timeout;
 
-pub use recv::{ParsedFrame, Receiver};
+pub use recv::{DatagramMeta, ParsedFrame, Receiver};
 pub use send::Sender;
 
 /// Operation kind encoded in the top 4 bits of `user_data`.

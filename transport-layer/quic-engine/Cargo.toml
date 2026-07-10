@@ -35,6 +35,12 @@ buffer-pool = { path = "../../runtime-layer/buffer-pool" }
 timer-wheel = { path = "../../runtime-layer/timer-wheel" }
 task-queue = { path = "../../runtime-layer/task-queue" }
 
+# IO layer — provides IoHandler trait + Reactor integration.
+io = { path = "../../io-layer/io" }
+
+# Message layer — frame codec for stream data parsing.
+frame = { path = "../../message-layer/frame" }
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 
