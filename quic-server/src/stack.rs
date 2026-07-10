@@ -24,7 +24,8 @@
 
 use std::net::SocketAddr;
 
-use frame::codec::Frame;
+use buffer_pool::Buffer;
+use frame::codec::{FrameHeader, FrameRef};
 use io::handler::{IoHandler, TickContext};
 use quic_engine::{QuicEngine, QuicEvent};
 
@@ -50,6 +51,10 @@ pub struct VireonStack {
     engine: QuicEngine,
     /// Cross-layer connection registry (conn_idx → conn_id + session_id).
     connections: ConnectionRegistry,
+
+    // ── Reusable scratch ────────────────────────────────────────
+    /// Pre-allocated scratch for `reap_idle` (avoids per-tick Vec alloc).
+    reap_buf: Vec<(usize, SocketAddr)>,
 }
 
 impl VireonStack {
@@ -65,6 +70,7 @@ impl VireonStack {
             runtime: RuntimeLayer::new(reactor_id)?,
             engine,
             connections: ConnectionRegistry::new(),
+            reap_buf: Vec::with_capacity(16),
         })
     }
 
@@ -87,8 +93,12 @@ impl VireonStack {
                 } => {
                     self.on_connection_closed(conn_idx, peer_addr, reason.as_deref());
                 }
-                QuicEvent::FrameReceived { conn_idx, frame } => {
-                    self.on_frame_received(conn_idx, frame);
+                QuicEvent::FrameReceived {
+                    conn_idx,
+                    header,
+                    payload,
+                } => {
+                    self.on_frame_received(conn_idx, header, payload);
                 }
                 QuicEvent::StreamFinished {
                     conn_idx,
@@ -164,19 +174,30 @@ impl VireonStack {
 
     // ── Frame dispatch ────────────────────────────────────────────
 
-    fn on_frame_received(&mut self, conn_idx: usize, frame: Frame) {
+    fn on_frame_received(&mut self, conn_idx: usize, header: FrameHeader, payload: Buffer) {
         // Look up cross-layer connection state (ConnState is Copy).
         let Some(cs) = self.connections.get(conn_idx) else {
             tracing::warn!(conn_idx, "frame for unknown session");
             return;
         };
 
-        // [runtime-layer] Update stats + reset timer + acquire buffer.
-        self.runtime
-            .on_frame(conn_idx, cs.conn_id, frame.payload.len());
+        // [runtime-layer] Update stats + reset timer.
+        self.runtime.on_frame(conn_idx, cs.conn_id, payload.len());
+
+        // Construct a zero-copy FrameRef borrowing from the pool buffer.
+        // `payload` (Buffer) lives on the stack for the duration of the
+        // layer-chain call, then drops → recycled to pool automatically.
+        let frame_ref = FrameRef {
+            stream_id: header.stream_id,
+            seq: header.seq,
+            msg_type: header.msg_type,
+            flags: header.flags,
+            payload: &payload[..],
+        };
 
         // [application → session → stream → message] Top-down processing.
-        self.application.on_frame(conn_idx, cs.session_id, &frame);
+        self.application
+            .on_frame(conn_idx, cs.session_id, &frame_ref);
     }
 
     fn on_stream_finished(&mut self, conn_idx: usize, stream_id: u64) {
@@ -187,27 +208,30 @@ impl VireonStack {
 
     /// Drains expired idle timers and closes timed-out connections.
     fn reap_idle(&mut self) {
+        // Reuse pre-allocated scratch buffer.
+        self.reap_buf.clear();
+
         let expired = self.runtime.drain_expired();
+        for conn_idx in expired {
+            if let Some(cs) = self.connections.get(conn_idx) {
+                self.reap_buf.push((conn_idx, cs.peer_addr));
+            }
+        }
 
-        // Collect conn_idx + peer_addr for connections still tracked.
-        let to_close: Vec<(usize, SocketAddr)> = expired
-            .into_iter()
-            .filter_map(|conn_idx| {
-                self.connections
-                    .get(conn_idx)
-                    .map(|cs| (conn_idx, cs.peer_addr))
-            })
-            .collect();
-
-        if !to_close.is_empty() {
+        if !self.reap_buf.is_empty() {
             tracing::debug!(
-                idle_closed = to_close.len(),
-                conn_idxs = ?to_close.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
+                idle_closed = self.reap_buf.len(),
+                conn_idxs = ?self.reap_buf.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
                 "idle-timeout connections reaped"
             );
         }
 
-        for (conn_idx, peer_addr) in to_close {
+        // Index-based iteration: `reap_buf[i]` copies the tuple out
+        // (both usize and SocketAddr are Copy), so the shared borrow ends
+        // before we call `on_connection_closed` which takes &mut self.
+        let n = self.reap_buf.len();
+        for i in 0..n {
+            let (conn_idx, peer_addr) = self.reap_buf[i];
             self.on_connection_closed(conn_idx, peer_addr, Some("idle timeout"));
         }
     }

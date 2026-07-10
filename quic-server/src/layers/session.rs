@@ -4,7 +4,7 @@
 //! and destruction delegate to the stream layer for per-connection
 //! stream initialization and cleanup.
 
-use frame::codec::Frame;
+use frame::codec::FrameRef;
 use session_manager::table::SessionTable;
 use session_manager::{SessionId, SessionManagerConfig};
 
@@ -57,7 +57,7 @@ impl SessionLayer {
     ///
     /// Returns the `FrameAction` from the stream layer so the
     /// application layer can decide whether to dispatch.
-    pub fn on_frame(&mut self, conn_idx: usize, frame: &Frame) -> FrameAction {
+    pub fn on_frame(&mut self, conn_idx: usize, frame: &FrameRef<'_>) -> FrameAction {
         self.stream.on_frame(conn_idx, frame)
     }
 

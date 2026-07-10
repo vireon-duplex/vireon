@@ -23,6 +23,8 @@
 
 use std::net::SocketAddr;
 
+use buffer_pool::BufferPool;
+
 use crate::config::{Preset, QuicConfig};
 use crate::crypto::build_quiche_config;
 use crate::engine::QuicEngine;
@@ -34,13 +36,14 @@ use crate::error::QuicError;
 /// [`QuicEngineBuilder::from_preset`], then set the mandatory
 /// `reactor_id`, `cert_path`, `key_path`, and `local_addr` before
 /// calling [`build`](Self::build).
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct QuicEngineBuilder {
     reactor_id: Option<u32>,
     local_addr: Option<SocketAddr>,
     cert_path: Option<String>,
     key_path: Option<String>,
     config: QuicConfig,
+    pool: Option<BufferPool>,
 }
 
 impl QuicEngineBuilder {
@@ -53,6 +56,7 @@ impl QuicEngineBuilder {
             cert_path: None,
             key_path: None,
             config: QuicConfig::default(),
+            pool: None,
         }
     }
 
@@ -65,6 +69,7 @@ impl QuicEngineBuilder {
             cert_path: None,
             key_path: None,
             config: preset.to_config(),
+            pool: None,
         }
     }
 
@@ -77,6 +82,7 @@ impl QuicEngineBuilder {
             cert_path: None,
             key_path: None,
             config,
+            pool: None,
         }
     }
 
@@ -116,6 +122,14 @@ impl QuicEngineBuilder {
         self
     }
 
+    /// Set the buffer pool used for zero-alloc frame payloads. If unset,
+    /// a default pool is created.
+    #[must_use]
+    pub fn buffer_pool(mut self, pool: BufferPool) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
     /// Build the engine. Validates config, constructs the
     /// `quiche::Config` from cert/key paths, and returns the engine.
     ///
@@ -142,13 +156,28 @@ impl QuicEngineBuilder {
             .ok_or_else(|| QuicError::InvalidConfig("key_path must be set".into()))?;
 
         let quiche_config = build_quiche_config(&self.config, &cert_path, &key_path)?;
+        let pool = self.pool.unwrap_or_default();
 
         Ok(QuicEngine::new(
             self.config,
             quiche_config,
             reactor_id,
             local_addr,
+            pool,
         ))
+    }
+}
+
+impl std::fmt::Debug for QuicEngineBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuicEngineBuilder")
+            .field("reactor_id", &self.reactor_id)
+            .field("local_addr", &self.local_addr)
+            .field("cert_path", &self.cert_path.as_deref().unwrap_or("(unset)"))
+            .field("key_path", &self.key_path.as_deref().unwrap_or("(unset)"))
+            .field("config", &self.config)
+            .field("pool", &self.pool.as_ref().map(|_| "<set>"))
+            .finish()
     }
 }
 

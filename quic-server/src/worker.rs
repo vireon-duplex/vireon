@@ -49,6 +49,7 @@ impl Worker {
             .local_addr(local_addr)
             .cert_path(&config.cert_path)
             .key_path(&config.key_path)
+            .buffer_pool(buffer_pool::BufferPool::default())
             .build()
             .map_err(|e| ServerError::EngineInit(format!("{e:?}")))?;
 

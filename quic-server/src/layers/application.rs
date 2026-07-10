@@ -13,7 +13,7 @@
 use std::net::SocketAddr;
 
 use ai_streaming::{AiStreamConfig, AiStreamPipeline, TokenChunk};
-use frame::codec::Frame;
+use frame::codec::FrameRef;
 use frame::header::MessageType;
 use session_manager::SessionId;
 
@@ -34,7 +34,7 @@ pub trait AppDispatcher {
     fn on_connection_established(&mut self, session_id: SessionId, peer: SocketAddr);
 
     /// Called for every data-plane frame received.
-    fn on_data_frame(&mut self, session_id: SessionId, conn_idx: usize, frame: &Frame);
+    fn on_data_frame(&mut self, session_id: SessionId, conn_idx: usize, frame: &FrameRef<'_>);
 
     /// Called when a session is destroyed (connection closed).
     fn on_connection_closed(&mut self, session_id: SessionId, reason: Option<&str>);
@@ -71,12 +71,12 @@ impl AppDispatcher for LoggingDispatcher {
         tracing::info!(session_id = ?session_id, %peer, "[app] connection established");
     }
 
-    fn on_data_frame(&mut self, session_id: SessionId, conn_idx: usize, frame: &Frame) {
+    fn on_data_frame(&mut self, session_id: SessionId, conn_idx: usize, frame: &FrameRef<'_>) {
         // [application-layer] Route AI token frames through the pipeline.
         if frame.msg_type == MessageType::TextToken {
             let chunk = TokenChunk {
                 token_id: frame.seq.get(),
-                text: String::from_utf8_lossy(&frame.payload).into_owned(),
+                text: String::from_utf8_lossy(frame.payload).into_owned(),
                 is_final: frame.flags.contains(frame::header::FrameFlags::FIN),
             };
             tracing::info!(
@@ -154,7 +154,7 @@ impl ApplicationLayer {
 
     /// Processes a frame through the session/stream layers, then
     /// dispatches to the application if it's a data frame.
-    pub fn on_frame(&mut self, conn_idx: usize, session_id: SessionId, frame: &Frame) {
+    pub fn on_frame(&mut self, conn_idx: usize, session_id: SessionId, frame: &FrameRef<'_>) {
         let action = self.session.on_frame(conn_idx, frame);
 
         if action == FrameAction::DispatchToApp {

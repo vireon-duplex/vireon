@@ -28,7 +28,8 @@ pub struct RuntimeLayer {
     shard: ConnectionShard,
     /// Hierarchical timing wheel (runtime-layer).
     timer: TimerWheel,
-    /// NUMA-aware buffer pool (runtime-layer).
+    /// NUMA-aware buffer pool (runtime-layer, reserved for send-path use).
+    #[allow(dead_code)]
     pool: BufferPool,
     /// Per-connection idle timer handles.
     timer_handles: HashMap<usize, TimerHandle>,
@@ -85,8 +86,7 @@ impl RuntimeLayer {
         Some(conn_id)
     }
 
-    /// Updates recv stats, resets the idle timer, and acquires a
-    /// scratch buffer from the pool.
+    /// Updates recv stats and resets the idle timer.
     pub fn on_frame(&mut self, conn_idx: usize, conn_id: ConnectionId, frame_len: usize) {
         // Update connection recv stats.
         let _ = self.shard.touch_recv(conn_id, frame_len);
@@ -97,11 +97,6 @@ impl RuntimeLayer {
         }
         if let Ok(handle) = self.timer.start(conn_idx as TaskId, IDLE_TIMEOUT) {
             self.timer_handles.insert(conn_idx, handle);
-        }
-
-        // Acquire scratch buffer.
-        if let Err(e) = self.pool.get(frame_len).as_ref() {
-            tracing::warn!(conn_idx, error = ?e, "buffer pool exhausted");
         }
     }
 

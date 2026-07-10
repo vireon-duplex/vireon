@@ -28,6 +28,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
+use buffer_pool::BufferPool;
 use frame::codec;
 use io::handler::{IoHandler, TickContext};
 
@@ -62,8 +63,10 @@ pub enum QuicEvent {
     FrameReceived {
         /// Slab index of the connection.
         conn_idx: usize,
-        /// The fully decoded, owned frame.
-        frame: codec::Frame,
+        /// Codec-layer frame header (stream_id, seq, msg_type, flags).
+        header: codec::FrameHeader,
+        /// Payload backed by a pool buffer (recycled on drop).
+        payload: buffer_pool::Buffer,
     },
     /// A stream signaled FIN (graceful close).
     StreamFinished {
@@ -82,6 +85,19 @@ struct ConnEntry {
     established: bool,
 }
 
+/// Copies a quiche `ConnectionId` into a fixed-size zero-padded array.
+///
+/// Used as a `HashMap` key to avoid per-datagram heap allocation (`to_vec`).
+/// Both the incoming packet DCID and the stored `source_id` are padded
+/// identically, so lookups are consistent.
+#[inline]
+fn pad_dcid(cid: &quiche::ConnectionId) -> [u8; quiche::MAX_CONN_ID_LEN] {
+    let mut key = [0u8; quiche::MAX_CONN_ID_LEN];
+    let len = cid.len().min(quiche::MAX_CONN_ID_LEN);
+    key[..len].copy_from_slice(&cid[..len]);
+    key
+}
+
 /// The QUIC engine — one per Reactor core. Implements [`IoHandler`] so
 /// the io-layer feeds packets directly.
 pub struct QuicEngine {
@@ -97,14 +113,25 @@ pub struct QuicEngine {
     // ── Connection storage ────────────────────────────────────────
     /// Slab of connections (None = freed slot).
     connections: Vec<Option<ConnEntry>>,
-    /// DCID → slab index routing table.
-    dcid_to_idx: HashMap<Vec<u8>, usize>,
+    /// DCID → slab index routing table. Uses a fixed-size zero-padded
+    /// array key to avoid per-datagram heap allocation.
+    dcid_to_idx: HashMap<[u8; quiche::MAX_CONN_ID_LEN], usize>,
 
     // ── Reusable buffers ──────────────────────────────────────────
     /// Buffer for incoming packet header parsing + recv.
     pkt_buf: Vec<u8>,
     /// Buffer for outgoing packet generation.
     out_buf: Vec<u8>,
+    /// Reusable scratch for collecting readable stream IDs (avoids
+    /// per-datagram Vec allocation).
+    readable_buf: Vec<u64>,
+    /// Reusable scratch for collecting closed connection indices (avoids
+    /// per-tick Vec allocation).
+    closed_buf: Vec<usize>,
+
+    // ── Buffer pool ───────────────────────────────────────────────
+    /// Pool for frame payload buffers (zero-alloc hot path).
+    pool: BufferPool,
 
     // ── Event queue ───────────────────────────────────────────────
     /// Events collected during `on_datagram` / `on_tick`, drained by caller.
@@ -141,6 +168,7 @@ impl QuicEngine {
         quiche_config: quiche::Config,
         reactor_id: u32,
         local_addr: SocketAddr,
+        pool: BufferPool,
     ) -> Self {
         Self {
             reactor_id,
@@ -151,6 +179,9 @@ impl QuicEngine {
             dcid_to_idx: HashMap::new(),
             pkt_buf: vec![0u8; 65535],
             out_buf: vec![0u8; MAX_PKT_SIZE],
+            readable_buf: Vec::with_capacity(16),
+            closed_buf: Vec::with_capacity(16),
+            pool,
             events: Vec::new(),
             active_count: 0,
             datagrams_recv: 0,
@@ -180,25 +211,27 @@ impl QuicEngine {
 
         // Parse QUIC header — scope ensures the header's borrow of pkt_buf
         // ends before we reuse pkt_buf for recv().
-        let (dcid, is_initial) = {
+        let (dcid_key, dcid_len, is_initial) = {
             let hdr =
                 match quiche::Header::from_slice(&mut self.pkt_buf[..len], quiche::MAX_CONN_ID_LEN)
                 {
                     Ok(h) => h,
                     Err(_) => return, // Malformed — drop silently (RFC 9000 §17).
                 };
-            (hdr.dcid.to_vec(), hdr.ty == quiche::Type::Initial)
+            let mut key = [0u8; quiche::MAX_CONN_ID_LEN];
+            key[..hdr.dcid.len()].copy_from_slice(&hdr.dcid);
+            (key, hdr.dcid.len(), hdr.ty == quiche::Type::Initial)
         };
 
-        // Route by DCID.
-        if let Some(&idx) = self.dcid_to_idx.get(&dcid) {
+        // Route by DCID (zero-alloc: dcid_key is a stack array).
+        if let Some(&idx) = self.dcid_to_idx.get(&dcid_key) {
             self.feed_existing(idx, len, peer);
         } else if is_initial {
-            self.accept_new(&dcid, peer);
+            self.accept_new(&dcid_key[..dcid_len], peer);
             // Feed the Initial packet to the newly created connection so
             // quiche processes the ClientHello and generates a ServerHello
             // on the next flush_sends.
-            if let Some(&idx) = self.dcid_to_idx.get(&dcid) {
+            if let Some(&idx) = self.dcid_to_idx.get(&dcid_key) {
                 self.feed_existing(idx, len, peer);
             }
         }
@@ -207,11 +240,13 @@ impl QuicEngine {
 
     /// Feeds a packet to an existing connection.
     fn feed_existing(&mut self, idx: usize, len: usize, peer: SocketAddr) {
-        // Disjoint field borrows: pkt_buf, events, and connections are
-        // separate fields of Self, so the borrow checker allows holding
-        // all three mutable references simultaneously.
+        // Disjoint field borrows: pkt_buf, events, readable_buf, pool, and
+        // connections are separate fields of Self, so the borrow checker
+        // allows holding all mutable references simultaneously.
         let pkt_buf = &mut self.pkt_buf;
         let events = &mut self.events;
+        let readable_buf = &mut self.readable_buf;
+        let pool = &self.pool;
         let local_addr = self.local_addr;
         let reactor_id = self.reactor_id;
 
@@ -244,7 +279,14 @@ impl QuicEngine {
                     );
                 }
                 // Process readable streams + datagrams, collecting frame events.
-                crate::stream_bridge::process_readable(&mut entry.conn, reactor_id, idx, events);
+                crate::stream_bridge::process_readable(
+                    &mut entry.conn,
+                    reactor_id,
+                    idx,
+                    events,
+                    readable_buf,
+                    pool,
+                );
             }
             Err(quiche::Error::Done) => {}
             Err(_) => {
@@ -272,8 +314,8 @@ impl QuicEngine {
             Err(_) => return,
         };
 
-        // Insert into routing table using the server's source ID.
-        let key: Vec<u8> = conn.source_id().to_vec();
+        // Insert into routing table using the server's source ID (padded key).
+        let key = pad_dcid(&conn.source_id());
         let idx = self.connections.len();
         self.connections.push(Some(ConnEntry {
             conn,
@@ -315,18 +357,22 @@ impl QuicEngine {
     /// Removes closed connections from the slab and routing table,
     /// emitting `ConnectionClosed` events for each.
     fn cleanup_closed(&mut self) {
-        let mut to_remove = Vec::new();
+        self.closed_buf.clear();
         for (idx, entry_opt) in self.connections.iter_mut().enumerate() {
             if let Some(entry) = entry_opt {
                 if entry.conn.is_closed() {
-                    to_remove.push(idx);
+                    self.closed_buf.push(idx);
                 }
             }
         }
 
-        for idx in to_remove {
+        // Index-based iteration: `self.closed_buf[i]` copies the usize
+        // out, so the shared borrow ends before we mutate other fields.
+        let n = self.closed_buf.len();
+        for i in 0..n {
+            let idx = self.closed_buf[i];
             if let Some(entry) = self.connections[idx].take() {
-                let key: Vec<u8> = entry.conn.source_id().to_vec();
+                let key = pad_dcid(&entry.conn.source_id());
                 self.dcid_to_idx.remove(&key);
                 self.active_count = self.active_count.saturating_sub(1);
 
@@ -369,6 +415,10 @@ impl IoHandler for QuicEngine {
 mod tests {
     use super::*;
 
+    fn test_pool() -> BufferPool {
+        BufferPool::default()
+    }
+
     #[test]
     fn engine_constructs() {
         let mut qconfig = QuicConfig::default();
@@ -377,7 +427,13 @@ mod tests {
         let mut qconfig_quiche = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
         qconfig_quiche.set_application_protos(&[b"h3-29"]).unwrap();
 
-        let engine = QuicEngine::new(qconfig, qconfig_quiche, 0, "127.0.0.1:0".parse().unwrap());
+        let engine = QuicEngine::new(
+            qconfig,
+            qconfig_quiche,
+            0,
+            "127.0.0.1:0".parse().unwrap(),
+            test_pool(),
+        );
 
         assert_eq!(engine.reactor_id, 0);
         assert_eq!(engine.active_count, 0);
@@ -390,8 +446,13 @@ mod tests {
         let mut qconfig_quiche = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
         qconfig_quiche.set_application_protos(&[b"h3-29"]).unwrap();
 
-        let mut engine =
-            QuicEngine::new(qconfig, qconfig_quiche, 0, "127.0.0.1:0".parse().unwrap());
+        let mut engine = QuicEngine::new(
+            qconfig,
+            qconfig_quiche,
+            0,
+            "127.0.0.1:0".parse().unwrap(),
+            test_pool(),
+        );
 
         // Feed garbage data — should not panic, should not create a connection.
         engine.on_datagram(&[0xFF; 10], "127.0.0.1:9999".parse().unwrap());
@@ -405,8 +466,13 @@ mod tests {
         let mut qconfig_quiche = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
         qconfig_quiche.set_application_protos(&[b"h3-29"]).unwrap();
 
-        let mut engine =
-            QuicEngine::new(qconfig, qconfig_quiche, 0, "127.0.0.1:0".parse().unwrap());
+        let mut engine = QuicEngine::new(
+            qconfig,
+            qconfig_quiche,
+            0,
+            "127.0.0.1:0".parse().unwrap(),
+            test_pool(),
+        );
 
         // on_tick should not panic with zero connections.
         // We can't easily construct a TickContext in tests, so just verify
