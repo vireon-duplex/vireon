@@ -3,6 +3,7 @@
 //! In single-worker mode the worker runs on the main thread.
 //! In multi-worker mode each worker runs on its own pinned thread.
 
+use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -112,8 +113,10 @@ impl Worker {
 
     /// Spawns a worker on a dedicated thread pinned to `core_id`.
     ///
-    /// Returns the `JoinHandle` plus a receiver that yields the worker's
-    /// `stop_handle` once the reactor is initialised inside the thread.
+    /// Returns the `JoinHandle` plus a receiver that yields a tuple of
+    /// `(stop_handle, socket_fd)` once the reactor is initialised inside
+    /// the thread. The socket fd is needed to attach the eBPF REUSEPORT
+    /// steering program after all workers are bound.
     ///
     /// # Errors
     ///
@@ -125,7 +128,7 @@ impl Worker {
     ) -> Result<
         (
             thread::JoinHandle<Result<(), ServerError>>,
-            mpsc::Receiver<Arc<AtomicBool>>,
+            mpsc::Receiver<(Arc<AtomicBool>, RawFd)>,
         ),
         ServerError,
     > {
@@ -140,8 +143,9 @@ impl Worker {
                         return Err(e);
                     }
                 };
-                // Send stop handle back before entering run loop.
-                let _ = tx.send(worker.stop_handle());
+                // Send stop handle + socket fd back before entering run loop.
+                let fd = worker.reactor.socket().raw_fd();
+                let _ = tx.send((worker.stop_handle(), fd));
                 worker.run()
             })
             .map_err(|e| ServerError::ThreadSpawn(format!("{e}")))?;

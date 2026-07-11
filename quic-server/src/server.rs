@@ -1,5 +1,6 @@
 //! [`QuicServer`] — top-level orchestrator that boots workers.
 
+use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -76,11 +77,16 @@ impl QuicServer {
             stop_rx_list.push(stop_rx);
         }
 
-        // Collect each worker's stop handle (reactor's internal flag).
-        let stop_handles: Vec<Arc<AtomicBool>> = stop_rx_list
-            .iter()
-            .filter_map(|rx| rx.recv_timeout(Duration::from_secs(5)).ok())
-            .collect();
+        // Collect each worker's stop handle (reactor's internal flag) and
+        // socket fd (for eBPF REUSEPORT steering attachment).
+        let mut stop_handles: Vec<Arc<AtomicBool>> = Vec::with_capacity(num_workers);
+        let mut socket_fds: Vec<RawFd> = Vec::with_capacity(num_workers);
+        for rx in &stop_rx_list {
+            if let Ok((stop_handle, fd)) = rx.recv_timeout(Duration::from_secs(5)) {
+                stop_handles.push(stop_handle);
+                socket_fds.push(fd);
+            }
+        }
 
         if stop_handles.is_empty() {
             return Err(ServerError::ReactorInit(
@@ -92,6 +98,27 @@ impl QuicServer {
             workers_ready = stop_handles.len(),
             "all workers initialised, installing signal handler"
         );
+
+        // Attach eBPF QUIC DCID steering program to the REUSEPORT group.
+        // Only meaningful with >1 worker (single worker trivially receives
+        // all packets). Must run AFTER all sockets are bound.
+        if socket_fds.len() > 1 {
+            match kernel_nic::attach_quic_reuseport_steering(socket_fds[0], socket_fds.len() as u32)
+            {
+                Ok(()) => {
+                    tracing::info!(
+                        workers = socket_fds.len(),
+                        "eBPF QUIC DCID reuseport steering attached"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "eBPF steering attach failed — falling back to kernel default hash"
+                    );
+                }
+            }
+        }
 
         // Signal handler sets the shared shutdown flag. Each worker's
         // VireonStack detects it in on_tick and drives graceful drain.
