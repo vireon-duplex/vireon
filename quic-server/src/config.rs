@@ -40,6 +40,7 @@ pub struct ServerConfig {
     pub preset: QuicPreset,
     pub quic_config: QuicConfig,
     pub queue_depth: u32,
+    pub echo: bool,
 }
 
 /// Default queue depth if the CLI passes 0.
@@ -76,6 +77,7 @@ impl ServerConfig {
             } else {
                 cli.queue_depth
             },
+            echo: cli.echo,
         })
     }
 

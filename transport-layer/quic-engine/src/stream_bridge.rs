@@ -1,12 +1,15 @@
 //! Bridge between quiche stream events and the frame codec.
 //!
 //! After `conn.recv()`, quiche marks streams as readable. This module
-//! reads the stream data, attempts to decode it as a frame using the
-//! 22-byte codec-layer wire format, and pushes decoded frames as
+//! reads the stream data, reassembles complete frames (which may span
+//! multiple `stream_recv` calls), and pushes decoded frames as
 //! [`QuicEvent::FrameReceived`] into the engine's event queue.
+
+use std::collections::HashMap;
 
 use buffer_pool::BufferPool;
 use frame::codec;
+use frame::error::FrameError;
 
 use crate::engine::QuicEvent;
 
@@ -16,12 +19,17 @@ const STREAM_READ_BUF_SIZE: usize = 65_535;
 /// Processes all readable streams on a quiche connection.
 ///
 /// Called by the engine after `conn.recv()` — drains every stream that
-/// quiche reports as readable, attempts frame decode on each chunk, and
-/// pushes successful decodes as `FrameReceived` events. Non-frame data
-/// (e.g. HTTP/3, TLS handshake) is logged at debug level.
+/// quiche reports as readable, reassembles frames from the byte stream
+/// (handling partial frames that span multiple reads), and pushes
+/// successful decodes as `FrameReceived` events.
 ///
-/// `readable_buf` and `pool` are caller-owned reusable buffers passed
-/// in from the engine to avoid per-datagram heap allocation.
+/// `readable_buf`, `pool`, and `carryover` are caller-owned reusable
+/// buffers passed in from the engine to avoid per-datagram heap allocation.
+///
+/// `carryover` is a per-stream reassembly buffer keyed by QUIC stream ID.
+/// It holds the tail of a partial frame that didn't fit in the previous
+/// read batch, so the rest can be prepended on the next `process_readable`
+/// call for that stream.
 pub fn process_readable(
     conn: &mut quiche::Connection,
     reactor_id: u32,
@@ -29,56 +37,137 @@ pub fn process_readable(
     events: &mut Vec<QuicEvent>,
     readable_buf: &mut Vec<u64>,
     pool: &BufferPool,
+    carryover: &mut HashMap<u64, Vec<u8>>,
 ) {
     // Collect readable stream IDs into the caller-provided buffer to
     // avoid per-datagram Vec allocation.
     readable_buf.clear();
     readable_buf.extend(conn.readable());
 
-    // `readable_buf.iter()` borrows the Vec immutably for the loop, but
-    // `conn` is a separate parameter — no aliasing conflict with
-    // `conn.stream_recv`.
-    for &stream_id in readable_buf.iter() {
-        let mut buf = [0u8; STREAM_READ_BUF_SIZE];
-        loop {
-            match conn.stream_recv(stream_id, &mut buf) {
-                Ok((len, fin)) => {
-                    if len > 0 {
-                        decode_stream_data(
-                            &buf[..len],
-                            stream_id,
-                            reactor_id,
-                            conn_idx,
-                            events,
-                            pool,
-                        );
-                    }
-                    if fin {
-                        events.push(QuicEvent::StreamFinished {
-                            conn_idx,
-                            stream_id,
-                        });
-                        break;
-                    }
-                    if len == 0 {
-                        break;
-                    }
-                }
-                Err(quiche::Error::Done) => break,
-                Err(e) => {
-                    tracing::warn!(
-                        reactor_id, conn_idx, stream_id,
-                        error = ?e,
-                        "stream_recv error"
-                    );
-                    break;
-                }
-            }
-        }
+    let readable_count = readable_buf.len();
+    if readable_count > 0 {
+        tracing::trace!(
+            reactor_id,
+            conn_idx,
+            readable_count,
+            "readable streams pending"
+        );
+    }
+
+    // Index-based iteration: `readable_buf[i]` copies the u64 out, so
+    // the shared borrow ends before we call `carryover.entry()` which
+    // takes &mut HashMap (disjoint from the &Vec used for iteration).
+    let n = readable_buf.len();
+    for i in 0..n {
+        let stream_id = readable_buf[i];
+        process_single_stream(
+            conn, stream_id, reactor_id, conn_idx, events, pool, carryover,
+        );
     }
 
     // Also process any pending DATAGRAM frames.
     process_datagrams(conn, reactor_id, conn_idx);
+}
+
+/// Reads all available data from a single stream, reassembles complete
+/// frames, and emits `FrameReceived` events.
+fn process_single_stream(
+    conn: &mut quiche::Connection,
+    stream_id: u64,
+    reactor_id: u32,
+    conn_idx: usize,
+    events: &mut Vec<QuicEvent>,
+    pool: &BufferPool,
+    carryover: &mut HashMap<u64, Vec<u8>>,
+) {
+    let mut read_buf = [0u8; STREAM_READ_BUF_SIZE];
+    let mut finished = false;
+    let mut total_frames = 0u32;
+
+    // Interleaved read + decode: after each stream_recv, append to
+    // carryover and immediately decode complete frames. This avoids
+    // accumulating megabytes of data before decoding anything.
+    loop {
+        match conn.stream_recv(stream_id, &mut read_buf) {
+            Ok((0, fin)) => {
+                if fin {
+                    finished = true;
+                }
+                break;
+            }
+            Ok((len, fin)) => {
+                if fin {
+                    finished = true;
+                }
+
+                let buf = carryover.entry(stream_id).or_default();
+                buf.extend_from_slice(&read_buf[..len]);
+
+                // Decode complete frames from carryover.
+                let mut offset = 0usize;
+                while offset < buf.len() {
+                    match codec::decode_with_len(&buf[offset..]) {
+                        Ok((frame_ref, consumed)) => {
+                            emit_frame_event(
+                                &frame_ref, stream_id, reactor_id, conn_idx, events, pool,
+                            );
+                            offset += consumed;
+                            total_frames += 1;
+                        }
+                        Err(FrameError::IncompleteHeader { .. })
+                        | Err(FrameError::IncompletePayload { .. }) => break,
+                        Err(_) => {
+                            offset += 1;
+                        }
+                    }
+                }
+                if offset > 0 {
+                    buf.drain(..offset);
+                }
+
+                if fin {
+                    break;
+                }
+            }
+            Err(quiche::Error::Done) => break,
+            Err(e) => {
+                tracing::warn!(
+                    reactor_id, conn_idx, stream_id,
+                    error = ?e,
+                    "stream_recv error"
+                );
+                break;
+            }
+        }
+    }
+
+    // Clean up carryover for finished or empty streams.
+    let remove = match carryover.get(&stream_id) {
+        Some(buf) => buf.is_empty() || finished,
+        None => false,
+    };
+    if remove {
+        carryover.remove(&stream_id);
+    }
+
+    if finished {
+        events.push(QuicEvent::StreamFinished {
+            conn_idx,
+            stream_id,
+        });
+    }
+
+    if total_frames > 0 {
+        let remaining = carryover.get(&stream_id).map_or(0, |b| b.len());
+        tracing::trace!(
+            reactor_id,
+            conn_idx,
+            stream_id,
+            total_frames,
+            remaining,
+            "decoded frames from stream"
+        );
+    }
 }
 
 /// Processes QUIC DATAGRAM frames (RFC 9221) if the extension is enabled.
@@ -95,78 +184,57 @@ fn process_datagrams(conn: &mut quiche::Connection, reactor_id: u32, conn_idx: u
     }
 }
 
-/// Attempts to decode stream data as a codec frame and pushes a
-/// `FrameReceived` event on success. Payload bytes are copied into a
-/// pool buffer that is recycled when the event is consumed.
-fn decode_stream_data(
-    data: &[u8],
+/// Creates a `FrameReceived` event from a decoded frame reference and
+/// pushes it into the engine's event queue. Payload bytes are copied
+/// into a pool buffer that is recycled when the event is consumed.
+fn emit_frame_event(
+    frame_ref: &codec::FrameRef<'_>,
     stream_id: u64,
-    reactor_id: u32,
+    _reactor_id: u32,
     conn_idx: usize,
     events: &mut Vec<QuicEvent>,
     pool: &BufferPool,
 ) {
-    match codec::decode(data) {
-        Ok(frame_ref) => {
-            let header = codec::FrameHeader {
-                stream_id: frame_ref.stream_id,
-                seq: frame_ref.seq,
-                msg_type: frame_ref.msg_type,
-                flags: frame_ref.flags,
-            };
-            let payload_len = frame_ref.payload.len();
+    let header = codec::FrameHeader {
+        stream_id: frame_ref.stream_id,
+        seq: frame_ref.seq,
+        msg_type: frame_ref.msg_type,
+        flags: frame_ref.flags,
+    };
+    let payload_len = frame_ref.payload.len();
 
-            tracing::debug!(
-                reactor_id, conn_idx, stream_id,
-                msg_type = ?header.msg_type,
-                seq = ?header.seq,
-                payload_len,
-                "decoded frame"
-            );
-
-            if payload_len == 0 {
-                // Acquire minimum-class buffer for uniform event shape.
-                match pool.try_get(1) {
-                    Ok(buf) => events.push(QuicEvent::FrameReceived {
-                        conn_idx,
-                        header,
-                        payload: buf,
-                    }),
-                    Err(e) => {
-                        tracing::warn!(
-                            reactor_id, conn_idx, error = ?e,
-                            "buffer pool exhausted — dropping zero-len frame"
-                        );
-                    }
-                }
-            } else {
-                match pool.try_get(payload_len) {
-                    Ok(mut buf) => {
-                        buf[..payload_len].copy_from_slice(frame_ref.payload);
-                        events.push(QuicEvent::FrameReceived {
-                            conn_idx,
-                            header,
-                            payload: buf,
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            reactor_id, conn_idx, error = ?e, payload_len,
-                            "buffer pool exhausted — dropping frame"
-                        );
-                    }
-                }
+    if payload_len == 0 {
+        match pool.try_get(1) {
+            Ok(buf) => events.push(QuicEvent::FrameReceived {
+                conn_idx,
+                quic_stream_id: stream_id,
+                header,
+                payload: buf,
+            }),
+            Err(e) => {
+                tracing::warn!(
+                    conn_idx, error = ?e,
+                    "buffer pool exhausted — dropping zero-len frame"
+                );
             }
         }
-        Err(_) => {
-            // Non-frame data — could be HTTP/3 framing, TLS, or raw bytes.
-            tracing::debug!(
-                reactor_id,
-                conn_idx,
-                stream_id,
-                len = data.len(),
-                "non-frame stream data"
-            );
+    } else {
+        match pool.try_get(payload_len) {
+            Ok(mut buf) => {
+                buf[..payload_len].copy_from_slice(frame_ref.payload);
+                events.push(QuicEvent::FrameReceived {
+                    conn_idx,
+                    quic_stream_id: stream_id,
+                    header,
+                    payload: buf,
+                });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    conn_idx, error = ?e, payload_len,
+                    "buffer pool exhausted — dropping frame"
+                );
+            }
         }
     }
 }

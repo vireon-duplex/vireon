@@ -27,6 +27,18 @@ impl QuicServer {
     ///
     /// Returns [`ServerError`] on fatal failure.
     pub fn run(&self) -> Result<(), ServerError> {
+        let nic_manager = kernel_nic::NicManagerBuilder::new()
+            .build()
+            .map_err(|e| ServerError::EngineInit(format!("kernel-nic: {e:?}")))?;
+
+        tracing::info!(
+            cpus = nic_manager.topology().thread_count(),
+            cores = nic_manager.topology().core_count(),
+            nics = nic_manager.nics().len(),
+            features = %nic_manager.features(),
+            "kernel-nic ready"
+        );
+
         match self.config.mode {
             WorkerMode::Single => self.run_single(),
             WorkerMode::Multi => self.run_multi(),
@@ -97,7 +109,29 @@ impl QuicServer {
 
     fn run_distributed(&self) -> Result<(), ServerError> {
         tracing::info!("distributed mode — coordination layer stub");
-        tracing::info!("running multi-worker base; session-registry will be wired later");
+
+        let self_node = session_registry::NodeId::new(1);
+
+        let _registry_cfg = session_registry::builder::RegistryBuilder::new(self_node)
+            .map_err(|e| ServerError::Config(format!("registry: {e:?}")))?
+            .build()
+            .map_err(|e| ServerError::Config(format!("registry: {e:?}")))?;
+
+        let _router = session_router::builder::RouterBuilder::new()
+            .build_resolver()
+            .map_err(|e| ServerError::Config(format!("router: {e:?}")))?;
+
+        let _migration_cfg = session_migration_manager::builder::MigrationServiceBuilder::new()
+            .build()
+            .map_err(|e| ServerError::Config(format!("migration: {e:?}")))?;
+
+        let _replication_cfg =
+            session_replication_service::builder::ReplicationServiceBuilder::new()
+                .build()
+                .map_err(|e| ServerError::Config(format!("replication: {e:?}")))?;
+
+        tracing::info!("session cluster services initialized");
+
         self.run_multi()
     }
 }

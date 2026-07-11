@@ -17,9 +17,12 @@ pub const LOW_WATERMARK: usize = 32 * 1024;
 /// Default number of provided buffers per `bgid` (per reactor).
 pub const DEFAULT_BUF_COUNT: u32 = 256;
 
-/// Default size of each provided buffer. Covers a 1500-byte UDP MTU with
-/// headroom for the `io_uring_recvmsg_out` header and peer-address field.
-pub const DEFAULT_BUF_SIZE: usize = 2048;
+/// Default size of each provided buffer. Large enough for max-size
+/// QUIC/UDP datagrams (65507-byte payload) plus the `io_uring_recvmsg_out`
+/// header (16 B) and peer-address field (up to 28 B for IPv6). If this
+/// is smaller than the incoming datagram, the kernel silently truncates
+/// the packet in the provided-buffer ring, causing AEAD decryption failures.
+pub const DEFAULT_BUF_SIZE: usize = 65600;
 
 /// Page size on the target architectures (x86_64, aarch64, …). Used to
 /// align provided-buffer ring backing storage and `BufRingEntry` arrays.

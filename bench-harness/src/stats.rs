@@ -252,7 +252,31 @@ pub fn print_summary(s: &Summary) {
     let us = |d: Duration| d.as_secs_f64() * 1_000_000.0;
 
     println!();
-    println!("=== Vireon Load Test ===");
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║                   Vireon Load Test — Full Stack              ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
+    println!();
+    println!("Server architecture under test:");
+    println!("  ┌─ Application Layer ─────────────────────────────────────┐");
+    println!("  │ AI Streaming · RPC · Event Bus · Media · PubSub · Agent│");
+    println!("  │ + 16 platform services (DI, Auth, Config, Observability)│");
+    println!("  ├─ Session Layer ────────────────────────────────────────┤");
+    println!("  │ SessionManager · Registry · Router · Migration · Repl  │");
+    println!("  ├─ Stream Layer ─────────────────────────────────────────┤");
+    println!("  │ StreamManager · StreamScheduler                        │");
+    println!("  ├─ Message Layer ────────────────────────────────────────┤");
+    println!("  │ Frame Codec (22B header) · Message Classifier          │");
+    println!("  ├─ Transport Layer ──────────────────────────────────────┤");
+    println!("  │ QUIC Engine (quiche: TLS 1.3, CC, Loss Recovery)       │");
+    println!("  ├─ Runtime Layer ────────────────────────────────────────┤");
+    println!("  │ ConnectionShard · TimerWheel · BufferPool · SendQueue  │");
+    println!("  │ TaskQueue · CqeProcessor · Reactor facade              │");
+    println!("  ├─ IO Layer ─────────────────────────────────────────────┤");
+    println!("  │ io_uring Reactor (SEND_ZC, multishot, PBUF_RING)       │");
+    println!("  ├─ Kernel Layer ─────────────────────────────────────────┤");
+    println!("  │ kernel-nic (CPU topology, NIC discovery)               │");
+    println!("  └────────────────────────────────────────────────────────┘");
+    println!();
     println!("target:       {}", s.target);
     println!("mode:         {}", s.mode_label);
     println!(

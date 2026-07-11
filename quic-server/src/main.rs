@@ -34,7 +34,7 @@ fn main() -> Result<(), ServerError> {
 
 fn init_tracing(cli: &Cli) {
     let filter = if cli.verbose {
-        "quic_server=debug,quic_engine=debug,io=debug,warn"
+        "quic_server=debug,quic_engine=debug,io=debug,quiche=trace,warn"
     } else {
         "quic_server=info,quic_engine=info,warn"
     };
@@ -54,5 +54,8 @@ fn print_banner(config: &ServerConfig) {
     tracing::info!("  Cert:     {}", config.cert_path);
     tracing::info!("  Max conns/shard: {}", config.quic_config.max_connections);
     tracing::info!("  CC:       {:?}", config.quic_config.congestion);
+    if config.echo {
+        tracing::info!("  Echo:     ENABLED (benchmark mode)");
+    }
     tracing::info!("============================================================");
 }

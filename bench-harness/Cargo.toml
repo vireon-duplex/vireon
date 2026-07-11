@@ -13,6 +13,8 @@ path = "src/main.rs"
 [dependencies]
 # Vireon crates
 frame = { path = "../message-layer/frame" }
+session-manager = { path = "../session-layer/session-manager" }
+stream-manager = { path = "../stream-layer/stream-manager" }
 
 # QUIC protocol
 quiche = { workspace = true }

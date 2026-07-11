@@ -45,6 +45,11 @@ pub struct Cli {
     /// Enable verbose logging.
     #[arg(short, long)]
     pub verbose: bool,
+
+    /// Echo mode — echo every received frame back on the same stream.
+    /// Used for load-testing (RR / pipeline benchmark modes).
+    #[arg(long)]
+    pub echo: bool,
 }
 
 /// CLI worker-mode selector.

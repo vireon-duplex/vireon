@@ -1,19 +1,17 @@
 //! Realistic per-`MessageType` workload generator.
 //!
-//! Builds one wire batch containing all 15 frame types — each with a payload
-//! whose size and shape match what a real Vireon client would send. The batch
-//! is encoded once at startup and reused on every iteration so the measurement
-//! exercises the transport + server decode path, not the encoder.
+//! Builds one workload containing all 15 frame types — each with a payload
+//! whose size and shape match what a real Vireon client would send. Unlike
+//! the previous design, payloads are stored **raw** (not pre-encoded); the
+//! layer stack encodes them at send time via `ClientStack::encode_frame_coalesced`.
 //!
 //! ## Target batch size: ~1 MiB
 
-use anyhow::Result;
-use frame::codec::{FrameHeader, HEADER_SIZE, encode_into_slice};
-use frame::header::{ALL_MESSAGE_TYPES, FrameFlags, MessageType, Seq, StreamId};
+use frame::header::{ALL_MESSAGE_TYPES, FrameFlags, MessageType};
 
 /// Per-type metadata, surfaced in the summary table so the operator can verify
 /// the realistic workload at a glance.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct WorkloadEntry {
     /// The message type this entry exercises.
     pub msg_type: MessageType,
@@ -21,81 +19,62 @@ pub struct WorkloadEntry {
     pub name: &'static str,
     /// Payload byte count (excludes the 22-byte header).
     pub payload_len: usize,
+    /// Per-type flags matching how a real client would tag each frame.
+    pub flags: FrameFlags,
+    /// Raw payload bytes (encoded at send time by the layer stack).
+    pub payload: Vec<u8>,
+    /// Logical stream index (0..14) — mapped to QUIC stream `i * 4`.
+    pub logical_stream: u64,
 }
 
-/// How many consecutive copies of a frame we pre-encode into one
-/// [`Workload::thick_frames`] entry.
+/// How many consecutive copies of a frame we encode + send in one
+/// `stream_send` call.
 ///
-/// Sending 32 copies in a single `stream_send` call lets quiche fill several
+/// Sending 32 copies in a single `stream_send` lets quiche fill several
 /// full-size QUIC packets from one call, reducing per-frame quiche overhead and
 /// lowering the number of `conn.send()` calls by roughly this factor.
 pub const COALESCE: usize = 32;
 
-/// The complete pre-encoded workload.
+/// The complete workload.
 pub struct Workload {
-    /// All 15 frames encoded back-to-back (used for summary byte counts).
-    pub batch: Vec<u8>,
-    /// Each frame encoded individually; index `i` is sent on QUIC stream `i*4`.
-    pub frames: Vec<Vec<u8>>,
-    /// Each entry is [`COALESCE`] consecutive copies of `frames[i]`.
-    pub thick_frames: Vec<Vec<u8>>,
-    /// [`COALESCE`] copies of [`Self::batch`] concatenated — for `measure_rr`.
-    pub thick_batch: Vec<u8>,
-    /// Per-type metadata, in the same order the frames were encoded.
+    /// Per-type entries with raw payloads.
     pub entries: Box<[WorkloadEntry]>,
     /// Sum of every payload length (no headers) — for the summary.
     pub total_payload_bytes: usize,
+    /// Total wire bytes for one un-coalesced batch (all 15 frames × 1 copy).
+    pub batch_wire_bytes: usize,
 }
 
 /// Builds the full 15-frame workload.
 ///
 /// Each `MessageType` gets its own logical `StreamId` (0..14), matching the
 /// "1 user = 15 streams" model: N users produce 15×N logical streams.
-pub fn build() -> Result<Workload> {
-    let mut batch: Vec<u8> = Vec::with_capacity(32 * 1024);
-    let mut frames: Vec<Vec<u8>> = Vec::with_capacity(ALL_MESSAGE_TYPES.len());
+pub fn build() -> anyhow::Result<Workload> {
     let mut entries: Vec<WorkloadEntry> = Vec::with_capacity(ALL_MESSAGE_TYPES.len());
     let mut total_payload_bytes = 0usize;
 
     for (i, &mt) in ALL_MESSAGE_TYPES.iter().enumerate() {
         let payload = realistic_payload(mt);
-        let header = FrameHeader::new(StreamId::new(i as u64), mt)
-            .with_seq(Seq::ZERO)
-            .with_flags(realistic_flags(mt));
         let payload_len = payload.len();
-
-        // Encode into a standalone buffer, then append to batch.
-        let frame_buf = encode_frame(header, &payload);
         total_payload_bytes += payload_len;
-        batch.extend_from_slice(&frame_buf);
-        frames.push(frame_buf);
 
         entries.push(WorkloadEntry {
             msg_type: mt,
             name: type_name(mt),
             payload_len,
+            flags: realistic_flags(mt),
+            payload,
+            logical_stream: i as u64,
         });
     }
 
-    let thick_frames: Vec<Vec<u8>> = frames.iter().map(|f| f.repeat(COALESCE)).collect();
-    let thick_batch: Vec<u8> = batch.repeat(COALESCE);
+    let batch_wire_bytes = entries.len() * frame::codec::HEADER_SIZE + total_payload_bytes;
 
     Ok(Workload {
-        batch,
-        frames,
-        thick_frames,
-        thick_batch,
         entries: entries.into_boxed_slice(),
         total_payload_bytes,
+        batch_wire_bytes,
     })
-}
-
-/// Encodes a single frame into a fresh `Vec<u8>`.
-fn encode_frame(header: FrameHeader, payload: &[u8]) -> Vec<u8> {
-    let mut buf = vec![0u8; HEADER_SIZE + payload.len()];
-    // encode_into_slice is infallible when the buffer is sized correctly.
-    let _ = encode_into_slice(&mut buf, header, payload);
-    buf
 }
 
 // ---- per-type payloads -----------------------------------------------------
@@ -309,20 +288,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn batch_has_fifteen_frames() {
+    fn workload_has_fifteen_entries() {
         let w = build().unwrap();
         assert_eq!(w.entries.len(), 15);
-        let expected_wire = 15 * HEADER_SIZE + w.total_payload_bytes;
-        assert_eq!(w.batch.len(), expected_wire);
     }
 
     #[test]
     fn batch_is_at_least_one_mib() {
         let w = build().unwrap();
         assert!(
-            w.batch.len() >= 1_024 * 1_024,
+            w.batch_wire_bytes >= 1_024 * 1_024,
             "batch is only {} bytes, expected >= 1 MiB",
-            w.batch.len()
+            w.batch_wire_bytes
         );
+    }
+
+    #[test]
+    fn logical_streams_are_zero_to_fourteen() {
+        let w = build().unwrap();
+        for (i, e) in w.entries.iter().enumerate() {
+            assert_eq!(e.logical_stream, i as u64);
+        }
     }
 }

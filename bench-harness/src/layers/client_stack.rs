@@ -1,0 +1,170 @@
+//! [`ClientStack`] — the client-side composition root.
+//!
+//! Wraps the application/session/stream/message layer chain and provides
+//! the encode/coalesce/decode machinery that `worker.rs` drives.
+//!
+//! ```text
+//!                     ClientStack
+//!                         │
+//!     ┌───────────────────┼───────────────────┐
+//!     │                   │                   │
+//!     ▼                   ▼                   ▼
+//!  ClientAppLayer    coalesce_buf      FrameDecoders
+//!  (owns Session →   (reused per       (one per QUIC
+//!   Stream →          send)             stream, lazy)
+//!   Message)
+//! ```
+//!
+//! SEND PATH:
+//!   stack.encode_frame_coalesced(stream, msg_type, flags, payload)
+//!     → app.prepare_frame()          [builds header + increments seq]
+//!       → session → stream           [layer chain]
+//!     → encode_into_slice() × N      [write into coalesce_buf]
+//!     → returns &[u8]                [caller does stream_send]
+//!
+//! RECV PATH:
+//!   stack.on_stream_data(quic_sid, &buf[..n])
+//!     → FrameDecoder.decode_frame()  [parse 22-byte header + payload]
+//!     → app.on_frame(&FrameRef)      [session → stream → message → count]
+//!     → returns frame count
+
+use std::collections::HashMap;
+
+use frame::codec::{FrameDecoder, FrameRef, encode_into_slice};
+use frame::header::{FrameFlags, MessageType};
+use session_manager::SessionId;
+
+use super::application::ClientApplicationLayer;
+
+/// Pre-allocation size for each per-stream `FrameDecoder`.
+const DECODER_CAPACITY: usize = 65_535;
+
+/// The client-side layer stack — owns the full application chain
+/// plus reusable encode/decode buffers.
+pub struct ClientStack {
+    /// Application layer (owns session → stream → message).
+    app: ClientApplicationLayer,
+    /// Reusable buffer for coalesced frame encoding (cleared + refilled per send).
+    coalesce_buf: Vec<u8>,
+    /// One incremental decoder per QUIC stream (created lazily).
+    decoders: HashMap<u64, FrameDecoder>,
+}
+
+impl ClientStack {
+    /// Creates a new stack with a coalesce buffer pre-allocated for
+    /// `coalesce_capacity` bytes (should be `max_frame_wire_size × COALESCE`).
+    #[must_use]
+    pub fn new(coalesce_capacity: usize) -> Self {
+        Self {
+            app: ClientApplicationLayer::new(),
+            coalesce_buf: Vec::with_capacity(coalesce_capacity),
+            decoders: HashMap::new(),
+        }
+    }
+
+    /// Wires up the session/stream layers after handshake completes.
+    ///
+    /// Returns `None` if the session table is full.
+    pub fn on_connect(&mut self) -> Option<SessionId> {
+        self.app.on_connect()
+    }
+
+    // ── Send path ──────────────────────────────────────────────────
+
+    /// Encodes `coalesce` copies of a single frame into the internal
+    /// coalesce buffer and returns a reference to the encoded bytes.
+    ///
+    /// Each copy gets a unique incrementing `seq` from the stream layer.
+    /// The caller feeds the returned slice to `conn.stream_send`.
+    pub fn encode_frame_coalesced(
+        &mut self,
+        logical_stream: u64,
+        msg_type: MessageType,
+        flags: FrameFlags,
+        payload: &[u8],
+        coalesce: usize,
+    ) -> &[u8] {
+        let frame_wire_size = frame::codec::HEADER_SIZE + payload.len();
+        self.coalesce_buf.clear();
+        self.coalesce_buf.resize(frame_wire_size * coalesce, 0);
+
+        for i in 0..coalesce {
+            let header = self.app.prepare_frame(logical_stream, msg_type, flags);
+            let off = i * frame_wire_size;
+            let _ = encode_into_slice(
+                &mut self.coalesce_buf[off..off + frame_wire_size],
+                header,
+                payload,
+            );
+        }
+        &self.coalesce_buf
+    }
+
+    // ── Receive path ───────────────────────────────────────────────
+
+    /// Feeds raw bytes from `stream_recv` into the decoder for `quic_sid`,
+    /// then drains all complete frames through the layer stack.
+    ///
+    /// Returns the number of frames decoded.
+    pub fn on_stream_data(&mut self, quic_sid: u64, data: &[u8]) -> usize {
+        let decoder = self
+            .decoders
+            .entry(quic_sid)
+            .or_insert_with(|| FrameDecoder::with_capacity(DECODER_CAPACITY));
+        decoder.push(data);
+
+        let mut count = 0usize;
+        loop {
+            match decoder.decode_frame() {
+                Ok(Some(frame)) => {
+                    // Construct a zero-copy FrameRef borrowing from `frame.payload`.
+                    // `frame` lives on the stack for the duration of `on_frame`.
+                    let frame_ref = FrameRef {
+                        stream_id: frame.stream_id,
+                        seq: frame.seq,
+                        msg_type: frame.msg_type,
+                        flags: frame.flags,
+                        payload: &frame.payload[..],
+                    };
+                    self.app.on_frame(&frame_ref);
+                    count += 1;
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    decoder.clear();
+                    break;
+                }
+            }
+        }
+        count
+    }
+
+    // ── Lifecycle ──────────────────────────────────────────────────
+
+    /// Tears down all layers.
+    ///
+    /// Returns the number of streams released.
+    pub fn on_close(&mut self) -> usize {
+        self.app.on_close()
+    }
+
+    // ── Introspection ──────────────────────────────────────────────
+
+    /// Returns the total frames sent through the layer stack.
+    #[must_use]
+    pub fn frames_tx(&self) -> u64 {
+        self.app.frames_tx()
+    }
+
+    /// Returns the total data frames received through the layer stack.
+    #[must_use]
+    pub fn frames_rx(&self) -> u64 {
+        self.app.frames_rx()
+    }
+
+    /// Returns the total payload bytes received.
+    #[must_use]
+    pub fn bytes_rx(&self) -> u64 {
+        self.app.bytes_rx()
+    }
+}

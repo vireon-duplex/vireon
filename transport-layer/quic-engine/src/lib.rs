@@ -102,5 +102,5 @@ pub mod token;
 pub use builder::QuicEngineBuilder;
 pub use config::{Preset as QuicPreset, QuicConfig};
 pub use crypto::build_quiche_config;
-pub use engine::{QuicEngine, QuicEvent};
+pub use engine::{QuicEngine, QuicEvent, QuicSendError};
 pub use error::QuicError;
