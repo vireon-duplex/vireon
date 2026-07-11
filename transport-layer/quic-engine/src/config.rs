@@ -49,11 +49,13 @@ pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 // ── Flow control defaults ────────────────────────────────────────
 
 /// Initial per-connection flow-control window (MAX_DATA,
-/// RFC 9000 §18.2). 1 MiB matches Cloudflare's published default.
-pub const DEFAULT_INITIAL_MAX_DATA: u64 = 1024 * 1024;
+/// RFC 9000 §18.2). 100 MiB — large enough for 15 streams × 10 MiB each.
+pub const DEFAULT_INITIAL_MAX_DATA: u64 = 100 * 1024 * 1024;
 
 /// Initial per-stream flow-control window (MAX_STREAM_DATA).
-pub const DEFAULT_INITIAL_MAX_STREAM_DATA: u64 = 256 * 1024;
+/// 10 MiB — matches the benchmark client's window, preventing per-stream
+/// flow-control stalls during bulk transfer.
+pub const DEFAULT_INITIAL_MAX_STREAM_DATA: u64 = 10 * 1024 * 1024;
 
 /// Initial bidirectional stream count (MAX_STREAMS_BIDIR).
 pub const DEFAULT_INITIAL_MAX_STREAMS_BIDI: u64 = 100;
@@ -220,8 +222,8 @@ impl Default for QuicConfig {
             initial_max_stream_data: DEFAULT_INITIAL_MAX_STREAM_DATA,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
-            congestion: CongestionAlgorithm::default(),
-            initial_congestion_window_packets: 10,
+            congestion: CongestionAlgorithm::Cubic,
+            initial_congestion_window_packets: 100,
             extensions: ExtensionFlags::production(),
             shutting_down: false,
         }

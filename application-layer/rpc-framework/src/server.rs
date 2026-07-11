@@ -1,31 +1,28 @@
-//! [`RpcServer`] — server-side RPC facade (typed skeleton).
+//! [`RpcServer`] — server-side RPC facade.
 //!
-//! This is a **Phase 0 skeleton**. The full implementation lands in
-//! Phase 1+.
-//!
-//! See `DESIGN.md` Part 9 (server).
+//! Phase 1: in-memory method registry. `handle()` echoes the request
+//! payload back as the response (real handler dispatch lands later).
+
+use std::collections::HashMap;
+use std::fmt;
 
 use crate::config::RpcConfig;
 use crate::error::RpcError;
 use crate::health::HealthReport;
 use crate::method::{RpcMethodId, RpcMethodType};
 use crate::stats::RpcStats;
-use std::fmt;
 
 /// Server-side RPC facade.
 ///
-/// In Phase 0, this is a typed skeleton. Phase 1+ will include:
-/// - Method registration table
-/// - Request handler spawning
-/// - Stream lifecycle management
-/// - Per-method statistics
+/// Owns the in-memory method registry and atomic statistics.
 pub struct RpcServer {
     /// Server configuration.
     #[allow(dead_code)]
     cfg: RpcConfig,
     /// RPC statistics.
-    #[allow(dead_code)]
     stats: RpcStats,
+    /// Registered methods (method id → type).
+    methods: HashMap<RpcMethodId, RpcMethodType>,
 }
 
 impl fmt::Debug for RpcServer {
@@ -33,6 +30,7 @@ impl fmt::Debug for RpcServer {
         f.debug_struct("RpcServer")
             .field("cfg", &self.cfg)
             .field("stats", &"<stats>")
+            .field("registered_methods", &self.methods.len())
             .finish()
     }
 }
@@ -44,33 +42,47 @@ impl RpcServer {
         Self {
             cfg,
             stats: RpcStats::new(),
+            methods: HashMap::new(),
         }
     }
 
     /// Register an RPC method.
     ///
-    /// # Errors
-    /// Returns [`RpcError::ShuttingDown`] if the server is shutting down.
-    ///
-    /// # Phase 0
-    /// This is a skeleton implementation.
+    /// Re-registering an existing id updates its method type (idempotent).
     pub fn register_method(
         &mut self,
-        _id: RpcMethodId,
-        _mtype: RpcMethodType,
+        id: RpcMethodId,
+        mtype: RpcMethodType,
     ) -> Result<(), RpcError> {
-        Err(RpcError::ShuttingDown)
+        self.methods.insert(id, mtype);
+        Ok(())
     }
 
     /// Handle an incoming RPC request.
     ///
-    /// # Errors
-    /// Returns [`RpcError::ShuttingDown`] if the server is shutting down.
-    ///
-    /// # Phase 0
-    /// This is a skeleton implementation.
-    pub fn handle(&self, _request: &[u8]) -> Result<Vec<u8>, RpcError> {
-        Err(RpcError::ShuttingDown)
+    /// Phase 1 behaviour: bumps the call counter and echoes the request
+    /// payload back as the response. Real handler dispatch is a later
+    /// phase; this is enough to exercise the full request/response flow
+    /// end-to-end.
+    pub fn handle(&self, request: &[u8]) -> Result<Vec<u8>, RpcError> {
+        self.stats.record_bytes_received(request.len() as u64);
+        // Echo the request as the Phase 1 response.
+        let response = request.to_vec();
+        self.stats.record_bytes_sent(response.len() as u64);
+        self.stats.record_call_success();
+        Ok(response)
+    }
+
+    /// Returns the number of registered methods.
+    #[must_use]
+    pub fn method_count(&self) -> usize {
+        self.methods.len()
+    }
+
+    /// Returns `true` if a method with the given id is registered.
+    #[must_use]
+    pub fn has_method(&self, id: RpcMethodId) -> bool {
+        self.methods.contains_key(&id)
     }
 
     /// Get the current health report.
@@ -86,23 +98,44 @@ mod tests {
 
     #[test]
     fn server_creation() {
-        let cfg = RpcConfig::new();
-        let server = RpcServer::new(cfg);
-        assert_eq!(server.stats.snapshot().calls_total, 0);
-    }
-
-    #[test]
-    fn register_method_returns_shutting_down() {
-        let mut server = RpcServer::new(RpcConfig::new());
-        let result = server.register_method(RpcMethodId::new(1), RpcMethodType::Unary);
-        assert!(matches!(result, Err(RpcError::ShuttingDown)));
-    }
-
-    #[test]
-    fn handle_returns_shutting_down() {
         let server = RpcServer::new(RpcConfig::new());
-        let result = server.handle(&[]);
-        assert!(matches!(result, Err(RpcError::ShuttingDown)));
+        assert_eq!(server.stats.snapshot().calls_total, 0);
+        assert_eq!(server.method_count(), 0);
+    }
+
+    #[test]
+    fn register_method_succeeds() {
+        let mut server = RpcServer::new(RpcConfig::new());
+        server
+            .register_method(RpcMethodId::new(1), RpcMethodType::Unary)
+            .unwrap();
+        assert!(server.has_method(RpcMethodId::new(1)));
+        assert_eq!(server.method_count(), 1);
+    }
+
+    #[test]
+    fn register_method_overwrites() {
+        let mut server = RpcServer::new(RpcConfig::new());
+        server
+            .register_method(RpcMethodId::new(1), RpcMethodType::Unary)
+            .unwrap();
+        server
+            .register_method(RpcMethodId::new(1), RpcMethodType::ServerStreaming)
+            .unwrap();
+        assert_eq!(server.method_count(), 1);
+    }
+
+    #[test]
+    fn handle_echoes_request_and_counts() {
+        let server = RpcServer::new(RpcConfig::new());
+        let req = b"ping";
+        let resp = server.handle(req).unwrap();
+        assert_eq!(resp, req);
+        let snap = server.stats.snapshot();
+        assert_eq!(snap.calls_total, 1);
+        assert_eq!(snap.calls_succeeded, 1);
+        assert_eq!(snap.bytes_received, 4);
+        assert_eq!(snap.bytes_sent, 4);
     }
 
     #[test]

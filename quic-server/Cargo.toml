@@ -9,16 +9,60 @@ autobenches = false
 
 [dependencies]
 # Vireon crates — one per architectural layer
-io = { path = "../io-layer/io" }                                       # io-layer
-quic-engine = { path = "../transport-layer/quic-engine" }              # transport-layer
-frame = { path = "../message-layer/frame" }                            # message-layer
-session-manager = { path = "../session-layer/session-manager" }        # session-layer
-stream-manager = { path = "../stream-layer/stream-manager" }           # stream-layer
-connection-shard = { path = "../runtime-layer/connection-shard" }      # runtime-layer
-timer-wheel = { path = "../runtime-layer/timer-wheel" }                # runtime-layer
-buffer-pool = { path = "../runtime-layer/buffer-pool" }               # runtime-layer
-kernel-nic = { path = "../kernel-layer/kernel-nic" }                  # kernel-layer
-ai-streaming = { path = "../application-layer/ai-streaming" }         # application-layer
+# ── IO Layer ────────────────────────────────────────────────────────
+io = { path = "../io-layer/io" }
+
+# ── Kernel Layer ────────────────────────────────────────────────────
+kernel-nic = { path = "../kernel-layer/kernel-nic" }
+
+# ── Runtime Layer ───────────────────────────────────────────────────
+connection-shard = { path = "../runtime-layer/connection-shard" }
+timer-wheel = { path = "../runtime-layer/timer-wheel" }
+buffer-pool = { path = "../runtime-layer/buffer-pool" }
+send-queue = { path = "../runtime-layer/send-queue" }
+task-queue = { path = "../runtime-layer/task-queue" }
+cqe-processor = { path = "../runtime-layer/cqe-processor" }
+vireon-reactor = { path = "../runtime-layer/reactor", package = "reactor" }
+
+# ── Transport Layer ─────────────────────────────────────────────────
+quic-engine = { path = "../transport-layer/quic-engine" }
+
+# ── Message Layer ───────────────────────────────────────────────────
+frame = { path = "../message-layer/frame" }
+
+# ── Stream Layer ────────────────────────────────────────────────────
+stream-manager = { path = "../stream-layer/stream-manager" }
+stream-scheduler = { path = "../stream-layer/stream-scheduler" }
+
+# ── Session Layer ───────────────────────────────────────────────────
+session-manager = { path = "../session-layer/session-manager" }
+session-registry = { path = "../session-layer/session-registry" }
+session-router = { path = "../session-layer/session-router" }
+session-migration-manager = { path = "../session-layer/session-migration-manager" }
+session-replication-service = { path = "../session-layer/session-replication-service" }
+
+# ── Application Layer ───────────────────────────────────────────────
+ai-streaming = { path = "../application-layer/ai-streaming" }
+event-bus = { path = "../application-layer/event-bus" }
+media-streaming = { path = "../application-layer/media-streaming" }
+pubsub-engine = { path = "../application-layer/pubsub-engine" }
+rpc-framework = { path = "../application-layer/rpc-framework" }
+agent-runtime = { path = "../application-layer/agent-runtime" }
+application-runtime = { path = "../application-layer/application-runtime" }
+service-registry = { path = "../application-layer/service-registry" }
+dependency-injection = { path = "../application-layer/dependency-injection" }
+module-lifecycle = { path = "../application-layer/module-lifecycle" }
+middleware-pipeline = { path = "../application-layer/middleware-pipeline" }
+configuration-system = { path = "../application-layer/configuration-system" }
+plugin-manager = { path = "../application-layer/plugin-manager" }
+scheduler-hooks = { path = "../application-layer/scheduler-hooks" }
+auth-framework = { path = "../application-layer/auth-framework" }
+observability-sdk = { path = "../application-layer/observability-sdk" }
+resource-quotas = { path = "../application-layer/resource-quotas" }
+feature-flags = { path = "../application-layer/feature-flags" }
+version-negotiation = { path = "../application-layer/version-negotiation" }
+graceful-startup-shutdown = { path = "../application-layer/graceful-startup-shutdown" }
+ops-dashboard = { path = "../application-layer/ops-dashboard" }
 
 # QUIC protocol
 quiche = { workspace = true }

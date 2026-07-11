@@ -8,7 +8,7 @@
 //!   ├─ SessionLayer                     (session-layer)
 //!   │    └─ StreamLayer                 (stream-layer)
 //!   │         └─ MessageLayer           (message-layer)
-//!   └─ dispatcher: LoggingDispatcher    (application dispatch)
+//!   └─ dispatcher: VireonDispatcher     (application dispatch)
 //! ```
 //!
 //! The `RuntimeLayer` is separate shared infrastructure (not nested
@@ -23,5 +23,5 @@ pub mod session;
 pub mod stream;
 
 // Re-export the types used by stack.rs.
-pub use application::ApplicationLayer;
+pub use application::{ApplicationLayer, FrameContext, OutgoingFrame};
 pub use runtime::RuntimeLayer;

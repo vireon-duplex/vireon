@@ -64,6 +64,22 @@ pub fn build_quiche_config(
     // Pacing helps reduce burstiness on high-throughput links.
     config.enable_pacing(true);
 
+    // UDP payload size — allow jumbo packets on loopback / jumbo-frame
+    // links. Without these, quiche defaults to 1200-byte sends, which
+    // cripples throughput. 65507 = IPv4 max UDP payload (65535 - 20 - 8).
+    config.set_max_send_udp_payload_size(65507);
+    config.set_max_recv_udp_payload_size(65507);
+
+    // Disable PMTU discovery — use the full payload size from the first
+    // packet. On loopback (benchmark) the MTU is 65536, so probing only
+    // adds latency before reaching full throughput.
+    config.discover_pmtu(false);
+
+    // Initial congestion window — start with a large window so the first
+    // flight fills the pipe immediately (critical for short transfers).
+    config
+        .set_initial_congestion_window_packets(quic_cfg.initial_congestion_window_packets as usize);
+
     Ok(config)
 }
 

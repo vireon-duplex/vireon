@@ -34,8 +34,10 @@ use io::handler::{IoHandler, TickContext};
 
 use crate::config::QuicConfig;
 
-/// Maximum QUIC packet size (typical MTU 1500 - IP header 20 - UDP header 8).
-const MAX_PKT_SIZE: usize = 1472;
+/// Maximum QUIC packet size — covers full IPv4 UDP jumbo payload
+/// (65535 - IP/UDP overhead). Must match the io-layer receive buffer
+/// and the client's `max_send_udp_payload_size`.
+const MAX_PKT_SIZE: usize = 65535;
 
 /// Events emitted by the QUIC engine for upper-layer processing.
 ///
@@ -63,6 +65,8 @@ pub enum QuicEvent {
     FrameReceived {
         /// Slab index of the connection.
         conn_idx: usize,
+        /// QUIC stream id the frame arrived on (used for responses).
+        quic_stream_id: u64,
         /// Codec-layer frame header (stream_id, seq, msg_type, flags).
         header: codec::FrameHeader,
         /// Payload backed by a pool buffer (recycled on drop).
@@ -77,12 +81,31 @@ pub enum QuicEvent {
     },
 }
 
+/// Errors returned by [`QuicEngine::send_stream`].
+#[derive(Debug)]
+pub enum QuicSendError {
+    /// `conn_idx` does not map to an active connection.
+    UnknownConnection,
+    /// The QUIC stream is blocked by flow / congestion control.
+    ///
+    /// The caller may retry on a later tick. Data is NOT buffered by the
+    /// engine — the application owns retry.
+    FlowBlocked,
+    /// A lower-level quiche error.
+    Quiche(quiche::Error),
+}
+
 /// One entry in the connection slab.
 struct ConnEntry {
     conn: quiche::Connection,
     peer_addr: SocketAddr,
     /// Tracks whether we've already emitted `ConnectionEstablished`.
     established: bool,
+    /// Routing key derived from the server's source CID (20 bytes).
+    scid_key: [u8; quiche::MAX_CONN_ID_LEN],
+    /// Routing key derived from the client's Initial DCID (for Initial
+    /// retransmissions that arrive after the connection exists).
+    initial_dcid_key: [u8; quiche::MAX_CONN_ID_LEN],
 }
 
 /// Copies a quiche `ConnectionId` into a fixed-size zero-padded array.
@@ -128,6 +151,9 @@ pub struct QuicEngine {
     /// Reusable scratch for collecting closed connection indices (avoids
     /// per-tick Vec allocation).
     closed_buf: Vec<usize>,
+    /// Per-stream reassembly buffer for frames spanning multiple
+    /// `stream_recv` calls. Keyed by QUIC stream ID.
+    stream_carryover: HashMap<u64, Vec<u8>>,
 
     // ── Buffer pool ───────────────────────────────────────────────
     /// Pool for frame payload buffers (zero-alloc hot path).
@@ -136,6 +162,10 @@ pub struct QuicEngine {
     // ── Event queue ───────────────────────────────────────────────
     /// Events collected during `on_datagram` / `on_tick`, drained by caller.
     events: Vec<QuicEvent>,
+
+    // ── SCID allocation ───────────────────────────────────────────
+    /// Monotonic counter for generating unique 20-byte SCIDs.
+    scid_counter: u64,
 
     // ── Stats ─────────────────────────────────────────────────────
     /// Number of active connections.
@@ -181,8 +211,10 @@ impl QuicEngine {
             out_buf: vec![0u8; MAX_PKT_SIZE],
             readable_buf: Vec::with_capacity(16),
             closed_buf: Vec::with_capacity(16),
+            stream_carryover: HashMap::new(),
             pool,
             events: Vec::new(),
+            scid_counter: 1,
             active_count: 0,
             datagrams_recv: 0,
             datagrams_sent: 0,
@@ -202,6 +234,31 @@ impl QuicEngine {
         std::mem::take(&mut self.events)
     }
 
+    /// Sends application data on a QUIC stream.
+    ///
+    /// `stream_id` is the QUIC stream id (not the logical frame stream id).
+    /// Data is written into quiche's stream buffer; the actual QUIC packets
+    /// are emitted on the next `on_tick` → `flush_sends`.
+    ///
+    /// Returns the number of bytes accepted. On
+    /// [`QuicSendError::FlowBlocked`] the caller should retry later.
+    pub fn send_stream(
+        &mut self,
+        conn_idx: usize,
+        stream_id: u64,
+        data: &[u8],
+        fin: bool,
+    ) -> Result<usize, QuicSendError> {
+        let Some(Some(entry)) = self.connections.get_mut(conn_idx) else {
+            return Err(QuicSendError::UnknownConnection);
+        };
+        match entry.conn.stream_send(stream_id, data, fin) {
+            Ok(n) => Ok(n),
+            Err(quiche::Error::Done) => Err(QuicSendError::FlowBlocked),
+            Err(e) => Err(QuicSendError::Quiche(e)),
+        }
+    }
+
     /// Processes a received datagram: routes by DCID and feeds to quiche.
     fn process_datagram(&mut self, data: &[u8], peer: SocketAddr) {
         self.datagrams_recv += 1;
@@ -209,14 +266,15 @@ impl QuicEngine {
         let len = data.len().min(self.pkt_buf.len());
         self.pkt_buf[..len].copy_from_slice(&data[..len]);
 
-        // Parse QUIC header — scope ensures the header's borrow of pkt_buf
-        // ends before we reuse pkt_buf for recv().
+        // Parse the QUIC header from pkt_buf.  `from_slice` only advances
+        // a cursor and does NOT modify the underlying bytes, so pkt_buf
+        // is safe to pass to `conn.recv()` afterwards.
         let (dcid_key, dcid_len, is_initial) = {
             let hdr =
                 match quiche::Header::from_slice(&mut self.pkt_buf[..len], quiche::MAX_CONN_ID_LEN)
                 {
                     Ok(h) => h,
-                    Err(_) => return, // Malformed — drop silently (RFC 9000 §17).
+                    Err(_) => return,
                 };
             let mut key = [0u8; quiche::MAX_CONN_ID_LEN];
             key[..hdr.dcid.len()].copy_from_slice(&hdr.dcid);
@@ -227,11 +285,7 @@ impl QuicEngine {
         if let Some(&idx) = self.dcid_to_idx.get(&dcid_key) {
             self.feed_existing(idx, len, peer);
         } else if is_initial && !self.is_shutting_down() {
-            self.accept_new(&dcid_key[..dcid_len], peer);
-            // Feed the Initial packet to the newly created connection so
-            // quiche processes the ClientHello and generates a ServerHello
-            // on the next flush_sends.
-            if let Some(&idx) = self.dcid_to_idx.get(&dcid_key) {
+            if let Some(idx) = self.accept_new(&dcid_key[..dcid_len], peer) {
                 self.feed_existing(idx, len, peer);
             }
         }
@@ -249,6 +303,7 @@ impl QuicEngine {
         let pool = &self.pool;
         let local_addr = self.local_addr;
         let reactor_id = self.reactor_id;
+        let carryover = &mut self.stream_carryover;
 
         let Some(Some(entry)) = self.connections.get_mut(idx) else {
             return;
@@ -278,6 +333,7 @@ impl QuicEngine {
                         "connection established"
                     );
                 }
+
                 // Process readable streams + datagrams, collecting frame events.
                 crate::stream_bridge::process_readable(
                     &mut entry.conn,
@@ -286,43 +342,87 @@ impl QuicEngine {
                     events,
                     readable_buf,
                     pool,
+                    carryover,
                 );
             }
             Err(quiche::Error::Done) => {}
-            Err(_) => {
-                // Connection-level error — mark for cleanup.
+            Err(e) => {
+                tracing::warn!(
+                    reactor_id,
+                    idx,
+                    error = ?e,
+                    pkt_len = len,
+                    "conn.recv error"
+                );
             }
         }
     }
 
+    /// Generates a unique 20-byte source connection id.
+    ///
+    /// Using `MAX_CONN_ID_LEN` (20) for every SCID ensures that 1-RTT
+    /// short-header packets — whose DCID length is not encoded in the
+    /// packet — can be routed via an O(1) hash lookup. Short-header
+    /// parsing uses `dcid_len = MAX_CONN_ID_LEN`, so the extracted DCID
+    /// always matches the stored key byte-for-byte.
+    fn generate_scid(&mut self) -> [u8; quiche::MAX_CONN_ID_LEN] {
+        let mut buf = [0u8; quiche::MAX_CONN_ID_LEN];
+        // reactor_id (4 bytes) + counter (8 bytes) provides per-engine
+        // uniqueness; remaining 8 bytes are zero (sufficient for Phase 1).
+        buf[..4].copy_from_slice(&self.reactor_id.to_le_bytes());
+        buf[4..12].copy_from_slice(&self.scid_counter.to_le_bytes());
+        self.scid_counter = self.scid_counter.wrapping_add(1);
+        buf
+    }
+
     /// Accepts a new QUIC connection from an Initial packet.
-    fn accept_new(&mut self, dcid: &[u8], peer: SocketAddr) {
+    ///
+    /// Returns the slab index of the new connection so the caller can
+    /// immediately feed it the Initial packet.
+    fn accept_new(&mut self, dcid: &[u8], peer: SocketAddr) -> Option<usize> {
         if self.active_count >= self.config.max_connections {
-            return; // At capacity — drop.
+            return None; // At capacity — drop.
         }
 
-        let scid = quiche::ConnectionId::from_ref(dcid);
+        // Generate a unique 20-byte server source CID.  Using MAX_CONN_ID_LEN
+        // guarantees that short-header (1-RTT) packets — whose DCID length
+        // is not encoded in the packet — can be routed by an exact 20-byte
+        // hash lookup against `from_slice(.., MAX_CONN_ID_LEN)`.
+        let scid_bytes = self.generate_scid();
+        let scid = quiche::ConnectionId::from_ref(&scid_bytes);
+
+        // The client's Initial DCID becomes the original DCID (odcid).  With
+        // `Some(odcid)`, quiche records it as the
+        // `original_destination_connection_id` transport parameter.
+        let odcid = quiche::ConnectionId::from_ref(dcid);
 
         let conn = match quiche::accept(
             &scid,
-            Some(&scid),
+            Some(&odcid),
             self.local_addr,
             peer,
             &mut self.quiche_config,
         ) {
             Ok(c) => c,
-            Err(_) => return,
+            Err(_) => return None,
         };
 
-        // Insert into routing table using the server's source ID (padded key).
-        let key = pad_dcid(&conn.source_id());
+        // Two routing keys:
+        //   scid_key        — server's source CID (20 bytes, used by 1-RTT).
+        //   initial_dcid_key — client's Initial DCID (for Initial retransmissions).
+        let scid_key = pad_dcid(&conn.source_id());
+        let initial_dcid_key = pad_dcid(&odcid);
+
         let idx = self.connections.len();
         self.connections.push(Some(ConnEntry {
             conn,
             peer_addr: peer,
             established: false,
+            scid_key,
+            initial_dcid_key,
         }));
-        self.dcid_to_idx.insert(key, idx);
+        self.dcid_to_idx.insert(scid_key, idx);
+        self.dcid_to_idx.insert(initial_dcid_key, idx);
         self.active_count += 1;
 
         tracing::debug!(
@@ -331,10 +431,12 @@ impl QuicEngine {
             peer = %peer,
             "accepted new QUIC connection"
         );
+
+        Some(idx)
     }
 
     /// Flushes outgoing packets for all connections.
-    fn flush_sends(&mut self, ctx: &mut TickContext) {
+    pub fn flush_sends(&mut self, ctx: &mut TickContext) {
         let out_buf = &mut self.out_buf;
         let connections = &mut self.connections;
 
@@ -372,8 +474,8 @@ impl QuicEngine {
         for i in 0..n {
             let idx = self.closed_buf[i];
             if let Some(entry) = self.connections[idx].take() {
-                let key = pad_dcid(&entry.conn.source_id());
-                self.dcid_to_idx.remove(&key);
+                self.dcid_to_idx.remove(&entry.scid_key);
+                self.dcid_to_idx.remove(&entry.initial_dcid_key);
                 self.active_count = self.active_count.saturating_sub(1);
 
                 // Capture close reason before the connection is dropped.

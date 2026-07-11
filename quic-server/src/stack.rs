@@ -28,13 +28,13 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use buffer_pool::Buffer;
-use frame::codec::{FrameHeader, FrameRef};
+use frame::codec::{self, FrameHeader, FrameRef};
 use io::handler::{IoHandler, TickContext};
 use quic_engine::{QuicEngine, QuicEvent};
 
 use crate::connection::{ConnState, ConnectionRegistry};
 use crate::error::ServerError;
-use crate::layers::{ApplicationLayer, RuntimeLayer};
+use crate::layers::{ApplicationLayer, FrameContext, OutgoingFrame, RuntimeLayer};
 
 /// Drain timeout — how long to wait for connections to close cleanly
 /// before forcing reactor exit. 2 seconds covers 3 × PTO (Probe Timeout)
@@ -53,7 +53,8 @@ pub struct VireonStack {
     application: ApplicationLayer,
 
     // ── Lower half (physical I/O) ──────────────────────────────
-    /// Runtime layer — ConnectionShard + TimerWheel + BufferPool.
+    /// Runtime layer — ConnectionShard + TimerWheel + BufferPool +
+    /// SendQueue + TaskQueue + CqeProcessor + Reactor facade.
     runtime: RuntimeLayer,
     /// Transport layer — QUIC engine (decodes datagrams, emits events).
     engine: QuicEngine,
@@ -63,6 +64,16 @@ pub struct VireonStack {
     // ── Reusable scratch ────────────────────────────────────────
     /// Pre-allocated scratch for `reap_idle` (avoids per-tick Vec alloc).
     reap_buf: Vec<(usize, SocketAddr)>,
+    /// Pre-allocated scratch for outgoing frame encoding (avoids per-send alloc).
+    send_scratch: Vec<u8>,
+
+    // ── Observability ────────────────────────────────────────────
+    /// Tick counter — used to throttle periodic stats logging.
+    tick_count: u64,
+
+    // ── Benchmark mode ───────────────────────────────────────────
+    /// When true, echo every received frame back on the same stream.
+    echo: bool,
 
     // ── Graceful shutdown ────────────────────────────────────────
     /// Set by the signal handler to request graceful shutdown.
@@ -99,14 +110,18 @@ impl VireonStack {
     pub fn new(
         engine: QuicEngine,
         reactor_id: u32,
+        echo: bool,
         shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, ServerError> {
         Ok(Self {
-            application: ApplicationLayer::new(),
+            application: ApplicationLayer::new()?,
             runtime: RuntimeLayer::new(reactor_id)?,
             engine,
             connections: ConnectionRegistry::new(),
             reap_buf: Vec::with_capacity(16),
+            send_scratch: Vec::with_capacity(4096),
+            tick_count: 0,
+            echo,
             shutdown_requested,
             reactor_stop: None,
             shutdown_state: ShutdownState::Running,
@@ -141,10 +156,11 @@ impl VireonStack {
                 }
                 QuicEvent::FrameReceived {
                     conn_idx,
+                    quic_stream_id,
                     header,
                     payload,
                 } => {
-                    self.on_frame_received(conn_idx, header, payload);
+                    self.on_frame_received(conn_idx, quic_stream_id, header, payload);
                 }
                 QuicEvent::StreamFinished {
                     conn_idx,
@@ -220,7 +236,13 @@ impl VireonStack {
 
     // ── Frame dispatch ────────────────────────────────────────────
 
-    fn on_frame_received(&mut self, conn_idx: usize, header: FrameHeader, payload: Buffer) {
+    fn on_frame_received(
+        &mut self,
+        conn_idx: usize,
+        quic_stream_id: u64,
+        header: FrameHeader,
+        payload: Buffer,
+    ) {
         // Look up cross-layer connection state (ConnState is Copy).
         let Some(cs) = self.connections.get(conn_idx) else {
             tracing::warn!(conn_idx, "frame for unknown session");
@@ -229,6 +251,20 @@ impl VireonStack {
 
         // [runtime-layer] Update stats + reset timer.
         self.runtime.on_frame(conn_idx, cs.conn_id, payload.len());
+
+        // [benchmark] Echo mode: bypass the full application layer chain
+        // (session → stream → message → application services) and echo
+        // the raw frame back immediately. This isolates transport-layer
+        // performance from application-layer overhead.
+        if self.echo {
+            self.dispatch_outgoing(OutgoingFrame {
+                conn_idx,
+                quic_stream_id,
+                header,
+                payload: payload.to_vec(),
+            });
+            return;
+        }
 
         // Construct a zero-copy FrameRef borrowing from the pool buffer.
         // `payload` (Buffer) lives on the stack for the duration of the
@@ -241,9 +277,50 @@ impl VireonStack {
             payload: &payload[..],
         };
 
+        // Build the dispatch context.
+        let ctx = FrameContext {
+            session_id: cs.session_id,
+            conn_idx,
+            quic_stream_id,
+        };
+
         // [application → session → stream → message] Top-down processing.
-        self.application
-            .on_frame(conn_idx, cs.session_id, &frame_ref);
+        self.application.on_frame(&ctx, &frame_ref);
+
+        // [application-layer → transport] Drain + send outgoing frames.
+        let outbox = self.application.drain_outbox();
+        for out in outbox {
+            self.dispatch_outgoing(out);
+        }
+    }
+
+    /// Encodes an outgoing frame and sends it via the QUIC engine.
+    ///
+    /// Reuses `send_scratch` to avoid per-send allocation. Send failures
+    /// (flow-control blocked, unknown connection) are logged at debug —
+    /// full retry / deferred-send is a future task.
+    fn dispatch_outgoing(&mut self, out: OutgoingFrame) {
+        let wire_size = codec::HEADER_SIZE + out.payload.len();
+        self.send_scratch.clear();
+        self.send_scratch.resize(wire_size, 0);
+        match codec::encode_into_slice(&mut self.send_scratch, out.header, &out.payload) {
+            Ok(n) => {
+                if let Err(e) = self.engine.send_stream(
+                    out.conn_idx,
+                    out.quic_stream_id,
+                    &self.send_scratch[..n],
+                    false,
+                ) {
+                    tracing::debug!(
+                        conn_idx = out.conn_idx,
+                        quic_stream_id = out.quic_stream_id,
+                        error = ?e,
+                        "send_stream failed"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(error = ?e, "encode outgoing frame failed"),
+        }
     }
 
     fn on_stream_finished(&mut self, conn_idx: usize, stream_id: u64) {
@@ -311,6 +388,23 @@ impl IoHandler for VireonStack {
     }
 
     fn on_tick(&mut self, ctx: &mut TickContext) {
+        self.tick_count = self.tick_count.wrapping_add(1);
+
+        // ── Periodic observability (every 1000 ticks ≈ ~1s) ────────
+        if self.tick_count % 1000 == 0 && !self.connections.is_empty() {
+            let sq_stats = self.runtime.send_queue_stats();
+            let cqe_snap = self.runtime.cqe_stats();
+            tracing::debug!(
+                tick = self.tick_count,
+                conns = self.connections.len(),
+                sessions = self.application.session_occupancy(),
+                sq_depth = sq_stats.queue_depth,
+                sq_inflight = sq_stats.inflight_count,
+                cqe_total = cqe_snap.cqes_total,
+                "[observability] periodic stats"
+            );
+        }
+
         // ── Shutdown phase transition: Running → Draining ─────────
         if self.shutdown_requested.load(Ordering::Acquire)
             && matches!(self.shutdown_state, ShutdownState::Running)
@@ -325,6 +419,13 @@ impl IoHandler for VireonStack {
         // During drain, this sends CONNECTION_CLOSE frames.
         self.engine.on_tick(ctx);
 
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        // [runtime-layer] Drive task queue and other runtime services.
+        self.runtime.on_tick(now_ns);
+
         // [transport-layer] Drain structured events.
         let events = self.engine.drain_events();
 
@@ -332,6 +433,15 @@ impl IoHandler for VireonStack {
         if !events.is_empty() {
             self.process_events(events);
         }
+
+        // [transport-layer] Flush outgoing packets queued by process_events
+        // (echo responses, flow-control credit, MAX_STREAM_DATA).
+        //
+        // Without this second flush, data queued in process_events sits in
+        // quiche's send buffer until the NEXT tick — a one-tick delay that
+        // deadlocks the client: it's blocked on flow control waiting for
+        // MAX_STREAM_DATA that the server has generated but not sent yet.
+        self.engine.flush_sends(ctx);
 
         // ── Shutdown drain check ──────────────────────────────────
         match self.shutdown_state {

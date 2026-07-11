@@ -1,9 +1,10 @@
-//! [`AiStreamPipeline`] — AI streaming pipeline facade (typed skeleton).
+//! [`AiStreamPipeline`] — AI streaming pipeline facade.
 //!
-//! This is a **Phase 0 skeleton**. The full implementation lands in
-//! Phase 1+.
-//!
-//! See `DESIGN.md` Part 9 (pipeline).
+//! Phase 1: in-memory stream registry with per-stream token accounting.
+//! Production-grade backpressure / flow control lands in a later phase.
+
+use std::collections::HashMap;
+use std::fmt;
 
 use crate::config::AiStreamConfig;
 use crate::error::AiStreamError;
@@ -11,21 +12,29 @@ use crate::health::HealthReport;
 use crate::stats::AiStreamStats;
 use crate::stream::{AiStreamId, StreamMode};
 use crate::token::TokenChunk;
-use std::fmt;
+
+/// Per-stream in-memory state.
+struct StreamEntry {
+    #[allow(dead_code)]
+    mode: StreamMode,
+    token_count: u64,
+}
 
 /// AI streaming pipeline facade.
 ///
-/// In Phase 0, this is a typed skeleton. Phase 1+ will include:
-/// - Stream lifecycle management (open/close)
-/// - Token chunk routing and delivery
-/// - Tool call dispatch
-/// - Backpressure and flow control
+/// Owns the in-memory stream registry and atomic statistics. All mutating
+/// methods take `&mut self` (single-threaded reactor — no interior
+/// mutability needed for the registry).
 pub struct AiStreamPipeline {
     /// Pipeline configuration.
     #[allow(dead_code)]
     cfg: AiStreamConfig,
-    /// Pipeline statistics.
+    /// Pipeline statistics (atomic — snapshot via `health()`).
     stats: AiStreamStats,
+    /// Open streams keyed by id.
+    streams: HashMap<AiStreamId, StreamEntry>,
+    /// Monotonic stream-id allocator (starts at 1; 0 is reserved nil).
+    next_id: u64,
 }
 
 impl fmt::Debug for AiStreamPipeline {
@@ -33,6 +42,7 @@ impl fmt::Debug for AiStreamPipeline {
         f.debug_struct("AiStreamPipeline")
             .field("cfg", &self.cfg)
             .field("stats", &"<stats>")
+            .field("open_streams", &self.streams.len())
             .finish()
     }
 }
@@ -44,50 +54,76 @@ impl AiStreamPipeline {
         Self {
             cfg,
             stats: AiStreamStats::new(),
+            streams: HashMap::new(),
+            next_id: 1,
         }
     }
 
-    /// Open a new AI stream.
+    /// Open a new AI stream, allocating an id and registering it.
     ///
     /// # Errors
-    /// Returns [`AiStreamError::ShuttingDown`] — skeleton implementation.
-    ///
-    /// # Phase 0
-    /// This is a skeleton implementation.
-    // TODO(phase-1): Implement stream opening with backpressure.
-    pub fn open_stream(&self, _mode: StreamMode) -> Result<AiStreamId, AiStreamError> {
-        // TODO(phase-1): Implement stream opening.
-        Err(AiStreamError::ShuttingDown)
+    /// Returns [`AiStreamError::StreamExists`] only if the id allocator
+    /// wraps into a live id (practically never — `u64` ≈ 584 years at
+    /// 1 M streams/s).
+    pub fn open_stream(&mut self, mode: StreamMode) -> Result<AiStreamId, AiStreamError> {
+        let id = AiStreamId::new(self.next_id);
+        self.next_id = self.next_id.wrapping_add(1);
+        if self
+            .streams
+            .insert(
+                id,
+                StreamEntry {
+                    mode,
+                    token_count: 0,
+                },
+            )
+            .is_some()
+        {
+            return Err(AiStreamError::StreamExists(id));
+        }
+        self.stats.record_stream_opened();
+        Ok(id)
     }
 
-    /// Send a token chunk to a stream.
+    /// Deliver a token chunk to an open stream.
     ///
     /// # Errors
-    /// Returns [`AiStreamError::ShuttingDown`] — skeleton implementation.
-    ///
-    /// # Phase 0
-    /// This is a skeleton implementation.
-    // TODO(phase-1): Implement token chunk delivery.
+    /// Returns [`AiStreamError::StreamNotFound`] if `stream` is not open.
     pub fn send_token_chunk(
-        &self,
-        _stream: AiStreamId,
-        _chunk: TokenChunk,
+        &mut self,
+        stream: AiStreamId,
+        chunk: TokenChunk,
     ) -> Result<(), AiStreamError> {
-        // TODO(phase-1): Implement token chunk delivery.
-        Err(AiStreamError::ShuttingDown)
+        let entry = self
+            .streams
+            .get_mut(&stream)
+            .ok_or(AiStreamError::StreamNotFound(stream))?;
+        entry.token_count += 1;
+        self.stats.record_tokens(1);
+        if chunk.is_final {
+            // Final chunk implicitly closes the stream.
+            self.streams.remove(&stream);
+            self.stats.record_stream_closed();
+        }
+        Ok(())
     }
 
-    /// Close an AI stream.
+    /// Close an open AI stream.
     ///
     /// # Errors
-    /// Returns [`AiStreamError::ShuttingDown`] — skeleton implementation.
-    ///
-    /// # Phase 0
-    /// This is a skeleton implementation.
-    // TODO(phase-1): Implement stream closing.
-    pub fn close_stream(&self, _stream: AiStreamId) -> Result<(), AiStreamError> {
-        // TODO(phase-1): Implement stream closing.
-        Err(AiStreamError::ShuttingDown)
+    /// Returns [`AiStreamError::StreamNotFound`] if `stream` is not open.
+    pub fn close_stream(&mut self, stream: AiStreamId) -> Result<(), AiStreamError> {
+        if self.streams.remove(&stream).is_none() {
+            return Err(AiStreamError::StreamNotFound(stream));
+        }
+        self.stats.record_stream_closed();
+        Ok(())
+    }
+
+    /// Returns the number of currently open streams.
+    #[must_use]
+    pub fn open_stream_count(&self) -> usize {
+        self.streams.len()
     }
 
     /// Get the current health report.
@@ -103,38 +139,81 @@ mod tests {
 
     #[test]
     fn pipeline_creation() {
-        let cfg = AiStreamConfig::new();
-        let pipeline = AiStreamPipeline::new(cfg);
+        let pipeline = AiStreamPipeline::new(AiStreamConfig::new());
         assert_eq!(pipeline.stats.snapshot().streams_opened, 0);
+        assert_eq!(pipeline.open_stream_count(), 0);
     }
 
     #[test]
-    fn open_stream_returns_shutting_down() {
-        let pipeline = AiStreamPipeline::new(AiStreamConfig::new());
-        let result = pipeline.open_stream(StreamMode::Text);
-        assert!(matches!(result, Err(AiStreamError::ShuttingDown)));
+    fn open_stream_succeeds_and_allocates_unique_ids() {
+        let mut pipeline = AiStreamPipeline::new(AiStreamConfig::new());
+        let a = pipeline.open_stream(StreamMode::Text).unwrap();
+        let b = pipeline.open_stream(StreamMode::Mixed).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(pipeline.open_stream_count(), 2);
+        assert_eq!(pipeline.stats.snapshot().streams_opened, 2);
     }
 
     #[test]
-    fn send_token_chunk_returns_shutting_down() {
-        let pipeline = AiStreamPipeline::new(AiStreamConfig::new());
-        let chunk = TokenChunk::new(1, String::from("hello"));
-        let result = pipeline.send_token_chunk(AiStreamId::new(1), chunk);
-        assert!(matches!(result, Err(AiStreamError::ShuttingDown)));
+    fn send_token_chunk_increments_counter() {
+        let mut pipeline = AiStreamPipeline::new(AiStreamConfig::new());
+        let id = pipeline.open_stream(StreamMode::Text).unwrap();
+        pipeline
+            .send_token_chunk(id, TokenChunk::new(1, String::from("hi")))
+            .unwrap();
+        pipeline
+            .send_token_chunk(id, TokenChunk::new(2, String::from("world")))
+            .unwrap();
+        assert_eq!(pipeline.stats.snapshot().tokens_generated, 2);
     }
 
     #[test]
-    fn close_stream_returns_shutting_down() {
-        let pipeline = AiStreamPipeline::new(AiStreamConfig::new());
-        let result = pipeline.close_stream(AiStreamId::new(1));
-        assert!(matches!(result, Err(AiStreamError::ShuttingDown)));
+    fn send_token_chunk_unknown_stream_errors() {
+        let mut pipeline = AiStreamPipeline::new(AiStreamConfig::new());
+        let err = pipeline
+            .send_token_chunk(AiStreamId::new(99), TokenChunk::new(1, String::from("x")))
+            .unwrap_err();
+        assert!(matches!(err, AiStreamError::StreamNotFound(_)));
     }
 
     #[test]
-    fn health_report_initially_healthy() {
-        let pipeline = AiStreamPipeline::new(AiStreamConfig::new());
+    fn final_token_closes_stream() {
+        let mut pipeline = AiStreamPipeline::new(AiStreamConfig::new());
+        let id = pipeline.open_stream(StreamMode::Text).unwrap();
+        pipeline
+            .send_token_chunk(id, TokenChunk::new_final(1, String::from("done")))
+            .unwrap();
+        assert_eq!(pipeline.open_stream_count(), 0);
+        assert_eq!(pipeline.stats.snapshot().streams_closed, 1);
+    }
+
+    #[test]
+    fn close_stream_succeeds() {
+        let mut pipeline = AiStreamPipeline::new(AiStreamConfig::new());
+        let id = pipeline.open_stream(StreamMode::Text).unwrap();
+        pipeline.close_stream(id).unwrap();
+        assert_eq!(pipeline.open_stream_count(), 0);
+        assert_eq!(pipeline.stats.snapshot().streams_closed, 1);
+    }
+
+    #[test]
+    fn close_stream_unknown_errors() {
+        let mut pipeline = AiStreamPipeline::new(AiStreamConfig::new());
+        assert!(matches!(
+            pipeline.close_stream(AiStreamId::new(42)),
+            Err(AiStreamError::StreamNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn health_report_reflects_activity() {
+        let mut pipeline = AiStreamPipeline::new(AiStreamConfig::new());
+        let id = pipeline.open_stream(StreamMode::Text).unwrap();
+        pipeline
+            .send_token_chunk(id, TokenChunk::new(1, String::from("tok")))
+            .unwrap();
         let health = pipeline.health();
-        assert!(health.is_healthy());
-        assert_eq!(health.tokens_generated, 0);
+        assert_eq!(health.active_streams, 1);
+        assert_eq!(health.tokens_generated, 1);
     }
 }

@@ -9,8 +9,12 @@ use std::collections::{HashMap, HashSet};
 use frame::codec::FrameRef;
 use frame::header::MessageType;
 use stream_manager::StreamSlab;
+use stream_scheduler::budget::SchedulingBudget;
+use stream_scheduler::builder::SchedulerBuilder;
+use stream_scheduler::scheduler::StreamScheduler;
 
 use super::message::{FrameAction, MessageLayer};
+use crate::error::ServerError;
 
 /// Stream layer — manages stream lifecycle and delegates frame
 /// classification to the message layer.
@@ -21,17 +25,23 @@ pub struct StreamLayer {
     slab: StreamSlab,
     /// Per-connection logical stream IDs.
     conn_streams: HashMap<usize, HashSet<u64>>,
+    /// Priority scheduling + flow control.
+    pub scheduler: StreamScheduler,
 }
 
 impl StreamLayer {
     /// Creates a new stream layer with default capacity.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
+    pub fn new() -> Result<Self, ServerError> {
+        let scheduler = SchedulerBuilder::new()
+            .build()
+            .map_err(|e| ServerError::EngineInit(format!("stream-scheduler: {e:?}")))?;
+
+        Ok(Self {
             message: MessageLayer::new(),
             slab: StreamSlab::default(),
             conn_streams: HashMap::new(),
-        }
+            scheduler,
+        })
     }
 
     /// Initializes stream-tracking state for a new connection.
@@ -46,6 +56,14 @@ impl StreamLayer {
     /// caller (session → application) can dispatch them.
     pub fn on_frame(&mut self, conn_idx: usize, frame: &FrameRef<'_>) -> FrameAction {
         let action = self.message.classify(frame);
+
+        // [stream-scheduler] Drive the scheduler each tick — records
+        // stats and (in Phase 1+) returns priority-ordered selections.
+        let mut budget = SchedulingBudget::default_budget(64);
+        if let Err(e) = self.scheduler.tick(&mut budget) {
+            // NoStreamsReady / BudgetExhausted are expected on idle ticks.
+            tracing::trace!(error = ?e, "[stream-scheduler] tick");
+        }
 
         if action == FrameAction::Consumed {
             // Control-plane frame — handle stream lifecycle.
@@ -159,12 +177,6 @@ impl StreamLayer {
     }
 }
 
-impl Default for StreamLayer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,7 +201,7 @@ mod tests {
 
     #[test]
     fn stream_open_close_lifecycle() {
-        let mut sl = StreamLayer::new();
+        let mut sl = StreamLayer::new().unwrap();
         sl.on_connect(0);
 
         assert_eq!(
@@ -207,7 +219,7 @@ mod tests {
 
     #[test]
     fn data_frame_dispatches_to_app() {
-        let mut sl = StreamLayer::new();
+        let mut sl = StreamLayer::new().unwrap();
         sl.on_connect(0);
         assert_eq!(
             send_frame(&mut sl, 0, MessageType::TextToken, 1),
@@ -217,7 +229,7 @@ mod tests {
 
     #[test]
     fn on_close_releases_all_streams() {
-        let mut sl = StreamLayer::new();
+        let mut sl = StreamLayer::new().unwrap();
         sl.on_connect(0);
         send_frame(&mut sl, 0, MessageType::StreamOpen, 1);
         send_frame(&mut sl, 0, MessageType::StreamOpen, 2);
