@@ -44,12 +44,14 @@
 //! | 11 | [`busy_poll`] | `BusyPollPolicy` + `BusyPollMode` |
 //! | 12 | [`sysctl`]   | Sysctl reader/writer + `SysctlProfile` presets |
 //! | 13 | [`socket`]   | `SocketBuilder`, `SocketGroup`, `PerCoreSocketRegistry` |
-//! | 14 | [`manager`]  | `NicManager` facade (top-level entry point) |
+//! | 14 | [`ebpf`]     | eBPF `SO_REUSEPORT` QUIC DCID steering program |
+//! | 15 | [`manager`]  | `NicManager` facade (top-level entry point) |
 
 pub mod affinity;
 pub mod busy_poll;
 pub mod config;
 pub mod cpuset;
+pub mod ebpf;
 pub mod error;
 pub mod features;
 pub mod irq;
@@ -67,6 +69,7 @@ pub use affinity::{IrqPolicy, affine_irqs};
 pub use busy_poll::{BusyPollMode, BusyPollPolicy};
 pub use config::{NicConfig, Preset};
 pub use cpuset::CpuSet;
+pub use ebpf::attach_quic_reuseport_steering;
 pub use error::KernelNicError;
 pub use features::KernelFeatures;
 pub use irq::{IrqInfo, IrqKind, IrqMap};

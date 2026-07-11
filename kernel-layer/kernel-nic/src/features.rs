@@ -13,6 +13,7 @@ use std::os::fd::AsRawFd;
 
 use socket2::{Domain, Protocol, Socket, Type};
 
+use crate::ebpf::BpfInsn;
 use crate::error::KernelNicError;
 
 /// Bitmask of detected kernel features.
@@ -335,17 +336,7 @@ fn try_sockopt_int(
 /// program is later rejected by the verifier — we only care that the
 /// socket option exists).
 fn try_attach_reuseport_ebpf(fd: libc::c_int) -> Result<(), std::io::Error> {
-    // The smallest valid eBPF program: a single `mov r0, 0 ; exit`.
-    // BPF_ALU64 | BPF_MOV | BPF_K with dst=r0, imm=0
-    // BPF_JMP | BPF_EXIT
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct BpfInsn {
-        code: u8,
-        regs: u8,
-        off: i16,
-        imm: i32,
-    }
+    // The smallest valid eBPF program: `mov r0, 0 ; exit`.
     let prog: [BpfInsn; 2] = [
         BpfInsn {
             code: 0xb7, // BPF_ALU64 | BPF_MOV | BPF_K
@@ -361,23 +352,34 @@ fn try_attach_reuseport_ebpf(fd: libc::c_int) -> Result<(), std::io::Error> {
         },
     ];
 
+    let license = b"GPL\0";
+
+    // Correct kernel `bpf_attr` layout for BPF_PROG_LOAD.
+    // Field order: prog_type, insn_cnt, insns, license, ...
     #[repr(C)]
     #[derive(Clone, Copy)]
-    struct SockProg {
+    struct BpfProgLoadAttr {
         prog_type: u32,
-        insns: u64, // pointer
         insn_cnt: u32,
-        license: u64, // pointer
+        insns: u64,
+        license: u64,
         log_level: u32,
+        _pad0: u32,
+        log_buf: u64,
+        log_size: u32,
+        kern_version: u32,
     }
 
-    let license = b"GPL\0";
-    let mut attr = SockProg {
+    let attr = BpfProgLoadAttr {
         prog_type: 9, // BPF_PROG_TYPE_SOCKET_FILTER
-        insns: prog.as_ptr() as u64,
         insn_cnt: prog.len() as u32,
+        insns: prog.as_ptr() as u64,
         license: license.as_ptr() as u64,
         log_level: 0,
+        _pad0: 0,
+        log_buf: 0,
+        log_size: 0,
+        kern_version: 0,
     };
 
     // SAFETY: `bpf(2)` with BPF_PROG_LOAD attribute. Buffer sizes are correct.
@@ -385,8 +387,8 @@ fn try_attach_reuseport_ebpf(fd: libc::c_int) -> Result<(), std::io::Error> {
         libc::syscall(
             libc::SYS_bpf,
             5, // BPF_PROG_LOAD
-            &mut attr as *mut _ as *mut libc::c_void,
-            std::mem::size_of::<SockProg>(),
+            &attr as *const _ as *const libc::c_void,
+            std::mem::size_of::<BpfProgLoadAttr>(),
         )
     };
     if prog_fd < 0 {
