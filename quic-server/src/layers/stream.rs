@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 use frame::codec::FrameRef;
 use frame::header::MessageType;
+use frame::reassembly::FragmentReassembler;
 use stream_manager::StreamSlab;
 use stream_scheduler::budget::SchedulingBudget;
 use stream_scheduler::builder::SchedulerBuilder;
@@ -27,6 +28,8 @@ pub struct StreamLayer {
     conn_streams: HashMap<usize, HashSet<u64>>,
     /// Priority scheduling + flow control.
     pub scheduler: StreamScheduler,
+    /// Fragment reassembler — collects Fragment frames per stream.
+    reassembler: FragmentReassembler,
 }
 
 impl StreamLayer {
@@ -41,6 +44,7 @@ impl StreamLayer {
             slab: StreamSlab::default(),
             conn_streams: HashMap::new(),
             scheduler,
+            reassembler: FragmentReassembler::new(),
         })
     }
 
@@ -115,14 +119,33 @@ impl StreamLayer {
                         "handshake control frame"
                     );
                 }
-                MessageType::Fragment => {
-                    tracing::debug!(
-                        conn_idx,
-                        stream_id = logical_stream,
-                        seq = frame.seq.get(),
-                        "fragment"
-                    );
-                }
+                MessageType::Fragment => match self.reassembler.on_fragment(frame) {
+                    Ok(Some(reassembled)) => {
+                        tracing::debug!(
+                            conn_idx,
+                            stream_id = logical_stream,
+                            bytes = reassembled.len(),
+                            "fragment chain reassembled"
+                        );
+                    }
+                    Ok(None) => {
+                        tracing::trace!(
+                            conn_idx,
+                            stream_id = logical_stream,
+                            seq = frame.seq.get(),
+                            pending_bytes = self.reassembler.pending_bytes(),
+                            "fragment accumulating"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            conn_idx,
+                            stream_id = logical_stream,
+                            error = %e,
+                            "fragment reassembly error"
+                        );
+                    }
+                },
                 MessageType::Ack => {
                     tracing::debug!(
                         conn_idx,

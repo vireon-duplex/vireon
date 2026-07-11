@@ -38,6 +38,19 @@ impl<'a> ByteReader<'a> {
     }
 
     #[inline(always)]
+    pub fn read_u16(&mut self) -> u16 {
+        self.check(2);
+
+        unsafe {
+            let v = u16::from_be(ptr::read_unaligned(self.ptr as *const u16));
+
+            self.ptr = self.ptr.add(2);
+
+            v
+        }
+    }
+
+    #[inline(always)]
     pub fn read_u32(&mut self) -> u32 {
         self.check(4);
 
