@@ -34,6 +34,16 @@ impl<'a> ByteWriter<'a> {
     }
 
     #[inline(always)]
+    pub fn write_u16(&mut self, v: u16) {
+        self.check(2);
+
+        unsafe {
+            ptr::write_unaligned(self.ptr as *mut u16, v.to_be());
+            self.ptr = self.ptr.add(2);
+        }
+    }
+
+    #[inline(always)]
     pub fn write_u32(&mut self, v: u32) {
         self.check(4);
 
