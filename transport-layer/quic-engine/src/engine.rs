@@ -510,13 +510,22 @@ impl QuicEngine {
                 match entry.conn.send(&mut self.out_buf) {
                     Ok((len, info)) => {
                         self.datagrams_sent += 1;
-                        let _ = ctx.sender.send_blocking(&self.out_buf[..len], info.to);
+                        // Batch same-destination packets for UDP_SEGMENT
+                        // offload — collapses N sendto syscalls into 1
+                        // when a connection emits multiple packets.
+                        let _ = self.gso_batcher.push(
+                            &self.out_buf[..len],
+                            info.to,
+                            ctx.sender,
+                        );
                     }
                     Err(quiche::Error::Done) => break,
                     Err(_) => break, // Non-fatal: try next connection.
                 }
             }
         }
+        // Flush any remaining batched packets.
+        let _ = self.gso_batcher.flush(ctx.sender);
     }
 
     /// Removes closed connections from the slab and routing table,
