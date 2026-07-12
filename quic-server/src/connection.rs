@@ -20,6 +20,10 @@ pub struct ConnState {
     pub session_id: SessionId,
     /// Peer socket address.
     pub peer_addr: SocketAddr,
+    /// Cumulative payload bytes received — drives eviction victim selection.
+    pub bytes_recv: u64,
+    /// Nanosecond timestamp of the most recent frame — drives idle detection.
+    pub last_active_ns: u64,
 }
 
 /// Maps QUIC engine `conn_idx` → cross-layer connection state.
@@ -63,6 +67,23 @@ impl ConnectionRegistry {
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+
+    /// Updates cumulative bytes and last-active timestamp for a connection.
+    ///
+    /// Called from the hot path (`on_frame_received`) once per frame —
+    /// uses `saturating_add` to avoid overflow on long-lived connections.
+    pub fn record_activity(&mut self, conn_idx: usize, bytes: u64, now_ns: u64) {
+        if let Some(cs) = self.map.get_mut(&conn_idx) {
+            cs.bytes_recv = cs.bytes_recv.saturating_add(bytes);
+            cs.last_active_ns = now_ns;
+        }
+    }
+
+    /// Iterates over all `(conn_idx, &ConnState)` pairs — used by the
+    /// eviction pass to collect victim metadata.
+    pub fn iter(&self) -> impl Iterator<Item = (&usize, &ConnState)> {
+        self.map.iter()
     }
 }
 

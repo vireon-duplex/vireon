@@ -34,6 +34,7 @@ use io::handler::{IoHandler, TickContext};
 
 use crate::config::QuicConfig;
 use crate::gso::GsoBatcher;
+use crate::stream_bridge::StreamCarry;
 
 /// Maximum QUIC packet size — covers full IPv4 UDP jumbo payload
 /// (65535 - IP/UDP overhead). Must match the io-layer receive buffer
@@ -162,7 +163,7 @@ pub struct QuicEngine {
     closed_buf: Vec<usize>,
     /// Per-stream reassembly buffer for frames spanning multiple
     /// `stream_recv` calls. Keyed by QUIC stream ID.
-    stream_carryover: HashMap<u64, bytes::BytesMut>,
+    stream_carryover: HashMap<u64, StreamCarry>,
 
     // ── Buffer pool ───────────────────────────────────────────────
     /// Pool for frame payload buffers (zero-alloc hot path).
@@ -555,6 +556,26 @@ impl QuicEngine {
             active_count = self.active_count,
             "graceful shutdown initiated — closing all connections"
         );
+    }
+
+    /// Closes a single connection by `conn_idx`.
+    ///
+    /// Sends a QUIC APPLICATION_CLOSE frame on the next `flush_sends`.
+    /// The connection is fully removed on the subsequent `cleanup_closed()`
+    /// call inside `on_tick`, which then emits `ConnectionClosed`.
+    ///
+    /// Used by the memory-pressure eviction path to selectively free
+    /// buffer pool capacity held by heavy consumers.
+    pub fn close_connection(&mut self, conn_idx: usize, app_error: u64, reason: &[u8]) {
+        if let Some(Some(entry)) = self.connections.get_mut(conn_idx) {
+            let _ = entry.conn.close(true, app_error, reason);
+            tracing::debug!(
+                reactor_id = self.reactor_id,
+                conn_idx,
+                app_error,
+                "connection close requested"
+            );
+        }
     }
 }
 
