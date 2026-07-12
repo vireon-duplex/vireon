@@ -412,10 +412,17 @@ impl IoHandler for VireonStack {
         if self.shutdown_requested.load(Ordering::Acquire)
             && matches!(self.shutdown_state, ShutdownState::Running)
         {
+            let active = self.engine.active_connections();
             self.engine.begin_shutdown();
             self.shutdown_state = ShutdownState::Draining {
                 deadline: Instant::now() + DRAIN_TIMEOUT,
             };
+            tracing::info!(
+                reactor_id = self.engine.reactor_id,
+                active_connections = active,
+                drain_timeout = ?DRAIN_TIMEOUT,
+                "shutdown drain started — closing all connections"
+            );
         }
 
         // [transport-layer] Flush outgoing packets + cleanup closed.
@@ -456,7 +463,14 @@ impl IoHandler for VireonStack {
                 let all_closed = self.engine.active_connections() == 0;
                 let timed_out = Instant::now() >= deadline;
                 if all_closed || timed_out {
-                    tracing::info!(all_closed, timed_out, "drain complete — stopping reactor");
+                    let remaining = self.engine.active_connections();
+                    tracing::info!(
+                        reactor_id = self.engine.reactor_id,
+                        all_closed,
+                        timed_out,
+                        remaining_connections = remaining,
+                        "drain complete — stopping reactor"
+                    );
                     self.shutdown_state = ShutdownState::Done;
                     if let Some(stop) = &self.reactor_stop {
                         stop.store(true, Ordering::Release);

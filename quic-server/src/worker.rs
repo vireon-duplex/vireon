@@ -153,19 +153,33 @@ impl Worker {
     }
 }
 
-/// Installs a Ctrl-C handler that sets `shutdown_requested` to true.
+/// Installs a Ctrl-C handler with graceful-to-forced escalation.
 ///
-/// Unlike the old behavior (which set the reactor stop flag directly),
-/// this triggers the graceful drain: connections receive CONNECTION_CLOSE
-/// frames, and the reactor exits after [`DRAIN_TIMEOUT`](crate::stack::DRAIN_TIMEOUT).
+/// **First SIGINT/SIGTERM**: sets `shutdown_requested`, triggering the
+/// graceful drain. Connections receive CONNECTION_CLOSE frames, and each
+/// reactor exits after [`DRAIN_TIMEOUT`](crate::stack::DRAIN_TIMEOUT).
+///
+/// **Second SIGINT/SIGTERM**: forces immediate process exit (code 130 =
+/// 128 + SIGINT). This gives the operator an escape hatch if the drain
+/// takes too long or is stuck.
 ///
 /// # Errors
 ///
 /// Returns an error if the signal handler cannot be installed.
 pub fn install_signal_handler(shutdown_requested: Arc<AtomicBool>) -> Result<(), ServerError> {
+    use std::sync::atomic::AtomicU8;
+    let signal_count = Arc::new(AtomicU8::new(0));
     ctrlc::set_handler(move || {
-        tracing::info!("received SIGINT/SIGTERM, initiating graceful shutdown...");
-        shutdown_requested.store(true, Ordering::Release);
+        let prev = signal_count.fetch_add(1, Ordering::AcqRel);
+        if prev == 0 {
+            tracing::info!(
+                "received SIGINT/SIGTERM — initiating graceful shutdown (press Ctrl-C again to force exit)"
+            );
+            shutdown_requested.store(true, Ordering::Release);
+        } else {
+            tracing::warn!("received second SIGINT/SIGTERM — forcing immediate exit");
+            std::process::exit(130);
+        }
     })
     .map_err(|e| ServerError::SignalHandler(format!("{e}")))
 }

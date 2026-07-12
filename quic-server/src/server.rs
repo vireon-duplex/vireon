@@ -2,7 +2,7 @@
 
 use std::os::fd::RawFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::thread;
 use std::time::Duration;
 
@@ -120,14 +120,10 @@ impl QuicServer {
             }
         }
 
-        // Signal handler sets the shared shutdown flag. Each worker's
-        // VireonStack detects it in on_tick and drives graceful drain.
-        let shutdown_for_handler = shutdown_requested;
-        ctrlc::set_handler(move || {
-            tracing::info!("received SIGINT/SIGTERM, initiating graceful shutdown...");
-            shutdown_for_handler.store(true, Ordering::Release);
-        })
-        .map_err(|e| ServerError::SignalHandler(format!("{e}")))?;
+        // Signal handler: first Ctrl-C initiates graceful drain, second
+        // forces immediate exit. Each worker's VireonStack detects the
+        // flag in on_tick and drives its own CONNECTION_CLOSE drain.
+        install_signal_handler(shutdown_requested)?;
 
         join_all(handles)
     }
