@@ -112,7 +112,10 @@ impl GsoBatcher {
             return Ok(());
         }
 
-        let dest = self.dest.expect("dest set when count > 0");
+        let Some(dest) = self.dest else {
+            self.reset();
+            return Ok(());
+        };
 
         // Single packet — no GSO benefit, just send_blocking.
         if self.count == 1 || !self.gso_supported {

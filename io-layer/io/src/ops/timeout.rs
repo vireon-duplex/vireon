@@ -12,21 +12,13 @@ use io_uring::types::{TimeoutFlags, Timespec};
 
 use crate::ops::{OpKind, encode};
 
-/// Builds a one-shot `Timeout` SQE.
+/// Builds a one-shot `Timeout` SQE from a caller-owned `Timespec`.
 ///
-/// `id` is encoded as `OpKind::Timeout` in the `user_data` so the reactor
-/// can classify the resulting CQE.
-///
-/// **Note**: the `Timespec` is leaked (`Box::leak`) because the kernel
-/// reads it at submit time and the pointer must remain valid until then.
-/// In practice the kernel copies the value during `io_uring_enter(2)`.
-pub fn build_timeout(duration: Duration, id: u64) -> Entry {
-    let ts = Box::leak(Box::new(
-        Timespec::new()
-            .sec(duration.as_secs())
-            .nsec(duration.subsec_nanos()),
-    ));
-    Timeout::new(ts)
+/// The caller MUST keep `timespec` alive until the kernel fires or
+/// cancels the timer (i.e. until the matching CQE arrives). Storing
+/// it inside `TimerWheel::ActiveTimer` is the intended pattern.
+pub fn build_timeout(timespec: &Timespec, id: u64) -> Entry {
+    Timeout::new(timespec)
         .build()
         .user_data(encode(OpKind::Timeout, id))
 }
@@ -34,13 +26,9 @@ pub fn build_timeout(duration: Duration, id: u64) -> Entry {
 /// Builds a multishot `Timeout` SQE (kernel ≥ 6.2).
 ///
 /// Each expiry posts a CQE with `IORING_CQE_F_MORE` set until cancelled.
-pub fn build_periodic_tick(period: Duration, id: u64) -> Entry {
-    let ts = Box::leak(Box::new(
-        Timespec::new()
-            .sec(period.as_secs())
-            .nsec(period.subsec_nanos()),
-    ));
-    Timeout::new(ts)
+/// The caller MUST keep `timespec` alive until the timer is cancelled.
+pub fn build_periodic_tick(timespec: &Timespec, id: u64) -> Entry {
+    Timeout::new(timespec)
         .flags(TimeoutFlags::MULTISHOT)
         .build()
         .user_data(encode(OpKind::Timeout, id))
@@ -72,12 +60,11 @@ mod tests {
 
     #[test]
     fn build_timeout_encodes_timeout_kind() {
-        // build_timeout uses encode(OpKind::Timeout, id) internally.
         let ud = encode(OpKind::Timeout, 42);
         assert_eq!(decode_kind(ud), OpKind::Timeout);
         assert_eq!(decode_id(ud), 42);
-        // Verify the builder compiles and produces an Entry.
-        let _entry = build_timeout(Duration::from_millis(50), 42);
+        let ts = Timespec::new().sec(0).nsec(50_000_000);
+        let _entry = build_timeout(&ts, 42);
     }
 
     #[test]
@@ -85,7 +72,8 @@ mod tests {
         let ud = encode(OpKind::Timeout, 7);
         assert_eq!(decode_kind(ud), OpKind::Timeout);
         assert_eq!(decode_id(ud), 7);
-        let _entry = build_periodic_tick(Duration::from_secs(1), 7);
+        let ts = Timespec::new().sec(1).nsec(0);
+        let _entry = build_periodic_tick(&ts, 7);
     }
 
     #[test]

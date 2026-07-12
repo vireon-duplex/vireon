@@ -40,6 +40,11 @@ use crate::gso::GsoBatcher;
 /// and the client's `max_send_udp_payload_size`.
 const MAX_PKT_SIZE: usize = 65535;
 
+/// Maximum pending events before the engine starts dropping. Prevents
+/// unbounded Vec growth if the upper layer is slow to drain_events().
+/// At ~200 bytes per event, 8192 events ≈ 1.6 MiB — negligible.
+pub const MAX_PENDING_EVENTS: usize = 8192;
+
 /// Events emitted by the QUIC engine for upper-layer processing.
 ///
 /// Collected during `on_datagram` / `on_tick` and drained by the
@@ -137,6 +142,9 @@ pub struct QuicEngine {
     // ── Connection storage ────────────────────────────────────────
     /// Slab of connections (None = freed slot).
     connections: Vec<Option<ConnEntry>>,
+    /// Free slots in `connections` — recycled when connections close
+    /// so the Vec doesn't grow unbounded under connection churn.
+    free_slots: Vec<usize>,
     /// DCID → slab index routing table. Uses a fixed-size zero-padded
     /// array key to avoid per-datagram heap allocation.
     dcid_to_idx: HashMap<[u8; quiche::MAX_CONN_ID_LEN], usize>,
@@ -211,6 +219,7 @@ impl QuicEngine {
             quiche_config,
             local_addr,
             connections: Vec::new(),
+            free_slots: Vec::new(),
             dcid_to_idx: HashMap::new(),
             pkt_buf: vec![0u8; 65535],
             out_buf: vec![0u8; MAX_PKT_SIZE],
@@ -419,14 +428,25 @@ impl QuicEngine {
         let scid_key = pad_dcid(&conn.source_id());
         let initial_dcid_key = pad_dcid(&odcid);
 
-        let idx = self.connections.len();
-        self.connections.push(Some(ConnEntry {
+        // Reuse a freed slot if available; otherwise grow the slab.
+        let entry = ConnEntry {
             conn,
             peer_addr: peer,
             established: false,
             scid_key,
             initial_dcid_key,
-        }));
+        };
+        let idx = match self.free_slots.pop() {
+            Some(free) => {
+                self.connections[free] = Some(entry);
+                free
+            }
+            None => {
+                let idx = self.connections.len();
+                self.connections.push(Some(entry));
+                idx
+            }
+        };
         self.dcid_to_idx.insert(scid_key, idx);
         self.dcid_to_idx.insert(initial_dcid_key, idx);
         self.active_count += 1;
@@ -483,6 +503,7 @@ impl QuicEngine {
                 self.dcid_to_idx.remove(&entry.scid_key);
                 self.dcid_to_idx.remove(&entry.initial_dcid_key);
                 self.active_count = self.active_count.saturating_sub(1);
+                self.free_slots.push(idx);
 
                 // Capture close reason before the connection is dropped.
                 let reason = entry
