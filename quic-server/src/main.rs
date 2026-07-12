@@ -5,6 +5,7 @@ mod config;
 mod connection;
 mod distributed;
 mod error;
+mod eviction;
 mod layers;
 mod server;
 mod stack;

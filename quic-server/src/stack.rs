@@ -73,6 +73,12 @@ pub struct VireonStack {
     /// Throttle for memory-pressure warnings (logs at most every 5 s).
     pressure_throttle: PressureThrottle,
 
+    // ── Memory-pressure eviction ────────────────────────────────
+    /// Last time an eviction pass ran — used to enforce cooldown.
+    eviction_cooldown: Option<Instant>,
+    /// Eviction thresholds and fractions.
+    eviction_config: crate::eviction::EvictionConfig,
+
     // ── Benchmark mode ───────────────────────────────────────────
     /// When true, echo every received frame back on the same stream.
     echo: bool,
@@ -154,6 +160,8 @@ impl VireonStack {
             send_scratch: Vec::with_capacity(4096),
             tick_count: 0,
             pressure_throttle: PressureThrottle::new(),
+            eviction_cooldown: None,
+            eviction_config: crate::eviction::EvictionConfig::default(),
             echo,
             shutdown_requested,
             reactor_stop: None,
@@ -240,6 +248,11 @@ impl VireonStack {
                 conn_id,
                 session_id,
                 peer_addr: peer,
+                bytes_recv: 0,
+                last_active_ns: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64,
             },
         );
     }
@@ -287,6 +300,16 @@ impl VireonStack {
 
         // [runtime-layer] Update stats + reset timer.
         self.runtime.on_frame(conn_idx, cs.conn_id, payload.len());
+
+        // Track per-connection activity for memory-pressure eviction.
+        self.connections.record_activity(
+            conn_idx,
+            payload.len() as u64,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64,
+        );
 
         // [benchmark] Echo mode: bypass the full application layer chain
         // (session → stream → message → application services) and echo
@@ -395,6 +418,54 @@ impl VireonStack {
         }
     }
 
+    // ── Memory-pressure eviction ──────────────────────────────────
+
+    /// Selects and closes the heaviest connections to relieve memory pressure.
+    ///
+    /// Collects metadata snapshots from [`ConnectionRegistry`], delegates
+    /// victim selection to [`eviction::select_victims`], then closes each
+    /// victim via [`QuicEngine::close_connection`]. The actual
+    /// CONNECTION_CLOSE frames are flushed on the subsequent `engine.on_tick`.
+    fn evict_connections(&mut self, pressure: buffer_pool::PressureLevel, now_ns: u64) {
+        // 1. Collect connection metadata (borrows registry immutably).
+        let infos: Vec<crate::eviction::ConnEvictInfo> = self
+            .connections
+            .iter()
+            .map(|(&idx, cs)| crate::eviction::ConnEvictInfo {
+                conn_idx: idx,
+                bytes_recv: cs.bytes_recv,
+                last_active_ns: cs.last_active_ns,
+            })
+            .collect();
+
+        // 2. Pure victim selection.
+        let victims =
+            crate::eviction::select_victims(&infos, pressure, now_ns, &self.eviction_config);
+        if victims.is_empty() {
+            return;
+        }
+
+        // 3. Close each victim — the CONNECTION_CLOSE frame is queued
+        //    inside quiche and sent on the next flush_sends.
+        let reason: &[u8] = match pressure {
+            buffer_pool::PressureLevel::Critical => b"memory pressure critical",
+            _ => b"memory pressure high",
+        };
+        for &conn_idx in &victims {
+            self.engine
+                .close_connection(conn_idx, crate::eviction::EVICTION_ERROR_CODE, reason);
+        }
+
+        tracing::warn!(
+            reactor_id = self.engine.reactor_id,
+            pressure = ?pressure,
+            evicted = victims.len(),
+            conn_idxs = ?victims,
+            remaining = self.connections.len() - victims.len(),
+            "evicted connections due to memory pressure"
+        );
+    }
+
     // ── Introspection ─────────────────────────────────────────────
 
     /// Returns the number of active sessions (connections tracked).
@@ -455,6 +526,31 @@ impl IoHandler for VireonStack {
                 rss_bytes = rss,
                 "memory pressure elevated"
             );
+        }
+
+        // ── Memory-pressure eviction ──────────────────────────────
+        // Close the heaviest / idle connections to free buffer capacity
+        // before OOM kills the process. Only in production mode (not
+        // echo benchmark) and only during normal operation (not drain).
+        if pressure >= buffer_pool::PressureLevel::High
+            && matches!(self.shutdown_state, ShutdownState::Running)
+            && !self.echo
+            && self.connections.len() > self.eviction_config.min_survivors
+        {
+            let can_evict = match self.eviction_cooldown {
+                None => true,
+                Some(t) => {
+                    Instant::now().saturating_duration_since(t) >= self.eviction_config.cooldown
+                }
+            };
+            if can_evict {
+                let evict_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                self.evict_connections(pressure, evict_ns);
+                self.eviction_cooldown = Some(Instant::now());
+            }
         }
 
         // ── Shutdown phase transition: Running → Draining ─────────
