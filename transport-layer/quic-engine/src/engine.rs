@@ -34,6 +34,7 @@ use io::handler::{IoHandler, TickContext};
 
 use crate::config::QuicConfig;
 use crate::gso::GsoBatcher;
+use crate::stream_bridge::StreamCarry;
 
 /// Maximum QUIC packet size — covers full IPv4 UDP jumbo payload
 /// (65535 - IP/UDP overhead). Must match the io-layer receive buffer
@@ -162,7 +163,7 @@ pub struct QuicEngine {
     closed_buf: Vec<usize>,
     /// Per-stream reassembly buffer for frames spanning multiple
     /// `stream_recv` calls. Keyed by QUIC stream ID.
-    stream_carryover: HashMap<u64, bytes::BytesMut>,
+    stream_carryover: HashMap<u64, StreamCarry>,
 
     // ── Buffer pool ───────────────────────────────────────────────
     /// Pool for frame payload buffers (zero-alloc hot path).

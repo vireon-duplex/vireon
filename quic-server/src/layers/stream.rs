@@ -22,7 +22,7 @@ use crate::error::ServerError;
 ///
 /// The first occurrence always logs immediately; subsequent identical
 /// warnings within this interval are silently counted.
-const WARN_THROTTLE: Duration = Duration::from_secs(5);
+const WARN_THROTTLE: Duration = Duration::from_secs(10);
 
 /// Rate-limits a repeating warning so it logs at most once per
 /// [`WARN_THROTTLE`] interval, while tracking the total occurrence count.
