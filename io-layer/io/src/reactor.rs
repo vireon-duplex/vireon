@@ -87,7 +87,12 @@ impl Reactor {
     /// When `enable_sqpoll` is `true`, attempts to set up the ring with
     /// `IORING_SETUP_SQPOLL`. If the kernel denies it (e.g. insufficient
     /// privileges), falls back to standard mode and logs a warning.
-    pub fn init(core_id: u32, port: u16, queue_depth: u32, enable_sqpoll: bool) -> Result<Self, IoError> {
+    pub fn init(
+        core_id: u32,
+        port: u16,
+        queue_depth: u32,
+        enable_sqpoll: bool,
+    ) -> Result<Self, IoError> {
         pin_to_core(core_id)?;
 
         let entries = if queue_depth == 0 {
