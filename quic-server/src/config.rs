@@ -41,6 +41,7 @@ pub struct ServerConfig {
     pub quic_config: QuicConfig,
     pub queue_depth: u32,
     pub echo: bool,
+    pub sqpoll: bool,
 }
 
 /// Default queue depth if the CLI passes 0.
@@ -78,6 +79,7 @@ impl ServerConfig {
                 cli.queue_depth
             },
             echo: cli.echo,
+            sqpoll: cli.sqpoll,
         })
     }
 
