@@ -123,7 +123,7 @@ impl StreamLayer {
                 }
                 MessageType::Fragment => match self.reassembler.on_fragment(frame) {
                     Ok(Some(reassembled)) => {
-                        tracing::debug!(
+                        tracing::trace!(
                             conn_idx,
                             stream_id = logical_stream,
                             bytes = reassembled.len(),
@@ -149,7 +149,7 @@ impl StreamLayer {
                     }
                 },
                 MessageType::Ack => {
-                    tracing::debug!(
+                    tracing::trace!(
                         conn_idx,
                         stream_id = logical_stream,
                         seq = frame.seq.get(),

@@ -180,7 +180,7 @@ fn process_datagrams(conn: &mut quiche::Connection, reactor_id: u32, conn_idx: u
     loop {
         match conn.dgram_recv(&mut dgram_buf) {
             Ok(len) => {
-                tracing::debug!(reactor_id, conn_idx, dgram_len = len, "datagram received");
+                tracing::trace!(reactor_id, conn_idx, dgram_len = len, "datagram received");
             }
             Err(quiche::Error::Done) => break,
             Err(_) => break,

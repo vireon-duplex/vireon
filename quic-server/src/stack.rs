@@ -327,7 +327,7 @@ impl VireonStack {
     }
 
     fn on_stream_finished(&mut self, conn_idx: usize, stream_id: u64) {
-        tracing::debug!(conn_idx, stream_id, "QUIC stream FIN");
+        tracing::trace!(conn_idx, stream_id, "QUIC stream FIN");
     }
 
     // ── Idle-timeout reaping ──────────────────────────────────────
