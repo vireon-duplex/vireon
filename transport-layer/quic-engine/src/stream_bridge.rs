@@ -144,6 +144,7 @@ fn process_single_stream(
                                 "oversized frame rejected — draining carryover"
                             );
                             buf.clear();
+                            offset = 0;
                             break;
                         }
                         Err(_) => {
