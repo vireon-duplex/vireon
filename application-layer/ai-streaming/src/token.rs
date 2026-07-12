@@ -2,6 +2,8 @@
 //!
 //! See `DESIGN.md` Part 5 (token model).
 
+use std::borrow::Cow;
+
 // ── TokenType ────────────────────────────────────────────────────
 
 /// The type of a token in an AI stream.
@@ -42,33 +44,41 @@ impl TokenType {
 /// Token chunks are the atomic unit of streaming. Each chunk carries
 /// a portion of generated text (or tool-call arguments) and a flag
 /// indicating whether it is the final chunk in the stream.
+///
+/// The `text` field uses [`Cow<'a, str>`] so that callers who receive
+/// frames from a byte buffer can pass `Cow::Borrowed` — zero allocation.
+/// Callers who need to own the text (e.g. aggregators that store chunks)
+/// can call [`TokenChunk::into_owned`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TokenChunk {
+pub struct TokenChunk<'a> {
     /// Unique identifier for this token within the stream.
     pub token_id: u64,
     /// The text content of this token chunk.
-    pub text: String,
+    pub text: Cow<'a, str>,
     /// Whether this is the final token in the stream.
     pub is_final: bool,
 }
 
-impl TokenChunk {
+impl<'a> TokenChunk<'a> {
     /// Create a new token chunk with the given ID and text.
+    ///
+    /// Accepts `impl Into<Cow<'a, str>>` so both `&str` (zero-alloc
+    /// `Cow::Borrowed`) and `String` (`Cow::Owned`) work.
     #[must_use]
-    pub fn new(token_id: u64, text: String) -> Self {
+    pub fn new(token_id: u64, text: impl Into<Cow<'a, str>>) -> Self {
         Self {
             token_id,
-            text,
+            text: text.into(),
             is_final: false,
         }
     }
 
     /// Create a new final token chunk.
     #[must_use]
-    pub fn new_final(token_id: u64, text: String) -> Self {
+    pub fn new_final(token_id: u64, text: impl Into<Cow<'a, str>>) -> Self {
         Self {
             token_id,
-            text,
+            text: text.into(),
             is_final: true,
         }
     }
@@ -78,6 +88,20 @@ impl TokenChunk {
     pub fn with_final(mut self, is_final: bool) -> Self {
         self.is_final = is_final;
         self
+    }
+
+    /// Converts the chunk to `'static` lifetime, copying the text if
+    /// it is currently borrowed.
+    ///
+    /// Use this when you need to store the chunk beyond the lifetime
+    /// of the source buffer (e.g. in an aggregator).
+    #[must_use]
+    pub fn into_owned(self) -> TokenChunk<'static> {
+        TokenChunk {
+            token_id: self.token_id,
+            text: Cow::Owned(self.text.into_owned()),
+            is_final: self.is_final,
+        }
     }
 }
 

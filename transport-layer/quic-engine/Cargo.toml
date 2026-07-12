@@ -26,6 +26,9 @@ tracing = { workspace = true }
 # Bytes abstraction (used by stream read/write API).
 bytes = { workspace = true }
 
+# Fast hashing for CID lookup and per-stream maps.
+rustc-hash = { workspace = true }
+
 # Vireon runtime-layer primitives. These provide the io_uring-native,
 # thread-per-core, NUMA-aware substrate the engine runs on.
 connection-shard = { path = "../../runtime-layer/connection-shard" }
