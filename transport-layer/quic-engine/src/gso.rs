@@ -1,9 +1,6 @@
 //! [`GsoBatcher`] — `UDP_SEGMENT` (Generic Segmentation Offload)
 //! batching for outgoing packets.
 //!
-//! Phase 10 — Packet Scheduler (batching half). See `DESIGN.md`
-//! §4.10.
-//!
 //! GSO lets the kernel split a single large `send()` into multiple
 //! UDP datagrams with the same destination. Combined with
 //! `sendmmsg`, this collapses dozens of syscalls per tick into one.
@@ -21,45 +18,160 @@
 //! ```
 //!
 //! All packets in a batch MUST have the same destination and the
-//! same segment size. The scheduler hands batches to the GSO module
-//! which performs the final coalescing before handing the buffer
-//! to [`send-queue`].
+//! same segment size (except the last, which may be shorter).
+
+use std::net::SocketAddr;
+
+use io::Sender;
+use io::error::IoError;
 
 /// Maximum number of packets coalesced into a single GSO burst.
 /// Matches Cloudflare's quiche-server default.
 pub const GSO_MAX_BATCH: usize = 64;
 
-/// Maximum GSO segment size. Must fit in a single UDP datagram on
-/// the path MTU.
-pub const GSO_MAX_SEGMENT: usize = 1300;
+/// Pre-allocated batch buffer capacity. Large enough for
+/// `GSO_MAX_BATCH` full-size jumbo packets.
+const BATCH_BUF_CAPACITY: usize = GSO_MAX_BATCH * 65_535;
 
-/// Phase-0 skeleton. Phase 10 populates the actual batching loop
-/// and the `send-queue::submit_gso` integration.
-#[derive(Default)]
+/// Collects outgoing QUIC packets and flushes them via `UDP_SEGMENT`
+/// when multiple packets share the same destination and segment size.
+///
+/// When a packet arrives that doesn't match the current batch's
+/// `(dest, seg_size)`, the pending batch is flushed first, then the
+/// new packet starts a fresh batch.
+///
+/// If the kernel rejects GSO (e.g. older kernel without `UDP_SEGMENT`
+/// support), the batcher automatically falls back to per-packet
+/// `send_blocking` for all subsequent sends.
 pub struct GsoBatcher {
-    /// Number of packets currently buffered for the next burst.
-    queued: usize,
-    /// Configured maximum batch size.
-    max_batch: usize,
+    /// Contiguous buffer of concatenated same-size packets.
+    buf: Vec<u8>,
+    /// Segment size of the current batch (0 = batch empty).
+    seg_size: usize,
+    /// Destination of the current batch.
+    dest: Option<SocketAddr>,
+    /// Number of packets in the current batch.
+    count: usize,
+    /// Whether the kernel accepted GSO on the last attempt.
+    /// Once false, all subsequent sends use `send_blocking`.
+    gso_supported: bool,
+}
+
+impl Default for GsoBatcher {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl GsoBatcher {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            queued: 0,
-            max_batch: GSO_MAX_BATCH,
+            buf: Vec::with_capacity(BATCH_BUF_CAPACITY),
+            seg_size: 0,
+            dest: None,
+            count: 0,
+            gso_supported: true,
         }
     }
-
-    /// TODO(phase-10): `fn push(&mut self, pkt: &[u8], dest: SocketAddr)`
-    /// and `fn flush(&mut self, sink: &mut send_queue::SendQueue)`.
-    pub fn _placeholder(&self) {}
 
     /// Whether the batcher has any packets waiting.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.queued == 0
+        self.count == 0
+    }
+
+    /// Pushes a packet. If it doesn't match the current batch's
+    /// `(dest, seg_size)`, or the batch is full, the pending batch is
+    /// flushed first via `sender`.
+    pub fn push(&mut self, pkt: &[u8], dest: SocketAddr, sender: &Sender) -> Result<(), IoError> {
+        let needs_flush = self.count >= GSO_MAX_BATCH
+            || (self.count > 0 && (self.dest != Some(dest) || pkt.len() != self.seg_size));
+
+        if needs_flush {
+            self.flush(sender)?;
+        }
+
+        if self.count == 0 {
+            // Start a new batch.
+            self.seg_size = pkt.len();
+            self.dest = Some(dest);
+        }
+
+        self.buf.extend_from_slice(pkt);
+        self.count += 1;
+        Ok(())
+    }
+
+    /// Flushes any remaining batched packets. If only one packet is
+    /// pending, uses `send_blocking` (no GSO benefit for a single
+    /// packet). If GSO is unsupported, falls back to `send_blocking`
+    /// for each segment.
+    pub fn flush(&mut self, sender: &Sender) -> Result<(), IoError> {
+        if self.count == 0 {
+            return Ok(());
+        }
+
+        let Some(dest) = self.dest else {
+            self.reset();
+            return Ok(());
+        };
+
+        // Single packet — no GSO benefit, just send_blocking.
+        if self.count == 1 || !self.gso_supported {
+            self.flush_individual(sender, dest)?;
+            return Ok(());
+        }
+
+        // Try GSO.
+        match sender.send_gso(&self.buf, self.seg_size as u16, dest) {
+            Ok(_) => {}
+            Err(e) => {
+                // send_gso wraps errors as IoError::Submit(io::Error).
+                // Extract the raw errno to decide whether GSO is supported.
+                let errno = match &e {
+                    IoError::Submit(io_err) => io_err.raw_os_error(),
+                    _ => None,
+                };
+                // EOPNOTSUPP (95), EINVAL (22), ENOTSUP (251) — kernel
+                // doesn't support UDP_SEGMENT on this socket. Fall back.
+                if matches!(errno, Some(95) | Some(22) | Some(251)) {
+                    tracing::warn!(
+                        errno,
+                        "GSO unsupported — falling back to per-packet send_blocking"
+                    );
+                    self.gso_supported = false;
+                    self.flush_individual(sender, dest)?;
+                } else {
+                    self.reset();
+                    return Err(e);
+                }
+            }
+        }
+
+        self.reset();
+        Ok(())
+    }
+
+    /// Sends each segment individually via `send_blocking`.
+    fn flush_individual(&mut self, sender: &Sender, dest: SocketAddr) -> Result<(), IoError> {
+        let seg = self.seg_size;
+        let total = self.buf.len();
+        let mut off = 0usize;
+        while off < total {
+            let end = (off + seg).min(total);
+            sender.send_blocking(&self.buf[off..end], dest)?;
+            off = end;
+        }
+        self.reset();
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.buf.clear();
+        self.seg_size = 0;
+        self.dest = None;
+        self.count = 0;
     }
 }
 
@@ -68,10 +180,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn placeholder() {
+    fn batcher_starts_empty() {
         let b = GsoBatcher::new();
         assert!(b.is_empty());
-        // TODO(phase-10): UDP_SEGMENT batching, send-queue flush,
-        // fallback to sendmmsg when GSO is unsupported.
+        assert_eq!(b.count, 0);
+    }
+
+    #[test]
+    fn capacity_is_reasonable() {
+        // Should hold at least GSO_MAX_BATCH jumbo packets.
+        assert!(GSO_MAX_BATCH * 65_535 <= BATCH_BUF_CAPACITY);
     }
 }

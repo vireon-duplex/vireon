@@ -41,6 +41,7 @@ use crate::common::{DEFAULT_BUF_COUNT, DEFAULT_BUF_SIZE, QUEUE_DEPTH};
 use crate::completion::{Completion, CompletionDecoder};
 use crate::context::IoUringCtx;
 use crate::error::IoError;
+use crate::handler::{IoHandler, TickContext};
 use crate::memory::BufferPool;
 use crate::metrics::MetricsCollector;
 use crate::metrics::MetricsSnapshot;
@@ -50,6 +51,17 @@ use crate::timer_wheel::TimerWheel;
 
 /// Negated errno constant, usable in `match` patterns.
 const ENOBUFS: i32 = -libc::ENOBUFS;
+
+/// Timer ID reserved for the reactor's internal periodic tick.
+/// This timer wakes the event loop every [`TICK_INTERVAL`] so the
+/// reactor can check `stop`, call `handler.on_tick()`, and flush
+/// quiche sends even when no packets arrive.
+const TICK_TIMER_ID: u64 = 0;
+
+/// Periodic tick interval — wakes `submit_and_wait(1)` at this rate.
+/// 10 ms balances responsiveness (sub-ms not needed for QUIC idle
+/// checks) with CPU overhead (100 wakeups/s).
+const TICK_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Thread-per-core reactor.
 pub struct Reactor {
@@ -133,6 +145,14 @@ impl Reactor {
         // Arm the initial multishot RX. ID 0 encodes as
         // `encode(OpKind::Recv, 0)` in user_data.
         reactor.receiver.arm(reactor.ctx.ring_mut(), 0)?;
+
+        // Arm the periodic tick timer so `submit_and_wait(1)` unblocks
+        // even when no packets arrive. This ensures the reactor can
+        // check `stop`, flush sends via `on_tick`, and run QUIC idle
+        // detection.
+        reactor
+            .timers
+            .add_periodic_tick(reactor.ctx.ring_mut(), TICK_TIMER_ID, TICK_INTERVAL)?;
 
         Ok(reactor)
     }
@@ -237,6 +257,43 @@ impl Reactor {
         Ok(())
     }
 
+    /// Drives the event loop with an [`IoHandler`], calling
+    /// `handler.on_datagram()` for each received datagram and
+    /// `handler.on_tick()` at the end of each iteration.
+    ///
+    /// This is the primary entry point for protocol-layer integration
+    /// (e.g. QUIC engine). The handler receives raw UDP payloads and
+    /// peer addresses; outgoing sends happen in `on_tick` via
+    /// [`TickContext`].
+    pub fn run_with_handler<H: IoHandler>(&mut self, handler: &mut H) -> Result<(), IoError> {
+        while !self.stop.load(Ordering::Relaxed) {
+            match self.ctx.ring_mut().submit_and_wait(1) {
+                Ok(_) => {}
+                Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
+                    self.metrics.record_submit_backpressure();
+                    self.drain_cq_with_handler(handler);
+                    continue;
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EINTR) => {
+                    continue;
+                }
+                Err(e) => return Err(IoError::Submit(e)),
+            }
+            self.drain_cq_with_handler(handler);
+
+            if self.ctx.ring_mut().completion().overflow() > 0 {
+                self.metrics.record_cq_overflow();
+            }
+
+            // End-of-tick: let the handler flush sends.
+            handler.on_tick(&mut TickContext {
+                ring: self.ctx.ring_mut(),
+                sender: &self.sender,
+            });
+        }
+        Ok(())
+    }
+
     /// Reaps every CQE currently in the completion queue and dispatches it
     /// via the [`CompletionDecoder`].
     fn drain_cq(&mut self) {
@@ -300,6 +357,83 @@ impl Reactor {
                 Completion::Cancel { .. } => {}
 
                 // ── Other errors (send failure, etc.) ──
+                Completion::Error { errno, .. } => {
+                    if errno == ENOBUFS {
+                        self.metrics.track_buffer_exhaustion(self.pool.bgid());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handler-aware CQE drain: like [`drain_cq`](Self::drain_cq) but calls
+    /// `handler.on_datagram()` for each received datagram before recycling
+    /// the buffer.
+    fn drain_cq_with_handler<H: IoHandler>(&mut self, handler: &mut H) {
+        let entries: Vec<cqueue::Entry> = {
+            let mut cq = self.ctx.ring_mut().completion();
+            cq.by_ref().collect()
+        };
+        for entry in entries {
+            let res = entry.result();
+            let completion = self.decoder.decode(&entry);
+
+            let is_rx = matches!(
+                completion,
+                Completion::Receive { .. } | Completion::ReceiveError { .. }
+            );
+            self.metrics.record_cqe_completion(res, is_rx);
+
+            match completion {
+                Completion::Receive {
+                    buf_id, len, more, ..
+                } => {
+                    if let Some(bid) = buf_id {
+                        self.metrics.record_bytes_rx(len as u64);
+
+                        // Extract the raw buffer pointer (no lifetime borrow).
+                        if let Some(ptr) = self.pool.buffer_ptr(bid) {
+                            // SAFETY: `ptr` points into the pool's backing
+                            // store; the kernel just wrote `len` bytes. The
+                            // slice is only used within this block — before
+                            // `refill_buffer` reclaims the buffer.
+                            let raw = unsafe { std::slice::from_raw_parts(ptr, len) };
+
+                            // Parse io_uring header to get UDP payload + peer.
+                            if let Ok(meta) = self.receiver.parse_raw(raw) {
+                                handler.on_datagram(meta.payload, meta.peer_addr);
+                            }
+                        }
+
+                        self.pool.refill_buffer(bid);
+                    }
+                    if !more {
+                        let _ = self.receiver.arm(self.ctx.ring_mut(), 0);
+                    }
+                }
+
+                Completion::ReceiveError { errno, more, .. } => {
+                    if errno == ENOBUFS {
+                        self.metrics.track_buffer_exhaustion(self.pool.bgid());
+                    }
+                    if !more {
+                        let _ = self.receiver.arm(self.ctx.ring_mut(), 0);
+                    }
+                }
+
+                Completion::SendBufferReclaim { id, .. } => {
+                    handler.on_send_reclaim(id);
+                }
+
+                Completion::Send { .. } => {}
+
+                Completion::Timeout { id } => {
+                    self.timers.retire(encode(OpKind::Timeout, id));
+                    handler.on_timeout(id);
+                }
+
+                Completion::Cancel { .. } => {}
+
                 Completion::Error { errno, .. } => {
                     if errno == ENOBUFS {
                         self.metrics.track_buffer_exhaustion(self.pool.bgid());

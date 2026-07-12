@@ -86,6 +86,7 @@ pub mod completion;
 pub mod context;
 pub mod error;
 pub mod features;
+pub mod handler;
 pub mod memory;
 pub mod metrics;
 pub mod ops;
@@ -99,10 +100,13 @@ pub use completion::{Completion, CompletionDecoder};
 pub use context::IoUringCtx;
 pub use error::IoError;
 pub use features::IoFeatures;
+pub use handler::{IoHandler, TickContext};
 pub use memory::BufferPool;
 pub use memory::MemoryRegion;
 pub use metrics::{MetricsCollector, MetricsSnapshot};
-pub use ops::{OpKind, ParsedFrame, Receiver, Sender, decode_id, decode_kind, encode};
+pub use ops::{
+    DatagramMeta, OpKind, ParsedFrame, Receiver, Sender, decode_id, decode_kind, encode,
+};
 pub use reactor::Reactor;
 pub use registry::IoRegistry;
 pub use socket::Socket;

@@ -160,6 +160,26 @@ impl BufferPool {
         self.publish_entry(buf_id, addr, self.buf_size);
     }
 
+    /// Returns a raw `*const u8` to buffer `buf_id`'s data area.
+    ///
+    /// Unlike [`get_buffer_address`](Self::get_buffer_address), the returned
+    /// pointer carries **no lifetime** — the caller may build a `&[u8]` from
+    /// it via `std::slice::from_raw_parts` without borrowing `self`.
+    /// This is essential for the reactor's `run_with_handler` loop, which
+    /// must call `refill_buffer` immediately after the handler returns.
+    ///
+    /// # Safety invariant
+    ///
+    /// The caller must ensure the slice is not used after `refill_buffer`
+    /// or any other operation that may overwrite the buffer's contents.
+    #[must_use]
+    pub fn buffer_ptr(&self, buf_id: u16) -> Option<*const u8> {
+        if u32::from(buf_id) >= self.buf_count {
+            return None;
+        }
+        Some(self.backing_address_of(buf_id).as_ptr())
+    }
+
     /// Returns the raw address of `buf_id`'s backing storage, or `None`
     /// if `buf_id` is out of range.
     #[must_use]
@@ -235,6 +255,10 @@ impl BufferPool {
         }
 
         let new_tail = tail.wrapping_add(1);
+        // Update our local tail so the next publish_entry advances to the
+        // next ring slot. Without this, every entry overwrites slot 0 and
+        // only one buffer is ever visible to the kernel.
+        self.tail.store(new_tail, Ordering::Relaxed);
         // SAFETY: `tail_ptr` is the overloaded `resv` field of entry 0
         // (see `BufRingEntry::tail`); it points inside our valid ring
         // allocation. We view it as an `AtomicU16` and release-store so
