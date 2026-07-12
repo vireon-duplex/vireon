@@ -1,11 +1,9 @@
-//! [`FeatureFlagManager`] — typed skeleton for flag registry and
-//! evaluation.
+//! [`FeatureFlagManager`] — flag registry and evaluation.
 //!
-//! # Phase 0
-//!
-//! Phase 0 ships only a typed skeleton. Every method returns a
-//! stub error so that callers can code against the API contract
-//! today. Phase 1 fills in the real logic.
+//! Provides an in-process feature flag registry backed by a
+//! `HashMap<FlagKey, FlagState>`. Single-threaded (reactor-local).
+
+use std::collections::HashMap;
 
 use crate::config::FeatureFlagsConfig;
 use crate::error::FlagError;
@@ -16,16 +14,14 @@ use crate::stats::FeatureFlagsStats;
 
 /// Feature flag manager facade.
 ///
-/// Composes config, stats, and (in Phase 1+) a flag registry
-/// and evaluation cache. Phase 0 ships a typed skeleton;
-/// Phase 1+ populates real logic.
+/// Owns the flag registry and evaluation stats. All methods take
+/// `&self` or `&mut self` (single-threaded, no locking).
 #[derive(Debug)]
 pub struct FeatureFlagManager {
-    /// Static configuration.
     #[allow(dead_code)]
     cfg: FeatureFlagsConfig,
-    /// Atomic observability counters.
     stats: FeatureFlagsStats,
+    flags: HashMap<FlagKey, FlagState>,
 }
 
 impl FeatureFlagManager {
@@ -38,34 +34,74 @@ impl FeatureFlagManager {
         Ok(Self {
             cfg,
             stats: FeatureFlagsStats::new(),
+            flags: HashMap::new(),
         })
     }
 
     /// Evaluate a flag for the given context.
     ///
+    /// Returns the flag's configured `FlagValue` if enabled, or
+    /// `FlagValue::Bool(false)` if the flag exists but is disabled.
+    ///
     /// # Errors
-    /// Always returns an error in Phase 0.
-    pub fn evaluate(&self, _key: FlagKey, _ctx: EvaluationContext) -> Result<FlagValue, FlagError> {
-        // TODO(phase-1): registry lookup + rule evaluation + cache.
-        Err(FlagError::ShuttingDown)
+    /// Returns [`FlagError::NotFound`] if the flag was never registered.
+    pub fn evaluate(&self, key: FlagKey, _ctx: EvaluationContext) -> Result<FlagValue, FlagError> {
+        let state = self
+            .flags
+            .get(&key)
+            .ok_or_else(|| FlagError::NotFound(key.as_str().to_string()))?;
+
+        let value = if state.is_enabled() {
+            state.value()
+        } else {
+            FlagValue::Bool(false)
+        };
+
+        self.stats.record_evaluation(state.is_enabled());
+        Ok(value)
+    }
+
+    /// Evaluate a flag and return a simple `bool`.
+    ///
+    /// Convenience for `evaluate(key, ctx)?.as_bool().unwrap_or(false)`.
+    /// Returns `false` if the flag is not found (fail-closed for bool).
+    #[must_use]
+    pub fn is_enabled(&self, key: FlagKey) -> bool {
+        match self.flags.get(&key) {
+            Some(state) => {
+                let enabled = state.is_enabled();
+                self.stats.record_evaluation(enabled);
+                enabled
+            }
+            None => false,
+        }
     }
 
     /// Toggle a flag's enabled state.
     ///
     /// # Errors
-    /// Always returns an error in Phase 0.
-    pub fn toggle(&mut self, _key: FlagKey, _enabled: bool) -> Result<(), FlagError> {
-        // TODO(phase-1): registry update + cache invalidation.
-        Err(FlagError::ShuttingDown)
+    /// Returns [`FlagError::Frozen`] if the flag is frozen.
+    /// Returns [`FlagError::NotFound`] if the flag was never registered.
+    pub fn toggle(&mut self, key: FlagKey, enabled: bool) -> Result<(), FlagError> {
+        let state = self
+            .flags
+            .get_mut(&key)
+            .ok_or_else(|| FlagError::NotFound(key.as_str().to_string()))?;
+
+        if state.is_frozen() {
+            return Err(FlagError::Frozen(key));
+        }
+
+        state.enabled = enabled;
+        Ok(())
     }
 
     /// Register a new flag.
     ///
-    /// # Errors
-    /// Always returns an error in Phase 0.
-    pub fn register(&mut self, _key: FlagKey, _state: FlagState) -> Result<(), FlagError> {
-        // TODO(phase-1): registry insert.
-        Err(FlagError::ShuttingDown)
+    /// If the flag already exists, its state is replaced.
+    pub fn register(&mut self, key: FlagKey, state: FlagState) -> Result<(), FlagError> {
+        self.flags.insert(key, state);
+        Ok(())
     }
 
     /// Snapshot the manager's health.
@@ -79,6 +115,18 @@ impl FeatureFlagManager {
     pub fn stats(&self) -> &FeatureFlagsStats {
         &self.stats
     }
+
+    /// Number of registered flags.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.flags.len()
+    }
+
+    /// Whether the registry is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.flags.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -86,12 +134,23 @@ mod tests {
     use super::*;
     use crate::config::Preset;
 
+    fn fresh() -> FeatureFlagManager {
+        let cfg = Preset::Default.to_config();
+        FeatureFlagManager::new(cfg).unwrap()
+    }
+
+    fn enabled_state() -> FlagState {
+        FlagState::new(true, FlagValue::bool(true), false, 0)
+    }
+
+    fn disabled_state() -> FlagState {
+        FlagState::new(false, FlagValue::bool(false), false, 0)
+    }
+
     #[test]
     fn manager_constructs_from_valid_config() {
-        let cfg = Preset::Default.to_config();
-        let manager = FeatureFlagManager::new(cfg).unwrap();
-        let h = manager.health();
-        assert!(h.is_healthy());
+        let manager = fresh();
+        assert!(manager.health().is_healthy());
     }
 
     #[test]
@@ -102,28 +161,100 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_phase0_stub() {
-        let cfg = Preset::Default.to_config();
-        let manager = FeatureFlagManager::new(cfg).unwrap();
-        let key = FlagKey::new("test").unwrap();
+    fn register_and_evaluate_enabled() {
+        let mut manager = fresh();
+        let key = FlagKey::new("ai.enabled").unwrap();
+        manager.register(key, enabled_state()).unwrap();
+
         let ctx = EvaluationContext::minimal(1, 100);
-        assert!(manager.evaluate(key, ctx).is_err());
+        let val = manager.evaluate(key, ctx).unwrap();
+        assert_eq!(val, FlagValue::Bool(true));
     }
 
     #[test]
-    fn toggle_phase0_stub() {
-        let cfg = Preset::Default.to_config();
-        let mut manager = FeatureFlagManager::new(cfg).unwrap();
-        let key = FlagKey::new("test").unwrap();
-        assert!(manager.toggle(key, true).is_err());
+    fn register_and_evaluate_disabled() {
+        let mut manager = fresh();
+        let key = FlagKey::new("beta.feature").unwrap();
+        manager.register(key, disabled_state()).unwrap();
+
+        let ctx = EvaluationContext::minimal(1, 100);
+        let val = manager.evaluate(key, ctx).unwrap();
+        assert_eq!(val, FlagValue::Bool(false));
     }
 
     #[test]
-    fn register_phase0_stub() {
-        let cfg = Preset::Default.to_config();
-        let mut manager = FeatureFlagManager::new(cfg).unwrap();
-        let key = FlagKey::new("test").unwrap();
-        let state = FlagState::new(true, FlagValue::bool(true), false, 0);
-        assert!(manager.register(key, state).is_err());
+    fn evaluate_unknown_returns_not_found() {
+        let manager = fresh();
+        let key = FlagKey::new("missing").unwrap();
+        let ctx = EvaluationContext::minimal(1, 100);
+        assert!(matches!(
+            manager.evaluate(key, ctx),
+            Err(FlagError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn toggle_changes_evaluation() {
+        let mut manager = fresh();
+        let key = FlagKey::new("toggle.me").unwrap();
+        manager.register(key, enabled_state()).unwrap();
+
+        let ctx = EvaluationContext::minimal(1, 100);
+        assert!(manager.evaluate(key, ctx).unwrap().as_bool() == Some(true));
+
+        manager.toggle(key, false).unwrap();
+        assert!(manager.evaluate(key, ctx).unwrap().as_bool() == Some(false));
+    }
+
+    #[test]
+    fn toggle_unknown_returns_not_found() {
+        let mut manager = fresh();
+        let key = FlagKey::new("missing").unwrap();
+        assert!(matches!(
+            manager.toggle(key, true),
+            Err(FlagError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn toggle_frozen_returns_frozen() {
+        let mut manager = fresh();
+        let key = FlagKey::new("locked").unwrap();
+        let frozen_state = FlagState::new(true, FlagValue::bool(true), true, 0); // frozen=true
+        manager.register(key, frozen_state).unwrap();
+
+        assert!(matches!(
+            manager.toggle(key, false),
+            Err(FlagError::Frozen(_))
+        ));
+    }
+
+    #[test]
+    fn is_enabled_convenience() {
+        let mut manager = fresh();
+        let key = FlagKey::new("quick.check").unwrap();
+        manager.register(key, enabled_state()).unwrap();
+        assert!(manager.is_enabled(key));
+
+        manager.toggle(key, false).unwrap();
+        assert!(!manager.is_enabled(key));
+
+        // Unknown flag → false (fail-closed)
+        let missing = FlagKey::new("missing").unwrap();
+        assert!(!manager.is_enabled(missing));
+    }
+
+    #[test]
+    fn len_tracks_registrations() {
+        let mut manager = fresh();
+        assert_eq!(manager.len(), 0);
+        manager
+            .register(FlagKey::new("a").unwrap(), enabled_state())
+            .unwrap();
+        assert_eq!(manager.len(), 1);
+        manager
+            .register(FlagKey::new("b").unwrap(), disabled_state())
+            .unwrap();
+        assert_eq!(manager.len(), 2);
     }
 }

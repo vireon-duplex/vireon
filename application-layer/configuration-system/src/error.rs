@@ -36,6 +36,10 @@ pub enum ConfigError {
     #[error("invalid configuration key: {0}")]
     InvalidKey(String),
 
+    /// The configuration key was not found in any layer.
+    #[error("configuration key not found: {0}")]
+    KeyNotFound(String),
+
     /// Failed to parse a value from its source.
     #[error("parse error: {0}")]
     ParseError(String),
