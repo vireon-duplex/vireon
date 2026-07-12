@@ -402,6 +402,19 @@ impl BufferPool {
         self.inner.closed.load(Ordering::Acquire)
     }
 
+    /// Current outstanding bytes across all live buffers.
+    #[must_use]
+    pub fn bytes_outstanding(&self) -> u64 {
+        self.inner.counters.bytes_outstanding()
+    }
+
+    /// Current memory-pressure level based on outstanding bytes vs capacity.
+    #[must_use]
+    pub fn pressure_level(&self) -> crate::buffer::policy::PressureLevel {
+        let outstanding = self.inner.counters.bytes_outstanding() as usize;
+        crate::maintenance::pressure::classify_pressure(outstanding, self.inner.bp_policy.capacity)
+    }
+
     /// Spawns a background maintenance thread that monitors pressure and
     /// shrinks caches.
     ///
@@ -618,17 +631,18 @@ mod tests {
     #[test]
     fn get_wakes_when_capacity_freed() {
         let config = BufferPoolConfig {
-            max_memory: 128,
+            max_memory: 256,
             ..Default::default()
         };
         let pool = BufferPool::new(config);
 
-        // Fill to capacity.
-        let held = pool.get(128).unwrap();
+        // Fill past the soft threshold (reject_at = 230 for 256 capacity).
+        let held = pool.get(200).unwrap();
 
         let pool2 = pool.clone();
         let handle = std::thread::spawn(move || {
-            // This parks because 128 outstanding + 64 requested > 128 capacity.
+            // This parks because 200 outstanding + 64 requested = 264
+            // > 230 (reject_at).
             pool2.get(64)
         });
 

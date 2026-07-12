@@ -6,6 +6,7 @@
 use crate::config::{Preset, SchedulerConfig};
 use crate::error::SchedulerError;
 use crate::policy::SchedulingPolicy;
+use crate::scheduler::StreamScheduler;
 
 /// Fluent builder for the scheduler.
 #[derive(Clone, Debug)]
@@ -90,10 +91,10 @@ impl SchedulerBuilder {
     /// - [`SchedulerError::InvalidConfig`] if validation fails.
     /// - Phase 0 always returns `Err` after validation (no
     ///   scheduler implementation yet).
-    pub fn build(self) -> Result<(), SchedulerError> {
+    pub fn build(self) -> Result<StreamScheduler, SchedulerError> {
         self.cfg.validate()?;
         // TODO(phase-1): construct StreamScheduler { queue, selector, ... }.
-        Err(SchedulerError::ShuttingDown)
+        StreamScheduler::new(self.cfg)
     }
 }
 
@@ -124,9 +125,9 @@ mod tests {
     }
 
     #[test]
-    fn build_validates_before_failing() {
+    fn build_validates_before_succeeding() {
         let r = SchedulerBuilder::new().build();
-        assert!(matches!(r, Err(SchedulerError::ShuttingDown)));
+        assert!(r.is_ok());
     }
 
     #[test]

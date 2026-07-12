@@ -1,9 +1,9 @@
-//! [`PubSubEngine`] — pub/sub engine facade (typed skeleton).
+//! [`PubSubEngine`] — pub/sub engine facade.
 //!
-//! This is a **Phase 0 skeleton**. The full implementation lands in
-//! Phase 1+.
-//!
-//! See `DESIGN.md` Part 9 (engine).
+//! Phase 1: in-memory subscription registry with pattern-based routing.
+
+use std::collections::HashMap;
+use std::fmt;
 
 use crate::config::PubSubConfig;
 use crate::error::PubSubError;
@@ -11,21 +11,20 @@ use crate::health::HealthReport;
 use crate::message::PubSubMessage;
 use crate::stats::PubSubStats;
 use crate::subscription::{SubscriptionId, TopicPattern};
-use std::fmt;
 
 /// Pub/sub engine facade.
 ///
-/// In Phase 0, this is a typed skeleton. Phase 1+ will include:
-/// - Subscription management (create, remove, list)
-/// - Message publishing and routing
-/// - Topic pattern matching via `TopicTrie`
-/// - Delivery with backpressure and backlog management
+/// Owns the in-memory subscription registry and atomic statistics.
 pub struct PubSubEngine {
     /// Engine configuration.
     #[allow(dead_code)]
     cfg: PubSubConfig,
     /// Engine statistics.
     stats: PubSubStats,
+    /// Active subscriptions keyed by id.
+    subscriptions: HashMap<SubscriptionId, TopicPattern>,
+    /// Monotonic subscription-id allocator (starts at 1; 0 is reserved nil).
+    next_sub_id: u64,
 }
 
 impl fmt::Debug for PubSubEngine {
@@ -33,6 +32,7 @@ impl fmt::Debug for PubSubEngine {
         f.debug_struct("PubSubEngine")
             .field("cfg", &self.cfg)
             .field("stats", &"<stats>")
+            .field("subscriptions", &self.subscriptions.len())
             .finish()
     }
 }
@@ -44,43 +44,57 @@ impl PubSubEngine {
         Self {
             cfg,
             stats: PubSubStats::new(),
+            subscriptions: HashMap::new(),
+            next_sub_id: 1,
         }
     }
 
     /// Publish a message to all matching subscriptions.
     ///
-    /// # Errors
-    /// Returns [`PubSubError::ShuttingDown`] — skeleton implementation.
-    ///
-    /// # Phase 0
-    /// This is a skeleton implementation. // TODO(phase-1)
-    pub fn publish(&self, _msg: PubSubMessage) -> Result<(), PubSubError> {
-        // TODO(phase-1): route message to matching subscriptions via TopicTrie
-        Err(PubSubError::ShuttingDown)
+    /// Counts how many subscription patterns match the message topic and
+    /// records one delivery per match.
+    pub fn publish(&mut self, msg: PubSubMessage) -> Result<(), PubSubError> {
+        self.stats.record_publish();
+        let mut deliveries = 0u64;
+        for pattern in self.subscriptions.values() {
+            if pattern.matches(msg.topic()) {
+                deliveries += 1;
+                self.stats.record_deliver();
+            }
+        }
+        let _ = deliveries; // observability via stats
+        Ok(())
     }
 
     /// Create a new subscription for a topic pattern.
-    ///
-    /// # Errors
-    /// Returns [`PubSubError::ShuttingDown`] — skeleton implementation.
-    ///
-    /// # Phase 0
-    /// This is a skeleton implementation. // TODO(phase-1)
-    pub fn subscribe(&self, _pattern: TopicPattern) -> Result<SubscriptionId, PubSubError> {
-        // TODO(phase-1): create subscription, insert pattern into TopicTrie
-        Err(PubSubError::ShuttingDown)
+    pub fn subscribe(&mut self, pattern: TopicPattern) -> Result<SubscriptionId, PubSubError> {
+        let id = SubscriptionId::new(self.next_sub_id);
+        self.next_sub_id = self.next_sub_id.wrapping_add(1);
+        self.subscriptions.insert(id, pattern);
+        self.stats.record_subscription_created();
+        self.stats
+            .set_active_subscriptions(self.subscriptions.len() as u64);
+        Ok(id)
     }
 
     /// Remove an existing subscription.
     ///
     /// # Errors
-    /// Returns [`PubSubError::ShuttingDown`] — skeleton implementation.
-    ///
-    /// # Phase 0
-    /// This is a skeleton implementation. // TODO(phase-1)
-    pub fn unsubscribe(&self, _id: SubscriptionId) -> Result<(), PubSubError> {
-        // TODO(phase-1): remove subscription, clean up from TopicTrie
-        Err(PubSubError::ShuttingDown)
+    /// Returns [`PubSubError::SubscriptionNotFound`] if `id` is not active.
+    pub fn unsubscribe(&mut self, id: SubscriptionId) -> Result<(), PubSubError> {
+        if self.subscriptions.remove(&id).is_none() {
+            return Err(PubSubError::SubscriptionNotFound(id));
+        }
+        self.stats.record_subscription_removed();
+        self.stats
+            .set_active_subscriptions(self.subscriptions.len() as u64);
+        Ok(())
+    }
+
+    /// Returns the number of active subscriptions.
+    #[must_use]
+    pub fn subscription_count(&self) -> usize {
+        self.subscriptions.len()
     }
 
     /// Get the current health report.
@@ -98,36 +112,57 @@ mod tests {
     fn engine_creation() {
         let engine = PubSubEngine::new(PubSubConfig::new());
         assert_eq!(engine.stats.snapshot().messages_published, 0);
+        assert_eq!(engine.subscription_count(), 0);
     }
 
     #[test]
-    fn publish_returns_shutting_down() {
-        let engine = PubSubEngine::new(PubSubConfig::new());
-        let msg = PubSubMessage::new("sensor.temp", vec![1, 2, 3]);
-        let result = engine.publish(msg);
-        assert!(matches!(result, Err(PubSubError::ShuttingDown)));
-    }
-
-    #[test]
-    fn subscribe_returns_shutting_down() {
-        let engine = PubSubEngine::new(PubSubConfig::new());
+    fn subscribe_succeeds() {
+        let mut engine = PubSubEngine::new(PubSubConfig::new());
         let pattern = TopicPattern::new("sensor.*").unwrap();
-        let result = engine.subscribe(pattern);
-        assert!(matches!(result, Err(PubSubError::ShuttingDown)));
+        let id = engine.subscribe(pattern).unwrap();
+        assert!(!id.is_nil());
+        assert_eq!(engine.subscription_count(), 1);
     }
 
     #[test]
-    fn unsubscribe_returns_shutting_down() {
-        let engine = PubSubEngine::new(PubSubConfig::new());
-        let result = engine.unsubscribe(SubscriptionId::new(1));
-        assert!(matches!(result, Err(PubSubError::ShuttingDown)));
+    fn unsubscribe_succeeds() {
+        let mut engine = PubSubEngine::new(PubSubConfig::new());
+        let id = engine
+            .subscribe(TopicPattern::new("topic").unwrap())
+            .unwrap();
+        engine.unsubscribe(id).unwrap();
+        assert_eq!(engine.subscription_count(), 0);
     }
 
     #[test]
-    fn health_report_initially_healthy() {
-        let engine = PubSubEngine::new(PubSubConfig::new());
+    fn unsubscribe_unknown_errors() {
+        let mut engine = PubSubEngine::new(PubSubConfig::new());
+        assert!(matches!(
+            engine.unsubscribe(SubscriptionId::new(99)),
+            Err(PubSubError::SubscriptionNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn publish_matches_subscriptions() {
+        let mut engine = PubSubEngine::new(PubSubConfig::new());
+        engine
+            .subscribe(TopicPattern::new("sensor.*").unwrap())
+            .unwrap();
+        engine
+            .subscribe(TopicPattern::new("alert.*").unwrap())
+            .unwrap();
+        engine
+            .publish(PubSubMessage::new("sensor.temp", vec![1, 2, 3]))
+            .unwrap();
+        assert_eq!(engine.stats.snapshot().messages_published, 1);
+    }
+
+    #[test]
+    fn health_report_reflects_publishes() {
+        let mut engine = PubSubEngine::new(PubSubConfig::new());
+        engine.publish(PubSubMessage::new("t", vec![])).unwrap();
         let health = engine.health();
-        assert!(health.is_healthy());
-        assert_eq!(health.messages_published, 0);
+        assert_eq!(health.messages_published, 1);
     }
 }

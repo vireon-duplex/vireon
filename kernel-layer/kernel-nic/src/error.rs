@@ -73,6 +73,17 @@ pub enum KernelNicError {
     /// Operation refused because the manager is shutting down.
     #[error("manager is shutting down")]
     ShuttingDown,
+
+    /// eBPF program load or attach failed (e.g. `bpf(BPF_PROG_LOAD)`
+    /// rejected by the verifier, or `SO_ATTACH_REUSEPORT_EBPF` denied).
+    /// Non-fatal — callers may fall back to kernel default behaviour.
+    #[error("eBPF {stage} failed: {source}{verifier_log}")]
+    Ebpf {
+        stage: &'static str,
+        #[source]
+        source: std::io::Error,
+        verifier_log: String,
+    },
 }
 
 impl KernelNicError {
