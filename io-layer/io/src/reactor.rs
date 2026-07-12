@@ -8,9 +8,9 @@
 //! # Lifecycle
 //!
 //! ```text
-//! init(core_id, port, queue_depth)
+//! init(core_id, port, queue_depth, enable_sqpoll)
 //!   1. sched_setaffinity(0, {core_id})
-//!   2. IoUringCtx::init_ring(queue_depth, sqpoll=false)
+//!   2. IoUringCtx::init_ring(queue_depth, sqpoll=enable_sqpoll)
 //!   3. BufferPool::init_buffer_ring(ring, bgid=1)
 //!   4. Socket::bind_with_reuseport(port, core_id)
 //!   5. socket.receiver(bgid).arm(ring, id=0)
@@ -83,7 +83,11 @@ impl Reactor {
     /// `port = 0` lets the kernel pick an ephemeral port (useful for
     /// tests); production callers pass a fixed port. `queue_depth = 0`
     /// falls back to [`QUEUE_DEPTH`].
-    pub fn init(core_id: u32, port: u16, queue_depth: u32) -> Result<Self, IoError> {
+    ///
+    /// When `enable_sqpoll` is `true`, attempts to set up the ring with
+    /// `IORING_SETUP_SQPOLL`. If the kernel denies it (e.g. insufficient
+    /// privileges), falls back to standard mode and logs a warning.
+    pub fn init(core_id: u32, port: u16, queue_depth: u32, enable_sqpoll: bool) -> Result<Self, IoError> {
         pin_to_core(core_id)?;
 
         let entries = if queue_depth == 0 {
@@ -91,7 +95,32 @@ impl Reactor {
         } else {
             queue_depth
         };
-        let mut ctx = IoUringCtx::init_ring(entries, /* sqpoll */ false)?;
+
+        // Try SQPOLL mode; fall back gracefully if the kernel denies it
+        // (typically needs CAP_SYS_NICE / root).
+        let mut ctx = if enable_sqpoll {
+            match IoUringCtx::init_ring(entries, true) {
+                Ok(ctx) => {
+                    tracing::info!(
+                        core_id,
+                        sqpoll = true,
+                        "SQPOLL enabled — kernel thread polling SQ ring"
+                    );
+                    ctx
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        core_id,
+                        error = ?e,
+                        "SQPOLL denied by kernel — falling back to standard mode \
+                         (needs CAP_SYS_NICE on kernels < 6.0)"
+                    );
+                    IoUringCtx::init_ring(entries, false)?
+                }
+            }
+        } else {
+            IoUringCtx::init_ring(entries, false)?
+        };
         // SAFETY: we register a brand-new pool whose backing storage will
         // outlive the ring (pool is stored in the reactor, which is
         // dropped before the ring). Construct iovecs after the pool.
@@ -497,7 +526,7 @@ mod tests {
     #[test]
     fn reactor_init_succeeds_on_ephemeral_port() {
         // core_id 0 is virtually always present.
-        let reactor = Reactor::init(0, 0, 32);
+        let reactor = Reactor::init(0, 0, 32, false);
         let reactor = match reactor {
             Ok(r) => r,
             Err(IoError::InvalidConfig(msg)) if msg.contains("sched_setaffinity") => {
@@ -513,7 +542,7 @@ mod tests {
 
     #[test]
     fn stop_flag_round_trips() {
-        let mut reactor = match Reactor::init(0, 0, 32) {
+        let mut reactor = match Reactor::init(0, 0, 32, false) {
             Ok(r) => r,
             Err(IoError::InvalidConfig(msg)) if msg.contains("sched_setaffinity") => return,
             Err(e) => panic!("init failed: {e:?}"),
@@ -527,7 +556,7 @@ mod tests {
 
     #[test]
     fn reactor_reaps_a_udp_packet() {
-        let mut reactor = match Reactor::init(0, 0, 64) {
+        let mut reactor = match Reactor::init(0, 0, 64, false) {
             Ok(r) => r,
             Err(IoError::InvalidConfig(msg)) if msg.contains("sched_setaffinity") => return,
             Err(e) => panic!("init failed: {e:?}"),

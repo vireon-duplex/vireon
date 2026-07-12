@@ -30,7 +30,7 @@
 //! ```no_run
 //! use io::Reactor;
 //!
-//! let mut reactor = Reactor::init(0, 8080, 0)?;
+//! let mut reactor = Reactor::init(0, 8080, 0, false)?;
 //! reactor.run()?;
 //! # Ok::<(), io::IoError>(())
 //! ```
