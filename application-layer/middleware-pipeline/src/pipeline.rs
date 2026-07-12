@@ -1,21 +1,12 @@
 //! [`Pipeline`] — the main pipeline facade.
 //!
-//! See `DESIGN.md` Part 1 (architecture), Part 8 (pipeline).
+//! Phase 1: passthrough chain execution with registration tracking.
+//! Real middleware callbacks (with trait objects) are Phase 2.
 //!
-//! # Role
-//!
-//! `Pipeline` is the single entry point that callers use to
-//! execute middleware chains. It composes:
-//!
-//! - a [`MiddlewareChain`] (registration),
-//! - execution context tracking,
-//! - a [`MiddlewareStats`] (observability).
-//!
-//! # Phase 0
-//!
-//! Phase 0 ships only a typed skeleton. Every method returns a
-//! stub error so that callers can code against the API contract
-//! today. Phase 1 fills in the real logic.
+//! The pipeline validates `MiddlewareContext` abort flags and records
+//! stats. It serves as the integration point for cross-cutting concerns
+//! (logging, validation, rate-limiting) that will be populated as the
+//! middleware trait ecosystem matures.
 
 use crate::config::MiddlewareConfig;
 use crate::context::MiddlewareContext;
@@ -25,15 +16,16 @@ use crate::stats::MiddlewareStats;
 
 /// The middleware pipeline facade.
 ///
-/// Composes the middleware chain and stats. Phase 0 ships a typed
-/// skeleton; Phase 1+ populates real logic.
+/// Composes the middleware chain and stats. Phase 1 implements
+/// passthrough execution with abort detection. Phase 2+ will add
+/// real middleware callbacks.
 #[derive(Debug)]
 pub struct Pipeline {
-    /// Static configuration.
     #[allow(dead_code)]
     cfg: MiddlewareConfig,
-    /// Atomic observability counters.
     stats: MiddlewareStats,
+    /// Number of registered middleware entries (Phase 1: count only).
+    registered_count: u32,
 }
 
 impl Pipeline {
@@ -47,20 +39,44 @@ impl Pipeline {
         Ok(Self {
             cfg,
             stats: MiddlewareStats::new(),
+            registered_count: 0,
         })
     }
 
     /// Execute the middleware chain with a context.
     ///
+    /// Phase 1 behavior:
+    /// - If `ctx.is_aborted()`, returns `Err(Rejected)` with stats.
+    /// - Otherwise, passes through with stats recording.
+    ///
+    /// Phase 2+ will execute real middleware callbacks in order.
+    ///
     /// # Errors
-    /// Always returns an error in Phase 0.
+    /// Returns [`MiddlewareError::Rejected`] if the context was
+    /// pre-aborted.
     pub fn execute(
         &mut self,
-        _ctx: MiddlewareContext,
+        ctx: MiddlewareContext,
     ) -> Result<MiddlewareContext, MiddlewareError> {
-        // TODO(phase-1): execute chain through stages.
         self.stats.record_execution();
-        Err(MiddlewareError::ShuttingDown)
+
+        if ctx.is_aborted() {
+            self.stats.record_rejected();
+            return Err(MiddlewareError::Rejected("context pre-aborted"));
+        }
+
+        // Phase 1: passthrough — no real middleware to execute.
+        // Phase 2: iterate registered callbacks here, checking abort
+        // after each step.
+        self.stats.record_success();
+        Ok(ctx)
+    }
+
+    /// Increment the registered middleware count.
+    ///
+    /// Phase 2 will replace this with real `MiddlewareEntry` storage.
+    pub fn register(&mut self) {
+        self.registered_count = self.registered_count.saturating_add(1);
     }
 
     /// Snapshot the pipeline's health.
@@ -73,6 +89,12 @@ impl Pipeline {
     #[must_use]
     pub fn stats(&self) -> &MiddlewareStats {
         &self.stats
+    }
+
+    /// Number of registered middleware entries.
+    #[must_use]
+    pub fn registered_count(&self) -> u32 {
+        self.registered_count
     }
 }
 
@@ -90,8 +112,7 @@ mod tests {
     #[test]
     fn pipeline_constructs_from_valid_config() {
         let pipeline = make_pipeline();
-        let h = pipeline.health();
-        assert!(h.is_healthy());
+        assert!(pipeline.health().is_healthy());
     }
 
     #[test]
@@ -102,9 +123,29 @@ mod tests {
     }
 
     #[test]
-    fn execute_phase0_stub() {
+    fn execute_passthrough_returns_ctx() {
         let mut pipeline = make_pipeline();
         let ctx = MiddlewareContext::new(MiddlewareStage::PreAuth);
-        assert!(pipeline.execute(ctx).is_err());
+        let result = pipeline.execute(ctx).unwrap();
+        assert!(!result.is_aborted());
+    }
+
+    #[test]
+    fn execute_aborted_context_returns_rejected() {
+        let mut pipeline = make_pipeline();
+        let ctx = MiddlewareContext::new(MiddlewareStage::PreAuth).with_abort();
+        assert!(matches!(
+            pipeline.execute(ctx),
+            Err(MiddlewareError::Rejected(_))
+        ));
+    }
+
+    #[test]
+    fn register_increments_count() {
+        let mut pipeline = make_pipeline();
+        assert_eq!(pipeline.registered_count(), 0);
+        pipeline.register();
+        pipeline.register();
+        assert_eq!(pipeline.registered_count(), 2);
     }
 }

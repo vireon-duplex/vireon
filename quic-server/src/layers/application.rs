@@ -57,6 +57,11 @@ use service_registry::registry::ServiceRegistry;
 use session_manager::SessionId;
 use version_negotiation::negotiator::VersionNegotiator;
 
+use configuration_system::{ConfigKey, ConfigValue};
+use feature_flags::{FlagKey, FlagState, FlagValue};
+use observability_sdk::{MetricKey, MetricType};
+use resource_quotas::{QuotaLimit, TenantId, TenantTier};
+
 use super::message::FrameAction;
 use super::session::SessionLayer;
 use crate::error::ServerError;
@@ -374,39 +379,50 @@ impl AppDispatcher for VireonDispatcher {
 /// Container for the 16 infrastructure/platform services.
 /// Each field holds the real facade object (not just a config),
 /// constructed from its builder-produced config + default stats.
-#[allow(dead_code)]
 pub struct PlatformServices {
     /// [agent-runtime] AI agent execution runtime.
+    #[allow(dead_code)]
     agent: AgentRuntime,
     /// [application-runtime] Top-level app lifecycle composition root.
+    #[allow(dead_code)]
     app: AppRuntime,
     /// [auth-framework] Authentication + authorization pipeline.
-    auth: AuthenticationPipeline,
+    #[allow(dead_code)]
+    pub(crate) auth: AuthenticationPipeline,
     /// [configuration-system] Config key-value store.
-    config_mgr: ConfigurationManager,
+    pub(crate) config_mgr: ConfigurationManager,
     /// [dependency-injection] DI container for module construction.
+    #[allow(dead_code)]
     di: Container,
     /// [feature-flags] Feature toggle management.
-    feature_flags: FeatureFlagManager,
+    pub(crate) feature_flags: FeatureFlagManager,
     /// [graceful-startup-shutdown] Startup/shutdown phase coordinator.
+    #[allow(dead_code)]
     graceful: StartupShutdownCoordinator,
     /// [middleware-pipeline] Frame middleware chain.
-    middleware: Pipeline,
+    #[allow(dead_code)]
+    pub(crate) middleware: Pipeline,
     /// [module-lifecycle] Module init/shutdown ordering.
+    #[allow(dead_code)]
     lifecycle: LifecycleCoordinator,
     /// [observability-sdk] Metrics registry + tracing.
-    observability: MetricsRegistry,
+    pub(crate) observability: MetricsRegistry,
     /// [ops-dashboard] Operational monitoring dashboard.
+    #[allow(dead_code)]
     ops: OpsDashboardService,
     /// [plugin-manager] Dynamic plugin loading.
+    #[allow(dead_code)]
     plugin: PluginManager,
     /// [resource-quotas] Per-tenant quota enforcement.
-    quotas: QuotaManager,
+    pub(crate) quotas: QuotaManager,
     /// [scheduler-hooks] Scheduler event callbacks.
+    #[allow(dead_code)]
     scheduler_hooks: HookCoordinator,
     /// [service-registry] Service discovery for modules.
+    #[allow(dead_code)]
     registry: ServiceRegistry,
     /// [version-negotiation] Protocol version ALPN negotiation.
+    #[allow(dead_code)]
     version: VersionNegotiator,
 }
 
@@ -538,19 +554,85 @@ pub struct ApplicationLayer {
     /// Session layer (owned — sits below application in the stack).
     session: SessionLayer,
     /// Platform infrastructure services.
-    #[allow(dead_code)]
-    platform: PlatformServices,
+    pub(crate) platform: PlatformServices,
     /// Application dispatch boundary.
     dispatcher: VireonDispatcher,
+
+    // ── Pre-registered hot-path keys ────────────────────────────────
+    // Constructed once at startup to avoid per-frame MetricKey/FlagKey
+    // allocation. These mirror the keys registered in PlatformServices.
+    metric_frames_rx: MetricKey,
+    metric_connections: MetricKey,
+    flag_ai: FlagKey,
+    flag_rpc: FlagKey,
+    flag_media: FlagKey,
+    flag_event_bus: FlagKey,
+    default_tenant: TenantId,
+    default_limit: QuotaLimit,
 }
 
 impl ApplicationLayer {
     /// Creates a new application layer.
+    ///
+    /// Pre-registers hot-path metric keys, feature flags, default tenant,
+    /// and config keys into the platform services so that the data path
+    /// can use them without per-frame allocation.
     pub fn new() -> Result<Self, ServerError> {
+        let mut platform = PlatformServices::new()?;
+
+        // Pre-register hot-path metrics (Counters).
+        let metric_frames_rx = MetricKey::new("frames_rx_total")
+            .map_err(|e| ServerError::EngineInit(format!("metric key: {e:?}")))?;
+        let _ = platform
+            .observability
+            .register(metric_frames_rx, MetricType::Counter);
+
+        let metric_connections = MetricKey::new("connections_total")
+            .map_err(|e| ServerError::EngineInit(format!("metric key: {e:?}")))?;
+        let _ = platform
+            .observability
+            .register(metric_connections, MetricType::Counter);
+
+        // Pre-register feature flags (all enabled by default).
+        let flag_ai = FlagKey::new("ai_streaming")
+            .map_err(|e| ServerError::EngineInit(format!("flag key: {e:?}")))?;
+        let flag_rpc =
+            FlagKey::new("rpc").map_err(|e| ServerError::EngineInit(format!("flag key: {e:?}")))?;
+        let flag_media = FlagKey::new("media_streaming")
+            .map_err(|e| ServerError::EngineInit(format!("flag key: {e:?}")))?;
+        let flag_event_bus = FlagKey::new("event_bus")
+            .map_err(|e| ServerError::EngineInit(format!("flag key: {e:?}")))?;
+
+        let flag_state = FlagState::new(true, FlagValue::bool(true), false, 0);
+        let _ = platform.feature_flags.register(flag_ai, flag_state);
+        let _ = platform.feature_flags.register(flag_rpc, flag_state);
+        let _ = platform.feature_flags.register(flag_media, flag_state);
+        let _ = platform.feature_flags.register(flag_event_bus, flag_state);
+
+        // Pre-register default tenant (Phase 1: single tenant, no resolution).
+        let default_tenant = TenantId::new(1);
+        let default_limit = QuotaLimit::for_tier(TenantTier::Internal);
+        let _ = platform
+            .quotas
+            .register_tenant(default_tenant, TenantTier::Internal);
+
+        // Pre-register a default config key.
+        if let Ok(key) = ConfigKey::new("server.max_streams_per_conn") {
+            let _ = platform.config_mgr.set(key, ConfigValue::U64(1000));
+        }
+
         Ok(Self {
             session: SessionLayer::new()?,
-            platform: PlatformServices::new()?,
+            platform,
             dispatcher: VireonDispatcher::new(),
+            metric_frames_rx,
+            metric_connections,
+            flag_ai,
+            flag_rpc,
+            flag_media,
+            flag_event_bus,
+            default_tenant,
+            default_limit,
         })
     }
 
@@ -560,6 +642,21 @@ impl ApplicationLayer {
     /// table or connection shard is full.
     pub fn on_connect(&mut self, conn_idx: usize, peer: SocketAddr) -> Option<SessionId> {
         let session_id = self.session.on_connect(conn_idx)?;
+
+        // Platform: record connection counter (observability).
+        let _ = self
+            .platform
+            .observability
+            .record(self.metric_connections, 1);
+
+        // Platform: reserve a session slot for the default tenant (quotas).
+        if let Err(e) = self
+            .platform
+            .quotas
+            .reserve(self.default_tenant, &self.default_limit)
+        {
+            tracing::warn!(error = ?e, "[app:quotas] reserve failed for default tenant");
+        }
 
         // Notify application dispatcher.
         self.dispatcher.on_connection_established(session_id, peer);
@@ -581,6 +678,26 @@ impl ApplicationLayer {
         let action = self.session.on_frame(ctx.conn_idx, frame);
 
         if action == FrameAction::DispatchToApp {
+            // Platform: per-frame counter (observability).
+            let _ = self.platform.observability.record(self.metric_frames_rx, 1);
+
+            // Platform: feature-flag gate (fail-open — proceed if flag
+            // missing; drop only if the flag exists and is disabled).
+            let flag = match frame.msg_type {
+                MessageType::TextToken => Some(self.flag_ai),
+                MessageType::ToolCall | MessageType::ToolResult => Some(self.flag_rpc),
+                MessageType::AudioFrame | MessageType::VideoFrame | MessageType::ImageFrame => {
+                    Some(self.flag_media)
+                }
+                MessageType::StateUpdate => Some(self.flag_event_bus),
+                _ => None,
+            };
+            if let Some(key) = flag {
+                if !self.platform.feature_flags.is_enabled(key) {
+                    return; // Feature disabled — drop frame.
+                }
+            }
+
             self.dispatcher.on_data_frame(ctx, frame);
         }
     }
@@ -601,6 +718,9 @@ impl ApplicationLayer {
 
     /// Tears down the session and notifies the application dispatcher.
     pub fn on_close(&mut self, conn_idx: usize, session_id: SessionId, reason: Option<&str>) {
+        // Platform: release the session slot for the default tenant.
+        let _ = self.platform.quotas.release(self.default_tenant);
+
         let released = self.session.on_close(conn_idx);
 
         self.dispatcher.on_connection_closed(session_id, reason);
