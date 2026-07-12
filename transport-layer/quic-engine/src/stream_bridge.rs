@@ -5,7 +5,7 @@
 //! multiple `stream_recv` calls), and pushes decoded frames as
 //! [`QuicEvent::FrameReceived`] into the engine's event queue.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use buffer_pool::BufferPool;
 use bytes::BytesMut;
@@ -31,7 +31,7 @@ const MAX_CARRYOVER: usize = 16 * 1024 * 1024 + 64; // 16 MiB + header
 /// first occurrence, then stays silent until the stream finishes and the
 /// entry is removed from the carryover map.
 #[derive(Default)]
-pub(crate) struct StreamCarry {
+pub struct StreamCarry {
     /// Reassembly buffer for frames spanning multiple `stream_recv` calls.
     pub buf: BytesMut,
     /// `true` after the first "carryover exceeds limit" warning for this
@@ -65,7 +65,7 @@ pub fn process_readable(
     events: &mut Vec<QuicEvent>,
     readable_buf: &mut Vec<u64>,
     pool: &BufferPool,
-    carryover: &mut HashMap<u64, StreamCarry>,
+    carryover: &mut FxHashMap<u64, StreamCarry>,
 ) {
     // Collect readable stream IDs into the caller-provided buffer to
     // avoid per-datagram Vec allocation.
@@ -84,7 +84,7 @@ pub fn process_readable(
 
     // Index-based iteration: `readable_buf[i]` copies the u64 out, so
     // the shared borrow ends before we call `carryover.entry()` which
-    // takes &mut HashMap (disjoint from the &Vec used for iteration).
+    // takes &mut FxHashMap (disjoint from the &Vec used for iteration).
     let n = readable_buf.len();
     for i in 0..n {
         let stream_id = readable_buf[i];
@@ -106,7 +106,7 @@ fn process_single_stream(
     conn_idx: usize,
     events: &mut Vec<QuicEvent>,
     pool: &BufferPool,
-    carryover: &mut HashMap<u64, StreamCarry>,
+    carryover: &mut FxHashMap<u64, StreamCarry>,
 ) {
     let mut read_buf = [0u8; STREAM_READ_BUF_SIZE];
     let mut finished = false;
@@ -205,8 +205,11 @@ fn process_single_stream(
     }
 
     // Clean up carryover for finished or empty streams.
+    // IMPORTANT: keep the entry alive if warning flags are set — removing
+    // it would reset `oversized_warned`/`overflow_warned`, causing the next
+    // oversized frame to log again (defeating the per-stream suppression).
     let remove = match carryover.get(&stream_id) {
-        Some(cs) => cs.buf.is_empty() || finished,
+        Some(cs) => finished || (cs.buf.is_empty() && !cs.oversized_warned && !cs.overflow_warned),
         None => false,
     };
     if remove {

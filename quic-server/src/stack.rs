@@ -34,7 +34,7 @@ use quic_engine::{QuicEngine, QuicEvent};
 
 use crate::connection::{ConnState, ConnectionRegistry};
 use crate::error::ServerError;
-use crate::layers::{ApplicationLayer, FrameContext, OutgoingFrame, RuntimeLayer};
+use crate::layers::{ApplicationLayer, FrameContext, RuntimeLayer};
 
 /// Drain timeout — how long to wait for connections to close cleanly
 /// before forcing reactor exit. 2 seconds covers 3 × PTO (Probe Timeout)
@@ -66,6 +66,8 @@ pub struct VireonStack {
     reap_buf: Vec<(usize, SocketAddr)>,
     /// Pre-allocated scratch for outgoing frame encoding (avoids per-send alloc).
     send_scratch: Vec<u8>,
+    /// Pre-allocated scratch for eviction metadata (avoids per-pass Vec alloc).
+    evict_scratch: Vec<crate::eviction::ConnEvictInfo>,
 
     // ── Observability ────────────────────────────────────────────
     /// Tick counter — used to throttle periodic stats logging.
@@ -158,6 +160,7 @@ impl VireonStack {
             connections: ConnectionRegistry::new(),
             reap_buf: Vec::with_capacity(16),
             send_scratch: Vec::with_capacity(4096),
+            evict_scratch: Vec::with_capacity(32),
             tick_count: 0,
             pressure_throttle: PressureThrottle::new(),
             eviction_cooldown: None,
@@ -213,6 +216,15 @@ impl VireonStack {
                     self.on_stream_finished(conn_idx, stream_id);
                 }
             }
+        }
+
+        // Drain + send all outgoing frames accumulated during the batch.
+        // Doing this once per batch (instead of per-frame) reduces the
+        // number of outbox drain calls and allows the engine to coalesce
+        // multiple frames into fewer flush cycles.
+        let outbox = self.application.drain_outbox();
+        for out in outbox {
+            self.encode_and_send(out.conn_idx, out.quic_stream_id, out.header, &out.payload);
         }
     }
 
@@ -294,7 +306,10 @@ impl VireonStack {
     ) {
         // Look up cross-layer connection state (ConnState is Copy).
         let Some(cs) = self.connections.get(conn_idx) else {
-            tracing::warn!(conn_idx, "frame for unknown session");
+            // Normal teardown race: the connection was removed from the
+            // registry but QUIC stream events for it are still draining.
+            // Not an error — just drop the frame.
+            tracing::debug!(conn_idx, "frame for unknown session (teardown race)");
             return;
         };
 
@@ -316,12 +331,7 @@ impl VireonStack {
         // the raw frame back immediately. This isolates transport-layer
         // performance from application-layer overhead.
         if self.echo {
-            self.dispatch_outgoing(OutgoingFrame {
-                conn_idx,
-                quic_stream_id,
-                header,
-                payload: payload.to_vec(),
-            });
+            self.encode_and_send(conn_idx, quic_stream_id, header, &payload[..]);
             return;
         }
 
@@ -346,39 +356,52 @@ impl VireonStack {
         // [application → session → stream → message] Top-down processing.
         self.application.on_frame(&ctx, &frame_ref);
 
-        // [application-layer → transport] Drain + send outgoing frames.
-        let outbox = self.application.drain_outbox();
-        for out in outbox {
-            self.dispatch_outgoing(out);
-        }
+        // Outbox is drained once per batch in `process_events`, not here —
+        // this allows coalescing responses from multiple frames into fewer
+        // flush cycles.
     }
 
-    /// Encodes an outgoing frame and sends it via the QUIC engine.
+    /// Encodes header + payload into `send_scratch` and sends via the
+    /// QUIC engine.
     ///
-    /// Reuses `send_scratch` to avoid per-send allocation. Send failures
-    /// (flow-control blocked, unknown connection) are logged at debug —
-    /// full retry / deferred-send is a future task.
-    fn dispatch_outgoing(&mut self, out: OutgoingFrame) {
-        let wire_size = codec::HEADER_SIZE + out.payload.len();
-        self.send_scratch.clear();
-        self.send_scratch.resize(wire_size, 0);
-        match codec::encode_into_slice(&mut self.send_scratch, out.header, &out.payload) {
+    /// Uses `set_len` instead of `resize` to avoid zeroing bytes that
+    /// `encode_into_slice` will immediately overwrite. Send failures
+    /// (flow-control blocked, unknown connection) are logged at debug.
+    fn encode_and_send(
+        &mut self,
+        conn_idx: usize,
+        quic_stream_id: u64,
+        header: codec::FrameHeader,
+        payload: &[u8],
+    ) {
+        let wire_size = codec::HEADER_SIZE + payload.len();
+        if self.send_scratch.capacity() < wire_size {
+            self.send_scratch.reserve_exact(wire_size);
+        }
+        // SAFETY: capacity >= wire_size. `encode_into_slice` writes all
+        // `wire_size` bytes on success. On error we `clear()` so no
+        // uninitialized memory persists beyond this call.
+        unsafe { self.send_scratch.set_len(wire_size) };
+        match codec::encode_into_slice(&mut self.send_scratch, header, payload) {
             Ok(n) => {
                 if let Err(e) = self.engine.send_stream(
-                    out.conn_idx,
-                    out.quic_stream_id,
+                    conn_idx,
+                    quic_stream_id,
                     &self.send_scratch[..n],
                     false,
                 ) {
                     tracing::debug!(
-                        conn_idx = out.conn_idx,
-                        quic_stream_id = out.quic_stream_id,
+                        conn_idx,
+                        quic_stream_id,
                         error = ?e,
                         "send_stream failed"
                     );
                 }
             }
-            Err(e) => tracing::warn!(error = ?e, "encode outgoing frame failed"),
+            Err(e) => {
+                self.send_scratch.clear();
+                tracing::warn!(error = ?e, "encode outgoing frame failed");
+            }
         }
     }
 
@@ -427,20 +450,26 @@ impl VireonStack {
     /// victim via [`QuicEngine::close_connection`]. The actual
     /// CONNECTION_CLOSE frames are flushed on the subsequent `engine.on_tick`.
     fn evict_connections(&mut self, pressure: buffer_pool::PressureLevel, now_ns: u64) {
-        // 1. Collect connection metadata (borrows registry immutably).
-        let infos: Vec<crate::eviction::ConnEvictInfo> = self
-            .connections
-            .iter()
-            .map(|(&idx, cs)| crate::eviction::ConnEvictInfo {
-                conn_idx: idx,
-                bytes_recv: cs.bytes_recv,
-                last_active_ns: cs.last_active_ns,
-            })
-            .collect();
+        // 1. Collect connection metadata into reusable scratch.
+        self.evict_scratch.clear();
+        self.evict_scratch
+            .extend(
+                self.connections
+                    .iter()
+                    .map(|(&idx, cs)| crate::eviction::ConnEvictInfo {
+                        conn_idx: idx,
+                        bytes_recv: cs.bytes_recv,
+                        last_active_ns: cs.last_active_ns,
+                    }),
+            );
 
         // 2. Pure victim selection.
-        let victims =
-            crate::eviction::select_victims(&infos, pressure, now_ns, &self.eviction_config);
+        let victims = crate::eviction::select_victims(
+            &self.evict_scratch,
+            pressure,
+            now_ns,
+            &self.eviction_config,
+        );
         if victims.is_empty() {
             return;
         }
