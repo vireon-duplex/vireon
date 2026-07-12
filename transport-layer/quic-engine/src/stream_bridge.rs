@@ -205,8 +205,11 @@ fn process_single_stream(
     }
 
     // Clean up carryover for finished or empty streams.
+    // IMPORTANT: keep the entry alive if warning flags are set — removing
+    // it would reset `oversized_warned`/`overflow_warned`, causing the next
+    // oversized frame to log again (defeating the per-stream suppression).
     let remove = match carryover.get(&stream_id) {
-        Some(cs) => cs.buf.is_empty() || finished,
+        Some(cs) => finished || (cs.buf.is_empty() && !cs.oversized_warned && !cs.overflow_warned),
         None => false,
     };
     if remove {
