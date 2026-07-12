@@ -242,6 +242,18 @@ impl QuicEngine {
         self.active_count
     }
 
+    /// Current outstanding bytes in the buffer pool.
+    #[must_use]
+    pub fn pool_bytes_outstanding(&self) -> u64 {
+        self.pool.bytes_outstanding()
+    }
+
+    /// Current memory-pressure level of the buffer pool.
+    #[must_use]
+    pub fn pressure_level(&self) -> buffer_pool::PressureLevel {
+        self.pool.pressure_level()
+    }
+
     /// Drains and returns all pending [`QuicEvent`]s collected since the
     /// last call. The caller (typically the io-layer handler wrapper) is
     /// responsible for dispatching them through the session/stream pipeline.

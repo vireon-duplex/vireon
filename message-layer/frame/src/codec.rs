@@ -331,6 +331,17 @@ pub fn decode_with_len(src: &[u8]) -> Result<(FrameRef<'_>, usize), FrameError> 
         (stream_id, seq, msg_type_byte, flags, payload_len)
     };
     let msg_type = MessageType::try_from(msg_type_byte)?;
+
+    // Reject oversized payloads before any downstream allocation.
+    // This is the primary defense against memory exhaustion from
+    // misbehaving or malicious peers declaring huge payload_len values.
+    if payload_len > DEFAULT_MAX_PAYLOAD_LEN {
+        return Err(FrameError::PayloadTooLarge {
+            len: payload_len,
+            max: DEFAULT_MAX_PAYLOAD_LEN,
+        });
+    }
+
     let frame_end = HEADER_SIZE
         .checked_add(payload_len)
         .ok_or(FrameError::PayloadTooLarge {
@@ -805,6 +816,25 @@ mod tests {
         assert!(matches!(
             err,
             FrameError::UnknownMessageType { value: 0x00 }
+        ));
+    }
+
+    #[test]
+    fn decode_with_len_rejects_oversized_payload() {
+        // Hand-craft a header declaring a 20 MiB payload (exceeds the
+        // 16 MiB default cap) but only include a few bytes of payload.
+        // The size check should fire before the completeness check.
+        let mut buf = BytesMut::new();
+        buf.put_u64(1); // stream_id
+        buf.put_u64(0); // seq
+        buf.put_u8(MessageType::TextToken as u8); // valid type
+        buf.put_u8(0); // flags
+        buf.put_u32(20 * 1024 * 1024); // 20 MiB declared payload
+        buf.extend_from_slice(&[0xAB; 64]); // only 64 bytes actually present
+        let err = decode_with_len(&buf).unwrap_err();
+        assert!(matches!(
+            err,
+            FrameError::PayloadTooLarge { len, max } if len == 20 * 1024 * 1024 && max == DEFAULT_MAX_PAYLOAD_LEN
         ));
     }
 

@@ -17,6 +17,10 @@ use crate::engine::QuicEvent;
 /// Maximum bytes to read per `stream_recv` call.
 const STREAM_READ_BUF_SIZE: usize = 65_535;
 
+/// Maximum carryover buffer per stream. Prevents unbounded memory growth
+/// from misbehaving peers. Matches the codec payload limit + header slack.
+const MAX_CARRYOVER: usize = 16 * 1024 * 1024 + 64; // 16 MiB + header
+
 /// Processes all readable streams on a quiche connection.
 ///
 /// Called by the engine after `conn.recv()` — drains every stream that
@@ -104,6 +108,20 @@ fn process_single_stream(
                 let buf = carryover.entry(stream_id).or_default();
                 buf.extend_from_slice(&read_buf[..len]);
 
+                // Defense-in-depth: cap carryover to prevent unbounded
+                // memory growth if a peer floods a stream with data.
+                if buf.len() > MAX_CARRYOVER {
+                    tracing::warn!(
+                        reactor_id,
+                        conn_idx,
+                        stream_id,
+                        carryover_len = buf.len(),
+                        max = MAX_CARRYOVER,
+                        "carryover exceeds limit — draining"
+                    );
+                    buf.clear();
+                }
+
                 // Decode complete frames from carryover.
                 let mut offset = 0usize;
                 while offset < buf.len() {
@@ -117,6 +135,17 @@ fn process_single_stream(
                         }
                         Err(FrameError::IncompleteHeader { .. })
                         | Err(FrameError::IncompletePayload { .. }) => break,
+                        Err(FrameError::PayloadTooLarge { len, .. }) => {
+                            tracing::warn!(
+                                reactor_id,
+                                conn_idx,
+                                stream_id,
+                                declared_len = len,
+                                "oversized frame rejected — draining carryover"
+                            );
+                            buf.clear();
+                            break;
+                        }
                         Err(_) => {
                             offset += 1;
                         }
