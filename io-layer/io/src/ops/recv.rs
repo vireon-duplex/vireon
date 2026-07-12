@@ -235,6 +235,9 @@ mod tests {
         let mut ring = fresh_ring();
         let recv = Receiver::new(0, 1);
         recv.arm(&mut ring, 0xABC).expect("arm");
+        // With batch-mode push, the SQE is pending in the shadow ring.
+        // Explicit submit flushes it to the kernel.
+        ring.submit().expect("submit");
         assert!(ring.submission().is_empty());
     }
 
