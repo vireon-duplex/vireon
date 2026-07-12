@@ -12,7 +12,7 @@
 //! performs zero allocation and no locking. Lookup is a HashMap probe
 //! + generation check; touch is a slab index + counter add.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::backpressure::BackpressureLevel;
 use crate::config::ShardConfig;
@@ -44,7 +44,7 @@ pub struct ConnectionShard {
     /// LIFO free list of available slot indices.
     free_list: Vec<u32>,
     /// `stream_id → slot index` for O(1) incoming-packet lookup.
-    stream_index: HashMap<u64, u32>,
+    stream_index: FxHashMap<u64, u32>,
     /// Configuration (capacity, backpressure thresholds).
     config: ShardConfig,
     /// Lock-free statistics collector.
@@ -86,7 +86,7 @@ impl ConnectionShard {
             slab,
             generations,
             free_list,
-            stream_index: HashMap::with_capacity(capacity),
+            stream_index: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
             config,
             stats: StatsCollector::new(),
             backpressure: BackpressureLevel::None,

@@ -5,7 +5,7 @@
 //! its own internal state (timer handles, stream sets, etc.); this
 //! registry only stores the identifiers needed to bridge layers.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::net::SocketAddr;
 
 use connection_shard::ConnectionId;
@@ -28,7 +28,7 @@ pub struct ConnState {
 
 /// Maps QUIC engine `conn_idx` → cross-layer connection state.
 pub struct ConnectionRegistry {
-    map: HashMap<usize, ConnState>,
+    map: FxHashMap<usize, ConnState>,
 }
 
 impl ConnectionRegistry {
@@ -36,7 +36,7 @@ impl ConnectionRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            map: HashMap::new(),
+            map: FxHashMap::default(),
         }
     }
 
