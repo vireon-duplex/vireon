@@ -67,6 +67,10 @@ quiche  = "0.22"
 libc    = "0.2"
 socket2 = { version = "0.5", features = ["all"] }
 
+# Fast hashing for hot-path HashMaps (FxHash — no DoS resistance needed,
+# thread-per-core with no untrusted keys).
+rustc-hash = "2.1"
+
 [dependencies]
 anyhow = { workspace = true }
 tracing = { workspace = true }

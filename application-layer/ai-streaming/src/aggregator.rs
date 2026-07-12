@@ -55,7 +55,11 @@ impl TokenAggregator {
     /// # Phase 0
     /// This is a skeleton implementation.
     // TODO(phase-1): Implement token aggregation.
-    pub fn aggregate(&self, _stream: AiStreamId, _chunk: TokenChunk) -> Result<(), AiStreamError> {
+    pub fn aggregate(
+        &self,
+        _stream: AiStreamId,
+        _chunk: TokenChunk<'_>,
+    ) -> Result<(), AiStreamError> {
         // TODO(phase-1): Implement token aggregation.
         Err(AiStreamError::ShuttingDown)
     }

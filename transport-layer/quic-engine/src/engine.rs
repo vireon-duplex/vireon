@@ -25,7 +25,7 @@
 //! └──────────────────────────────────────────────────────────────────┘
 //! ```
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::net::SocketAddr;
 
 use buffer_pool::BufferPool;
@@ -117,7 +117,7 @@ struct ConnEntry {
 
 /// Copies a quiche `ConnectionId` into a fixed-size zero-padded array.
 ///
-/// Used as a `HashMap` key to avoid per-datagram heap allocation (`to_vec`).
+/// Used as a `FxHashMap` key to avoid per-datagram heap allocation (`to_vec`).
 /// Both the incoming packet DCID and the stored `source_id` are padded
 /// identically, so lookups are consistent.
 #[inline]
@@ -148,7 +148,7 @@ pub struct QuicEngine {
     free_slots: Vec<usize>,
     /// DCID → slab index routing table. Uses a fixed-size zero-padded
     /// array key to avoid per-datagram heap allocation.
-    dcid_to_idx: HashMap<[u8; quiche::MAX_CONN_ID_LEN], usize>,
+    dcid_to_idx: FxHashMap<[u8; quiche::MAX_CONN_ID_LEN], usize>,
 
     // ── Reusable buffers ──────────────────────────────────────────
     /// Buffer for incoming packet header parsing + recv.
@@ -161,9 +161,15 @@ pub struct QuicEngine {
     /// Reusable scratch for collecting closed connection indices (avoids
     /// per-tick Vec allocation).
     closed_buf: Vec<usize>,
+    /// Connections with pending sends — avoids O(N) flush scan of idle
+    /// connections every tick. Populated by `feed_existing` (ACKs, flow
+    /// control after recv), `send_stream` (application data), and
+    /// `close_connection` / `begin_shutdown` (CONNECTION_CLOSE).
+    /// Duplicates are harmless: a second `conn.send()` returns `Done`.
+    dirty_senders: Vec<usize>,
     /// Per-stream reassembly buffer for frames spanning multiple
     /// `stream_recv` calls. Keyed by QUIC stream ID.
-    stream_carryover: HashMap<u64, StreamCarry>,
+    stream_carryover: FxHashMap<u64, StreamCarry>,
 
     // ── Buffer pool ───────────────────────────────────────────────
     /// Pool for frame payload buffers (zero-alloc hot path).
@@ -221,12 +227,13 @@ impl QuicEngine {
             local_addr,
             connections: Vec::new(),
             free_slots: Vec::new(),
-            dcid_to_idx: HashMap::new(),
+            dcid_to_idx: FxHashMap::default(),
             pkt_buf: vec![0u8; 65535],
             out_buf: vec![0u8; MAX_PKT_SIZE],
             readable_buf: Vec::with_capacity(16),
             closed_buf: Vec::with_capacity(16),
-            stream_carryover: HashMap::new(),
+            dirty_senders: Vec::with_capacity(64),
+            stream_carryover: FxHashMap::default(),
             pool,
             gso_batcher: GsoBatcher::new(),
             events: Vec::new(),
@@ -281,7 +288,11 @@ impl QuicEngine {
             return Err(QuicSendError::UnknownConnection);
         };
         match entry.conn.stream_send(stream_id, data, fin) {
-            Ok(n) => Ok(n),
+            Ok(n) => {
+                // Mark dirty so flush_sends picks this connection up.
+                self.dirty_senders.push(conn_idx);
+                Ok(n)
+            }
             Err(quiche::Error::Done) => Err(QuicSendError::FlowBlocked),
             Err(e) => Err(QuicSendError::Quiche(e)),
         }
@@ -332,6 +343,7 @@ impl QuicEngine {
         let local_addr = self.local_addr;
         let reactor_id = self.reactor_id;
         let carryover = &mut self.stream_carryover;
+        let dirty = &mut self.dirty_senders;
 
         let Some(Some(entry)) = self.connections.get_mut(idx) else {
             return;
@@ -347,6 +359,10 @@ impl QuicEngine {
 
         match entry.conn.recv(&mut pkt_buf[..len], info) {
             Ok(_) => {
+                // Mark dirty — recv may have generated ACKs, flow-control
+                // updates, or probe packets that need to be flushed.
+                dirty.push(idx);
+
                 // Emit ConnectionEstablished on handshake completion (once).
                 if !entry.established && entry.conn.is_established() {
                     entry.established = true;
@@ -474,19 +490,27 @@ impl QuicEngine {
         Some(idx)
     }
 
-    /// Flushes outgoing packets for all connections.
+    /// Flushes outgoing packets for connections that have pending sends.
+    ///
+    /// Only iterates [`dirty_senders`](Self.dirty_senders) instead of all
+    /// connections — a connection enters the dirty set when it receives a
+    /// datagram (ACKs / flow-control updates) or when application data is
+    /// queued via [`send_stream`](Self::send_stream).
     pub fn flush_sends(&mut self, ctx: &mut TickContext) {
-        let out_buf = &mut self.out_buf;
-        let connections = &mut self.connections;
-
-        for entry_opt in connections.iter_mut() {
-            let Some(entry) = entry_opt else { continue };
-
+        let n = self.dirty_senders.len();
+        if n == 0 {
+            return;
+        }
+        for i in 0..n {
+            let idx = self.dirty_senders[i];
+            let Some(Some(entry)) = self.connections.get_mut(idx) else {
+                continue;
+            };
             loop {
-                match entry.conn.send(out_buf) {
+                match entry.conn.send(&mut self.out_buf) {
                     Ok((len, info)) => {
                         self.datagrams_sent += 1;
-                        let _ = ctx.sender.send_blocking(&out_buf[..len], info.to);
+                        let _ = ctx.sender.send_blocking(&self.out_buf[..len], info.to);
                     }
                     Err(quiche::Error::Done) => break,
                     Err(_) => break, // Non-fatal: try next connection.
@@ -497,10 +521,20 @@ impl QuicEngine {
 
     /// Removes closed connections from the slab and routing table,
     /// emitting `ConnectionClosed` events for each.
+    ///
+    /// Only checks connections in [`dirty_senders`](Self.dirty_senders)
+    /// — connections that were active this tick (received datagrams,
+    /// had sends queued, or were explicitly closed). Idle connections
+    /// that closed without traffic are handled by the higher-level
+    /// idle-timeout reaper in `VireonStack::reap_idle`.
     fn cleanup_closed(&mut self) {
         self.closed_buf.clear();
-        for (idx, entry_opt) in self.connections.iter_mut().enumerate() {
-            if let Some(entry) = entry_opt {
+
+        // Check only dirty connections (not all slots).
+        let dirty_n = self.dirty_senders.len();
+        for i in 0..dirty_n {
+            let idx = self.dirty_senders[i];
+            if let Some(Some(entry)) = self.connections.get(idx) {
                 if entry.conn.is_closed() {
                     self.closed_buf.push(idx);
                 }
@@ -548,8 +582,14 @@ impl QuicEngine {
     pub fn begin_shutdown(&mut self) {
         self.config.shutting_down = true;
         let reason = b"server shutting down";
-        for entry in self.connections.iter_mut().flatten() {
-            let _ = entry.conn.close(true, 0x00, reason);
+        // Mark all active connections dirty so CONNECTION_CLOSE frames
+        // are flushed by the next `flush_sends`.
+        self.dirty_senders.clear();
+        for (idx, entry) in self.connections.iter_mut().enumerate() {
+            if let Some(e) = entry {
+                let _ = e.conn.close(true, 0x00, reason);
+                self.dirty_senders.push(idx);
+            }
         }
         tracing::info!(
             reactor_id = self.reactor_id,
@@ -569,6 +609,7 @@ impl QuicEngine {
     pub fn close_connection(&mut self, conn_idx: usize, app_error: u64, reason: &[u8]) {
         if let Some(Some(entry)) = self.connections.get_mut(conn_idx) {
             let _ = entry.conn.close(true, app_error, reason);
+            self.dirty_senders.push(conn_idx);
             tracing::debug!(
                 reactor_id = self.reactor_id,
                 conn_idx,
@@ -587,6 +628,8 @@ impl IoHandler for QuicEngine {
     fn on_tick(&mut self, ctx: &mut TickContext) {
         self.flush_sends(ctx);
         self.cleanup_closed();
+        // Clear dirty list after both flush + cleanup have consumed it.
+        self.dirty_senders.clear();
     }
 }
 

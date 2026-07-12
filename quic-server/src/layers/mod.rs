@@ -23,5 +23,5 @@ pub mod session;
 pub mod stream;
 
 // Re-export the types used by stack.rs.
-pub use application::{ApplicationLayer, FrameContext, OutgoingFrame};
+pub use application::{ApplicationLayer, FrameContext};
 pub use runtime::RuntimeLayer;

@@ -92,7 +92,7 @@ impl AiStreamPipeline {
     pub fn send_token_chunk(
         &mut self,
         stream: AiStreamId,
-        chunk: TokenChunk,
+        chunk: TokenChunk<'_>,
     ) -> Result<(), AiStreamError> {
         let entry = self
             .streams

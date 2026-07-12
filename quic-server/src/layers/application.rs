@@ -26,7 +26,7 @@
 //!        └─ next_seq: per-QUIC-stream response seq
 //! ```
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::net::SocketAddr;
 
 use agent_runtime::AgentRuntime;
@@ -142,14 +142,14 @@ pub struct VireonDispatcher {
     pubsub: PubSubEngine,
 
     /// Maps logical frame stream → AI stream id (lazily opened).
-    ai_streams: HashMap<u64, AiStreamId>,
+    ai_streams: FxHashMap<u64, AiStreamId>,
     /// Default event-bus topic for `StateUpdate` routing.
     default_topic: TopicId,
 
     /// Queued outgoing frames, drained by the stack after each recv.
     outbox: Vec<OutgoingFrame>,
     /// Per-QUIC-stream response sequence counter.
-    next_seq: HashMap<u64, Seq>,
+    next_seq: FxHashMap<u64, Seq>,
 }
 
 impl VireonDispatcher {
@@ -172,10 +172,10 @@ impl VireonDispatcher {
             media: MediaSession::new(MediaStreamingConfig::new()),
             event_bus,
             pubsub,
-            ai_streams: HashMap::new(),
+            ai_streams: FxHashMap::default(),
             default_topic,
             outbox: Vec::new(),
-            next_seq: HashMap::new(),
+            next_seq: FxHashMap::default(),
         }
     }
 
@@ -207,7 +207,7 @@ impl VireonDispatcher {
         let logical = frame.stream_id.get();
         let chunk = TokenChunk {
             token_id: frame.seq.get(),
-            text: String::from_utf8_lossy(frame.payload).into_owned(),
+            text: String::from_utf8_lossy(frame.payload),
             is_final: frame.flags.contains(FrameFlags::FIN),
         };
         if !self.ai_streams.contains_key(&logical) {

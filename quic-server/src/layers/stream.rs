@@ -4,7 +4,8 @@
 //! (slot allocation). Tracks per-connection logical stream IDs so
 //! that all streams can be released when a connection closes.
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::FxHashMap;
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use frame::codec::FrameRef;
@@ -73,7 +74,7 @@ pub struct StreamLayer {
     /// Stream slab — allocates/tracks stream slots.
     slab: StreamSlab,
     /// Per-connection logical stream IDs.
-    conn_streams: HashMap<usize, HashSet<u64>>,
+    conn_streams: FxHashMap<usize, HashSet<u64>>,
     /// Priority scheduling + flow control.
     pub scheduler: StreamScheduler,
     /// Fragment reassembler — collects Fragment frames per stream.
@@ -94,7 +95,7 @@ impl StreamLayer {
         Ok(Self {
             message: MessageLayer::new(),
             slab: StreamSlab::default(),
-            conn_streams: HashMap::new(),
+            conn_streams: FxHashMap::default(),
             scheduler,
             reassembler: FragmentReassembler::new(),
             slab_full_throttle: WarnThrottle::new(),

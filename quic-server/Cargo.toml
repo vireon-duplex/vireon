@@ -82,5 +82,8 @@ tracing-subscriber = { workspace = true }
 # Concurrency
 libc = { workspace = true }
 
+# Fast hashing for hot-path HashMaps.
+rustc-hash = { workspace = true }
+
 [lints]
 workspace = true

@@ -184,7 +184,7 @@ impl ShardingStrategy for RendezvousSharding {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use rustc_hash::FxHashMap;
 
     #[test]
     fn local_returns_reactor_id() {
@@ -223,7 +223,7 @@ mod tests {
     #[test]
     fn jump_hash_distributes() {
         let s = JumpHashSharding;
-        let mut counts = HashMap::<u32, u32>::new();
+        let mut counts = FxHashMap::<u32, u32>::default();
         for i in 0..10_000u64 {
             let shard = s.shard_for_stream(i, 8);
             assert!(shard < 8);

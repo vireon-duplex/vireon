@@ -98,7 +98,10 @@ pub enum ReassemblyError {
 /// In-progress reassembly state for one `(session_id, stream_id)`.
 struct PendingReassembly {
     /// Fragment payloads keyed by `seq` — `BTreeMap` keeps them sorted.
-    fragments: BTreeMap<u64, Bytes>,
+    /// Uses `Vec<u8>` instead of `Bytes` to avoid per-fragment `Arc`
+    /// allocation. `Bytes` (with its reference-counted `Arc<[u8]>`)
+    /// is only created once at reassembly time.
+    fragments: BTreeMap<u64, Vec<u8>>,
     /// Total bytes accumulated across all fragments.
     total_bytes: usize,
     /// When the first fragment arrived — for timeout eviction.
@@ -115,7 +118,7 @@ impl PendingReassembly {
     }
 
     /// Adds a fragment's payload. Returns `Err` on duplicate seq.
-    fn insert(&mut self, seq: u64, payload: Bytes) -> Result<(), ReassemblyError> {
+    fn insert(&mut self, seq: u64, payload: Vec<u8>) -> Result<(), ReassemblyError> {
         if self.fragments.contains_key(&seq) {
             return Err(ReassemblyError::DuplicateFragment { seq, stream_id: 0 });
         }
@@ -127,8 +130,8 @@ impl PendingReassembly {
     /// Concatenates all fragment payloads in seq order, consuming `self`.
     fn reassemble(self) -> Bytes {
         if self.fragments.len() == 1 {
-            // Single fragment — no copy needed.
-            return self.fragments.into_values().next().unwrap_or_default();
+            // Single fragment — wrap in Bytes (one Arc alloc instead of N).
+            return Bytes::from(self.fragments.into_values().next().unwrap_or_default());
         }
         let mut buf = Vec::with_capacity(self.total_bytes);
         for payload in self.fragments.values() {
@@ -217,7 +220,7 @@ impl FragmentReassembler {
         let key = frame.stream_id;
         let seq = frame.seq.get();
         let is_fin = frame.flags.contains(FrameFlags::FIN);
-        let payload = Bytes::copy_from_slice(frame.payload);
+        let payload = frame.payload.to_vec();
 
         // Check per-stream byte limit BEFORE inserting.
         let existing_bytes = self.pending.get(&key).map_or(0, |p| p.total_bytes);
