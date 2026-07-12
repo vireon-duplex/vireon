@@ -340,14 +340,14 @@ impl AppDispatcher for VireonDispatcher {
                 );
             }
             MessageType::Heartbeat => {
-                tracing::debug!(
+                tracing::trace!(
                     conn_idx = ctx.conn_idx,
                     session_id = ?ctx.session_id,
                     "[app] Heartbeat"
                 );
             }
             _ => {
-                tracing::debug!(
+                tracing::trace!(
                     conn_idx = ctx.conn_idx,
                     msg_type = ?frame.msg_type,
                     "[app] unhandled data type"
