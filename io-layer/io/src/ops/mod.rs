@@ -77,23 +77,50 @@ pub const fn decode_id(user_data: u64) -> u64 {
     user_data & ID_MASK
 }
 
-// ─── SQE submission helper ─────────────────────────────────────────
+// ─── SQE submission helpers ────────────────────────────────────────
 
 use io_uring::IoUring;
 use io_uring::squeue::Entry;
 
 use crate::error::IoError;
 
-/// Pushes one SQE to the submission queue and submits the ring.
+/// Pushes one SQE to the submission queue WITHOUT calling `submit()`.
 ///
-/// Maps the queue-full case to [`IoError::Backpressure`].
+/// SQEs accumulate in the shadow submission queue and are committed to
+/// the kernel in a single batch by the reactor's `submit_and_wait(1)`
+/// call at the top of each event-loop iteration. This collapses N
+/// individual `io_uring_enter(2)` syscalls into one.
+///
+/// **Safety contract:** the caller MUST NOT embed raw pointers to
+/// stack-local data in `entry`. The SQE is not read by the kernel until
+/// the next `submit()` / `submit_and_wait()` call, by which time
+/// stack-local data would be dangling. Use [`push_and_submit`] for
+/// SQEs that carry stack-local pointers (e.g. `send_zc`'s `dest_addr`).
+///
+/// If the SQ ring is full, a `submit()` is performed transparently to
+/// make room (flushing all pending SQEs), then the push is retried.
 pub(crate) fn push_entry(ring: &mut IoUring, entry: Entry) -> Result<(), IoError> {
     let mut sq = ring.submission();
     // SAFETY: `entry` is a well-formed SQE from an opcode builder.
     if unsafe { sq.push(&entry) }.is_err() {
-        return Err(IoError::Backpressure { errno: libc::EBUSY });
+        // SQ ring full — flush pending SQEs to the kernel, then retry.
+        drop(sq);
+        ring.submit().map_err(IoError::Submit)?;
+        let mut sq = ring.submission();
+        if unsafe { sq.push(&entry) }.is_err() {
+            return Err(IoError::Backpressure { errno: libc::EBUSY });
+        }
     }
-    drop(sq);
+    Ok(())
+}
+
+/// Pushes one SQE and immediately submits it.
+///
+/// Use this for SQEs that carry raw pointers to stack-local data
+/// (e.g. `SendZc` with `dest_addr`). The immediate `submit()` ensures
+/// the kernel copies the pointer-target before the stack frame unwinds.
+pub(crate) fn push_and_submit(ring: &mut IoUring, entry: Entry) -> Result<(), IoError> {
+    push_entry(ring, entry)?;
     ring.submit().map_err(IoError::Submit)?;
     Ok(())
 }
