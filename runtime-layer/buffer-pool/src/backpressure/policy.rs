@@ -33,10 +33,13 @@ impl BackpressurePolicy {
         }
     }
 
-    /// `true` when `outstanding + requested` would exceed `capacity`.
+    /// `true` when `outstanding + requested` would exceed `reject_at`
+    /// (90 % of `capacity`). Rejecting before the hard ceiling leaves a
+    /// safety margin so a single large request cannot push memory past
+    /// the budget before the next release.
     #[inline]
     pub fn would_exceed(&self, outstanding: usize, requested: usize) -> bool {
-        outstanding.saturating_add(requested) > self.capacity
+        outstanding.saturating_add(requested) > self.reject_at
     }
 }
 
@@ -67,9 +70,10 @@ mod tests {
     #[test]
     fn would_exceed_checks_sum() {
         let p = BackpressurePolicy::from_max_memory(1000);
-        assert!(!p.would_exceed(500, 400));
-        assert!(p.would_exceed(500, 501));
-        assert!(p.would_exceed(1000, 1));
+        // reject_at = 900 (90 % of capacity)
+        assert!(!p.would_exceed(500, 400)); // 900, not > 900
+        assert!(p.would_exceed(500, 401)); // 901 > 900
+        assert!(p.would_exceed(900, 1)); // 901 > 900
     }
 
     #[test]

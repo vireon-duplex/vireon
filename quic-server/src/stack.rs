@@ -70,6 +70,8 @@ pub struct VireonStack {
     // ── Observability ────────────────────────────────────────────
     /// Tick counter — used to throttle periodic stats logging.
     tick_count: u64,
+    /// Throttle for memory-pressure warnings (logs at most every 5 s).
+    pressure_throttle: PressureThrottle,
 
     // ── Benchmark mode ───────────────────────────────────────────
     /// When true, echo every received frame back on the same stream.
@@ -82,6 +84,36 @@ pub struct VireonStack {
     reactor_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Current shutdown phase.
     shutdown_state: ShutdownState,
+}
+
+/// Cooldown for memory-pressure log messages.
+const PRESSURE_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Returns `true` on the first call or after `PRESSURE_LOG_INTERVAL`
+/// has elapsed since the last `true` return.
+struct PressureThrottle {
+    last: Option<Instant>,
+}
+
+impl PressureThrottle {
+    const fn new() -> Self {
+        Self { last: None }
+    }
+
+    fn tick(&mut self) -> bool {
+        let now = Instant::now();
+        match self.last {
+            None => {
+                self.last = Some(now);
+                true
+            }
+            Some(t) if now.saturating_duration_since(t) >= PRESSURE_LOG_INTERVAL => {
+                self.last = Some(now);
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Graceful shutdown state machine.
@@ -121,6 +153,7 @@ impl VireonStack {
             reap_buf: Vec::with_capacity(16),
             send_scratch: Vec::with_capacity(4096),
             tick_count: 0,
+            pressure_throttle: PressureThrottle::new(),
             echo,
             shutdown_requested,
             reactor_stop: None,
@@ -405,6 +438,22 @@ impl IoHandler for VireonStack {
                 sq_inflight = sq_stats.inflight_count,
                 cqe_total = cqe_snap.cqes_total,
                 "[observability] periodic stats"
+            );
+        }
+
+        // ── Memory-pressure monitoring ─────────────────────────────
+        // Check every tick (cheap: 2 atomic loads). Log only when
+        // elevated and throttled to avoid spam.
+        let pressure = self.engine.pressure_level();
+        if pressure >= buffer_pool::PressureLevel::High && self.pressure_throttle.tick() {
+            let rss = buffer_pool::maintenance::pressure::resident_memory().unwrap_or(0);
+            tracing::warn!(
+                reactor_id = self.engine.reactor_id,
+                pressure = ?pressure,
+                active_conns = self.engine.active_connections(),
+                outstanding_bytes = self.engine.pool_bytes_outstanding(),
+                rss_bytes = rss,
+                "memory pressure elevated"
             );
         }
 

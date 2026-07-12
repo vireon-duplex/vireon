@@ -23,6 +23,8 @@ struct TenantEntry {
     sessions_used: u32,
     /// Current active stream count.
     streams_used: u32,
+    /// Cumulative bytes received for this tenant (observability).
+    bytes_used: u64,
 }
 
 /// Quota manager — tracks per-tenant resource usage.
@@ -60,6 +62,7 @@ impl QuotaManager {
                 limit: QuotaLimit::for_tier(tier),
                 sessions_used: 0,
                 streams_used: 0,
+                bytes_used: 0,
             },
         );
         self.stats.record_tenant_tracked();
@@ -134,6 +137,24 @@ impl QuotaManager {
         Ok(())
     }
 
+    /// Record bytes received for a tenant (cumulative — observability).
+    ///
+    /// Used for monitoring per-tenant data volume. Does **not** enforce
+    /// `QuotaLimit::max_memory_bytes` (that requires outstanding-byte
+    /// tracking with buffer-lifecycle integration — future work).
+    ///
+    /// # Errors
+    /// Returns [`QuotaError::TenantNotFound`] if unregistered.
+    pub fn record_bytes(&mut self, id: TenantId, n: u64) -> Result<(), QuotaError> {
+        let entry = self
+            .tenants
+            .get_mut(&id)
+            .ok_or(QuotaError::TenantNotFound(id))?;
+        entry.bytes_used = entry.bytes_used.saturating_add(n);
+        self.stats.record_bandwidth(n);
+        Ok(())
+    }
+
     /// Get the current health state.
     #[must_use]
     pub fn health(&self) -> bool {
@@ -150,6 +171,12 @@ impl QuotaManager {
     #[must_use]
     pub fn sessions_used(&self, id: TenantId) -> u32 {
         self.tenants.get(&id).map_or(0, |e| e.sessions_used)
+    }
+
+    /// Cumulative bytes received for a tenant (0 if not found).
+    #[must_use]
+    pub fn bytes_used(&self, id: TenantId) -> u64 {
+        self.tenants.get(&id).map_or(0, |e| e.bytes_used)
     }
 }
 
@@ -288,5 +315,33 @@ mod tests {
             manager.release(TenantId::new(1)).unwrap();
         }
         assert_eq!(manager.sessions_used(TenantId::new(1)), 0);
+    }
+
+    #[test]
+    fn record_bytes_accumulates() {
+        let mut manager = fresh();
+        manager
+            .register_tenant(TenantId::new(1), TenantTier::Pro)
+            .unwrap();
+
+        assert_eq!(manager.bytes_used(TenantId::new(1)), 0);
+        manager.record_bytes(TenantId::new(1), 1024).unwrap();
+        manager.record_bytes(TenantId::new(1), 2048).unwrap();
+        assert_eq!(manager.bytes_used(TenantId::new(1)), 3072);
+    }
+
+    #[test]
+    fn record_bytes_unknown_tenant_returns_error() {
+        let mut manager = fresh();
+        assert!(matches!(
+            manager.record_bytes(TenantId::new(99), 100),
+            Err(QuotaError::TenantNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn bytes_used_unknown_tenant_is_zero() {
+        let manager = fresh();
+        assert_eq!(manager.bytes_used(TenantId::new(99)), 0);
     }
 }

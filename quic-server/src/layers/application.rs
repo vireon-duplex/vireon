@@ -699,6 +699,12 @@ impl ApplicationLayer {
             }
 
             self.dispatcher.on_data_frame(ctx, frame);
+
+            // Platform: track per-tenant byte volume (observability).
+            let _ = self
+                .platform
+                .quotas
+                .record_bytes(self.default_tenant, frame.payload.len() as u64);
         }
     }
 
