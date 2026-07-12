@@ -294,7 +294,10 @@ impl VireonStack {
     ) {
         // Look up cross-layer connection state (ConnState is Copy).
         let Some(cs) = self.connections.get(conn_idx) else {
-            tracing::warn!(conn_idx, "frame for unknown session");
+            // Normal teardown race: the connection was removed from the
+            // registry but QUIC stream events for it are still draining.
+            // Not an error — just drop the frame.
+            tracing::debug!(conn_idx, "frame for unknown session (teardown race)");
             return;
         };
 
