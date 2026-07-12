@@ -199,6 +199,16 @@ fn emit_frame_event(
     events: &mut Vec<QuicEvent>,
     pool: &BufferPool,
 ) {
+    // Backpressure: stop pushing when the upper layer hasn't drained.
+    if events.len() >= crate::engine::MAX_PENDING_EVENTS {
+        tracing::warn!(
+            conn_idx,
+            pending = events.len(),
+            "event queue full — dropping frame"
+        );
+        return;
+    }
+
     let header = codec::FrameHeader {
         stream_id: frame_ref.stream_id,
         seq: frame_ref.seq,

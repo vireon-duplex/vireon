@@ -25,19 +25,23 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use io_uring::IoUring;
+use io_uring::types::Timespec;
 
 use crate::error::IoError;
 use crate::ops::timeout::{build_async_cancel, build_cancel, build_periodic_tick, build_timeout};
 use crate::ops::{OpKind, decode_id, decode_kind, encode, push_entry};
 
 /// Bookkeeping for one in-flight kernel timeout.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 #[allow(dead_code)]
 struct ActiveTimer {
     /// Caller-supplied ID (decoded from `user_data`).
     user_data: u64,
     /// When the timer was scheduled to fire (best-effort wall-clock).
     deadline: Instant,
+    /// Owned Timespec — kept alive until the kernel fires or cancels
+    /// the timer, preventing the leak that `Box::leak` caused.
+    _timespec: Option<Box<Timespec>>,
 }
 
 /// Kernel-side timer wheel.
@@ -72,13 +76,19 @@ impl TimerWheel {
         id: u64,
         duration: Duration,
     ) -> Result<(), IoError> {
-        let entry = build_timeout(duration, id);
+        let ts = Box::new(
+            Timespec::new()
+                .sec(duration.as_secs())
+                .nsec(duration.subsec_nanos()),
+        );
+        let entry = build_timeout(&ts, id);
         push_entry(ring, entry)?;
         self.active.insert(
             id,
             ActiveTimer {
                 user_data: id,
                 deadline: Instant::now() + duration,
+                _timespec: Some(ts),
             },
         );
         Ok(())
@@ -94,13 +104,19 @@ impl TimerWheel {
         id: u64,
         period: Duration,
     ) -> Result<(), IoError> {
-        let entry = build_periodic_tick(period, id);
+        let ts = Box::new(
+            Timespec::new()
+                .sec(period.as_secs())
+                .nsec(period.subsec_nanos()),
+        );
+        let entry = build_periodic_tick(&ts, id);
         push_entry(ring, entry)?;
         self.active.insert(
             id,
             ActiveTimer {
                 user_data: id,
                 deadline: Instant::now() + period,
+                _timespec: Some(ts),
             },
         );
         Ok(())
