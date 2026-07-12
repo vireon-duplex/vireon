@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 use buffer_pool::BufferPool;
+use bytes::BytesMut;
 use frame::codec;
 use frame::error::FrameError;
 
@@ -37,7 +38,7 @@ pub fn process_readable(
     events: &mut Vec<QuicEvent>,
     readable_buf: &mut Vec<u64>,
     pool: &BufferPool,
-    carryover: &mut HashMap<u64, Vec<u8>>,
+    carryover: &mut HashMap<u64, BytesMut>,
 ) {
     // Collect readable stream IDs into the caller-provided buffer to
     // avoid per-datagram Vec allocation.
@@ -78,7 +79,7 @@ fn process_single_stream(
     conn_idx: usize,
     events: &mut Vec<QuicEvent>,
     pool: &BufferPool,
-    carryover: &mut HashMap<u64, Vec<u8>>,
+    carryover: &mut HashMap<u64, BytesMut>,
 ) {
     let mut read_buf = [0u8; STREAM_READ_BUF_SIZE];
     let mut finished = false;
@@ -122,7 +123,10 @@ fn process_single_stream(
                     }
                 }
                 if offset > 0 {
-                    buf.drain(..offset);
+                    // split_to is O(1) for uniquely-owned buffers — just
+                    // advances the internal pointer, no memmove (unlike
+                    // Vec::drain which shifts all remaining bytes forward).
+                    let _ = buf.split_to(offset);
                 }
 
                 if fin {

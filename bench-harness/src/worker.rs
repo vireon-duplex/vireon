@@ -320,6 +320,7 @@ fn send_through_stack(
     recv_buf: &mut [u8],
     send_buf: &mut [u8],
     stream_buf: &mut [u8],
+    encode_buf: &mut Vec<u8>,
     target: SocketAddr,
     local: SocketAddr,
     handshake_time: Duration,
@@ -331,24 +332,23 @@ fn send_through_stack(
             return Ok(bytes_sent);
         }
         let quic_sid = STREAM_IDS[entry.logical_stream as usize];
-        // .to_vec() releases the borrow on stack so we can call
-        // drain_recv_through_stack inside the send loop.
-        let encoded = stack
-            .encode_frame_coalesced(
-                entry.logical_stream,
-                entry.msg_type,
-                entry.flags,
-                &entry.payload,
-                COALESCE,
-            )
-            .to_vec();
+        // Encode into caller-owned buffer — no heap allocation, no memset.
+        // The borrow on `stack` is released immediately after this call.
+        stack.encode_frame_coalesced_into(
+            encode_buf,
+            entry.logical_stream,
+            entry.msg_type,
+            entry.flags,
+            &entry.payload,
+            COALESCE,
+        );
         let mut off = 0usize;
-        while off < encoded.len() {
+        while off < encode_buf.len() {
             if Instant::now() >= deadline {
                 bytes_sent += off as u64;
                 return Ok(bytes_sent);
             }
-            match conn.stream_send(quic_sid, &encoded[off..], false) {
+            match conn.stream_send(quic_sid, &encode_buf[off..], false) {
                 Ok(n) => {
                     if n == 0 {
                         let _ = flush_outbound(conn, socket, send_buf);
@@ -373,7 +373,7 @@ fn send_through_stack(
                 }
             }
         }
-        bytes_sent += encoded.len() as u64;
+        bytes_sent += encode_buf.len() as u64;
     }
     Ok(bytes_sent)
 }
@@ -427,6 +427,7 @@ fn measure_rr(
         .map(|e| (frame::codec::HEADER_SIZE + e.payload_len) as u64 * COALESCE as u64)
         .sum();
     let mut stream_buf = vec![0u8; DGRAM_BUF];
+    let mut encode_buf: Vec<u8> = Vec::with_capacity(DGRAM_BUF);
     let mut rtts = Vec::new();
     let mut bytes_sent = 0u64;
     let mut blocked_writes = 0u64;
@@ -443,18 +444,17 @@ fn measure_rr(
 
         // Send all entries on QUIC stream 0 (frame headers carry logical_stream 0..14).
         for entry in entries {
-            let encoded = stack
-                .encode_frame_coalesced(
-                    entry.logical_stream,
-                    entry.msg_type,
-                    entry.flags,
-                    &entry.payload,
-                    COALESCE,
-                )
-                .to_vec();
+            stack.encode_frame_coalesced_into(
+                &mut encode_buf,
+                entry.logical_stream,
+                entry.msg_type,
+                entry.flags,
+                &entry.payload,
+                COALESCE,
+            );
             let mut off = 0usize;
-            while off < encoded.len() {
-                match conn.stream_send(STREAM_IDS[0], &encoded[off..], false) {
+            while off < encode_buf.len() {
+                match conn.stream_send(STREAM_IDS[0], &encode_buf[off..], false) {
                     Ok(n) => {
                         write_syscalls += 1;
                         off += n;
@@ -475,7 +475,7 @@ fn measure_rr(
                     }
                 }
             }
-            bytes_sent += encoded.len() as u64;
+            bytes_sent += encode_buf.len() as u64;
         }
         write_syscalls += 1;
         if let Err(e) = flush_outbound(conn, socket, send_buf) {
@@ -556,6 +556,7 @@ fn measure_multi_rr(
         .sum();
     let frames_per_batch = (entries.len() * COALESCE) as u64;
     let mut stream_buf = vec![0u8; DGRAM_BUF];
+    let mut encode_buf: Vec<u8> = Vec::with_capacity(DGRAM_BUF);
     let mut rtts = Vec::new();
     let mut bytes_sent = 0u64;
     let mut blocked_writes = 0u64;
@@ -580,6 +581,7 @@ fn measure_multi_rr(
             recv_buf,
             send_buf,
             &mut stream_buf,
+            &mut encode_buf,
             target,
             local,
             handshake_time,
@@ -649,6 +651,7 @@ fn measure_stream(
 ) -> WorkerResult {
     let frames_per_batch = (entries.len() * COALESCE) as u64;
     let mut stream_buf = vec![0u8; DGRAM_BUF];
+    let mut encode_buf: Vec<u8> = Vec::with_capacity(DGRAM_BUF);
     let mut bytes_sent = 0u64;
     let mut blocked_writes = 0u64;
     let mut flow_control_waits = 0u64;
@@ -667,21 +670,20 @@ fn measure_stream(
 
         for entry in entries {
             let quic_sid = STREAM_IDS[entry.logical_stream as usize];
-            let encoded = stack
-                .encode_frame_coalesced(
-                    entry.logical_stream,
-                    entry.msg_type,
-                    entry.flags,
-                    &entry.payload,
-                    COALESCE,
-                )
-                .to_vec();
+            stack.encode_frame_coalesced_into(
+                &mut encode_buf,
+                entry.logical_stream,
+                entry.msg_type,
+                entry.flags,
+                &entry.payload,
+                COALESCE,
+            );
             let mut off = 0usize;
-            while off < encoded.len() {
+            while off < encode_buf.len() {
                 if shutdown.load(Ordering::Relaxed) || start.elapsed() >= duration {
                     break;
                 }
-                match conn.stream_send(quic_sid, &encoded[off..], false) {
+                match conn.stream_send(quic_sid, &encode_buf[off..], false) {
                     Ok(n) => off += n,
                     Err(quiche::Error::Done) => {
                         blocked_writes += 1;
@@ -702,7 +704,7 @@ fn measure_stream(
                     }
                 }
             }
-            bytes_sent += encoded.len() as u64;
+            bytes_sent += encode_buf.len() as u64;
         }
         if let Ok(syscalls) = flush_outbound(conn, socket, send_buf) {
             write_syscalls += syscalls;
@@ -776,6 +778,7 @@ fn measure_pipeline(
     let depth = pipeline_depth.max(1);
     let mut in_flight: VecDeque<(Instant, u64)> = VecDeque::with_capacity(depth);
     let mut stream_buf = vec![0u8; DGRAM_BUF];
+    let mut encode_buf: Vec<u8> = Vec::with_capacity(DGRAM_BUF);
     let mut rtts = Vec::new();
     let mut bytes_sent_total = 0u64;
     let mut payload_bytes_sent_total = 0u64;
@@ -807,6 +810,7 @@ fn measure_pipeline(
                 recv_buf,
                 send_buf,
                 &mut stream_buf,
+                &mut encode_buf,
                 target,
                 local,
                 handshake_time,

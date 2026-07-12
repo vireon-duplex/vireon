@@ -116,6 +116,12 @@ impl SessionLayer {
         self.stream.on_frame(conn_idx, frame)
     }
 
+    /// Drives the stream scheduler once per recv batch.
+    /// Propagates to the stream layer.
+    pub fn on_batch_tick(&mut self) {
+        self.stream.on_batch_tick();
+    }
+
     /// Destroys a session: releases streams, releases the session slot,
     /// and unregisters ownership.
     ///

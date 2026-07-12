@@ -71,11 +71,51 @@ impl ClientStack {
 
     // ── Send path ──────────────────────────────────────────────────
 
+    /// Encodes `coalesce` copies of a single frame into `dst` (caller-owned).
+    ///
+    /// Each copy gets a unique incrementing `seq` from the stream layer.
+    /// The caller feeds `dst` to `conn.stream_send`. Using a caller-owned
+    /// buffer releases the borrow on `self` immediately — no `.to_vec()`
+    /// needed in the caller, and no `memset` on the buffer since
+    /// `encode_into_slice` writes every byte.
+    pub fn encode_frame_coalesced_into(
+        &mut self,
+        dst: &mut Vec<u8>,
+        logical_stream: u64,
+        msg_type: MessageType,
+        flags: FrameFlags,
+        payload: &[u8],
+        coalesce: usize,
+    ) {
+        let frame_wire_size = frame::codec::HEADER_SIZE + payload.len();
+        let total = frame_wire_size * coalesce;
+        dst.clear();
+        // reserve ensures capacity >= len + additional. After clear,
+        // len is 0, so reserve(total) guarantees capacity >= total.
+        if dst.capacity() < total {
+            dst.reserve(total);
+        }
+        // SAFETY: `encode_into_slice` writes every byte of each frame
+        // segment, so the buffer is fully initialised after the loop.
+        // We use set_len (not resize(n, 0)) to skip the zero-fill.
+        unsafe { dst.set_len(total) }
+
+        for i in 0..coalesce {
+            let header = self.app.prepare_frame(logical_stream, msg_type, flags);
+            let off = i * frame_wire_size;
+            let _ = encode_into_slice(&mut dst[off..off + frame_wire_size], header, payload);
+        }
+    }
+
     /// Encodes `coalesce` copies of a single frame into the internal
     /// coalesce buffer and returns a reference to the encoded bytes.
     ///
     /// Each copy gets a unique incrementing `seq` from the stream layer.
     /// The caller feeds the returned slice to `conn.stream_send`.
+    ///
+    /// Prefer [`encode_frame_coalesced_into`](Self::encode_frame_coalesced_into)
+    /// when you need to call other `&mut self` methods between encode
+    /// and send — it avoids the borrow-conflict that forces `.to_vec()`.
     pub fn encode_frame_coalesced(
         &mut self,
         logical_stream: u64,
@@ -84,19 +124,25 @@ impl ClientStack {
         payload: &[u8],
         coalesce: usize,
     ) -> &[u8] {
+        // Split borrows: `app` and `coalesce_buf` are disjoint fields.
+        let app = &mut self.app;
+        let buf = &mut self.coalesce_buf;
+
         let frame_wire_size = frame::codec::HEADER_SIZE + payload.len();
-        self.coalesce_buf.clear();
-        self.coalesce_buf.resize(frame_wire_size * coalesce, 0);
+        let total = frame_wire_size * coalesce;
+        buf.clear();
+        if buf.capacity() < total {
+            buf.reserve(total);
+        }
+        // SAFETY: encode_into_slice writes every byte below.
+        unsafe { buf.set_len(total) }
 
         for i in 0..coalesce {
-            let header = self.app.prepare_frame(logical_stream, msg_type, flags);
+            let header = app.prepare_frame(logical_stream, msg_type, flags);
             let off = i * frame_wire_size;
-            let _ = encode_into_slice(
-                &mut self.coalesce_buf[off..off + frame_wire_size],
-                header,
-                payload,
-            );
+            let _ = encode_into_slice(&mut buf[off..off + frame_wire_size], header, payload);
         }
+
         &self.coalesce_buf
     }
 
