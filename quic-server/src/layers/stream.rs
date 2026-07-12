@@ -5,6 +5,7 @@
 //! that all streams can be released when a connection closes.
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use frame::codec::FrameRef;
 use frame::header::MessageType;
@@ -16,6 +17,53 @@ use stream_scheduler::scheduler::StreamScheduler;
 
 use super::message::{FrameAction, MessageLayer};
 use crate::error::ServerError;
+
+/// Minimum interval between repeated warn logs for the same condition.
+///
+/// The first occurrence always logs immediately; subsequent identical
+/// warnings within this interval are silently counted.
+const WARN_THROTTLE: Duration = Duration::from_secs(5);
+
+/// Rate-limits a repeating warning so it logs at most once per
+/// [`WARN_THROTTLE`] interval, while tracking the total occurrence count.
+#[derive(Debug)]
+struct WarnThrottle {
+    /// Total occurrences since startup.
+    total: u64,
+    /// When we last emitted the warn (`None` = never).
+    last: Option<Instant>,
+}
+
+impl WarnThrottle {
+    const fn new() -> Self {
+        Self {
+            total: 0,
+            last: None,
+        }
+    }
+
+    /// Increments the total count and returns `true` if the caller
+    /// should emit a log line now (first occurrence or throttle
+    /// interval elapsed).
+    fn tick(&mut self) -> bool {
+        self.total = self.total.wrapping_add(1);
+        let now = Instant::now();
+        match self.last {
+            None => {
+                self.last = Some(now);
+                true
+            }
+            Some(t) => {
+                if now.saturating_duration_since(t) >= WARN_THROTTLE {
+                    self.last = Some(now);
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+}
 
 /// Stream layer — manages stream lifecycle and delegates frame
 /// classification to the message layer.
@@ -30,6 +78,10 @@ pub struct StreamLayer {
     pub scheduler: StreamScheduler,
     /// Fragment reassembler — collects Fragment frames per stream.
     reassembler: FragmentReassembler,
+    // ── Warn throttles (prevent log spam under sustained error conditions) ──
+    slab_full_throttle: WarnThrottle,
+    frag_overflow_throttle: WarnThrottle,
+    unexpected_type_throttle: WarnThrottle,
 }
 
 impl StreamLayer {
@@ -45,6 +97,9 @@ impl StreamLayer {
             conn_streams: HashMap::new(),
             scheduler,
             reassembler: FragmentReassembler::new(),
+            slab_full_throttle: WarnThrottle::new(),
+            frag_overflow_throttle: WarnThrottle::new(),
+            unexpected_type_throttle: WarnThrottle::new(),
         })
     }
 
@@ -90,12 +145,15 @@ impl StreamLayer {
                         );
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            conn_idx,
-                            stream_id = logical_stream,
-                            error = ?e,
-                            "stream slab full — cannot open stream"
-                        );
+                        if self.slab_full_throttle.tick() {
+                            tracing::warn!(
+                                conn_idx,
+                                stream_id = logical_stream,
+                                total = self.slab_full_throttle.total,
+                                error = ?e,
+                                "stream slab full — cannot open stream"
+                            );
+                        }
                     }
                 },
                 MessageType::StreamClose | MessageType::StreamReset => {
@@ -140,12 +198,15 @@ impl StreamLayer {
                         );
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            conn_idx,
-                            stream_id = logical_stream,
-                            error = %e,
-                            "fragment reassembly error"
-                        );
+                        if self.frag_overflow_throttle.tick() {
+                            tracing::warn!(
+                                conn_idx,
+                                stream_id = logical_stream,
+                                total = self.frag_overflow_throttle.total,
+                                error = %e,
+                                "fragment reassembly error"
+                            );
+                        }
                     }
                 },
                 MessageType::Ack => {
@@ -158,11 +219,14 @@ impl StreamLayer {
                 }
                 // Data-plane types are handled above.
                 _ => {
-                    tracing::warn!(
-                        conn_idx,
-                        msg_type = ?frame.msg_type,
-                        "unexpected type in control dispatch"
-                    );
+                    if self.unexpected_type_throttle.tick() {
+                        tracing::warn!(
+                            conn_idx,
+                            msg_type = ?frame.msg_type,
+                            total = self.unexpected_type_throttle.total,
+                            "unexpected type in control dispatch"
+                        );
+                    }
                 }
             }
         }
