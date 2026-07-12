@@ -513,17 +513,29 @@ impl IoHandler for VireonStack {
         }
 
         // ── Memory-pressure monitoring ─────────────────────────────
-        // Check every tick (cheap: 2 atomic loads). Log only when
-        // elevated and throttled to avoid spam.
-        let pressure = self.engine.pressure_level();
+        // Two independent pressure signals:
+        //   1. Pool-internal: outstanding pool bytes vs pool capacity
+        //   2. cgroup-level:  real process RSS vs cgroup memory limit
+        // Take the higher (more urgent) of the two — a cgroup OOM kills
+        // the process regardless of how healthy the pool thinks it is.
+        let pool_pressure = self.engine.pressure_level();
+        let cgroup_pressure = buffer_pool::maintenance::cgroup::cgroup_pressure_level();
+        let pressure = pool_pressure.max(cgroup_pressure);
+
         if pressure >= buffer_pool::PressureLevel::High && self.pressure_throttle.tick() {
             let rss = buffer_pool::maintenance::pressure::resident_memory().unwrap_or(0);
+            let cgroup_usage = buffer_pool::maintenance::cgroup::cgroup_memory_usage().unwrap_or(0);
+            let cgroup_limit = buffer_pool::maintenance::cgroup::cgroup_memory_limit().unwrap_or(0);
             tracing::warn!(
                 reactor_id = self.engine.reactor_id,
                 pressure = ?pressure,
+                pool_pressure = ?pool_pressure,
+                cgroup_pressure = ?cgroup_pressure,
                 active_conns = self.engine.active_connections(),
                 outstanding_bytes = self.engine.pool_bytes_outstanding(),
                 rss_bytes = rss,
+                cgroup_usage_bytes = cgroup_usage,
+                cgroup_limit_bytes = cgroup_limit,
                 "memory pressure elevated"
             );
         }

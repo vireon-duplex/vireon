@@ -63,12 +63,28 @@ impl Worker {
 
         tracing::info!(core_id, %local_addr, "reactor bound");
 
+        // Auto-size the buffer pool based on cgroup memory limits.
+        // Falls back to the default 256 MiB on bare metal.
+        let pool_budget = buffer_pool::maintenance::cgroup::recommended_pool_budget();
+        let cgroup_limit = buffer_pool::maintenance::cgroup::cgroup_memory_limit();
+        tracing::info!(
+            core_id,
+            cgroup_limit_bytes = cgroup_limit.unwrap_or(0),
+            pool_budget_bytes = pool_budget,
+            "buffer pool sized for container memory"
+        );
+
         let engine = QuicEngineBuilder::from_config(config.quic_config.clone())
             .reactor_id(core_id)
             .local_addr(local_addr)
             .cert_path(&config.cert_path)
             .key_path(&config.key_path)
-            .buffer_pool(buffer_pool::BufferPool::default())
+            .buffer_pool(
+                buffer_pool::BufferPoolBuilder::new()
+                    .max_memory(pool_budget)
+                    .build()
+                    .expect("pool config is valid"),
+            )
             .build()
             .map_err(|e| ServerError::EngineInit(format!("{e:?}")))?;
 
