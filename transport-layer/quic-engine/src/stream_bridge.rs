@@ -21,6 +21,29 @@ const STREAM_READ_BUF_SIZE: usize = 65_535;
 /// from misbehaving peers. Matches the codec payload limit + header slack.
 const MAX_CARRYOVER: usize = 16 * 1024 * 1024 + 64; // 16 MiB + header
 
+/// Per-stream reassembly state — holds partial frame data plus warning
+/// suppression flags to prevent log spam from misbehaving peers.
+///
+/// A malicious or buggy peer can flood a stream with thousands of oversized
+/// frames in milliseconds. Without per-stream deduplication, each rejected
+/// frame emits a `WARN` log — which itself becomes a DoS vector (disk I/O,
+/// log aggregation costs). The flags below ensure each stream logs the
+/// first occurrence, then stays silent until the stream finishes and the
+/// entry is removed from the carryover map.
+#[derive(Default)]
+pub(crate) struct StreamCarry {
+    /// Reassembly buffer for frames spanning multiple `stream_recv` calls.
+    pub buf: BytesMut,
+    /// `true` after the first "carryover exceeds limit" warning for this
+    /// stream. Prevents repeated logs on every tick while the peer
+    /// continues flooding.
+    overflow_warned: bool,
+    /// `true` after the first "oversized frame rejected" warning.
+    /// Prevents thousands of log lines when a peer sends garbage
+    /// headers with multi-gigabyte declared lengths.
+    oversized_warned: bool,
+}
+
 /// Processes all readable streams on a quiche connection.
 ///
 /// Called by the engine after `conn.recv()` — drains every stream that
@@ -42,7 +65,7 @@ pub fn process_readable(
     events: &mut Vec<QuicEvent>,
     readable_buf: &mut Vec<u64>,
     pool: &BufferPool,
-    carryover: &mut HashMap<u64, BytesMut>,
+    carryover: &mut HashMap<u64, StreamCarry>,
 ) {
     // Collect readable stream IDs into the caller-provided buffer to
     // avoid per-datagram Vec allocation.
@@ -83,7 +106,7 @@ fn process_single_stream(
     conn_idx: usize,
     events: &mut Vec<QuicEvent>,
     pool: &BufferPool,
-    carryover: &mut HashMap<u64, BytesMut>,
+    carryover: &mut HashMap<u64, StreamCarry>,
 ) {
     let mut read_buf = [0u8; STREAM_READ_BUF_SIZE];
     let mut finished = false;
@@ -105,27 +128,30 @@ fn process_single_stream(
                     finished = true;
                 }
 
-                let buf = carryover.entry(stream_id).or_default();
-                buf.extend_from_slice(&read_buf[..len]);
+                let cs = carryover.entry(stream_id).or_default();
+                cs.buf.extend_from_slice(&read_buf[..len]);
 
                 // Defense-in-depth: cap carryover to prevent unbounded
                 // memory growth if a peer floods a stream with data.
-                if buf.len() > MAX_CARRYOVER {
-                    tracing::warn!(
-                        reactor_id,
-                        conn_idx,
-                        stream_id,
-                        carryover_len = buf.len(),
-                        max = MAX_CARRYOVER,
-                        "carryover exceeds limit — draining"
-                    );
-                    buf.clear();
+                if cs.buf.len() > MAX_CARRYOVER {
+                    if !cs.overflow_warned {
+                        cs.overflow_warned = true;
+                        tracing::warn!(
+                            reactor_id,
+                            conn_idx,
+                            stream_id,
+                            carryover_len = cs.buf.len(),
+                            max = MAX_CARRYOVER,
+                            "carryover exceeds limit — draining (further occurrences suppressed)"
+                        );
+                    }
+                    cs.buf.clear();
                 }
 
                 // Decode complete frames from carryover.
                 let mut offset = 0usize;
-                while offset < buf.len() {
-                    match codec::decode_with_len(&buf[offset..]) {
+                while offset < cs.buf.len() {
+                    match codec::decode_with_len(&cs.buf[offset..]) {
                         Ok((frame_ref, consumed)) => {
                             emit_frame_event(
                                 &frame_ref, stream_id, reactor_id, conn_idx, events, pool,
@@ -136,14 +162,17 @@ fn process_single_stream(
                         Err(FrameError::IncompleteHeader { .. })
                         | Err(FrameError::IncompletePayload { .. }) => break,
                         Err(FrameError::PayloadTooLarge { len, .. }) => {
-                            tracing::warn!(
-                                reactor_id,
-                                conn_idx,
-                                stream_id,
-                                declared_len = len,
-                                "oversized frame rejected — draining carryover"
-                            );
-                            buf.clear();
+                            if !cs.oversized_warned {
+                                cs.oversized_warned = true;
+                                tracing::warn!(
+                                    reactor_id,
+                                    conn_idx,
+                                    stream_id,
+                                    declared_len = len,
+                                    "oversized frame rejected — draining carryover (further occurrences suppressed)"
+                                );
+                            }
+                            cs.buf.clear();
                             offset = 0;
                             break;
                         }
@@ -156,7 +185,7 @@ fn process_single_stream(
                     // split_to is O(1) for uniquely-owned buffers — just
                     // advances the internal pointer, no memmove (unlike
                     // Vec::drain which shifts all remaining bytes forward).
-                    let _ = buf.split_to(offset);
+                    let _ = cs.buf.split_to(offset);
                 }
 
                 if fin {
@@ -177,7 +206,7 @@ fn process_single_stream(
 
     // Clean up carryover for finished or empty streams.
     let remove = match carryover.get(&stream_id) {
-        Some(buf) => buf.is_empty() || finished,
+        Some(cs) => cs.buf.is_empty() || finished,
         None => false,
     };
     if remove {
@@ -192,7 +221,7 @@ fn process_single_stream(
     }
 
     if total_frames > 0 {
-        let remaining = carryover.get(&stream_id).map_or(0, |b| b.len());
+        let remaining = carryover.get(&stream_id).map_or(0, |cs| cs.buf.len());
         tracing::trace!(
             reactor_id,
             conn_idx,
