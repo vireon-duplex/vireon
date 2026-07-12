@@ -28,7 +28,10 @@ pub fn build_client_config() -> Result<quiche::Config> {
     // Skip incremental PMTU probing so the full payload size is used from the
     // first 1-RTT packet, maximising per-datagram throughput.
     config.discover_pmtu(false);
-    // Match server's congestion control settings for symmetric throughput.
+    // CUBIC outperforms BBR on loopback: BBR paces to BDP (bandwidth ×
+    // min_RTT), and loopback's ~20µs RTT yields a tiny BDP that throttles
+    // throughput. CUBIC is loss-based — no loss on loopback means the
+    // window grows unbounded.
     config.set_cc_algorithm(quiche::CongestionControlAlgorithm::CUBIC);
     config.set_initial_congestion_window_packets(100);
     Ok(config)

@@ -22,6 +22,10 @@ use io_uring::types::Fd;
 use crate::error::IoError;
 use crate::ops::{OpKind, encode, push_entry};
 
+/// `UDP_SEGMENT` cmsg type — Generic Segmentation Offload for UDP.
+/// Linux kernel ≥ 4.18. Defined in `<linux/udp.h>`.
+const UDP_SEGMENT: i32 = 103;
+
 /// Zero-copy send handle. Borrows the socket fd (never closes it).
 ///
 /// Created by [`Socket::sender`](crate::socket::Socket::sender).
@@ -48,7 +52,7 @@ impl Sender {
     /// This is a simple, safe send path that does **not** require
     /// pre-registered buffers. It copies `buf` into kernel space at
     /// call time. For high-throughput paths, prefer
-    /// [`send_zc`](Self::send_zc).
+    /// [`send_zc`](Self::send_zc) or [`send_gso`](Self::send_gso).
     ///
     /// Returns the number of bytes sent.
     pub fn send_blocking(&self, buf: &[u8], dest: SocketAddr) -> Result<usize, IoError> {
@@ -83,6 +87,80 @@ impl Sender {
             }
             SocketAddr::V6(_) => Err(IoError::Unsupported(
                 "IPv6 send path not implemented; use IPv4".into(),
+            )),
+        }
+    }
+
+    /// Sends multiple same-size UDP datagrams in a single `sendmsg`
+    /// syscall using `UDP_SEGMENT` (Generic Segmentation Offload).
+    ///
+    /// `buf` contains `num_packets` concatenated packets, each exactly
+    /// `gso_size` bytes (the last packet may be shorter). The kernel
+    /// splits the buffer into individual UDP datagrams.
+    ///
+    /// This collapses N syscalls into 1 — the biggest single throughput
+    /// win for high-packet-rate QUIC servers.
+    ///
+    /// Returns the total bytes sent (sum of all segments).
+    pub fn send_gso(&self, buf: &[u8], gso_size: u16, dest: SocketAddr) -> Result<usize, IoError> {
+        match dest {
+            SocketAddr::V4(v4) => {
+                let sin = libc::sockaddr_in {
+                    sin_family: libc::AF_INET as u16,
+                    sin_port: v4.port().to_be(),
+                    sin_addr: libc::in_addr {
+                        s_addr: u32::from(*v4.ip()).to_be(),
+                    },
+                    sin_zero: [0; 8],
+                };
+
+                let iov = libc::iovec {
+                    iov_base: buf.as_ptr() as *mut libc::c_void,
+                    iov_len: buf.len(),
+                };
+
+                // cmsg buffer aligned for cmsghdr + u16 payload.
+                // CMSG_SPACE(sizeof(u16)) on 64-bit = 24 bytes.
+                #[repr(C, align(8))]
+                struct AlignedCmsg([u8; 24]);
+                let mut cmsg_buf = AlignedCmsg([0u8; 24]);
+
+                let cmsg_space =
+                    unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) as usize };
+                let cmsg_len =
+                    unsafe { libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as usize };
+
+                let mut msg = libc::msghdr {
+                    msg_name: &sin as *const _ as *mut libc::c_void,
+                    msg_namelen: std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                    msg_iov: &iov as *const _ as *mut libc::iovec,
+                    msg_iovlen: 1,
+                    msg_control: cmsg_buf.0.as_mut_ptr() as *mut libc::c_void,
+                    msg_controllen: cmsg_space,
+                    msg_flags: 0,
+                };
+
+                // SAFETY: We're writing into the stack-local cmsg_buf
+                // which lives for the duration of sendmsg. CMSG_FIRSTHDR
+                // and CMSG_DATA return pointers within msg_control.
+                unsafe {
+                    let cmsg = libc::CMSG_FIRSTHDR(&msg);
+                    (*cmsg).cmsg_level = libc::IPPROTO_UDP;
+                    (*cmsg).cmsg_type = UDP_SEGMENT;
+                    (*cmsg).cmsg_len = cmsg_len;
+                    let data_ptr = libc::CMSG_DATA(cmsg) as *mut u16;
+                    *data_ptr = gso_size;
+                }
+
+                let sent = unsafe { libc::sendmsg(self.fd, &msg, 0) };
+                if sent < 0 {
+                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+                    return Err(IoError::Submit(std::io::Error::from_raw_os_error(errno)));
+                }
+                Ok(sent as usize)
+            }
+            SocketAddr::V6(_) => Err(IoError::Unsupported(
+                "IPv6 GSO not implemented; use IPv4".into(),
             )),
         }
     }

@@ -139,6 +139,9 @@ impl VireonStack {
 
     /// Processes a batch of [`QuicEvent`]s through the layer stack.
     pub fn process_events(&mut self, events: Vec<QuicEvent>) {
+        // Drive the stream scheduler once per batch (not per-frame).
+        self.application.on_batch_tick();
+
         for event in events {
             match event {
                 QuicEvent::ConnectionEstablished {

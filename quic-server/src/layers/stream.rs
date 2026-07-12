@@ -53,6 +53,16 @@ impl StreamLayer {
         self.conn_streams.insert(conn_idx, HashSet::new());
     }
 
+    /// Drives the stream scheduler once. Call this once per recv batch,
+    /// not per frame — the scheduler records stats and returns
+    /// priority-ordered selections.
+    pub fn on_batch_tick(&mut self) {
+        let mut budget = SchedulingBudget::default_budget(64);
+        if let Err(e) = self.scheduler.tick(&mut budget) {
+            tracing::trace!(error = ?e, "[stream-scheduler] tick");
+        }
+    }
+
     /// Processes a frame: classifies via message layer, then handles
     /// stream lifecycle for control frames.
     ///
@@ -60,14 +70,6 @@ impl StreamLayer {
     /// caller (session → application) can dispatch them.
     pub fn on_frame(&mut self, conn_idx: usize, frame: &FrameRef<'_>) -> FrameAction {
         let action = self.message.classify(frame);
-
-        // [stream-scheduler] Drive the scheduler each tick — records
-        // stats and (in Phase 1+) returns priority-ordered selections.
-        let mut budget = SchedulingBudget::default_budget(64);
-        if let Err(e) = self.scheduler.tick(&mut budget) {
-            // NoStreamsReady / BudgetExhausted are expected on idle ticks.
-            tracing::trace!(error = ?e, "[stream-scheduler] tick");
-        }
 
         if action == FrameAction::Consumed {
             // Control-plane frame — handle stream lifecycle.
@@ -79,7 +81,7 @@ impl StreamLayer {
                             .entry(conn_idx)
                             .or_default()
                             .insert(logical_stream);
-                        tracing::info!(
+                        tracing::trace!(
                             conn_idx,
                             stream_id = logical_stream,
                             open_streams = self.conn_streams.get(&conn_idx).map_or(0, HashSet::len),
@@ -104,7 +106,7 @@ impl StreamLayer {
                         .remove(&logical_stream)
                     {
                         self.slab.release();
-                        tracing::info!(
+                        tracing::trace!(
                             conn_idx,
                             stream_id = logical_stream,
                             msg_type = ?frame.msg_type,
@@ -113,7 +115,7 @@ impl StreamLayer {
                     }
                 }
                 MessageType::Handshake => {
-                    tracing::info!(
+                    tracing::trace!(
                         conn_idx,
                         len = frame.payload.len(),
                         "handshake control frame"

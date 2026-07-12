@@ -33,6 +33,7 @@ use frame::codec;
 use io::handler::{IoHandler, TickContext};
 
 use crate::config::QuicConfig;
+use crate::gso::GsoBatcher;
 
 /// Maximum QUIC packet size — covers full IPv4 UDP jumbo payload
 /// (65535 - IP/UDP overhead). Must match the io-layer receive buffer
@@ -153,11 +154,15 @@ pub struct QuicEngine {
     closed_buf: Vec<usize>,
     /// Per-stream reassembly buffer for frames spanning multiple
     /// `stream_recv` calls. Keyed by QUIC stream ID.
-    stream_carryover: HashMap<u64, Vec<u8>>,
+    stream_carryover: HashMap<u64, bytes::BytesMut>,
 
     // ── Buffer pool ───────────────────────────────────────────────
     /// Pool for frame payload buffers (zero-alloc hot path).
     pool: BufferPool,
+
+    // ── GSO send batching ─────────────────────────────────────────
+    /// Batches same-destination packets for `UDP_SEGMENT` offload.
+    gso_batcher: GsoBatcher,
 
     // ── Event queue ───────────────────────────────────────────────
     /// Events collected during `on_datagram` / `on_tick`, drained by caller.
@@ -213,6 +218,7 @@ impl QuicEngine {
             closed_buf: Vec::with_capacity(16),
             stream_carryover: HashMap::new(),
             pool,
+            gso_batcher: GsoBatcher::new(),
             events: Vec::new(),
             scid_counter: 1,
             active_count: 0,

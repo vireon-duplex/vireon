@@ -275,9 +275,8 @@ impl AppDispatcher for VireonDispatcher {
         match frame.msg_type {
             MessageType::TextToken => {
                 self.route_ai_token(ctx, frame);
-                tracing::info!(
+                tracing::trace!(
                     conn_idx = ctx.conn_idx,
-                    session_id = ?ctx.session_id,
                     logical_stream = frame.stream_id.get(),
                     seq = frame.seq.get(),
                     payload_len = frame.payload.len(),
@@ -285,9 +284,8 @@ impl AppDispatcher for VireonDispatcher {
                 );
             }
             MessageType::ToolCall => {
-                tracing::info!(
+                tracing::trace!(
                     conn_idx = ctx.conn_idx,
-                    session_id = ?ctx.session_id,
                     payload_len = frame.payload.len(),
                     "[app:rpc] ToolCall → handle"
                 );
@@ -310,18 +308,16 @@ impl AppDispatcher for VireonDispatcher {
                 }
             }
             MessageType::ToolResult => {
-                tracing::info!(
+                tracing::trace!(
                     conn_idx = ctx.conn_idx,
-                    session_id = ?ctx.session_id,
                     payload_len = frame.payload.len(),
                     "[app:rpc] ToolResult (client-side, log only)"
                 );
             }
             MessageType::AudioFrame | MessageType::VideoFrame | MessageType::ImageFrame => {
                 self.route_media_frame(ctx, frame);
-                tracing::info!(
+                tracing::trace!(
                     conn_idx = ctx.conn_idx,
-                    session_id = ?ctx.session_id,
                     msg_type = ?frame.msg_type,
                     logical_stream = frame.stream_id.get(),
                     payload_len = frame.payload.len(),
@@ -330,17 +326,15 @@ impl AppDispatcher for VireonDispatcher {
             }
             MessageType::StateUpdate => {
                 self.route_state_update(ctx, frame);
-                tracing::info!(
+                tracing::trace!(
                     conn_idx = ctx.conn_idx,
-                    session_id = ?ctx.session_id,
                     payload_len = frame.payload.len(),
                     "[app:event-bus+pubsub] StateUpdate"
                 );
             }
             MessageType::Error => {
-                tracing::info!(
+                tracing::trace!(
                     conn_idx = ctx.conn_idx,
-                    session_id = ?ctx.session_id,
                     payload_len = frame.payload.len(),
                     "[app] Error frame"
                 );
@@ -589,6 +583,12 @@ impl ApplicationLayer {
         if action == FrameAction::DispatchToApp {
             self.dispatcher.on_data_frame(ctx, frame);
         }
+    }
+
+    /// Drives the stream scheduler once per recv batch.
+    /// Propagates through session → stream.
+    pub fn on_batch_tick(&mut self) {
+        self.session.on_batch_tick();
     }
 
     /// Drains queued outgoing frames produced by the dispatcher.
