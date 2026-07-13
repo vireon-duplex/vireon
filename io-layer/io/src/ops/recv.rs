@@ -14,7 +14,7 @@ use io_uring::opcode::RecvMsgMulti;
 use io_uring::types::{Fd, RecvMsgOut};
 
 use crate::error::IoError;
-use crate::ops::{OpKind, encode, push_entry};
+use crate::ops::{OpKind, encode, push_and_submit};
 
 /// Maximum space the kernel will reserve in each provided buffer for the
 /// peer's socket address. `sockaddr_storage` is 128 bytes; we cap at 128
@@ -100,13 +100,15 @@ impl Receiver {
     pub fn arm(&self, ring: &mut IoUring, id: u64) -> Result<(), IoError> {
         let fd = Fd(self.fd);
         let user_data = encode(OpKind::Recv, id);
-        // SAFETY: `msg_hdr` lives in `self` for the duration of the call;
-        // the kernel reads `msg_namelen`/`msg_controllen` at submit time
-        // and does not retain the pointer afterwards.
+        // SAFETY: `msg_hdr` lives in `self` (the Receiver), which outlives
+        // the ring, so the pointer never dangles. We use `push_and_submit`
+        // (immediate submit) rather than batched `push_entry` because the
+        // re-arm must take effect before the reactor's `on_tick` phase —
+        // otherwise packets arriving during `flush_sends` are dropped.
         let entry = RecvMsgMulti::new(fd, &self.msg_hdr as *const _, self.bgid)
             .build()
             .user_data(user_data);
-        push_entry(ring, entry)
+        push_and_submit(ring, entry)
     }
 
     /// Parses a provided buffer into raw payload + peer address — no
@@ -234,6 +236,7 @@ mod tests {
     fn arm_pushes_an_sqe() {
         let mut ring = fresh_ring();
         let recv = Receiver::new(0, 1);
+        // arm() uses push_and_submit — SQE is immediately submitted.
         recv.arm(&mut ring, 0xABC).expect("arm");
         assert!(ring.submission().is_empty());
     }

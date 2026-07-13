@@ -53,7 +53,7 @@ impl Worker {
 
         tracing::info!(core_id, port = config.port, "initializing reactor");
 
-        let reactor = Reactor::init(core_id, config.port, config.queue_depth)
+        let reactor = Reactor::init(core_id, config.port, config.queue_depth, config.sqpoll)
             .map_err(|e| ServerError::ReactorInit(format!("{e:?}")))?;
 
         let local_addr = reactor

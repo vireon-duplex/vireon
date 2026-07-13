@@ -20,7 +20,7 @@ use io_uring::opcode::SendZc;
 use io_uring::types::Fd;
 
 use crate::error::IoError;
-use crate::ops::{OpKind, encode, push_entry};
+use crate::ops::{OpKind, encode, push_and_submit};
 
 /// `UDP_SEGMENT` cmsg type — Generic Segmentation Offload for UDP.
 /// Linux kernel ≥ 4.18. Defined in `<linux/udp.h>`.
@@ -189,8 +189,10 @@ impl Sender {
         let user_data = encode(OpKind::Send, id);
         match dest {
             SocketAddr::V4(v4) => {
-                // Stack-local sockaddr_in; valid through the `submit()`
-                // call inside `push_entry` (kernel copies at submit time).
+                // Stack-local sockaddr_in; valid through the immediate
+                // `submit()` inside `push_and_submit` (the kernel reads
+                // dest_addr during submit). Using batch-mode push here
+                // would leave a dangling pointer in the SQ ring.
                 let sin = libc::sockaddr_in {
                     sin_family: libc::AF_INET as u16,
                     sin_port: v4.port().to_be(),
@@ -205,7 +207,7 @@ impl Sender {
                     .dest_addr_len(std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t)
                     .build()
                     .user_data(user_data);
-                push_entry(ring, entry)
+                push_and_submit(ring, entry)
             }
             SocketAddr::V6(_) => Err(IoError::Unsupported(
                 "IPv6 send path not implemented; use IPv4".into(),

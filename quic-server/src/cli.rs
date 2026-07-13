@@ -50,6 +50,12 @@ pub struct Cli {
     /// Used for load-testing (RR / pipeline benchmark modes).
     #[arg(long)]
     pub echo: bool,
+
+    /// Enable SQPOLL kernel thread (kernel ≥ 5.11, requires CAP_SYS_NICE).
+    /// The kernel thread polls the SQ ring, eliminating submit syscalls.
+    /// Falls back to standard mode if the kernel denies SQPOLL.
+    #[arg(long)]
+    pub sqpoll: bool,
 }
 
 /// CLI worker-mode selector.
