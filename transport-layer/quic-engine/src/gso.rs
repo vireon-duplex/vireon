@@ -89,7 +89,10 @@ impl GsoBatcher {
             || (self.count > 0 && (self.dest != Some(dest) || pkt.len() != self.seg_size));
 
         if needs_flush {
-            self.flush(sender)?;
+            // Flush the old batch. Errors here (e.g. EAGAIN on a
+            // non-blocking socket) must not prevent the new packet from
+            // being queued — the old batch is already lost regardless.
+            let _ = self.flush(sender);
         }
 
         if self.count == 0 {
@@ -119,48 +122,61 @@ impl GsoBatcher {
 
         // Single packet — no GSO benefit, just send_blocking.
         if self.count == 1 || !self.gso_supported {
-            self.flush_individual(sender, dest)?;
-            return Ok(());
+            return self.flush_individual(sender, dest);
         }
 
         // Try GSO.
         match sender.send_gso(&self.buf, self.seg_size as u16, dest) {
-            Ok(_) => {}
+            Ok(_) => {
+                self.reset();
+                Ok(())
+            }
             Err(e) => {
-                // send_gso wraps errors as IoError::Submit(io::Error).
-                // Extract the raw errno to decide whether GSO is supported.
                 let errno = match &e {
                     IoError::Submit(io_err) => io_err.raw_os_error(),
                     _ => None,
                 };
-                // EOPNOTSUPP (95), EINVAL (22), ENOTSUP (251) — kernel
-                // doesn't support UDP_SEGMENT on this socket. Fall back.
-                if matches!(errno, Some(95) | Some(22) | Some(251)) {
-                    tracing::warn!(
-                        errno,
-                        "GSO unsupported — falling back to per-packet send_blocking"
-                    );
-                    self.gso_supported = false;
-                    self.flush_individual(sender, dest)?;
-                } else {
-                    self.reset();
-                    return Err(e);
+                match errno {
+                    // EAGAIN/EWOULDBLOCK (11) — socket send buffer full on
+                    // a non-blocking socket. Transient: fall back to
+                    // individual sends WITHOUT permanently disabling GSO.
+                    Some(11) => self.flush_individual(sender, dest),
+                    // EOPNOTSUPP (95), EINVAL (22), ENOTSUP (251) — kernel
+                    // doesn't support UDP_SEGMENT. Disable GSO permanently.
+                    Some(95) | Some(22) | Some(251) => {
+                        tracing::warn!(
+                            errno,
+                            "GSO unsupported — falling back to per-packet send_blocking"
+                        );
+                        self.gso_supported = false;
+                        self.flush_individual(sender, dest)
+                    }
+                    _ => {
+                        self.reset();
+                        Err(e)
+                    }
                 }
             }
         }
-
-        self.reset();
-        Ok(())
     }
 
     /// Sends each segment individually via `send_blocking`.
+    ///
+    /// Resets the batch state even on error to prevent duplicate sends
+    /// when the caller retries.
     fn flush_individual(&mut self, sender: &Sender, dest: SocketAddr) -> Result<(), IoError> {
         let seg = self.seg_size;
         let total = self.buf.len();
         let mut off = 0usize;
         while off < total {
             let end = (off + seg).min(total);
-            sender.send_blocking(&self.buf[off..end], dest)?;
+            if let Err(e) = sender.send_blocking(&self.buf[off..end], dest) {
+                // Reset even on partial failure so the next push/flush
+                // starts fresh — no duplicate sends of already-sent
+                // segments.
+                self.reset();
+                return Err(e);
+            }
             off = end;
         }
         self.reset();
