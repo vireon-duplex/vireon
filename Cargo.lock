@@ -190,6 +190,7 @@ dependencies = [
  "criterion",
  "libc",
  "opentelemetry",
+ "parking_lot",
  "prometheus",
  "thiserror 2.0.18",
  "tracing",
