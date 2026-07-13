@@ -26,6 +26,8 @@
 //! ```
 
 use rustc_hash::FxHashMap;
+
+use crate::hash::CrcHashMap;
 use std::net::SocketAddr;
 
 use buffer_pool::BufferPool;
@@ -148,7 +150,7 @@ pub struct QuicEngine {
     free_slots: Vec<usize>,
     /// DCID → slab index routing table. Uses a fixed-size zero-padded
     /// array key to avoid per-datagram heap allocation.
-    dcid_to_idx: FxHashMap<[u8; quiche::MAX_CONN_ID_LEN], usize>,
+    dcid_to_idx: CrcHashMap<[u8; quiche::MAX_CONN_ID_LEN], usize>,
 
     // ── Reusable buffers ──────────────────────────────────────────
     /// Buffer for incoming packet header parsing + recv.
@@ -227,7 +229,7 @@ impl QuicEngine {
             local_addr,
             connections: Vec::new(),
             free_slots: Vec::new(),
-            dcid_to_idx: FxHashMap::default(),
+            dcid_to_idx: CrcHashMap::default(),
             pkt_buf: vec![0u8; 65535],
             out_buf: vec![0u8; MAX_PKT_SIZE],
             readable_buf: Vec::with_capacity(16),

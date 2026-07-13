@@ -82,6 +82,7 @@ pub mod error;
 pub mod flow_control;
 pub mod frame;
 pub mod gso;
+pub mod hash;
 pub mod health;
 pub mod loss_recovery;
 pub mod migration;
