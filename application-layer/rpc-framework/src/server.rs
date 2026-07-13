@@ -3,6 +3,7 @@
 //! Phase 1: in-memory method registry. `handle()` echoes the request
 //! payload back as the response (real handler dispatch lands later).
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -64,13 +65,15 @@ impl RpcServer {
     /// payload back as the response. Real handler dispatch is a later
     /// phase; this is enough to exercise the full request/response flow
     /// end-to-end.
-    pub fn handle(&self, request: &[u8]) -> Result<Vec<u8>, RpcError> {
+    ///
+    /// The echo case returns [`Cow::Borrowed`] — zero-allocation, zero-copy.
+    /// Future real handlers that compute a response will return
+    /// [`Cow::Owned`], which converts to `bytes::Bytes` without copying.
+    pub fn handle<'a>(&self, request: &'a [u8]) -> Result<Cow<'a, [u8]>, RpcError> {
         self.stats.record_bytes_received(request.len() as u64);
-        // Echo the request as the Phase 1 response.
-        let response = request.to_vec();
-        self.stats.record_bytes_sent(response.len() as u64);
+        self.stats.record_bytes_sent(request.len() as u64);
         self.stats.record_call_success();
-        Ok(response)
+        Ok(Cow::Borrowed(request))
     }
 
     /// Returns the number of registered methods.
@@ -130,7 +133,7 @@ mod tests {
         let server = RpcServer::new(RpcConfig::new());
         let req = b"ping";
         let resp = server.handle(req).unwrap();
-        assert_eq!(resp, req);
+        assert_eq!(&*resp, req);
         let snap = server.stats.snapshot();
         assert_eq!(snap.calls_total, 1);
         assert_eq!(snap.calls_succeeded, 1);
