@@ -46,6 +46,7 @@
 
 use bytes::{BufMut, Bytes, BytesMut};
 
+use crate::crc32c;
 use crate::error::FrameError;
 use crate::header::{FrameFlags, MessageType, Seq, StreamId};
 
@@ -53,6 +54,9 @@ use crate::header::{FrameFlags, MessageType, Seq, StreamId};
 ///
 /// Layout: `stream_id(8) + seq(8) + msg_type(1) + flags(1) + payload_len(4) = 22`.
 pub const HEADER_SIZE: usize = 22;
+
+/// Wire size of the CRC32C trailer in bytes.
+pub const CRC_SIZE: usize = 4;
 
 // ---------------------------------------------------------------------------
 // Codec-local value types
@@ -121,10 +125,10 @@ pub struct FrameRef<'a> {
 }
 
 impl<'a> FrameRef<'a> {
-    /// Total wire bytes this frame occupies: header + payload.
+    /// Total wire bytes this frame occupies: header + payload + CRC.
     #[inline(always)]
     pub fn wire_size(&self) -> usize {
-        HEADER_SIZE + self.payload.len()
+        HEADER_SIZE + self.payload.len() + CRC_SIZE
     }
 
     /// Copies the payload once to produce an owned [`Frame`].
@@ -167,10 +171,10 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// Total wire bytes this frame occupies: header + payload.
+    /// Total wire bytes this frame occupies: header + payload + CRC.
     #[inline(always)]
     pub fn wire_size(&self) -> usize {
-        HEADER_SIZE + self.payload.len()
+        HEADER_SIZE + self.payload.len() + CRC_SIZE
     }
 }
 
@@ -210,29 +214,29 @@ pub fn encode_into(
         len: payload.len(),
         max: u32::MAX as usize,
     })?;
-    let needed = HEADER_SIZE + payload.len();
-    // Skip reserve() when capacity is already sufficient — avoids the branch
-    // cost when the caller pre-allocates the buffer.
+    let needed = HEADER_SIZE + payload.len() + CRC_SIZE;
     let spare = dst.capacity() - dst.len();
     if spare < needed {
-        // Pool-backed callers route through `encode_buffer_pooled` and never
-        // hit this branch — the slot is sized up front via `pool.get(needed)`.
-        // This `reserve()` is the BytesMut growth path for non-pool callers.
         dst.reserve(needed - spare);
     }
     // SAFETY: `dst` now has at least `needed` spare bytes starting at
     // `as_mut_ptr() + len()`. Writing there and committing via `advance_mut`
     // is the documented BytesMut unsafe-write pattern.
     unsafe {
-        let p = dst.as_mut_ptr().add(dst.len());
-        core::ptr::write_unaligned(p as *mut u64, header.stream_id.get().to_be());
-        core::ptr::write_unaligned(p.add(8) as *mut u64, header.seq.get().to_be());
-        *p.add(16) = header.msg_type.as_byte();
-        *p.add(17) = header.flags.bits();
-        core::ptr::write_unaligned(p.add(18) as *mut u32, len.to_be());
+        let base = dst.as_mut_ptr().add(dst.len());
+        // Write header (22 bytes).
+        core::ptr::write_unaligned(base as *mut u64, header.stream_id.get().to_be());
+        core::ptr::write_unaligned(base.add(8) as *mut u64, header.seq.get().to_be());
+        *base.add(16) = header.msg_type.as_byte();
+        *base.add(17) = header.flags.bits();
+        core::ptr::write_unaligned(base.add(18) as *mut u32, len.to_be());
+        // Write payload.
         if !payload.is_empty() {
-            core::ptr::copy_nonoverlapping(payload.as_ptr(), p.add(HEADER_SIZE), payload.len());
+            core::ptr::copy_nonoverlapping(payload.as_ptr(), base.add(HEADER_SIZE), payload.len());
         }
+        // Compute CRC32C over header + payload, write trailer.
+        let crc = crc32c::crc32c(core::slice::from_raw_parts(base, HEADER_SIZE + payload.len()));
+        core::ptr::write_unaligned(base.add(HEADER_SIZE + payload.len()) as *mut u32, crc.to_be());
         dst.advance_mut(needed);
     }
     Ok(())
@@ -263,7 +267,7 @@ pub fn encode_into_slice(
         len: payload.len(),
         max: u32::MAX as usize,
     })?;
-    let needed = HEADER_SIZE + payload.len();
+    let needed = HEADER_SIZE + payload.len() + CRC_SIZE;
     if dst.len() < needed {
         return Err(FrameError::BufferTooSmall {
             needed,
@@ -271,9 +275,7 @@ pub fn encode_into_slice(
         });
     }
     // SAFETY: `dst.len() >= needed` (checked above). Every offset below is
-    // strictly less than `needed` and therefore in-bounds. Unaligned stores
-    // are sound because `u8` slices have no alignment guarantee — we never
-    // read these back as typed values, only as raw bytes on the wire.
+    // strictly less than `needed` and therefore in-bounds.
     unsafe {
         let p = dst.as_mut_ptr();
         core::ptr::write_unaligned(p as *mut u64, header.stream_id.get().to_be());
@@ -284,6 +286,9 @@ pub fn encode_into_slice(
         if !payload.is_empty() {
             core::ptr::copy_nonoverlapping(payload.as_ptr(), p.add(HEADER_SIZE), payload.len());
         }
+        // Compute CRC32C over header + payload, write trailer.
+        let crc = crc32c::crc32c(core::slice::from_raw_parts(p, HEADER_SIZE + payload.len()));
+        core::ptr::write_unaligned(p.add(HEADER_SIZE + payload.len()) as *mut u32, crc.to_be());
     }
     Ok(needed)
 }
@@ -332,9 +337,6 @@ pub fn decode_with_len(src: &[u8]) -> Result<(FrameRef<'_>, usize), FrameError> 
     };
     let msg_type = MessageType::try_from(msg_type_byte)?;
 
-    // Reject oversized payloads before any downstream allocation.
-    // This is the primary defense against memory exhaustion from
-    // misbehaving or malicious peers declaring huge payload_len values.
     if payload_len > DEFAULT_MAX_PAYLOAD_LEN {
         return Err(FrameError::PayloadTooLarge {
             len: payload_len,
@@ -344,9 +346,10 @@ pub fn decode_with_len(src: &[u8]) -> Result<(FrameRef<'_>, usize), FrameError> 
 
     let frame_end = HEADER_SIZE
         .checked_add(payload_len)
+        .and_then(|v| v.checked_add(CRC_SIZE))
         .ok_or(FrameError::PayloadTooLarge {
             len: payload_len,
-            max: usize::MAX.saturating_sub(HEADER_SIZE),
+            max: usize::MAX.saturating_sub(HEADER_SIZE + CRC_SIZE),
         })?;
     if src.len() < frame_end {
         return Err(FrameError::IncompletePayload {
@@ -354,14 +357,31 @@ pub fn decode_with_len(src: &[u8]) -> Result<(FrameRef<'_>, usize), FrameError> 
             have: src.len() - HEADER_SIZE,
         });
     }
+
+    // Verify CRC32C over header + payload.
+    let data_end = HEADER_SIZE + payload_len;
+    // SAFETY: src.len() >= frame_end = HEADER_SIZE + payload_len + CRC_SIZE
+    let expected = unsafe {
+        u32::from_be(core::ptr::read_unaligned(
+            src.as_ptr().add(data_end) as *const u32,
+        ))
+    };
+    let actual = crc32c::crc32c(&src[..data_end]);
+    if expected != actual {
+        return Err(FrameError::CrcMismatch {
+            expected,
+            actual,
+        });
+    }
+
     Ok((
         FrameRef {
             stream_id,
             seq,
             msg_type,
             flags,
-            // SAFETY: frame_end = HEADER_SIZE + payload_len <= src.len()
-            payload: unsafe { src.get_unchecked(HEADER_SIZE..frame_end) },
+            // SAFETY: data_end = HEADER_SIZE + payload_len <= src.len() - CRC_SIZE
+            payload: unsafe { src.get_unchecked(HEADER_SIZE..data_end) },
         },
         frame_end,
     ))
@@ -502,9 +522,6 @@ impl FrameDecoder {
         if self.buf.len() < HEADER_SIZE {
             return Ok(None);
         }
-        // Read the complete header in a single pass before split_to —
-        // no double-parse (previously msg_type/payload_len were read before
-        // split, then stream_id/seq/flags were re-read from frame_bytes).
         // SAFETY: buf.len() >= HEADER_SIZE = 22; all offsets are in-bounds.
         let (stream_id, seq, msg_type_byte, flags, payload_len) = unsafe {
             let p = self.buf.as_ptr();
@@ -518,8 +535,6 @@ impl FrameDecoder {
                 u32::from_be(core::ptr::read_unaligned(p.add(18) as *const u32)) as usize;
             (stream_id, seq, msg_type_byte, flags, payload_len)
         };
-        // Validate type *before* split_to so an error leaves offending bytes
-        // in the buffer for inspection / recovery.
         let msg_type = MessageType::try_from(msg_type_byte)?;
         if payload_len > self.max_payload_len {
             return Err(FrameError::PayloadTooLarge {
@@ -530,6 +545,7 @@ impl FrameDecoder {
         let frame_end =
             HEADER_SIZE
                 .checked_add(payload_len)
+                .and_then(|v| v.checked_add(CRC_SIZE))
                 .ok_or(FrameError::PayloadTooLarge {
                     len: payload_len,
                     max: self.max_payload_len,
@@ -537,15 +553,24 @@ impl FrameDecoder {
         if self.buf.len() < frame_end {
             return Ok(None);
         }
-        // All validation passed. Detach the frame bytes — zero-copy split.
-        // `freeze()` bumps a refcount; `slice()` gives a sub-view with no copy.
-        // Future optimisation: a `decode_frame_ref` variant returning
-        // `FrameRef<'_>` borrowing `self.buf` would eliminate the `freeze()`
-        // Arc increment entirely. Tracked alongside the `Frame` doc note and
-        // the ring-buffer follow-up above — independent of the pool-backed
-        // encoder path that is already implemented.
+        // Verify CRC32C over header + payload before detaching.
+        let data_end = HEADER_SIZE + payload_len;
+        // SAFETY: buf.len() >= frame_end = HEADER_SIZE + payload_len + CRC_SIZE
+        let expected = unsafe {
+            u32::from_be(core::ptr::read_unaligned(
+                self.buf.as_ptr().add(data_end) as *const u32,
+            ))
+        };
+        let actual = crc32c::crc32c(&self.buf[..data_end]);
+        if expected != actual {
+            return Err(FrameError::CrcMismatch {
+                expected,
+                actual,
+            });
+        }
+
         let frame_bytes = self.buf.split_to(frame_end).freeze();
-        let payload = frame_bytes.slice(HEADER_SIZE..);
+        let payload = frame_bytes.slice(HEADER_SIZE..data_end);
         Ok(Some(Frame {
             stream_id,
             seq,
@@ -651,7 +676,7 @@ impl FrameEncoder {
         payload: &[u8],
     ) -> Result<BytesMut, FrameError> {
         self.check_len(payload.len())?;
-        let mut buf = BytesMut::with_capacity(HEADER_SIZE + payload.len());
+        let mut buf = BytesMut::with_capacity(HEADER_SIZE + payload.len() + CRC_SIZE);
         encode_into(&mut buf, header, payload)?;
         Ok(buf)
     }
@@ -683,7 +708,7 @@ impl FrameEncoder {
         payload: &[u8],
     ) -> Result<buffer_pool::Buffer, EncodePooledError> {
         self.check_len(payload.len())?;
-        let needed = HEADER_SIZE + payload.len();
+        let needed = HEADER_SIZE + payload.len() + CRC_SIZE;
         let mut buf = pool.get(needed).map_err(EncodePooledError::Pool)?;
         // SAFETY: `encode_into_slice` only writes within `needed` bytes and
         // `buf` was just leased for at least `needed` bytes.
@@ -740,7 +765,7 @@ mod tests {
         assert!(frame.flags.contains(FrameFlags::FIN));
         assert!(frame.flags.contains(FrameFlags::ACK_REQ));
         assert_eq!(frame.payload, payload);
-        assert_eq!(consumed, HEADER_SIZE + payload.len());
+        assert_eq!(consumed, HEADER_SIZE + payload.len() + CRC_SIZE);
         assert_eq!(frame.wire_size(), consumed);
     }
 
@@ -761,16 +786,16 @@ mod tests {
         assert_eq!(buf[17], FrameFlags::FIN.bits());
         // payload_len u32 BE = 0
         assert_eq!(&buf[18..22], &[0u8, 0, 0, 0]);
-        assert_eq!(buf.len(), HEADER_SIZE);
+        assert_eq!(buf.len(), HEADER_SIZE + CRC_SIZE);
     }
 
     #[test]
     fn encode_into_reuses_preallocated_capacity() {
         // Pre-allocate exact capacity; encode_into must not grow the buffer.
-        let mut buf = BytesMut::with_capacity(HEADER_SIZE + 4);
+        let mut buf = BytesMut::with_capacity(HEADER_SIZE + 4 + CRC_SIZE);
         let header = FrameHeader::new(StreamId::new(1), MessageType::TextToken);
         encode_into(&mut buf, header, b"abcd").unwrap();
-        assert_eq!(buf.len(), HEADER_SIZE + 4);
+        assert_eq!(buf.len(), HEADER_SIZE + 4 + CRC_SIZE);
     }
 
     #[test]
@@ -791,14 +816,14 @@ mod tests {
         let mut buf = BytesMut::new();
         let header = FrameHeader::new(StreamId::new(1), MessageType::TextToken);
         encode_into(&mut buf, header, b"abc").unwrap();
-        // Truncate the payload by one byte.
+        // Truncate by one byte — CRC trailer will be incomplete.
         let truncated = &buf[..buf.len() - 1];
         let err = decode(truncated).unwrap_err();
         assert!(matches!(
             err,
             FrameError::IncompletePayload {
                 declared: 3,
-                have: 2
+                have: 6
             }
         ));
     }
@@ -1107,7 +1132,7 @@ mod tests {
         let header =
             FrameHeader::new(StreamId::new(1), MessageType::TextToken).with_seq(Seq::new(5));
         let out = enc.encode_buffer(header, b"abc").unwrap();
-        assert_eq!(out.len(), HEADER_SIZE + 3);
+        assert_eq!(out.len(), HEADER_SIZE + 3 + CRC_SIZE);
         let frame = decode(&out).unwrap();
         assert_eq!(frame.stream_id, StreamId::new(1));
         assert_eq!(frame.seq, Seq::new(5));
@@ -1137,9 +1162,9 @@ mod tests {
         let header =
             FrameHeader::new(StreamId::new(1), MessageType::TextToken).with_seq(Seq::new(5));
         let payload = b"hello slice";
-        let mut buf = vec![0u8; HEADER_SIZE + payload.len()];
+        let mut buf = vec![0u8; HEADER_SIZE + payload.len() + CRC_SIZE];
         let written = encode_into_slice(&mut buf, header, payload).unwrap();
-        assert_eq!(written, HEADER_SIZE + payload.len());
+        assert_eq!(written, HEADER_SIZE + payload.len() + CRC_SIZE);
 
         let frame = decode(&buf).unwrap();
         assert_eq!(frame.stream_id, StreamId::new(1));
@@ -1151,12 +1176,13 @@ mod tests {
     fn encode_into_slice_rejects_small_buffer() {
         let header = FrameHeader::new(StreamId::new(1), MessageType::TextToken);
         let payload = b"hello slice";
-        let mut buf = vec![0u8; HEADER_SIZE + payload.len() - 1];
+        let mut buf = vec![0u8; HEADER_SIZE + payload.len() + CRC_SIZE - 1];
         let err = encode_into_slice(&mut buf, header, payload).unwrap_err();
         assert!(matches!(
             err,
             FrameError::BufferTooSmall { needed, have }
-            if needed == HEADER_SIZE + payload.len() && have == HEADER_SIZE + payload.len() - 1
+            if needed == HEADER_SIZE + payload.len() + CRC_SIZE
+                && have == HEADER_SIZE + payload.len() + CRC_SIZE - 1
         ));
     }
 
@@ -1171,12 +1197,26 @@ mod tests {
             FrameHeader::new(StreamId::new(2), MessageType::AudioFrame).with_seq(Seq::new(10));
         let payload = b"hello pooled codec";
         let buf = enc.encode_buffer_pooled(&pool, header, payload).unwrap();
-        assert_eq!(buf.len(), HEADER_SIZE + payload.len());
+        assert_eq!(buf.len(), HEADER_SIZE + payload.len() + CRC_SIZE);
 
         let frame = decode(&buf).unwrap();
         assert_eq!(frame.stream_id, StreamId::new(2));
         assert_eq!(frame.seq, Seq::new(10));
         assert_eq!(frame.payload, payload);
+    }
+
+    // ---------- CRC32C verification ----------
+
+    #[test]
+    fn decode_rejects_corrupted_payload() {
+        let mut buf = BytesMut::new();
+        let header = FrameHeader::new(StreamId::new(1), MessageType::TextToken)
+            .with_seq(Seq::new(42));
+        encode_into(&mut buf, header, b"hello crc").unwrap();
+        // Flip a bit in the payload.
+        buf[HEADER_SIZE] ^= 1;
+        let err = decode(&buf).unwrap_err();
+        assert!(matches!(err, FrameError::CrcMismatch { .. }));
     }
 
     // ---------- zero-copy verification ----------
