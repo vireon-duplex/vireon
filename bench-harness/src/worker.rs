@@ -25,7 +25,7 @@ use crate::config::build_client_config;
 use crate::gso::send_with_gso;
 use crate::layers::ClientStack;
 use crate::stats::WorkerResult;
-use crate::workload::{COALESCE, WorkloadEntry};
+use crate::workload::WorkloadEntry;
 
 /// Selects the measurement strategy for each worker.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -66,11 +66,11 @@ fn gen_scid() -> Vec<u8> {
     bytes
 }
 
-/// Computes the max coalesce buffer capacity needed (largest single frame × COALESCE).
-fn max_coalesce_capacity(entries: &[WorkloadEntry]) -> usize {
+/// Computes the max coalesce buffer capacity needed (largest single frame × coalesce).
+fn max_coalesce_capacity(entries: &[WorkloadEntry], coalesce: usize) -> usize {
     entries
         .iter()
-        .map(|e| (frame::codec::HEADER_SIZE + e.payload_len) * COALESCE)
+        .map(|e| (frame::codec::HEADER_SIZE + e.payload_len) * coalesce)
         .max()
         .unwrap_or(64 * 1024)
 }
@@ -84,6 +84,7 @@ pub fn worker(
     duration: Duration,
     mode: BenchMode,
     pipeline_depth: usize,
+    coalesce: usize,
     shutdown: &AtomicBool,
     barrier: &Barrier,
 ) -> WorkerResult {
@@ -169,7 +170,7 @@ pub fn worker(
     );
 
     // --- Create client layer stack --------------------------------------
-    let mut stack = ClientStack::new(max_coalesce_capacity(entries));
+    let mut stack = ClientStack::new(max_coalesce_capacity(entries, coalesce));
     if stack.on_connect().is_none() {
         return WorkerResult::failed("session table full".into(), handshake_time);
     }
@@ -181,6 +182,7 @@ pub fn worker(
             &mut conn,
             entries,
             duration,
+            coalesce,
             shutdown,
             handshake_time,
             target,
@@ -194,6 +196,7 @@ pub fn worker(
             &mut conn,
             entries,
             duration,
+            coalesce,
             shutdown,
             handshake_time,
             target,
@@ -207,6 +210,7 @@ pub fn worker(
             &mut conn,
             entries,
             duration,
+            coalesce,
             shutdown,
             handshake_time,
             target,
@@ -220,6 +224,7 @@ pub fn worker(
             &mut conn,
             entries,
             duration,
+            coalesce,
             shutdown,
             handshake_time,
             pipeline_depth,
@@ -316,6 +321,7 @@ fn send_through_stack(
     stack: &mut ClientStack,
     conn: &mut quiche::Connection,
     entries: &[WorkloadEntry],
+    coalesce: usize,
     socket: &UdpSocket,
     recv_buf: &mut [u8],
     send_buf: &mut [u8],
@@ -340,7 +346,7 @@ fn send_through_stack(
             entry.msg_type,
             entry.flags,
             &entry.payload,
-            COALESCE,
+            coalesce,
         );
         let mut off = 0usize;
         while off < encode_buf.len() {
@@ -414,6 +420,7 @@ fn measure_rr(
     conn: &mut quiche::Connection,
     entries: &[WorkloadEntry],
     duration: Duration,
+    coalesce: usize,
     shutdown: &AtomicBool,
     handshake_time: Duration,
     target: SocketAddr,
@@ -424,7 +431,7 @@ fn measure_rr(
 ) -> WorkerResult {
     let batch_coalesced_bytes: u64 = entries
         .iter()
-        .map(|e| (frame::codec::HEADER_SIZE + e.payload_len) as u64 * COALESCE as u64)
+        .map(|e| (frame::codec::HEADER_SIZE + e.payload_len) as u64 * coalesce as u64)
         .sum();
     let mut stream_buf = vec![0u8; DGRAM_BUF];
     let mut encode_buf: Vec<u8> = Vec::with_capacity(DGRAM_BUF);
@@ -450,7 +457,7 @@ fn measure_rr(
                 entry.msg_type,
                 entry.flags,
                 &entry.payload,
-                COALESCE,
+                coalesce,
             );
             let mut off = 0usize;
             while off < encode_buf.len() {
@@ -542,6 +549,7 @@ fn measure_multi_rr(
     conn: &mut quiche::Connection,
     entries: &[WorkloadEntry],
     duration: Duration,
+    coalesce: usize,
     shutdown: &AtomicBool,
     handshake_time: Duration,
     target: SocketAddr,
@@ -552,9 +560,9 @@ fn measure_multi_rr(
 ) -> WorkerResult {
     let total_bytes: u64 = entries
         .iter()
-        .map(|e| (frame::codec::HEADER_SIZE + e.payload_len) as u64 * COALESCE as u64)
+        .map(|e| (frame::codec::HEADER_SIZE + e.payload_len) as u64 * coalesce as u64)
         .sum();
-    let frames_per_batch = (entries.len() * COALESCE) as u64;
+    let frames_per_batch = (entries.len() * coalesce) as u64;
     let mut stream_buf = vec![0u8; DGRAM_BUF];
     let mut encode_buf: Vec<u8> = Vec::with_capacity(DGRAM_BUF);
     let mut rtts = Vec::new();
@@ -577,6 +585,7 @@ fn measure_multi_rr(
             stack,
             conn,
             entries,
+            coalesce,
             socket,
             recv_buf,
             send_buf,
@@ -641,6 +650,7 @@ fn measure_stream(
     conn: &mut quiche::Connection,
     entries: &[WorkloadEntry],
     duration: Duration,
+    coalesce: usize,
     shutdown: &AtomicBool,
     handshake_time: Duration,
     target: SocketAddr,
@@ -649,7 +659,7 @@ fn measure_stream(
     recv_buf: &mut [u8],
     send_buf: &mut [u8],
 ) -> WorkerResult {
-    let frames_per_batch = (entries.len() * COALESCE) as u64;
+    let frames_per_batch = (entries.len() * coalesce) as u64;
     let mut stream_buf = vec![0u8; DGRAM_BUF];
     let mut encode_buf: Vec<u8> = Vec::with_capacity(DGRAM_BUF);
     let mut bytes_sent = 0u64;
@@ -676,7 +686,7 @@ fn measure_stream(
                 entry.msg_type,
                 entry.flags,
                 &entry.payload,
-                COALESCE,
+                coalesce,
             );
             let mut off = 0usize;
             while off < encode_buf.len() {
@@ -757,6 +767,7 @@ fn measure_pipeline(
     conn: &mut quiche::Connection,
     entries: &[WorkloadEntry],
     duration: Duration,
+    coalesce: usize,
     shutdown: &AtomicBool,
     handshake_time: Duration,
     pipeline_depth: usize,
@@ -766,14 +777,14 @@ fn measure_pipeline(
     recv_buf: &mut [u8],
     send_buf: &mut [u8],
 ) -> WorkerResult {
-    let frames_per_batch = (entries.len() * COALESCE) as u64;
+    let frames_per_batch = (entries.len() * coalesce) as u64;
     // Milestone must match what stack.bytes_rx() counts — which only
     // includes data-plane frames (is_data() == true), not control frames
     // like Fragment, Ack, StreamOpen, etc.
     let batch_data_payload_bytes: u64 = entries
         .iter()
         .filter(|e| e.msg_type.is_data())
-        .map(|e| e.payload_len as u64 * COALESCE as u64)
+        .map(|e| e.payload_len as u64 * coalesce as u64)
         .sum();
     let depth = pipeline_depth.max(1);
     let mut in_flight: VecDeque<(Instant, u64)> = VecDeque::with_capacity(depth);
@@ -806,6 +817,7 @@ fn measure_pipeline(
                 stack,
                 conn,
                 entries,
+                coalesce,
                 socket,
                 recv_buf,
                 send_buf,

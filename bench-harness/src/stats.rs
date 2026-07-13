@@ -137,6 +137,16 @@ pub struct Summary {
 
     pub write_syscalls_per_sec: f64,
     pub read_syscalls_per_sec: f64,
+
+    // ── Resource efficiency metrics ────────────────────────────────
+    /// CPU cores utilized during measurement (cpu_time_delta / wall_time).
+    pub cpu_cores: f64,
+    /// CPU cores per GiB/s of throughput — lower is better.
+    pub cpu_per_gibps: f64,
+    /// Process RSS in KiB at end of measurement.
+    pub rss_kib: u64,
+    /// RSS (KiB) divided by successful connections.
+    pub rss_per_conn_kib: f64,
 }
 
 /// Merges per-worker results into a [`Summary`].
@@ -234,6 +244,10 @@ pub fn aggregate(
         flow_control_waits,
         write_syscalls_per_sec,
         read_syscalls_per_sec,
+        cpu_cores: 0.0,
+        cpu_per_gibps: 0.0,
+        rss_kib: 0,
+        rss_per_conn_kib: 0.0,
     }
 }
 
@@ -244,6 +258,133 @@ fn pct(sorted: &[Duration], p: f64) -> Duration {
     }
     let idx = (p / 100.0 * (sorted.len() - 1) as f64).round() as usize;
     sorted[idx.min(sorted.len() - 1)]
+}
+
+impl Summary {
+    /// Attaches resource-efficiency metrics after aggregation.
+    ///
+    /// - `cpu_delta_secs`: total CPU time (all threads) consumed during the run.
+    /// - `wall_secs`: wall-clock duration of the measurement window.
+    /// - `rss_kib`: process RSS sampled at the end of the run.
+    pub fn attach_resources(&mut self, cpu_delta_secs: f64, wall_secs: f64, rss_kib: u64) {
+        self.cpu_cores = if wall_secs > 0.0 {
+            cpu_delta_secs / wall_secs
+        } else {
+            0.0
+        };
+        let gibps = self.throughput_mibps / 1024.0;
+        self.cpu_per_gibps = if gibps > 0.01 {
+            self.cpu_cores / gibps
+        } else {
+            0.0
+        };
+        self.rss_kib = rss_kib;
+        self.rss_per_conn_kib = if self.connections_ok > 0 {
+            rss_kib as f64 / self.connections_ok as f64
+        } else {
+            0.0
+        };
+    }
+}
+
+/// One row in a sweep comparison table.
+pub struct SweepPoint {
+    /// Label for this row (e.g. "1", "100", "1 KB", "1 MB").
+    pub label: String,
+    /// Connections used in this run.
+    pub conns: usize,
+    /// Throughput in MiB/s.
+    pub throughput_mibps: f64,
+    pub latency_p50: Duration,
+    pub latency_p99: Duration,
+    pub latency_max: Duration,
+    /// CPU cores per GiB/s.
+    pub cpu_per_gibps: f64,
+    /// RSS (KiB) per connection.
+    pub rss_per_conn_kib: f64,
+}
+
+impl SweepPoint {
+    /// Builds a sweep point from a summary with the given row label.
+    #[must_use]
+    pub fn from_summary(label: impl Into<String>, s: &Summary) -> Self {
+        Self {
+            label: label.into(),
+            conns: s.connections_ok,
+            throughput_mibps: s.throughput_mibps,
+            latency_p50: s.latency_p50,
+            latency_p99: s.latency_p99,
+            latency_max: s.latency_max,
+            cpu_per_gibps: s.cpu_per_gibps,
+            rss_per_conn_kib: s.rss_per_conn_kib,
+        }
+    }
+}
+
+/// Prints the resource-efficiency lines (CPU + memory).
+fn print_resource_stats(s: &Summary) {
+    println!(
+        "  CPU Cores Used      {:>10.2}  (over measurement window)",
+        s.cpu_cores
+    );
+    println!(
+        "  CPU per GiB/s       {:>10.2}  (cores per GiB/s — lower is better)",
+        s.cpu_per_gibps
+    );
+    println!("  RSS                 {:>10.0} KiB", s.rss_kib);
+    println!("  RSS per Connection  {:>10.0} KiB", s.rss_per_conn_kib);
+}
+
+/// Prints the connections-sweep comparison table.
+pub fn print_conn_sweep(points: &[SweepPoint]) {
+    let us = |d: Duration| d.as_secs_f64() * 1_000_000.0;
+    println!();
+    println!("╔══════════════════════════════════════════════════════════════════╗");
+    println!("║              Throughput vs. Connections Sweep                     ║");
+    println!("╚══════════════════════════════════════════════════════════════════╝");
+    println!();
+    println!("┌────────┬───────────┬──────────┬──────────┬──────────┬──────────────┐");
+    println!("│ Conns  │ MiB/s     │ p50 (us) │ p99 (us) │ CPU/GiB  │ KiB/conn     │");
+    println!("├────────┼───────────┼──────────┼──────────┼──────────┼──────────────┤");
+    for p in points {
+        println!(
+            "│ {:>6} │ {:>9.1} │ {:>8.1} │ {:>8.1} │ {:>8.2} │ {:>12.0} │",
+            p.conns,
+            p.throughput_mibps,
+            us(p.latency_p50),
+            us(p.latency_p99),
+            p.cpu_per_gibps,
+            p.rss_per_conn_kib,
+        );
+    }
+    println!("└────────┴───────────┴──────────┴──────────┴──────────┴──────────────┘");
+    println!("encryption: TLS 1.3 (BoringSSL via quiche) — ACTIVE");
+    println!();
+}
+
+/// Prints the payload-size-sweep comparison table.
+pub fn print_payload_sweep(points: &[SweepPoint]) {
+    let us = |d: Duration| d.as_secs_f64() * 1_000_000.0;
+    println!();
+    println!("╔══════════════════════════════════════════════════════════════════╗");
+    println!("║            Latency vs. Payload Size Sweep (rr mode)              ║");
+    println!("╚══════════════════════════════════════════════════════════════════╝");
+    println!();
+    println!("┌──────────┬───────────┬──────────┬──────────┐");
+    println!("│ Payload  │ p50 (us)  │ p99 (us) │ Max (us) │");
+    println!("├──────────┼───────────┼──────────┼──────────┤");
+    for p in points {
+        println!(
+            "│ {:<8} │ {:>9.1} │ {:>8.1} │ {:>8.1} │",
+            p.label,
+            us(p.latency_p50),
+            us(p.latency_p99),
+            us(p.latency_max),
+        );
+    }
+    println!("└──────────┴───────────┴──────────┴──────────┘");
+    println!("encryption: TLS 1.3 (BoringSSL via quiche) — ACTIVE");
+    println!();
 }
 
 /// Prints the summary to stdout in a human-readable table.
@@ -296,6 +437,7 @@ pub fn print_summary(s: &Summary) {
         s.batch_bytes.saturating_sub(s.frames_per_batch * 22),
     );
     println!("duration:     {:.1}s", s.duration.as_secs_f64());
+    println!("encryption:  TLS 1.3 (BoringSSL via quiche) — ACTIVE");
     println!();
     println!("requests:     {}", s.total_requests);
     println!("frames:       {}", s.total_frames);
@@ -352,6 +494,9 @@ pub fn print_summary(s: &Summary) {
     );
     println!("  Write Syscalls/s    {:>10.1}", s.write_syscalls_per_sec);
     println!("  Read Syscalls/s     {:>10.1}", s.read_syscalls_per_sec);
+    println!();
+    println!("resource efficiency:");
+    print_resource_stats(s);
     println!();
 
     println!("workload breakdown (per request):");
