@@ -235,8 +235,14 @@ pub fn encode_into(
             core::ptr::copy_nonoverlapping(payload.as_ptr(), base.add(HEADER_SIZE), payload.len());
         }
         // Compute CRC32C over header + payload, write trailer.
-        let crc = crc32c::crc32c(core::slice::from_raw_parts(base, HEADER_SIZE + payload.len()));
-        core::ptr::write_unaligned(base.add(HEADER_SIZE + payload.len()) as *mut u32, crc.to_be());
+        let crc = crc32c::crc32c(core::slice::from_raw_parts(
+            base,
+            HEADER_SIZE + payload.len(),
+        ));
+        core::ptr::write_unaligned(
+            base.add(HEADER_SIZE + payload.len()) as *mut u32,
+            crc.to_be(),
+        );
         dst.advance_mut(needed);
     }
     Ok(())
@@ -363,15 +369,12 @@ pub fn decode_with_len(src: &[u8]) -> Result<(FrameRef<'_>, usize), FrameError> 
     // SAFETY: src.len() >= frame_end = HEADER_SIZE + payload_len + CRC_SIZE
     let expected = unsafe {
         u32::from_be(core::ptr::read_unaligned(
-            src.as_ptr().add(data_end) as *const u32,
+            src.as_ptr().add(data_end) as *const u32
         ))
     };
     let actual = crc32c::crc32c(&src[..data_end]);
     if expected != actual {
-        return Err(FrameError::CrcMismatch {
-            expected,
-            actual,
-        });
+        return Err(FrameError::CrcMismatch { expected, actual });
     }
 
     Ok((
@@ -542,14 +545,13 @@ impl FrameDecoder {
                 max: self.max_payload_len,
             });
         }
-        let frame_end =
-            HEADER_SIZE
-                .checked_add(payload_len)
-                .and_then(|v| v.checked_add(CRC_SIZE))
-                .ok_or(FrameError::PayloadTooLarge {
-                    len: payload_len,
-                    max: self.max_payload_len,
-                })?;
+        let frame_end = HEADER_SIZE
+            .checked_add(payload_len)
+            .and_then(|v| v.checked_add(CRC_SIZE))
+            .ok_or(FrameError::PayloadTooLarge {
+                len: payload_len,
+                max: self.max_payload_len,
+            })?;
         if self.buf.len() < frame_end {
             return Ok(None);
         }
@@ -558,15 +560,12 @@ impl FrameDecoder {
         // SAFETY: buf.len() >= frame_end = HEADER_SIZE + payload_len + CRC_SIZE
         let expected = unsafe {
             u32::from_be(core::ptr::read_unaligned(
-                self.buf.as_ptr().add(data_end) as *const u32,
+                self.buf.as_ptr().add(data_end) as *const u32
             ))
         };
         let actual = crc32c::crc32c(&self.buf[..data_end]);
         if expected != actual {
-            return Err(FrameError::CrcMismatch {
-                expected,
-                actual,
-            });
+            return Err(FrameError::CrcMismatch { expected, actual });
         }
 
         let frame_bytes = self.buf.split_to(frame_end).freeze();
@@ -1210,8 +1209,8 @@ mod tests {
     #[test]
     fn decode_rejects_corrupted_payload() {
         let mut buf = BytesMut::new();
-        let header = FrameHeader::new(StreamId::new(1), MessageType::TextToken)
-            .with_seq(Seq::new(42));
+        let header =
+            FrameHeader::new(StreamId::new(1), MessageType::TextToken).with_seq(Seq::new(42));
         encode_into(&mut buf, header, b"hello crc").unwrap();
         // Flip a bit in the payload.
         buf[HEADER_SIZE] ^= 1;
