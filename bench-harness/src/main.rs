@@ -16,6 +16,7 @@
 mod config;
 mod gso;
 mod layers;
+mod resource;
 mod stats;
 mod worker;
 mod workload;
@@ -29,9 +30,9 @@ use std::time::Duration;
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
-use stats::{WorkerResult, aggregate, print_summary};
+use stats::{Summary, SweepPoint, WorkerResult, aggregate, print_summary};
 use worker::{BenchMode, worker};
-use workload::WorkloadEntry;
+use workload::Workload;
 
 struct Args {
     target: SocketAddr,
@@ -39,51 +40,157 @@ struct Args {
     duration: Duration,
     mode: BenchMode,
     pipeline_depth: usize,
+    sweep: SweepMode,
+}
+
+/// Selects single-run vs. sweep mode.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SweepMode {
+    /// Default single-run benchmark.
+    None,
+    /// Sweep across connection counts [1, 10, 100, 500, 1000].
+    Conn,
+    /// Sweep across payload sizes [1KB, 4KB, 64KB, 1MB] in rr mode.
+    Payload,
 }
 
 fn main() -> Result<()> {
     init_tracing();
     let args = parse_args()?;
 
-    let workload = workload::build()?;
     let sni = args.target.ip().to_string();
-
-    tracing::info!(
-        target = %args.target,
-        conns = args.conns,
-        logical_streams = args.conns * workload.entries.len(),
-        batch_bytes = workload.batch_wire_bytes,
-        frames_per_batch = workload.entries.len(),
-        payload_bytes = workload.total_payload_bytes,
-        duration_secs = args.duration.as_secs(),
-        mode = ?args.mode,
-        "starting load test",
-    );
-
     let shutdown = Arc::new(AtomicBool::new(false));
     install_signal_handlers(Arc::clone(&shutdown));
 
-    let barrier = Barrier::new(args.conns + 1);
+    match args.sweep {
+        SweepMode::None => {
+            let workload = workload::build()?;
+            let summary = run_benchmark(
+                args.target,
+                &sni,
+                args.conns,
+                args.duration,
+                args.mode,
+                args.pipeline_depth,
+                &workload,
+                &shutdown,
+            )?;
+            print_summary(&summary);
+        }
+        SweepMode::Conn => {
+            let workload = workload::build()?;
+            let mut points = Vec::new();
+            for &c in &[1_usize, 10, 100, 500, 1000] {
+                if shutdown.load(Ordering::Relaxed) {
+                    tracing::info!("shutdown requested — aborting sweep");
+                    break;
+                }
+                tracing::info!("=== connections sweep: {c} conns ===");
+                let summary = run_benchmark(
+                    args.target,
+                    &sni,
+                    c,
+                    args.duration,
+                    args.mode,
+                    args.pipeline_depth,
+                    &workload,
+                    &shutdown,
+                )?;
+                print_summary(&summary);
+                points.push(SweepPoint::from_summary(c.to_string(), &summary));
+            }
+            if !points.is_empty() {
+                stats::print_conn_sweep(&points);
+            }
+        }
+        SweepMode::Payload => {
+            let sizes: [(usize, &str); 4] = [
+                (1024, "1 KB"),
+                (4096, "4 KB"),
+                (65_536, "64 KB"),
+                (1_048_576, "1 MB"),
+            ];
+            let mut points = Vec::new();
+            for &(sz, label) in &sizes {
+                if shutdown.load(Ordering::Relaxed) {
+                    tracing::info!("shutdown requested — aborting sweep");
+                    break;
+                }
+                tracing::info!("=== payload sweep: {label} ===");
+                let workload = workload::build_fixed_size(sz)?;
+                let summary = run_benchmark(
+                    args.target,
+                    &sni,
+                    1,
+                    args.duration,
+                    BenchMode::Rr,
+                    args.pipeline_depth,
+                    &workload,
+                    &shutdown,
+                )?;
+                print_summary(&summary);
+                points.push(SweepPoint::from_summary(label, &summary));
+            }
+            if !points.is_empty() {
+                stats::print_payload_sweep(&points);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Runs one benchmark pass: spawns `conns` worker threads, waits for
+/// handshakes, measures CPU/RSS, then aggregates results.
+///
+/// Returns a [`Summary`] with resource-efficiency metrics attached.
+#[allow(clippy::too_many_arguments)]
+fn run_benchmark(
+    target: SocketAddr,
+    sni: &str,
+    conns: usize,
+    duration: Duration,
+    mode: BenchMode,
+    pipeline_depth: usize,
+    workload: &Workload,
+    shutdown: &Arc<AtomicBool>,
+) -> Result<Summary> {
+    tracing::info!(
+        target = %target,
+        conns,
+        logical_streams = conns * workload.entries.len(),
+        batch_bytes = workload.batch_wire_bytes,
+        frames_per_batch = workload.entries.len(),
+        payload_bytes = workload.total_payload_bytes,
+        duration_secs = duration.as_secs(),
+        mode = ?mode,
+        "starting benchmark run",
+    );
+
+    let barrier = Barrier::new(conns + 1);
+
+    let cpu_start = resource::cpu_time_secs();
+
+    let coalesce = workload.coalesce;
 
     let results = thread::scope(|s| {
-        let shutdown_ref = &shutdown;
+        let shutdown_ref = shutdown;
         let barrier_ref = &barrier;
-        let sni_ref = &sni;
-        let entries_ref: &[WorkloadEntry] = &workload.entries;
-        let mode = args.mode;
-        let pipeline_depth = args.pipeline_depth;
+        let sni_ref = sni;
+        let entries_ref: &[workload::WorkloadEntry] = &workload.entries;
 
-        let handles: Vec<_> = (0..args.conns)
+        let handles: Vec<_> = (0..conns)
             .map(|idx| {
                 s.spawn(move || {
                     worker(
                         idx,
-                        args.target,
+                        target,
                         sni_ref,
                         entries_ref,
-                        args.duration,
+                        duration,
                         mode,
                         pipeline_depth,
+                        coalesce,
                         shutdown_ref,
                         barrier_ref,
                     )
@@ -104,18 +211,24 @@ fn main() -> Result<()> {
             .collect::<Vec<_>>()
     });
 
-    let summary = aggregate(
+    let cpu_end = resource::cpu_time_secs();
+    let rss = resource::rss_kib();
+
+    let mut summary = aggregate(
         results,
-        &args.target.to_string(),
+        &target.to_string(),
         workload.batch_wire_bytes,
         workload.entries.len(),
-        args.duration,
+        duration,
         &workload.entries,
-        mode_label(args.mode, args.pipeline_depth),
+        mode_label(mode, pipeline_depth),
     );
-    print_summary(&summary);
 
-    Ok(())
+    let wall_secs = duration.as_secs_f64().max(0.001);
+    let cpu_delta = (cpu_end - cpu_start).max(0.0);
+    summary.attach_resources(cpu_delta, wall_secs, rss);
+
+    Ok(summary)
 }
 
 fn mode_label(mode: BenchMode, depth: usize) -> String {
@@ -133,11 +246,15 @@ fn init_tracing() {
 }
 
 fn install_signal_handlers(shutdown: Arc<AtomicBool>) {
-    // Best-effort: if the handler fails (e.g. already installed), the load
-    // test still runs to completion — the duration timer acts as a fallback.
+    // First Ctrl-C: set the shutdown flag so workers and sweep loops
+    // wind down gracefully. Second Ctrl-C: force-exit immediately.
     let _ = ctrlc::set_handler(move || {
-        tracing::info!("received SIGINT/SIGTERM, stopping load test");
-        shutdown.store(true, Ordering::Relaxed);
+        if shutdown.swap(true, Ordering::Relaxed) {
+            // Already set — this is the second interrupt, force exit now.
+            eprintln!("\nInterrupted — forcing exit.");
+            std::process::exit(130); // 130 = standard exit code for SIGINT
+        }
+        eprintln!("Stopping... (press Ctrl-C again to force exit)");
     });
 }
 
@@ -147,6 +264,7 @@ fn parse_args() -> Result<Args> {
     let mut duration_secs: u64 = 10;
     let mut mode = BenchMode::Stream;
     let mut pipeline_depth: usize = 4;
+    let mut sweep = SweepMode::None;
 
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -190,6 +308,19 @@ fn parse_args() -> Result<Args> {
                     pipeline_depth = argv[i].parse().unwrap_or(pipeline_depth);
                 }
             }
+            "--sweep" => {
+                i += 1;
+                if i < argv.len() {
+                    sweep = match argv[i].as_str() {
+                        "conn" | "connections" => SweepMode::Conn,
+                        "payload" => SweepMode::Payload,
+                        "none" => SweepMode::None,
+                        other => {
+                            anyhow::bail!("unknown --sweep '{other}'; valid: conn, payload, none")
+                        }
+                    };
+                }
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -213,6 +344,7 @@ fn parse_args() -> Result<Args> {
         duration: Duration::from_secs(duration_secs),
         mode,
         pipeline_depth,
+        sweep,
     })
 }
 
@@ -225,6 +357,7 @@ fn print_usage() {
     println!("  -d, --duration SECS          Measurement window in seconds (default: 10)");
     println!("  -m, --mode MODE              Benchmark mode (default: stream)");
     println!("  -p, --pipeline-depth N       In-flight batches for pipeline mode (default: 4)");
+    println!("      --sweep MODE             Sweep mode: conn, payload, none (default: none)");
     println!("  -h, --help                   Show this help");
     println!();
     println!("Modes:");
@@ -255,6 +388,8 @@ fn print_usage() {
     println!("  loadtest -c 4 -d 10 -m stream          # throughput test, 4 users");
     println!("  loadtest -c 4 -d 30 -m pipeline -p 8   # pipelined, depth 8");
     println!("  loadtest -c 1 -d 10 -m rr              # latency baseline");
+    println!("  loadtest --sweep conn -d 5             # throughput vs connections sweep");
+    println!("  loadtest --sweep payload -d 5          # latency vs payload size sweep");
     println!();
     println!("Server start:");
     println!("  quic-server --cert cert.pem --key key.pem --port 4433 --mode single");
