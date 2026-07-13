@@ -374,7 +374,7 @@ impl VireonStack {
         header: codec::FrameHeader,
         payload: &[u8],
     ) {
-        let wire_size = codec::HEADER_SIZE + payload.len();
+        let wire_size = codec::HEADER_SIZE + payload.len() + codec::CRC_SIZE;
         if self.send_scratch.capacity() < wire_size {
             self.send_scratch.reserve_exact(wire_size);
         }

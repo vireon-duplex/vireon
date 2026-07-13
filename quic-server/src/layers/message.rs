@@ -62,7 +62,7 @@ mod tests {
     fn classify_msg_type(ml: &MessageLayer, msg_type: MessageType) -> FrameAction {
         let header = FrameHeader::new(StreamId::new(1), msg_type);
         let payload = b"x";
-        let mut buf = vec![0u8; frame::codec::HEADER_SIZE + payload.len()];
+        let mut buf = vec![0u8; frame::codec::HEADER_SIZE + payload.len() + frame::codec::CRC_SIZE];
         let _ = encode_into_slice(&mut buf, header, payload);
         let frame = decode(&buf).unwrap();
         ml.classify(&frame)
