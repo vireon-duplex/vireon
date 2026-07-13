@@ -87,7 +87,7 @@ impl ClientStack {
         payload: &[u8],
         coalesce: usize,
     ) {
-        let frame_wire_size = frame::codec::HEADER_SIZE + payload.len();
+        let frame_wire_size = frame::codec::HEADER_SIZE + payload.len() + frame::codec::CRC_SIZE;
         let total = frame_wire_size * coalesce;
         dst.clear();
         // reserve ensures capacity >= len + additional. After clear,
@@ -128,7 +128,7 @@ impl ClientStack {
         let app = &mut self.app;
         let buf = &mut self.coalesce_buf;
 
-        let frame_wire_size = frame::codec::HEADER_SIZE + payload.len();
+        let frame_wire_size = frame::codec::HEADER_SIZE + payload.len() + frame::codec::CRC_SIZE;
         let total = frame_wire_size * coalesce;
         buf.clear();
         if buf.capacity() < total {

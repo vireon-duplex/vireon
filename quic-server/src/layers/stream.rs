@@ -283,7 +283,7 @@ mod tests {
     ) -> FrameAction {
         let header = FrameHeader::new(StreamId::new(stream_id), msg_type);
         let payload = b"x";
-        let mut buf = vec![0u8; frame::codec::HEADER_SIZE + payload.len()];
+        let mut buf = vec![0u8; frame::codec::HEADER_SIZE + payload.len() + frame::codec::CRC_SIZE];
         let _ = encode_into_slice(&mut buf, header, payload);
         let frame = decode(&buf).unwrap();
         sl.on_frame(conn_idx, &frame)

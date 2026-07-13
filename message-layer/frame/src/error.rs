@@ -36,6 +36,10 @@ pub enum FrameError {
     /// [`MessageType`](super::MessageType).
     #[error("unknown message type byte: 0x{value:02X}")]
     UnknownMessageType { value: u8 },
+
+    /// The CRC32C trailer did not match the computed checksum of the frame.
+    #[error("CRC32C mismatch: expected {expected:08X}, got {actual:08X}")]
+    CrcMismatch { expected: u32, actual: u32 },
 }
 
 #[cfg(test)]
