@@ -116,19 +116,21 @@ pub const MAX_CLASS_SIZE: usize = 1_048_576;
 ///
 /// Returns [`ClassId::HUGE`] when `size` exceeds [`MAX_CLASS_SIZE`]. A zero
 /// request maps to the smallest class (64 B).
+///
+/// Uses O(1) bit-manipulation (`ilog2`) instead of a linear scan, since all
+/// class sizes are exact powers of two in the range 2⁶ … 2²⁰.
 #[inline]
 pub fn classify(size: usize) -> ClassId {
     if size > MAX_CLASS_SIZE {
         return ClassId::HUGE;
     }
-    for (idx, class) in CLASS_TABLE.iter().enumerate() {
-        if class.size >= size {
-            return ClassId(idx as u8);
-        }
+    // Sizes up to 64 all map to the smallest class (index 0).
+    if size <= 64 {
+        return ClassId(0);
     }
-    // Unreachable: MAX_CLASS_SIZE equals the last class size, so the loop
-    // always returns before this point. Kept to satisfy the type system.
-    ClassId((NUM_CLASSES - 1) as u8)
+    // For size > 64: size−1 ≥ 64, so ilog2 returns ≥ 6 (never panics).
+    // Class sizes are 2⁶…2²⁰, so index = floor(log2(size−1)) − 5.
+    ClassId(((size - 1).ilog2() - 5) as u8)
 }
 
 /// Returns the [`SizeClass`] for `id`, or `None` for [`ClassId::HUGE`].
