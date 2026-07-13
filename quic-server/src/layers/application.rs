@@ -65,6 +65,7 @@ use resource_quotas::{QuotaLimit, TenantId, TenantTier};
 use super::message::FrameAction;
 use super::session::SessionLayer;
 use crate::error::ServerError;
+use bytes::Bytes;
 
 // ── FrameContext & OutgoingFrame ──────────────────────────────────
 
@@ -95,8 +96,8 @@ pub struct OutgoingFrame {
     pub quic_stream_id: u64,
     /// Codec frame header (logical stream, seq, type, flags).
     pub header: FrameHeader,
-    /// Payload bytes.
-    pub payload: Vec<u8>,
+    /// Payload bytes (refcounted for cheap cloning / zero-copy reuse).
+    pub payload: Bytes,
 }
 
 // ── AppDispatcher trait ───────────────────────────────────────────
@@ -186,7 +187,7 @@ impl VireonDispatcher {
         ctx: &FrameContext,
         logical_stream: StreamId,
         msg_type: MessageType,
-        payload: Vec<u8>,
+        payload: Bytes,
     ) {
         let seq = self.next_seq.entry(ctx.quic_stream_id).or_insert(Seq::ZERO);
         let header = FrameHeader::new(logical_stream, msg_type)
@@ -296,11 +297,15 @@ impl AppDispatcher for VireonDispatcher {
                 );
                 match self.rpc.handle(frame.payload) {
                     Ok(response) => {
+                        let payload = match response {
+                            std::borrow::Cow::Borrowed(slice) => Bytes::copy_from_slice(slice),
+                            std::borrow::Cow::Owned(vec) => Bytes::from(vec),
+                        };
                         self.enqueue_response(
                             ctx,
                             frame.stream_id,
                             MessageType::ToolResult,
-                            response,
+                            payload,
                         );
                     }
                     Err(e) => {
