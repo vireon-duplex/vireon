@@ -140,7 +140,7 @@ unsafe fn crc32c_parallel(data: &[u8]) -> u32 {
     let len2 = c2_qw * 8; // |C2| (qword-aligned part)
 
     let m12 = transfer_constant(len1 + len2); // M_{|C1|+|C2|}
-    let m2 = transfer_constant(len2);         // M_{|C2|}
+    let m2 = transfer_constant(len2); // M_{|C2|}
 
     let s0 = gf_mul(crc0 as u32, m12);
     let s1 = gf_mul(crc1 as u32, m2);
@@ -302,7 +302,9 @@ mod tests {
 
     #[test]
     fn hardware_and_software_agree() {
-        for size in [1, 7, 8, 15, 16, 31, 64, 100, 255, 256, 511, 512, 513, 1024, 4096, 65536] {
+        for size in [
+            1, 7, 8, 15, 16, 31, 64, 100, 255, 256, 511, 512, 513, 1024, 4096, 65536,
+        ] {
             let data: Vec<u8> = (0..size).map(|i| i as u8).collect();
             let hw = crc32c(&data);
             let sw = crc32c_sw(&data);
@@ -317,7 +319,10 @@ mod tests {
             let data: Vec<u8> = (0..size).map(|i| (i * 7 + 13) as u8).collect();
             let fast = crc32c(&data);
             let slow = crc32c_sw(&data);
-            assert_eq!(fast, slow, "size {size}: parallel=0x{fast:08X} sw=0x{slow:08X}");
+            assert_eq!(
+                fast, slow,
+                "size {size}: parallel=0x{fast:08X} sw=0x{slow:08X}"
+            );
         }
     }
 

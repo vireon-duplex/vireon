@@ -298,9 +298,7 @@ impl AppDispatcher for VireonDispatcher {
                 match self.rpc.handle(frame.payload) {
                     Ok(response) => {
                         let payload = match response {
-                            std::borrow::Cow::Borrowed(slice) => {
-                                Bytes::copy_from_slice(slice)
-                            }
+                            std::borrow::Cow::Borrowed(slice) => Bytes::copy_from_slice(slice),
                             std::borrow::Cow::Owned(vec) => Bytes::from(vec),
                         };
                         self.enqueue_response(
