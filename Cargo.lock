@@ -1024,6 +1024,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "quic-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "ctrlc",
+ "frame",
+ "libc",
+ "quiche",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "quic-engine"
 version = "0.1.0"
 dependencies = [
