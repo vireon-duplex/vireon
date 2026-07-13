@@ -4,7 +4,8 @@
 //! class let releasing threads avoid contending on a single lock.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+
+use parking_lot::Mutex;
 
 use crate::cache::SlotPtr;
 
@@ -25,12 +26,12 @@ impl Shard {
 
     /// Pops one slot from the front.
     pub fn pop(&self) -> Option<SlotPtr> {
-        lock(&self.buffers).pop_front()
+        self.buffers.lock().pop_front()
     }
 
     /// Pops up to `n` slots, appending them to `out`. Returns the count moved.
     pub fn pop_batch(&self, n: usize, out: &mut Vec<SlotPtr>) -> usize {
-        let mut q = lock(&self.buffers);
+        let mut q = self.buffers.lock();
         let take = n.min(q.len());
         for _ in 0..take {
             if let Some(p) = q.pop_front() {
@@ -42,7 +43,7 @@ impl Shard {
 
     /// Pushes one slot if below capacity. Returns `true` when accepted.
     pub fn push(&self, ptr: SlotPtr) -> bool {
-        let mut q = lock(&self.buffers);
+        let mut q = self.buffers.lock();
         if q.len() >= self.cap {
             return false;
         }
@@ -54,7 +55,7 @@ impl Shard {
     /// removed from the front of `batch`; the remainder stay for the caller to
     /// return to the arena. Returns the count accepted.
     pub fn push_batch(&self, batch: &mut Vec<SlotPtr>) -> usize {
-        let mut q = lock(&self.buffers);
+        let mut q = self.buffers.lock();
         let mut accepted = 0;
         while q.len() < self.cap {
             let Some(ptr) = batch.pop() else {
@@ -68,7 +69,7 @@ impl Shard {
 
     /// Current number of cached slots.
     pub fn len(&self) -> usize {
-        lock(&self.buffers).len()
+        self.buffers.lock().len()
     }
 
     /// Capacity (soft cap on retained slots).
@@ -79,7 +80,7 @@ impl Shard {
 
     /// Drops slots until at most `max` remain, returning the drained pointers.
     pub fn trim_to(&self, max: usize) -> Vec<SlotPtr> {
-        let mut q = lock(&self.buffers);
+        let mut q = self.buffers.lock();
         let mut drained = Vec::new();
         while q.len() > max {
             if let Some(p) = q.pop_front() {
@@ -91,24 +92,12 @@ impl Shard {
 
     /// Drains every slot. Used by the shrinker.
     pub fn drain_all(&self) -> Vec<SlotPtr> {
-        let mut q = lock(&self.buffers);
-        q.drain(..).collect()
+        self.buffers.lock().drain(..).collect()
     }
 
     /// True when no slots are cached.
     pub fn is_empty(&self) -> bool {
-        lock(&self.buffers).is_empty()
-    }
-}
-
-/// Locks a shard mutex, recovering from poison rather than aborting.
-fn lock(buffers: &Mutex<VecDeque<SlotPtr>>) -> std::sync::MutexGuard<'_, VecDeque<SlotPtr>> {
-    match buffers.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            tracing::error!("buffer-pool shard mutex poisoned; recovering inner queue");
-            poisoned.into_inner()
-        }
+        self.buffers.lock().is_empty()
     }
 }
 

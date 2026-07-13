@@ -12,7 +12,8 @@
 //! on the per-buffer fast path.
 
 use std::ptr::NonNull;
-use std::sync::Mutex;
+
+use parking_lot::Mutex;
 
 use crate::allocator::size_class::{CLASS_TABLE, ClassId, NUM_CLASSES};
 use crate::allocator::slab::{Slab, SlabGeometry, slab_geometry_for};
@@ -56,7 +57,7 @@ impl Arena {
     /// existing slab of that class is full.
     pub fn allocate_slot(&self, class: ClassId) -> Result<NonNull<u8>, BufferPoolError> {
         let idx = class_index(class)?;
-        let mut state = lock(&self.state);
+        let mut state = self.state.lock();
         let slabs = &mut state.slabs[idx];
         for slab in slabs.iter_mut() {
             if let Some(ptr) = slab.alloc_slot() {
@@ -79,7 +80,7 @@ impl Arena {
     /// shrinker when draining caches.
     pub fn mark_free(&self, ptr: NonNull<u8>, class: ClassId) -> Result<(), BufferPoolError> {
         let idx = class_index(class)?;
-        let mut state = lock(&self.state);
+        let mut state = self.state.lock();
         for slab in state.slabs[idx].iter_mut() {
             if slab.contains(ptr) {
                 slab.mark_free_slot(ptr);
@@ -97,7 +98,7 @@ impl Arena {
     /// caches are not drained here, so their slots keep their slabs alive.
     pub fn purge(&self) -> usize {
         let mut freed = 0;
-        let mut state = lock(&self.state);
+        let mut state = self.state.lock();
         for class_slabs in state.slabs.iter_mut() {
             class_slabs.retain(|slab| {
                 if slab.is_empty() {
@@ -117,7 +118,7 @@ impl Arena {
         let idx = class_index(class)?;
         let geometry = self.geometry[idx];
         let class_info = CLASS_TABLE[idx];
-        let mut state = lock(&self.state);
+        let mut state = self.state.lock();
         while free_slots_in(&state.slabs[idx]) < count {
             let slab = Slab::new(class, class_info.size, class_info.align, geometry)?;
             state.slabs[idx].push(slab);
@@ -130,12 +131,12 @@ impl Arena {
         let Ok(idx) = class_index(class) else {
             return 0;
         };
-        lock(&self.state).slabs[idx].len()
+        self.state.lock().slabs[idx].len()
     }
 
     /// Total bytes of backing memory currently held.
     pub fn memory_usage(&self) -> usize {
-        let state = lock(&self.state);
+        let state = self.state.lock();
         state.slabs.iter().flatten().map(|s| s.slab_bytes()).sum()
     }
 
@@ -144,7 +145,7 @@ impl Arena {
         let Ok(idx) = class_index(class) else {
             return 0;
         };
-        free_slots_in(&lock(&self.state).slabs[idx])
+        free_slots_in(&self.state.lock().slabs[idx])
     }
 }
 
@@ -171,21 +172,6 @@ fn class_index(class: ClassId) -> Result<usize, BufferPoolError> {
         Ok(idx)
     } else {
         Err(BufferPoolError::WrongPool { class })
-    }
-}
-
-/// Locks the arena mutex, recovering from poison rather than aborting.
-///
-/// A poisoned mutex means a thread panicked mid-operation; for a memory pool
-/// it is safer to keep serving requests (with possibly-inconsistent state that
-/// the debug validator will surface) than to cascade the failure.
-fn lock(state: &Mutex<ArenaState>) -> std::sync::MutexGuard<'_, ArenaState> {
-    match state.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            tracing::error!("buffer-pool arena mutex poisoned; recovering inner state");
-            poisoned.into_inner()
-        }
     }
 }
 

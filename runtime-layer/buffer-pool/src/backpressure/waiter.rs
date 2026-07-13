@@ -5,8 +5,9 @@
 //!
 //! [`BufferPool::get`]: crate::buffer::BufferPool::get
 
-use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::Duration;
+
+use parking_lot::{Condvar, Mutex};
 
 /// A parking permit for backpressure.
 ///
@@ -34,11 +35,9 @@ impl Waiter {
     ///
     /// [`notify_one`]: Waiter::notify_one
     pub fn park(&self, timeout: Duration) -> bool {
-        let guard = lock(&self.flag);
-        match self.cond.wait_timeout(guard, timeout) {
-            Ok((_, wt)) => !wt.timed_out(),
-            Err(_) => false,
-        }
+        let mut guard = self.flag.lock();
+        let wt = self.cond.wait_for(&mut guard, timeout);
+        !wt.timed_out()
     }
 
     /// Wakes one waiting thread.
@@ -55,17 +54,6 @@ impl Waiter {
 impl Default for Waiter {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// Locks a mutex, recovering from poison.
-fn lock(flag: &Mutex<()>) -> MutexGuard<'_, ()> {
-    match flag.lock() {
-        Ok(g) => g,
-        Err(poisoned) => {
-            tracing::error!("waiter mutex poisoned; recovering");
-            poisoned.into_inner()
-        }
     }
 }
 

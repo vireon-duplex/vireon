@@ -8,7 +8,7 @@
 //! internally so that a [`Counters::reset`](crate::stats::Counters::reset) is
 //! treated as a fresh start rather than a negative spike.
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use prometheus::{
     IntCounter, IntGauge, Registry, register_int_counter_with_registry,
@@ -181,13 +181,7 @@ impl PrometheusExporter {
 impl MetricsExporter for PrometheusExporter {
     fn export(&self, snapshot: &StatsSnapshot) {
         // Update counters via delta.
-        let mut last = match self.last.lock() {
-            Ok(g) => g,
-            Err(p) => {
-                tracing::error!("prometheus exporter mutex poisoned; recovering");
-                p.into_inner()
-            }
-        };
+        let mut last = self.last.lock();
         apply_delta(&self.hits, &mut last.hits, snapshot.counters.hits);
         apply_delta(&self.misses, &mut last.misses, snapshot.counters.misses);
         apply_delta(&self.reuses, &mut last.reuses, snapshot.counters.reuses);
