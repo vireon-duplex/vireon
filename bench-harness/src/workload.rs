@@ -43,6 +43,35 @@ pub struct Workload {
     pub total_payload_bytes: usize,
     /// Total wire bytes for one un-coalesced batch (all 15 frames × 1 copy).
     pub batch_wire_bytes: usize,
+    /// How many consecutive copies of each frame to coalesce per stream_send.
+    /// The full workload uses [`COALESCE`] (32); latency sweeps use 1 to avoid
+    /// exceeding QUIC flow-control windows with large payloads.
+    pub coalesce: usize,
+}
+
+/// Builds a single-frame workload with exactly `payload_bytes` of TextToken
+/// data on logical stream 0.
+///
+/// Used for the payload-size sweep — isolates payload size as the sole
+/// variable while keeping the encode/decode path identical to the full
+/// workload.
+pub fn build_fixed_size(payload_bytes: usize) -> anyhow::Result<Workload> {
+    let payload = vec![0u8; payload_bytes];
+    let batch_wire_bytes = frame::codec::HEADER_SIZE + payload_bytes + frame::codec::CRC_SIZE;
+    Ok(Workload {
+        entries: vec![WorkloadEntry {
+            msg_type: MessageType::TextToken,
+            name: "TextToken",
+            payload_len: payload_bytes,
+            flags: FrameFlags::NONE,
+            payload,
+            logical_stream: 0,
+        }]
+        .into_boxed_slice(),
+        total_payload_bytes: payload_bytes,
+        batch_wire_bytes,
+        coalesce: 1,
+    })
 }
 
 /// Builds the full 15-frame workload.
@@ -74,6 +103,7 @@ pub fn build() -> anyhow::Result<Workload> {
         entries: entries.into_boxed_slice(),
         total_payload_bytes,
         batch_wire_bytes,
+        coalesce: COALESCE,
     })
 }
 
@@ -309,5 +339,17 @@ mod tests {
         for (i, e) in w.entries.iter().enumerate() {
             assert_eq!(e.logical_stream, i as u64);
         }
+    }
+
+    #[test]
+    fn fixed_size_workload_has_correct_wire_bytes() {
+        let w = build_fixed_size(4096).unwrap();
+        assert_eq!(w.entries.len(), 1);
+        assert_eq!(w.entries[0].payload_len, 4096);
+        assert_eq!(w.total_payload_bytes, 4096);
+        assert_eq!(
+            w.batch_wire_bytes,
+            frame::codec::HEADER_SIZE + 4096 + frame::codec::CRC_SIZE
+        );
     }
 }

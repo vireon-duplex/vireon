@@ -144,6 +144,9 @@ loadtest -m rr -c 1 -d 10
 
 # Multi-stream concurrent request-response
 loadtest -m multi-rr -c 1 -d 10
+
+# Connections mode
+RUST_LOG=bench_harness=warn cargo run -p bench-harness -- -m pipeline -c 1 -d 5 -p 800 --sweep conn
 ```
 
 ## Output Metrics
