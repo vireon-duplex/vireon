@@ -45,7 +45,8 @@
 //! | 12 | [`sysctl`]   | Sysctl reader/writer + `SysctlProfile` presets |
 //! | 13 | [`socket`]   | `SocketBuilder`, `SocketGroup`, `PerCoreSocketRegistry` |
 //! | 14 | [`ebpf`]     | eBPF `SO_REUSEPORT` QUIC DCID steering program |
-//! | 15 | [`manager`]  | `NicManager` facade (top-level entry point) |
+//! | 15 | [`xdp`]      | AF_XDP socket, UMEM, rings for kernel bypass |
+//! | 16 | [`manager`]  | `NicManager` facade (top-level entry point) |
 
 pub mod affinity;
 pub mod busy_poll;
@@ -61,6 +62,7 @@ pub mod rss;
 pub mod socket;
 pub mod sysctl;
 pub mod topology;
+pub mod xdp;
 pub mod xps;
 
 // ── Re-exports ──────────────────────────────────────────────────────
@@ -82,4 +84,5 @@ pub use socket::{
 };
 pub use sysctl::{Sysctl, SysctlProfile, SysctlSnapshot};
 pub use topology::{CpuInfo, CpuTopology, LlcDomain, NumaNode};
+pub use xdp::{FrameAddr, RingType, XdpConfig, XdpCopyMode, XdpMode, XdpRing, XdpSocket, XdpUmem};
 pub use xps::XpsConfig;
