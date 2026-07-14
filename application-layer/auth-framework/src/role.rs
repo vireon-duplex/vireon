@@ -40,10 +40,37 @@ impl Role {
         self.permissions.contains(perm)
     }
 
+    /// Computes the effective permissions including inherited roles.
+    ///
+    /// Traverses the inheritance chain (up to 4 levels deep) and
+    /// merges permissions from all reachable roles. Cycles are handled
+    /// by the limited inheritance depth.
     #[must_use]
-    pub const fn effective_permissions(&self, _roles: &[Role]) -> PermissionSet {
-        // Phase 1: compute transitive permissions
-        self.permissions
+    pub fn effective_permissions(&self, roles: &[Role]) -> PermissionSet {
+        let mut result = self.permissions;
+        self.collect_inherited_permissions(&mut result, roles, 0);
+        result
+    }
+
+    fn collect_inherited_permissions(
+        &self,
+        result: &mut PermissionSet,
+        roles: &[Role],
+        depth: u8,
+    ) {
+        if depth >= 4 {
+            return;
+        }
+        for i in 0..self.inherit_count as usize {
+            let inherited_id = self.inherits[i];
+            // Find the inherited role in the slice.
+            if let Some(inherited) = roles.iter().find(|r| r.id == inherited_id) {
+                for &perm in inherited.permissions.as_slice() {
+                    let _ = result.add(perm);
+                }
+                inherited.collect_inherited_permissions(result, roles, depth + 1);
+            }
+        }
     }
 }
 

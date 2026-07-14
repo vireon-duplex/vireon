@@ -65,6 +65,12 @@ impl PermissionSet {
     pub const fn is_empty(&self) -> bool {
         self.count == 0
     }
+
+    /// Returns the valid permissions as a slice.
+    #[must_use]
+    pub fn as_slice(&self) -> &[Permission] {
+        &self.permissions[..self.count as usize]
+    }
 }
 
 impl Default for PermissionSet {

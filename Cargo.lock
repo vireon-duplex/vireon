@@ -141,6 +141,7 @@ version = "0.1.0"
 dependencies = [
  "configuration-system",
  "criterion",
+ "rustc-hash",
  "session-manager",
  "thiserror 2.0.18",
  "tracing",
