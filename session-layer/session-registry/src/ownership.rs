@@ -4,6 +4,8 @@
 //! See `DESIGN.md` Part 3 (session ownership) and Part 7 (ownership
 //! transfer).
 
+use std::collections::HashMap;
+
 use crate::error::RegistryError;
 use crate::node::NodeId;
 use crate::version::{Epoch, Generation};
@@ -70,64 +72,107 @@ impl OwnershipEntry {
     }
 }
 
-// ── OwnershipTable (Phase 1 skeleton) ───────────────────────────
+// ── OwnershipTable ──────────────────────────────────────────────
 
-/// Ownership table skeleton. Phase 1 will populate this with an
-/// `FxHashMap<SessionId, OwnershipEntry>` and lock-free operations.
-// TODO(phase-1): real ownership table with HashMap + epoch GC.
-#[derive(Debug, Default)]
+/// Ownership table mapping `SessionId → OwnershipEntry`.
+///
+/// Backed by a `HashMap` for O(1) lookups on the hot path.
 pub struct OwnershipTable {
-    /// Number of entries (the only state Phase 0 tracks).
-    count: usize,
+    entries: HashMap<SessionId, OwnershipEntry>,
 }
 
 impl OwnershipTable {
     /// Construct an empty table.
     #[must_use]
-    pub const fn new() -> Self {
-        Self { count: 0 }
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
     }
 
     /// Current entry count.
     #[must_use]
-    pub const fn len(&self) -> usize {
-        self.count
+    pub fn len(&self) -> usize {
+        self.entries.len()
     }
 
     /// Whether the table is empty.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.count == 0
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
-    /// Phase-1 `get` placeholder.
+    /// Look up an ownership entry by session id.
     ///
     /// # Errors
-    /// Always returns [`RegistryError::SessionNotFound`] in Phase 0.
+    /// Returns [`RegistryError::SessionNotFound`] if the session is
+    /// not registered.
     pub fn get(&self, id: SessionId) -> Result<OwnershipEntry, RegistryError> {
-        // TODO(phase-1): index lookup
-        Err(RegistryError::SessionNotFound(id))
+        self.entries
+            .get(&id)
+            .copied()
+            .ok_or(RegistryError::SessionNotFound(id))
     }
 
-    /// Phase-1 `insert` placeholder.
+    /// Insert an ownership entry.
+    ///
+    /// If an entry already exists, the new one must supersede it
+    /// (higher generation); otherwise returns
+    /// [`RegistryError::SessionExists`].
     ///
     /// # Errors
-    /// Always returns [`RegistryError::ResourceExhausted`] in Phase 0.
-    pub fn insert(&mut self, _entry: OwnershipEntry) -> Result<(), RegistryError> {
-        // TODO(phase-1): install entry
-        self.count = self.count.saturating_add(1);
-        Err(RegistryError::CapacityExceeded(
-            "ownership table phase-1 stub",
-        ))
+    /// - [`RegistryError::SessionExists`] if the session is already
+    ///   registered and the new entry does not supersede the existing
+    ///   one.
+    pub fn insert(&mut self, entry: OwnershipEntry) -> Result<(), RegistryError> {
+        if let Some(existing) = self.entries.get(&entry.session_id) {
+            if !entry.supersedes(*existing) {
+                return Err(RegistryError::SessionExists(entry.session_id));
+            }
+        }
+        self.entries.insert(entry.session_id, entry);
+        Ok(())
     }
 
-    /// Phase-1 `remove` placeholder.
+    /// Remove an ownership entry.
     ///
     /// # Errors
-    /// Always returns [`RegistryError::SessionNotFound`] in Phase 0.
+    /// Returns [`RegistryError::SessionNotFound`] if the session is
+    /// not registered.
     pub fn remove(&mut self, id: SessionId) -> Result<(), RegistryError> {
-        // TODO(phase-1): remove entry
-        Err(RegistryError::SessionNotFound(id))
+        self.entries
+            .remove(&id)
+            .ok_or(RegistryError::SessionNotFound(id))?;
+        Ok(())
+    }
+
+    /// Returns `true` if the session is currently registered.
+    #[must_use]
+    pub fn contains(&self, id: SessionId) -> bool {
+        self.entries.contains_key(&id)
+    }
+
+    /// Purge all entries whose lease has expired at `now_ns`.
+    ///
+    /// Returns the number of entries purged.
+    pub fn purge_expired(&mut self, now_ns: u64) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|_, e| !e.is_expired(now_ns));
+        before - self.entries.len()
+    }
+}
+
+impl Default for OwnershipTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for OwnershipTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnershipTable")
+            .field("entries", &self.entries.len())
+            .finish()
     }
 }
 
@@ -181,7 +226,56 @@ mod tests {
     }
 
     #[test]
-    fn table_get_phase0_stub() {
+    fn table_insert_and_get() {
+        let mut t = OwnershipTable::new();
+        let e = entry_for(1, 1);
+        assert!(t.insert(e).is_ok());
+        assert_eq!(t.len(), 1);
+        let got = t.get(SessionId::from_pair(1, 1)).unwrap();
+        assert_eq!(got, e);
+    }
+
+    #[test]
+    fn table_insert_duplicate_same_gen_fails() {
+        let mut t = OwnershipTable::new();
+        let e = entry_for(1, 1);
+        t.insert(e).unwrap();
+        // Same session, same generation → error.
+        assert!(matches!(
+            t.insert(entry_for(2, 1)),
+            Err(RegistryError::SessionExists(_))
+        ));
+    }
+
+    #[test]
+    fn table_insert_superseding_gen_succeeds() {
+        let mut t = OwnershipTable::new();
+        t.insert(entry_for(1, 1)).unwrap();
+        // Higher generation supersedes.
+        assert!(t.insert(entry_for(2, 2)).is_ok());
+        let got = t.get(SessionId::from_pair(1, 1)).unwrap();
+        assert_eq!(got.node_id, NodeId::new(2));
+    }
+
+    #[test]
+    fn table_remove() {
+        let mut t = OwnershipTable::new();
+        t.insert(entry_for(1, 1)).unwrap();
+        assert!(t.remove(SessionId::from_pair(1, 1)).is_ok());
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn table_remove_missing_errors() {
+        let mut t = OwnershipTable::new();
+        assert!(matches!(
+            t.remove(SessionId::nil()),
+            Err(RegistryError::SessionNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn table_get_missing_errors() {
         let t = OwnershipTable::new();
         assert!(matches!(
             t.get(SessionId::nil()),
@@ -190,15 +284,36 @@ mod tests {
     }
 
     #[test]
-    fn table_insert_phase0_stub() {
+    fn table_contains() {
         let mut t = OwnershipTable::new();
-        let e = entry_for(1, 1);
-        assert!(t.insert(e).is_err());
+        assert!(!t.contains(SessionId::from_pair(1, 1)));
+        t.insert(entry_for(1, 1)).unwrap();
+        assert!(t.contains(SessionId::from_pair(1, 1)));
     }
 
     #[test]
-    fn table_remove_phase0_stub() {
+    fn table_purge_expired() {
         let mut t = OwnershipTable::new();
-        assert!(t.remove(SessionId::nil()).is_err());
+        let expired = OwnershipEntry::new(
+            SessionId::from_pair(1, 1),
+            NodeId::new(1),
+            Generation::new(1),
+            Epoch::INITIAL,
+            1_000, // expired at 1us
+        );
+        let active = OwnershipEntry::new(
+            SessionId::from_pair(2, 2),
+            NodeId::new(2),
+            Generation::new(1),
+            Epoch::INITIAL,
+            999_999_999_999, // far future
+        );
+        t.insert(expired).unwrap();
+        t.insert(active).unwrap();
+
+        let purged = t.purge_expired(5_000_000_000);
+        assert_eq!(purged, 1);
+        assert_eq!(t.len(), 1);
+        assert!(t.contains(SessionId::from_pair(2, 2)));
     }
 }
