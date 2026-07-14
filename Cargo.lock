@@ -33,6 +33,7 @@ dependencies = [
  "criterion",
  "middleware-pipeline",
  "rpc-framework",
+ "rustc-hash",
  "session-manager",
  "thiserror 2.0.18",
  "tracing",
@@ -140,6 +141,7 @@ version = "0.1.0"
 dependencies = [
  "configuration-system",
  "criterion",
+ "rustc-hash",
  "session-manager",
  "thiserror 2.0.18",
  "tracing",
@@ -482,6 +484,7 @@ dependencies = [
  "configuration-system",
  "criterion",
  "middleware-pipeline",
+ "rustc-hash",
  "session-manager",
  "thiserror 2.0.18",
  "tracing",
@@ -756,6 +759,7 @@ dependencies = [
  "criterion",
  "middleware-pipeline",
  "resource-quotas",
+ "rustc-hash",
  "session-manager",
  "stream-manager",
  "thiserror 2.0.18",
@@ -1019,8 +1023,24 @@ dependencies = [
  "configuration-system",
  "criterion",
  "event-bus",
+ "rustc-hash",
  "thiserror 2.0.18",
  "tracing",
+]
+
+[[package]]
+name = "quic-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "ctrlc",
+ "frame",
+ "libc",
+ "quiche",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1242,6 +1262,7 @@ dependencies = [
  "configuration-system",
  "criterion",
  "middleware-pipeline",
+ "rustc-hash",
  "session-manager",
  "stream-manager",
  "thiserror 2.0.18",

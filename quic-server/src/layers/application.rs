@@ -116,7 +116,7 @@ pub trait AppDispatcher {
     fn on_data_frame(&mut self, ctx: &FrameContext, frame: &FrameRef<'_>);
 
     /// Called when a session is destroyed (connection closed).
-    fn on_connection_closed(&mut self, session_id: SessionId, reason: Option<&str>);
+    fn on_connection_closed(&mut self, conn_idx: usize, session_id: SessionId, reason: Option<&str>);
 
     /// Drains queued outgoing frames (responses produced by the modules).
     fn drain_outbox(&mut self) -> Vec<OutgoingFrame>;
@@ -149,8 +149,11 @@ pub struct VireonDispatcher {
 
     /// Queued outgoing frames, drained by the stack after each recv.
     outbox: Vec<OutgoingFrame>,
-    /// Per-QUIC-stream response sequence counter.
-    next_seq: FxHashMap<u64, Seq>,
+    /// Per-(conn_idx, QUIC-stream) response sequence counter.
+    next_seq: FxHashMap<(usize, u64), Seq>,
+
+    /// Active pub/sub subscriptions: (pattern, subscriber conn_idx, subscriber quic_stream_id).
+    subscriptions: Vec<(TopicPattern, usize, u64)>,
 }
 
 impl VireonDispatcher {
@@ -177,6 +180,7 @@ impl VireonDispatcher {
             default_topic,
             outbox: Vec::new(),
             next_seq: FxHashMap::default(),
+            subscriptions: Vec::new(),
         }
     }
 
@@ -189,14 +193,30 @@ impl VireonDispatcher {
         msg_type: MessageType,
         payload: Bytes,
     ) {
-        let seq = self.next_seq.entry(ctx.quic_stream_id).or_insert(Seq::ZERO);
+        self.enqueue_frame(ctx.conn_idx, ctx.quic_stream_id, logical_stream, msg_type, payload);
+    }
+
+    /// Enqueues a frame targeting an explicit connection + QUIC stream.
+    /// Used for both same-connection responses and cross-connection delivery.
+    fn enqueue_frame(
+        &mut self,
+        conn_idx: usize,
+        quic_stream_id: u64,
+        logical_stream: StreamId,
+        msg_type: MessageType,
+        payload: Bytes,
+    ) {
+        let seq = self
+            .next_seq
+            .entry((conn_idx, quic_stream_id))
+            .or_insert(Seq::ZERO);
         let header = FrameHeader::new(logical_stream, msg_type)
             .with_seq(*seq)
             .with_flags(FrameFlags::NONE);
         *seq = seq.next();
         self.outbox.push(OutgoingFrame {
-            conn_idx: ctx.conn_idx,
-            quic_stream_id: ctx.quic_stream_id,
+            conn_idx,
+            quic_stream_id,
             header,
             payload,
         });
@@ -255,8 +275,103 @@ impl VireonDispatcher {
         }
     }
 
-    /// Routes a `StateUpdate` frame to the event bus and pub/sub engine.
-    fn route_state_update(&mut self, _ctx: &FrameContext, frame: &FrameRef<'_>) {
+    /// Routes a `StateUpdate` frame.
+    ///
+    /// Parses payload for pub/sub control messages:
+    /// - `{"action":"subscribe","pattern":"sensor.*"}` → register subscription
+    /// - `{"action":"publish","topic":"sensor.temp","payload":"23.5"}` → deliver to subscribers
+    ///
+    /// Falls through to event bus + pubsub engine for other payloads.
+    fn route_state_update(&mut self, ctx: &FrameContext, frame: &FrameRef<'_>) {
+        let text = String::from_utf8_lossy(frame.payload);
+
+        if let Some(action) = extract_json_string(&text, "action") {
+            match action.as_str() {
+                "subscribe" => {
+                    if let Some(pattern_str) = extract_json_string(&text, "pattern") {
+                        match TopicPattern::new(&pattern_str) {
+                            Ok(pattern) => {
+                                eprintln!(
+                                    "[pubsub] subscribe: conn_idx={} pattern={pattern_str} \
+                                     stream={}",
+                                    ctx.conn_idx, ctx.quic_stream_id
+                                );
+                                self.subscriptions
+                                    .push((pattern, ctx.conn_idx, ctx.quic_stream_id));
+                                let ack = format!("{{\"subscribed\":\"{pattern_str}\"}}");
+                                self.enqueue_response(
+                                    ctx,
+                                    frame.stream_id,
+                                    MessageType::StateUpdate,
+                                    Bytes::from(ack),
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    conn_idx = ctx.conn_idx,
+                                    pattern = %pattern_str,
+                                    error = ?e,
+                                    "[pubsub] invalid pattern"
+                                );
+                            }
+                        }
+                    }
+                    return;
+                }
+                "publish" => {
+                    if let Some(topic) = extract_json_string(&text, "topic") {
+                        let msg_payload =
+                            extract_json_string(&text, "payload").unwrap_or_default();
+
+                        let targets: Vec<(usize, u64)> = self
+                            .subscriptions
+                            .iter()
+                            .filter(|(p, _, _)| p.matches(&topic))
+                            .map(|(_, c, s)| (*c, *s))
+                            .filter(|(c, _)| *c != ctx.conn_idx)
+                            .collect();
+
+                        let deliver =
+                            format!("{{\"topic\":\"{topic}\",\"payload\":\"{msg_payload}\"}}");
+                        let bytes = Bytes::from(deliver);
+
+                        eprintln!(
+                            "[pubsub] publish: conn_idx={} topic={topic} \
+                             targets={} subs={}",
+                            ctx.conn_idx,
+                            targets.len(),
+                            self.subscriptions.len()
+                        );
+
+                        let delivered = targets.len();
+                        for (target_conn, target_stream) in targets {
+                            eprintln!(
+                                "[pubsub] delivering to conn_idx={target_conn} \
+                                 stream={target_stream}"
+                            );
+                            self.enqueue_frame(
+                                target_conn,
+                                target_stream,
+                                frame.stream_id,
+                                MessageType::StateUpdate,
+                                bytes.clone(),
+                            );
+                        }
+
+                        tracing::info!(
+                            conn_idx = ctx.conn_idx,
+                            topic = %topic,
+                            delivered,
+                            "[pubsub] published"
+                        );
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Default: event bus + pubsub engine (e.g. eventbus mode).
         let msg_hash = frame.seq.get();
         let _ = self
             .event_bus
@@ -270,6 +385,17 @@ impl Default for VireonDispatcher {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Lightweight JSON string-field extractor.
+///
+/// Finds `"key":"value"` and returns the value. Sufficient for the
+/// simple JSON the pub/sub client produces — avoids a serde dependency.
+fn extract_json_string(json: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\":\"");
+    let rest = json.split_once(&needle)?;
+    let end = rest.1.find('"')?;
+    Some(rest.1[..end].to_string())
 }
 
 impl AppDispatcher for VireonDispatcher {
@@ -366,9 +492,14 @@ impl AppDispatcher for VireonDispatcher {
         }
     }
 
-    fn on_connection_closed(&mut self, session_id: SessionId, reason: Option<&str>) {
+    fn on_connection_closed(&mut self, conn_idx: usize, session_id: SessionId, reason: Option<&str>) {
+        let before = self.subscriptions.len();
+        self.subscriptions.retain(|(_, c, _)| *c != conn_idx);
+        let removed = before - self.subscriptions.len();
         tracing::info!(
+            conn_idx,
             session_id = ?session_id,
+            subs_removed = removed,
             reason = reason.unwrap_or("none"),
             "[app] connection closed"
         );
@@ -734,7 +865,7 @@ impl ApplicationLayer {
 
         let released = self.session.on_close(conn_idx);
 
-        self.dispatcher.on_connection_closed(session_id, reason);
+        self.dispatcher.on_connection_closed(conn_idx, session_id, reason);
 
         tracing::info!(
             conn_idx,
