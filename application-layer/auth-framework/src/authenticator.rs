@@ -1,9 +1,12 @@
-//! [`AuthenticationPipeline`] — authentication facade.
+//! [`AuthenticationPipeline`] — authentication with principal registry
+//! and per-principal rate limiting.
 //!
 //! Provides an in-process principal registry backed by a
-//! `HashMap<PrincipalId, Credential>`. Single-threaded (reactor-local).
+//! `HashMap<PrincipalId, Credential>`. Each `authenticate()` call is
+//! rate-limited per principal using a sliding-window counter.
 
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::AuthConfig;
 use crate::credential::Credential;
@@ -12,13 +15,26 @@ use crate::health::HealthReport;
 use crate::principal::PrincipalId;
 use crate::stats::AuthStats;
 
-/// Authentication pipeline — owns principal registry and stats.
+/// Sliding window for rate limiting (nanoseconds).
+const RATE_WINDOW_NS: u64 = 60 * 1_000_000_000; // 1 minute
+
+/// Authentication pipeline — owns principal registry, rate limiter,
+/// and stats.
 #[derive(Debug)]
 pub struct AuthenticationPipeline {
-    #[allow(dead_code)]
     cfg: AuthConfig,
     stats: AuthStats,
     principals: HashMap<PrincipalId, Credential>,
+    /// Per-principal attempt timestamps (nanoseconds since epoch).
+    rate_tracker: HashMap<PrincipalId, Vec<u64>>,
+}
+
+/// Returns the current time in nanoseconds since UNIX_EPOCH.
+fn now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 impl AuthenticationPipeline {
@@ -32,6 +48,7 @@ impl AuthenticationPipeline {
             cfg,
             stats: AuthStats::new(),
             principals: HashMap::new(),
+            rate_tracker: HashMap::new(),
         })
     }
 
@@ -46,10 +63,12 @@ impl AuthenticationPipeline {
     /// Authenticate a principal against stored credentials.
     ///
     /// Compares the `data_hash` of the provided credential against the
-    /// stored one. On success returns the principal's raw ID. On failure
-    /// returns an appropriate error variant.
+    /// stored one. Rate-limited per principal: if `rate_limit_per_minute`
+    /// attempts have been made in the last 60 seconds, returns
+    /// [`AuthError::RateLimited`].
     ///
     /// # Errors
+    /// - [`AuthError::RateLimited`] — too many attempts.
     /// - [`AuthError::UnknownPrincipal`] — principal not registered.
     /// - [`AuthError::AuthenticationFailed`] — credential hash mismatch.
     pub fn authenticate(
@@ -58,6 +77,17 @@ impl AuthenticationPipeline {
         credential: Credential,
     ) -> Result<u64, AuthError> {
         self.stats.record_auth_attempt();
+
+        // Rate limit check.
+        let now = now_ns();
+        let cutoff = now.saturating_sub(RATE_WINDOW_NS);
+        let timestamps = self.rate_tracker.entry(principal).or_default();
+        timestamps.retain(|&t| t > cutoff);
+        if timestamps.len() >= self.cfg.rate_limit_per_minute as usize {
+            self.stats.record_rate_limited();
+            return Err(AuthError::RateLimited);
+        }
+        timestamps.push(now);
 
         let stored = self
             .principals
@@ -89,6 +119,12 @@ impl AuthenticationPipeline {
     #[must_use]
     pub fn principal_count(&self) -> usize {
         self.principals.len()
+    }
+
+    /// Returns the rate limit config (attempts per minute).
+    #[must_use]
+    pub const fn rate_limit_per_minute(&self) -> u32 {
+        self.cfg.rate_limit_per_minute
     }
 }
 
@@ -151,9 +187,7 @@ mod tests {
         let new_cred = Credential::new(CredentialType::Token, 22222, 0);
         auth.register_principal(principal, new_cred);
 
-        // Old credential should now fail.
         assert!(auth.authenticate(principal, old_cred).is_err());
-        // New credential should succeed.
         assert!(auth.authenticate(principal, new_cred).is_ok());
     }
 
@@ -171,5 +205,33 @@ mod tests {
             Credential::new(CredentialType::Token, 2, 0),
         );
         assert_eq!(auth.principal_count(), 2);
+    }
+
+    #[test]
+    fn rate_limiting_kicks_in() {
+        let cfg = AuthConfig {
+            rate_limit_per_minute: 3,
+            ..Preset::Standard.to_config()
+        };
+        let mut auth = AuthenticationPipeline::new(cfg).unwrap();
+        let principal = PrincipalId::new(1);
+        let cred = Credential::new(CredentialType::Password, 12345, 0);
+        auth.register_principal(principal, cred);
+
+        let wrong = Credential::new(CredentialType::Password, 99999, 0);
+
+        // 3 attempts allowed.
+        assert!(auth.authenticate(principal, wrong.clone()).is_err()); // 1
+        assert!(auth.authenticate(principal, wrong.clone()).is_err()); // 2
+        assert!(auth.authenticate(principal, wrong.clone()).is_err()); // 3
+        // 4th should be rate limited.
+        let result = auth.authenticate(principal, wrong);
+        assert!(matches!(result, Err(AuthError::RateLimited)));
+    }
+
+    #[test]
+    fn rate_limit_per_minute_exposed() {
+        let auth = fresh();
+        assert_eq!(auth.rate_limit_per_minute(), Preset::Standard.to_config().rate_limit_per_minute);
     }
 }

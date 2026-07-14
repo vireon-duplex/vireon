@@ -13,40 +13,35 @@
 //! - an [`OwnershipTable`] (per-session records),
 //! - a [`MembershipList`] (node liveness),
 //! - a [`RegistryStats`] (observability).
-//!
-//! # Phase 0
-//!
-//! Phase 0 ships only a typed skeleton. Every method returns a
-//! stub error so that callers can code against the API contract
-//! today. Phase 1 fills in the real logic.
+
+use std::collections::HashMap;
 
 use crate::config::RegistryConfig;
 use crate::error::RegistryError;
 use crate::health::HealthReport;
 use crate::lease::LeaseInfo;
 use crate::locator::SessionLocator;
+use crate::membership::MembershipList;
 use crate::node::{NodeId, NodeInfo};
-use crate::ownership::OwnershipTable;
+use crate::ownership::{OwnershipEntry, OwnershipTable};
 use crate::ring::ConsistentHash;
 use crate::stats::RegistryStats;
+use crate::version::{Epoch, Generation, MonotonicVersion};
+use connection_shard::ConnectionId;
 use session_manager::SessionId;
 
 /// The distributed session directory facade.
 ///
 /// Composes the ring, ownership table, membership list, and stats.
-/// Phase 0 ships a typed skeleton; Phase 1+ populates real logic.
-#[derive(Debug)]
 pub struct SessionDirectory {
-    /// Static configuration.
-    #[allow(dead_code)]
     cfg: RegistryConfig,
-    /// Consistent-hash ring (real impl in Phase 0).
-    #[allow(dead_code)]
     ring: ConsistentHash,
-    /// Per-session ownership records (Phase 1 will populate).
-    #[allow(dead_code)]
     ownership: OwnershipTable,
-    /// Atomic observability counters.
+    membership: MembershipList,
+    /// Lookup cache for the hot path.
+    cache: HashMap<SessionId, SessionLocator>,
+    /// Current cluster epoch (bumped on topology change).
+    epoch: Epoch,
     stats: RegistryStats,
 }
 
@@ -59,10 +54,13 @@ impl SessionDirectory {
     pub fn new(cfg: RegistryConfig) -> Result<Self, RegistryError> {
         cfg.validate()?;
         Ok(Self {
-            cfg,
-            ring: ConsistentHash::new(150),
+            ring: ConsistentHash::new(cfg.ring_vnodes),
             ownership: OwnershipTable::new(),
+            membership: MembershipList::new(),
+            cache: HashMap::new(),
+            epoch: Epoch::INITIAL,
             stats: RegistryStats::new(),
+            cfg,
         })
     }
 
@@ -72,59 +70,174 @@ impl SessionDirectory {
     /// installs an ownership entry + lease.
     ///
     /// # Errors
-    /// Always returns an error in Phase 0.
-    pub fn register_session(&mut self, _id: SessionId) -> Result<SessionLocator, RegistryError> {
-        // TODO(phase-1): ring lookup + ownership insert + lease grant.
-        Err(RegistryError::ShuttingDown)
+    /// - [`RegistryError::RingEmpty`] if no nodes are registered.
+    /// - [`RegistryError::SessionExists`] if the session is already
+    ///   registered.
+    pub fn register_session(&mut self, id: SessionId) -> Result<SessionLocator, RegistryError> {
+        let owner = self.ring.lookup(&id).ok_or(RegistryError::RingEmpty)?;
+
+        let now_ns = 0u64; // caller provides timing in real deployments
+        let lease = LeaseInfo::new(owner, Generation::INITIAL, now_ns, self.cfg.lease_ttl_ms);
+
+        let entry = OwnershipEntry::new(
+            id,
+            owner,
+            Generation::INITIAL,
+            self.epoch,
+            lease.expiry_ns,
+        );
+        self.ownership.insert(entry)?;
+
+        let locator = SessionLocator::new(
+            id,
+            owner,
+            ConnectionId::from_raw(0),
+            0,
+            MonotonicVersion::new(1),
+            lease,
+        );
+
+        // Update cache.
+        self.cache.insert(id, locator);
+        Ok(locator)
     }
 
     /// Resolve a session to its current locator.
     ///
-    /// This is the **hot path** — must be O(1) in steady state
-    /// (cache hit). Phase 1 will add the cache layer.
+    /// Checks the cache first (hot path), then falls back to the
+    /// ownership table.
     ///
     /// # Errors
-    /// Always returns [`RegistryError::SessionNotFound`] in Phase 0.
+    /// Returns [`RegistryError::SessionNotFound`] if the session is
+    /// not registered.
     pub fn lookup(&self, id: SessionId) -> Result<SessionLocator, RegistryError> {
-        // TODO(phase-1): cache → ownership table → ring.
+        // Cache hit.
+        if let Some(locator) = self.cache.get(&id) {
+            self.stats.record_lookup(true);
+            return Ok(*locator);
+        }
+
+        // Cache miss → ownership table.
+        let entry = self.ownership.get(id)?;
+        let lease = LeaseInfo::new(
+            entry.node_id,
+            entry.generation,
+            0,
+            self.cfg.lease_ttl_ms,
+        );
+        let locator = SessionLocator::new(
+            id,
+            entry.node_id,
+            ConnectionId::from_raw(0),
+            0,
+            MonotonicVersion::new(1),
+            lease,
+        );
+
         self.stats.record_lookup(false);
-        Err(RegistryError::SessionNotFound(id))
+        Ok(locator)
     }
 
     /// Unregister a session (graceful close).
     ///
     /// # Errors
-    /// Always returns [`RegistryError::SessionNotFound`] in Phase 0.
+    /// Returns [`RegistryError::SessionNotFound`] if the session is
+    /// not registered.
     pub fn unregister(&mut self, id: SessionId) -> Result<(), RegistryError> {
-        // TODO(phase-1): ownership remove + lease revoke.
-        Err(RegistryError::SessionNotFound(id))
+        self.ownership.remove(id)?;
+        self.cache.remove(&id);
+        Ok(())
     }
 
     /// Add a node to the cluster.
     ///
+    /// Adds to the membership list and the consistent-hash ring.
+    /// Bumps the cluster epoch.
+    ///
     /// # Errors
-    /// Always returns an error in Phase 0.
-    pub fn add_node(&mut self, _info: NodeInfo) -> Result<(), RegistryError> {
-        // TODO(phase-1): membership add + ring add + epoch bump.
-        Err(RegistryError::ShuttingDown)
+    /// Returns [`RegistryError::NodeExists`] if the node is already
+    /// registered.
+    pub fn add_node(&mut self, info: NodeInfo) -> Result<(), RegistryError> {
+        if info.id.is_nil() {
+            return Err(RegistryError::InvalidConfig(
+                "node id must not be nil".into(),
+            ));
+        }
+        let node_id = info.id;
+        self.membership.add(info)?;
+        self.ring.add_node(node_id);
+        self.stats.record_node_added();
+        self.epoch = Epoch::new(self.epoch.raw() + 1);
+        // Invalidate cache — topology changed.
+        self.cache.clear();
+        Ok(())
     }
 
     /// Remove a node from the cluster (graceful leave).
     ///
     /// # Errors
-    /// Always returns [`RegistryError::NodeNotFound`] in Phase 0.
+    /// Returns [`RegistryError::NodeNotFound`] if the node is not
+    /// registered.
     pub fn remove_node(&mut self, id: NodeId) -> Result<(), RegistryError> {
-        // TODO(phase-1): membership remove + ring remove + rebalance.
-        Err(RegistryError::NodeNotFound(id))
+        self.membership.remove(id)?;
+        self.ring.remove_node(id);
+        self.epoch = Epoch::new(self.epoch.raw() + 1);
+        // Invalidate cache — topology changed.
+        self.cache.clear();
+        Ok(())
     }
 
     /// Renew a session's lease.
     ///
     /// # Errors
-    /// Always returns [`RegistryError::SessionNotFound`] in Phase 0.
-    pub fn renew_lease(&mut self, id: SessionId, _now_ns: u64) -> Result<LeaseInfo, RegistryError> {
-        // TODO(phase-1): load entry + verify owner + extend expiry.
-        Err(RegistryError::SessionNotFound(id))
+    /// Returns [`RegistryError::SessionNotFound`] if the session is
+    /// not registered.
+    pub fn renew_lease(&mut self, id: SessionId, now_ns: u64) -> Result<LeaseInfo, RegistryError> {
+        let entry = self.ownership.get(id)?;
+        let renewed_lease = LeaseInfo::new(
+            entry.node_id,
+            entry.generation,
+            now_ns,
+            self.cfg.lease_ttl_ms,
+        );
+
+        // Update the ownership entry with the new expiry.
+        let updated = OwnershipEntry::new(
+            id,
+            entry.node_id,
+            entry.generation,
+            entry.epoch,
+            renewed_lease.expiry_ns,
+        );
+        // Remove + re-insert with updated lease.
+        let _ = self.ownership.remove(id);
+        self.ownership.insert(updated)?;
+
+        // Update cache.
+        if let Some(locator) = self.cache.get_mut(&id) {
+            locator.lease = renewed_lease;
+        }
+
+        self.stats.record_lease_renewed();
+        Ok(renewed_lease)
+    }
+
+    /// Current number of registered sessions.
+    #[must_use]
+    pub fn session_count(&self) -> usize {
+        self.ownership.len()
+    }
+
+    /// Current number of nodes on the ring.
+    #[must_use]
+    pub fn node_count(&self) -> usize {
+        self.ring.node_count()
+    }
+
+    /// Current cluster epoch.
+    #[must_use]
+    pub const fn epoch(&self) -> Epoch {
+        self.epoch
     }
 
     /// Snapshot the directory's health.
@@ -140,15 +253,39 @@ impl SessionDirectory {
     }
 }
 
+impl std::fmt::Debug for SessionDirectory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionDirectory")
+            .field("self_node", &self.cfg.self_node_id)
+            .field("nodes", &self.ring.node_count())
+            .field("sessions", &self.ownership.len())
+            .field("epoch", &self.epoch.raw())
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Preset;
-    use crate::node::{Region, Zone};
+    use crate::node::{NodeAddress, NodeCapacity, NodeState, Region, Zone};
 
     fn make_dir() -> SessionDirectory {
         let cfg = Preset::SingleRegion.to_config(NodeId::new(1)).unwrap();
         SessionDirectory::new(cfg).unwrap()
+    }
+
+    fn sample_node(id: u32) -> NodeInfo {
+        NodeInfo {
+            id: NodeId::new(id),
+            region: Region::GLOBAL,
+            zone: Zone::DEFAULT,
+            address: NodeAddress::loopback(443),
+            capacity: NodeCapacity::default(),
+            weight: 100,
+            state: NodeState::Alive,
+            joined_ns: 0,
+        }
     }
 
     #[test]
@@ -166,49 +303,123 @@ mod tests {
     }
 
     #[test]
-    fn register_session_phase0_stub() {
+    fn register_on_empty_ring_errors() {
         let mut dir = make_dir();
-        assert!(dir.register_session(SessionId::from_pair(1, 1)).is_err());
+        // No nodes added yet.
+        assert!(matches!(
+            dir.register_session(SessionId::from_pair(1, 1)),
+            Err(RegistryError::RingEmpty)
+        ));
     }
 
     #[test]
-    fn lookup_phase0_stub() {
+    fn add_node_then_register_succeeds() {
+        let mut dir = make_dir();
+        dir.add_node(sample_node(1)).unwrap();
+        dir.add_node(sample_node(2)).unwrap();
+
+        let locator = dir.register_session(SessionId::from_pair(1, 1)).unwrap();
+        assert!(locator.is_valid());
+        assert_eq!(dir.session_count(), 1);
+    }
+
+    #[test]
+    fn lookup_returns_registered_locator() {
+        let mut dir = make_dir();
+        dir.add_node(sample_node(1)).unwrap();
+        let id = SessionId::from_pair(42, 99);
+        let registered = dir.register_session(id).unwrap();
+
+        let looked_up = dir.lookup(id).unwrap();
+        assert_eq!(looked_up.session_id, id);
+        assert_eq!(looked_up.owner_node, registered.owner_node);
+    }
+
+    #[test]
+    fn lookup_missing_session_errors() {
         let dir = make_dir();
-        let res = dir.lookup(SessionId::from_pair(1, 1));
-        assert!(matches!(res, Err(RegistryError::SessionNotFound(_))));
+        assert!(matches!(
+            dir.lookup(SessionId::from_pair(1, 1)),
+            Err(RegistryError::SessionNotFound(_))
+        ));
     }
 
     #[test]
-    fn unregister_phase0_stub() {
+    fn unregister_removes_session() {
         let mut dir = make_dir();
-        assert!(dir.unregister(SessionId::from_pair(1, 1)).is_err());
+        dir.add_node(sample_node(1)).unwrap();
+        let id = SessionId::from_pair(1, 1);
+        dir.register_session(id).unwrap();
+        assert_eq!(dir.session_count(), 1);
+
+        dir.unregister(id).unwrap();
+        assert_eq!(dir.session_count(), 0);
+        assert!(dir.lookup(id).is_err());
     }
 
     #[test]
-    fn renew_lease_phase0_stub() {
+    fn renew_lease_extends_expiry() {
         let mut dir = make_dir();
-        assert!(dir.renew_lease(SessionId::from_pair(1, 1), 0).is_err());
+        dir.add_node(sample_node(1)).unwrap();
+        let id = SessionId::from_pair(1, 1);
+        let original = dir.register_session(id).unwrap();
+
+        let renewed = dir.renew_lease(id, 5_000_000_000).unwrap();
+        assert!(renewed.expiry_ns > original.lease.expiry_ns);
     }
 
     #[test]
-    fn add_node_phase0_stub() {
+    fn add_remove_node_bumps_epoch() {
         let mut dir = make_dir();
-        let info = NodeInfo {
-            id: NodeId::new(2),
-            region: Region::GLOBAL,
-            zone: Zone::DEFAULT,
-            address: crate::node::NodeAddress::loopback(443),
-            capacity: crate::node::NodeCapacity::default(),
-            weight: 100,
-            state: crate::node::NodeState::Alive,
-            joined_ns: 0,
-        };
-        assert!(dir.add_node(info).is_err());
+        let initial_epoch = dir.epoch().raw();
+
+        dir.add_node(sample_node(1)).unwrap();
+        assert!(dir.epoch().raw() > initial_epoch);
+
+        let before_remove = dir.epoch().raw();
+        dir.remove_node(NodeId::new(1)).unwrap();
+        assert!(dir.epoch().raw() > before_remove);
     }
 
     #[test]
-    fn remove_node_phase0_stub() {
+    fn add_node_increases_node_count() {
         let mut dir = make_dir();
-        assert!(dir.remove_node(NodeId::new(2)).is_err());
+        assert_eq!(dir.node_count(), 0);
+        dir.add_node(sample_node(1)).unwrap();
+        assert_eq!(dir.node_count(), 1);
+        dir.add_node(sample_node(2)).unwrap();
+        assert_eq!(dir.node_count(), 2);
+    }
+
+    #[test]
+    fn remove_node_missing_errors() {
+        let mut dir = make_dir();
+        assert!(matches!(
+            dir.remove_node(NodeId::new(99)),
+            Err(RegistryError::NodeNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn multiple_sessions_register_to_ring_owners() {
+        let mut dir = make_dir();
+        for i in 1..=3 {
+            dir.add_node(sample_node(i)).unwrap();
+        }
+
+        let mut owners = std::collections::HashSet::new();
+        for i in 0..20 {
+            let locator = dir.register_session(SessionId::from_pair(i, i * 7)).unwrap();
+            owners.insert(locator.owner_node);
+        }
+        // With 3 nodes and 20 sessions, we expect at least 2 distinct owners.
+        assert!(owners.len() >= 2);
+    }
+
+    #[test]
+    fn debug_formatter_works() {
+        let dir = make_dir();
+        let dbg = format!("{dir:?}");
+        assert!(dbg.contains("SessionDirectory"));
     }
 }
