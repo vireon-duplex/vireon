@@ -13,6 +13,7 @@ configuration-system = { path = "../configuration-system" }
 event-bus            = { path = "../event-bus" }
 thiserror = { workspace = true }
 tracing  = { workspace = true }
+rustc-hash = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
