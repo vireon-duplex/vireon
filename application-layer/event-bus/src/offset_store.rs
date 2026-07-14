@@ -1,9 +1,18 @@
-//! [`OffsetStore`] — consumer offset tracking facade (typed skeleton).
+//! [`OffsetStore`] — consumer offset tracking with in-memory persistence.
 //!
-//! This is a **Phase 0 skeleton**. The full implementation lands in
-//! Phase 1+.
+//! Stores `(ConsumerGroupId, PartitionId) → Offset` pairs in memory.
+//! Supports commit (write) and fetch (read) operations with validation.
 //!
-//! See `DESIGN.md` Part 10 (offset store).
+//! ```text
+//! commit(group=1, partition=0, offset=42)
+//!   → stores (1, 0) → 42
+//!
+//! fetch(group=1, partition=0)
+//!   → returns 42
+//!
+//! fetch(group=2, partition=0)
+//!   → returns Offset::ZERO (never committed)
+//! ```
 
 use crate::config::EventBusConfig;
 use crate::consumer::ConsumerGroupId;
@@ -11,71 +20,91 @@ use crate::error::EventError;
 use crate::health::HealthReport;
 use crate::partition::{Offset, PartitionId};
 use crate::stats::EventBusStats;
+use rustc_hash::FxHashMap;
 use std::fmt;
 
 /// Consumer offset tracking store.
 ///
-/// In Phase 0, this is a typed skeleton. Phase 1+ will include:
-/// - Offset commit API
-/// - Offset fetch API
-/// - Offset validation
-/// - Offset compaction
+/// Maintains an in-memory map of committed offsets per consumer group
+/// and partition. Monotonic offset advancement is enforced: committing
+/// an offset lower than the current one is silently ignored.
 pub struct OffsetStore {
-    /// Offset store configuration.
     #[allow(dead_code)]
     cfg: EventBusConfig,
-    /// Offset store statistics.
     stats: EventBusStats,
+    offsets: FxHashMap<(ConsumerGroupId, PartitionId), Offset>,
 }
 
 impl fmt::Debug for OffsetStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OffsetStore")
             .field("cfg", &self.cfg)
-            .field("stats", &"<stats>")
+            .field("tracked_offsets", &self.offsets.len())
             .finish()
     }
 }
 
 impl OffsetStore {
-    /// Create a new offset store with the given config.
+    /// Creates a new offset store with the given config.
     #[must_use]
     pub fn new(cfg: EventBusConfig) -> Self {
         Self {
             cfg,
             stats: EventBusStats::new(),
+            offsets: FxHashMap::default(),
         }
     }
 
-    /// Commit an offset for a consumer group partition.
+    /// Commits (advances) the offset for a consumer group + partition.
+    ///
+    /// Offsets are monotonic: if the new offset is lower than the
+    /// currently committed one, the call is silently ignored (no error).
+    /// This matches at-least-once semantics where retries may re-deliver.
     ///
     /// # Errors
-    /// Returns [`EventError::ShuttingDown`] if the store is shutting down.
-    ///
-    /// # Phase 0
-    /// This is a skeleton implementation.
+    /// Currently never errors; reserved for future persistence failures.
     pub fn commit(
-        &self,
-        _group: ConsumerGroupId,
-        _partition: PartitionId,
-        _offset: Offset,
+        &mut self,
+        group: ConsumerGroupId,
+        partition: PartitionId,
+        offset: Offset,
     ) -> Result<(), EventError> {
-        Err(EventError::ShuttingDown)
+        let entry = self.offsets.entry((group, partition)).or_insert(Offset::ZERO);
+        if offset.raw() > entry.raw() {
+            *entry = offset;
+        }
+        self.stats.record_ack();
+        Ok(())
     }
 
-    /// Fetch the committed offset for a consumer group partition.
+    /// Fetches the committed offset for a consumer group + partition.
+    ///
+    /// Returns [`Offset::ZERO`] if no offset has been committed for
+    /// the given `(group, partition)` pair.
     ///
     /// # Errors
-    /// Returns [`EventError::ShuttingDown`] if the store is shutting down.
-    ///
-    /// # Phase 0
-    /// This is a skeleton implementation.
+    /// Currently never errors; reserved for future persistence failures.
     pub fn fetch(
         &self,
-        _group: ConsumerGroupId,
-        _partition: PartitionId,
+        group: ConsumerGroupId,
+        partition: PartitionId,
     ) -> Result<Offset, EventError> {
-        Err(EventError::ShuttingDown)
+        Ok(self
+            .offsets
+            .get(&(group, partition))
+            .copied()
+            .unwrap_or(Offset::ZERO))
+    }
+
+    /// Returns the number of tracked `(group, partition)` pairs.
+    #[must_use]
+    pub fn tracked_count(&self) -> usize {
+        self.offsets.len()
+    }
+
+    /// Resets all offsets (for testing or admin reset).
+    pub fn reset(&mut self) {
+        self.offsets.clear();
     }
 
     /// Get the current health report.
@@ -85,29 +114,77 @@ impl OffsetStore {
     }
 }
 
+// ── Tests ─────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn offset_store_creation() {
-        let cfg = EventBusConfig::new();
-        let store = OffsetStore::new(cfg);
-        assert_eq!(store.stats.snapshot().ack_total, 0);
+    fn store_creation() {
+        let store = OffsetStore::new(EventBusConfig::new());
+        assert_eq!(store.tracked_count(), 0);
     }
 
     #[test]
-    fn commit_returns_shutting_down() {
-        let store = OffsetStore::new(EventBusConfig::new());
-        let result = store.commit(ConsumerGroupId::new(1), PartitionId::new(0), Offset::new(0));
-        assert!(matches!(result, Err(EventError::ShuttingDown)));
+    fn commit_then_fetch() {
+        let mut store = OffsetStore::new(EventBusConfig::new());
+        store
+            .commit(ConsumerGroupId::new(1), PartitionId::new(0), Offset::new(42))
+            .unwrap();
+
+        let offset = store
+            .fetch(ConsumerGroupId::new(1), PartitionId::new(0))
+            .unwrap();
+        assert_eq!(offset, Offset::new(42));
     }
 
     #[test]
-    fn fetch_returns_shutting_down() {
+    fn fetch_uncommitted_returns_zero() {
         let store = OffsetStore::new(EventBusConfig::new());
-        let result = store.fetch(ConsumerGroupId::new(1), PartitionId::new(0));
-        assert!(matches!(result, Err(EventError::ShuttingDown)));
+        let offset = store
+            .fetch(ConsumerGroupId::new(99), PartitionId::new(99))
+            .unwrap();
+        assert_eq!(offset, Offset::ZERO);
+    }
+
+    #[test]
+    fn commit_is_monotonic() {
+        let mut store = OffsetStore::new(EventBusConfig::new());
+        let g = ConsumerGroupId::new(1);
+        let p = PartitionId::new(0);
+
+        store.commit(g, p, Offset::new(10)).unwrap();
+        store.commit(g, p, Offset::new(5)).unwrap(); // lower — ignored
+        store.commit(g, p, Offset::new(20)).unwrap();
+
+        assert_eq!(store.fetch(g, p).unwrap(), Offset::new(20));
+    }
+
+    #[test]
+    fn multiple_groups_and_partitions() {
+        let mut store = OffsetStore::new(EventBusConfig::new());
+
+        store.commit(ConsumerGroupId::new(1), PartitionId::new(0), Offset::new(10)).unwrap();
+        store.commit(ConsumerGroupId::new(1), PartitionId::new(1), Offset::new(20)).unwrap();
+        store.commit(ConsumerGroupId::new(2), PartitionId::new(0), Offset::new(30)).unwrap();
+
+        assert_eq!(store.fetch(ConsumerGroupId::new(1), PartitionId::new(0)).unwrap(), Offset::new(10));
+        assert_eq!(store.fetch(ConsumerGroupId::new(1), PartitionId::new(1)).unwrap(), Offset::new(20));
+        assert_eq!(store.fetch(ConsumerGroupId::new(2), PartitionId::new(0)).unwrap(), Offset::new(30));
+        assert_eq!(store.tracked_count(), 3);
+    }
+
+    #[test]
+    fn reset_clears_all() {
+        let mut store = OffsetStore::new(EventBusConfig::new());
+        store
+            .commit(ConsumerGroupId::new(1), PartitionId::new(0), Offset::new(10))
+            .unwrap();
+        assert_eq!(store.tracked_count(), 1);
+
+        store.reset();
+        assert_eq!(store.tracked_count(), 0);
     }
 
     #[test]
