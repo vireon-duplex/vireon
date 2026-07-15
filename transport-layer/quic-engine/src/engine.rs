@@ -389,6 +389,7 @@ impl QuicEngine {
                     readable_buf,
                     pool,
                     carryover,
+                    self.config.skip_crc,
                 );
             }
             Err(quiche::Error::Done) => {}
