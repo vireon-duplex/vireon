@@ -55,6 +55,9 @@ pub struct ConnectionShard {
     strategy: Box<dyn ShardingStrategy>,
     /// Whether the shard has begun shutdown.
     shutting_down: bool,
+    /// Slots in `Closed` state awaiting reclamation by `drain_closed`.
+    /// Avoids O(capacity) full-slab scan — drain is O(closed_count).
+    closed_slots: Vec<u32>,
 }
 
 impl ConnectionShard {
@@ -92,6 +95,7 @@ impl ConnectionShard {
             backpressure: BackpressureLevel::None,
             strategy: Box::new(LocalSharding::new(reactor_id)),
             shutting_down,
+            closed_slots: Vec::new(),
         })
     }
 
@@ -376,12 +380,13 @@ impl ConnectionShard {
 
     /// Recycles all `Closed` entries, returning the number reclaimed.
     pub fn drain_closed(&mut self) -> usize {
-        let mut reclaimed = 0;
-        for slot in 0..self.slab.len() {
-            if self.slab[slot].state == ConnectionState::Closed {
-                self.retire_slot(slot as u32);
-                reclaimed += 1;
-            }
+        if self.closed_slots.is_empty() {
+            return 0;
+        }
+        let reclaimed = self.closed_slots.len();
+        let to_retire = std::mem::take(&mut self.closed_slots);
+        for &slot in &to_retire {
+            self.retire_slot(slot);
         }
         if reclaimed > 0 {
             self.recompute_backpressure();
@@ -392,9 +397,10 @@ impl ConnectionShard {
     /// Marks `Closing` connections as `Closed` (transition to drainable).
     pub fn finalize_closing(&mut self) -> usize {
         let mut count = 0;
-        for entry in &mut self.slab {
+        for (slot, entry) in self.slab.iter_mut().enumerate() {
             if entry.state == ConnectionState::Closing {
                 entry.state = ConnectionState::Closed;
+                self.closed_slots.push(slot as u32);
                 count += 1;
             }
         }
@@ -440,6 +446,9 @@ impl ConnectionShard {
             return Err(ShardError::IllegalTransition { from, to });
         }
         self.slab[slot].state = to;
+        if to == ConnectionState::Closed {
+            self.closed_slots.push(slot as u32);
+        }
         self.stats.record_transition();
         Ok(())
     }

@@ -38,8 +38,11 @@ pub struct SessionDirectory {
     ring: ConsistentHash,
     ownership: OwnershipTable,
     membership: MembershipList,
-    /// Lookup cache for the hot path.
-    cache: FxHashMap<SessionId, SessionLocator>,
+    /// Lookup cache: `(locator, topology_version_at_insert)`.
+    cache: FxHashMap<SessionId, (SessionLocator, u64)>,
+    /// Monotonic version bumped on topology changes. Cached entries whose
+    /// version differs are treated as misses without clearing the map.
+    topology_version: u64,
     /// Current cluster epoch (bumped on topology change).
     epoch: Epoch,
     stats: RegistryStats,
@@ -58,6 +61,7 @@ impl SessionDirectory {
             ownership: OwnershipTable::new(),
             membership: MembershipList::new(),
             cache: FxHashMap::default(),
+            topology_version: 0,
             epoch: Epoch::INITIAL,
             stats: RegistryStats::new(),
             cfg,
@@ -93,7 +97,7 @@ impl SessionDirectory {
         );
 
         // Update cache.
-        self.cache.insert(id, locator);
+        self.cache.insert(id, (locator, self.topology_version));
         Ok(locator)
     }
 
@@ -106,10 +110,12 @@ impl SessionDirectory {
     /// Returns [`RegistryError::SessionNotFound`] if the session is
     /// not registered.
     pub fn lookup(&self, id: SessionId) -> Result<SessionLocator, RegistryError> {
-        // Cache hit.
-        if let Some(locator) = self.cache.get(&id) {
-            self.stats.record_lookup(true);
-            return Ok(*locator);
+        // Cache hit — only valid if topology hasn't changed since insertion.
+        if let Some((locator, ver)) = self.cache.get(&id) {
+            if *ver == self.topology_version {
+                self.stats.record_lookup(true);
+                return Ok(*locator);
+            }
         }
 
         // Cache miss → ownership table.
@@ -158,8 +164,7 @@ impl SessionDirectory {
         self.ring.add_node(node_id);
         self.stats.record_node_added();
         self.epoch = Epoch::new(self.epoch.raw() + 1);
-        // Invalidate cache — topology changed.
-        self.cache.clear();
+        self.topology_version = self.topology_version.wrapping_add(1);
         Ok(())
     }
 
@@ -172,8 +177,7 @@ impl SessionDirectory {
         self.membership.remove(id)?;
         self.ring.remove_node(id);
         self.epoch = Epoch::new(self.epoch.raw() + 1);
-        // Invalidate cache — topology changed.
-        self.cache.clear();
+        self.topology_version = self.topology_version.wrapping_add(1);
         Ok(())
     }
 
@@ -204,8 +208,10 @@ impl SessionDirectory {
         self.ownership.insert(updated)?;
 
         // Update cache.
-        if let Some(locator) = self.cache.get_mut(&id) {
-            locator.lease = renewed_lease;
+        if let Some((locator, ver)) = self.cache.get_mut(&id) {
+            if *ver == self.topology_version {
+                locator.lease = renewed_lease;
+            }
         }
 
         self.stats.record_lease_renewed();

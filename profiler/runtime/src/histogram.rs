@@ -149,12 +149,12 @@ impl LatencyHistogram {
     /// the bucket where the cumulative count crosses the target.
     #[must_use]
     pub fn percentile(&self, p: f64) -> u64 {
-        let counts: Vec<u64> = self
-            .buckets
-            .iter()
-            .map(|a| a.load(Ordering::Relaxed))
-            .collect();
-        let total: u64 = counts.iter().sum();
+        let mut counts = [0u64; NUM_BUCKETS];
+        let mut total: u64 = 0;
+        for (i, slot) in counts.iter_mut().enumerate() {
+            *slot = self.buckets[i].load(Ordering::Relaxed);
+            total += *slot;
+        }
         if total == 0 {
             return 0;
         }
