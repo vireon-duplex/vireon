@@ -10,7 +10,6 @@ use rustc_hash::FxHashMap;
 use buffer_pool::BufferPool;
 use bytes::BytesMut;
 use frame::codec;
-use frame::error::FrameError;
 
 use crate::engine::QuicEvent;
 
@@ -66,6 +65,7 @@ pub fn process_readable(
     readable_buf: &mut Vec<u64>,
     pool: &BufferPool,
     carryover: &mut FxHashMap<u64, StreamCarry>,
+    skip_crc: bool,
 ) {
     // Collect readable stream IDs into the caller-provided buffer to
     // avoid per-datagram Vec allocation.
@@ -89,7 +89,7 @@ pub fn process_readable(
     for i in 0..n {
         let stream_id = readable_buf[i];
         process_single_stream(
-            conn, stream_id, reactor_id, conn_idx, events, pool, carryover,
+            conn, stream_id, reactor_id, conn_idx, events, pool, carryover, skip_crc,
         );
     }
 
@@ -107,6 +107,7 @@ fn process_single_stream(
     events: &mut Vec<QuicEvent>,
     pool: &BufferPool,
     carryover: &mut FxHashMap<u64, StreamCarry>,
+    skip_crc: bool,
 ) {
     let mut read_buf = [0u8; STREAM_READ_BUF_SIZE];
     let mut finished = false;
@@ -150,8 +151,48 @@ fn process_single_stream(
 
                 // Decode complete frames from carryover.
                 let mut offset = 0usize;
-                while offset < cs.buf.len() {
-                    match codec::decode_with_len(&cs.buf[offset..]) {
+                while offset + codec::HEADER_SIZE <= cs.buf.len() {
+                    // P2: Peek payload_len from the header before calling
+                    // the full decode function. This avoids the overhead of
+                    // header parse + CRC setup + error-return for the last
+                    // incomplete frame in each batch.
+                    let remaining = cs.buf.len() - offset;
+                    // SAFETY: offset + HEADER_SIZE <= buf.len() verified above.
+                    let payload_len = unsafe {
+                        let p = cs.buf.as_ptr().add(offset + 18);
+                        u32::from_be(core::ptr::read_unaligned(p as *const u32)) as usize
+                    };
+
+                    if payload_len > codec::DEFAULT_MAX_PAYLOAD_LEN {
+                        if !cs.oversized_warned {
+                            cs.oversized_warned = true;
+                            tracing::warn!(
+                                reactor_id,
+                                conn_idx,
+                                stream_id,
+                                declared_len = payload_len,
+                                "oversized frame rejected — draining carryover (further occurrences suppressed)"
+                            );
+                        }
+                        cs.buf.clear();
+                        offset = 0;
+                        break;
+                    }
+
+                    let frame_end = codec::HEADER_SIZE + payload_len + codec::CRC_SIZE;
+                    if remaining < frame_end {
+                        break; // incomplete frame — wait for more data
+                    }
+
+                    // P3: Select CRC-skipping variant when configured.
+                    // The branch is constant for the engine's lifetime,
+                    // so perfectly predicted by the CPU.
+                    let result = if skip_crc {
+                        codec::decode_with_len_unchecked(&cs.buf[offset..])
+                    } else {
+                        codec::decode_with_len(&cs.buf[offset..])
+                    };
+                    match result {
                         Ok((frame_ref, consumed)) => {
                             emit_frame_event(
                                 &frame_ref, stream_id, reactor_id, conn_idx, events, pool,
@@ -159,25 +200,23 @@ fn process_single_stream(
                             offset += consumed;
                             total_frames += 1;
                         }
-                        Err(FrameError::IncompleteHeader { .. })
-                        | Err(FrameError::IncompletePayload { .. }) => break,
-                        Err(FrameError::PayloadTooLarge { len, .. }) => {
-                            if !cs.oversized_warned {
-                                cs.oversized_warned = true;
-                                tracing::warn!(
-                                    reactor_id,
-                                    conn_idx,
-                                    stream_id,
-                                    declared_len = len,
-                                    "oversized frame rejected — draining carryover (further occurrences suppressed)"
-                                );
-                            }
+                        // P1: On any decode error (CRC mismatch, unknown
+                        // type), drain the carryover instead of skipping 1
+                        // byte at a time. The old `offset += 1` approach
+                        // could call decode_with_len once per byte on
+                        // corrupted data — a call-count bomb.
+                        Err(e) => {
+                            tracing::warn!(
+                                reactor_id,
+                                conn_idx,
+                                stream_id,
+                                offset,
+                                error = ?e,
+                                "decode error — draining carryover to resync"
+                            );
                             cs.buf.clear();
                             offset = 0;
                             break;
-                        }
-                        Err(_) => {
-                            offset += 1;
                         }
                     }
                 }

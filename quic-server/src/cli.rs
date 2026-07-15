@@ -51,6 +51,12 @@ pub struct Cli {
     #[arg(long)]
     pub echo: bool,
 
+    /// Skip CRC32C verification on received frames.
+    /// Use ONLY in trusted environments where QUIC's AEAD guarantees
+    /// integrity. Saves ~50% of decode time for small frames.
+    #[arg(long)]
+    pub skip_crc: bool,
+
     /// Enable SQPOLL kernel thread (kernel ≥ 5.11, requires CAP_SYS_NICE).
     /// The kernel thread polls the SQ ring, eliminating submit syscalls.
     /// Falls back to standard mode if the kernel denies SQPOLL.
