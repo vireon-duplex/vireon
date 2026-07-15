@@ -79,13 +79,8 @@ impl SessionDirectory {
         let now_ns = 0u64; // caller provides timing in real deployments
         let lease = LeaseInfo::new(owner, Generation::INITIAL, now_ns, self.cfg.lease_ttl_ms);
 
-        let entry = OwnershipEntry::new(
-            id,
-            owner,
-            Generation::INITIAL,
-            self.epoch,
-            lease.expiry_ns,
-        );
+        let entry =
+            OwnershipEntry::new(id, owner, Generation::INITIAL, self.epoch, lease.expiry_ns);
         self.ownership.insert(entry)?;
 
         let locator = SessionLocator::new(
@@ -119,12 +114,7 @@ impl SessionDirectory {
 
         // Cache miss → ownership table.
         let entry = self.ownership.get(id)?;
-        let lease = LeaseInfo::new(
-            entry.node_id,
-            entry.generation,
-            0,
-            self.cfg.lease_ttl_ms,
-        );
+        let lease = LeaseInfo::new(entry.node_id, entry.generation, 0, self.cfg.lease_ttl_ms);
         let locator = SessionLocator::new(
             id,
             entry.node_id,
@@ -409,7 +399,9 @@ mod tests {
 
         let mut owners = std::collections::HashSet::new();
         for i in 0..20 {
-            let locator = dir.register_session(SessionId::from_pair(i, i * 7)).unwrap();
+            let locator = dir
+                .register_session(SessionId::from_pair(i, i * 7))
+                .unwrap();
             owners.insert(locator.owner_node);
         }
         // With 3 nodes and 20 sessions, we expect at least 2 distinct owners.

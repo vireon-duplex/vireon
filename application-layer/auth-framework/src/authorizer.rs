@@ -72,11 +72,7 @@ impl AuthorizationEngine {
     ///
     /// # Errors
     /// Returns [`AuthError::PermissionDenied`] if the role is not registered.
-    pub fn assign_role(
-        &mut self,
-        principal: PrincipalId,
-        role_id: u16,
-    ) -> Result<(), AuthError> {
+    pub fn assign_role(&mut self, principal: PrincipalId, role_id: u16) -> Result<(), AuthError> {
         if !self.roles.contains_key(&role_id) {
             return Err(AuthError::PermissionDenied("unknown role"));
         }
@@ -160,11 +156,7 @@ impl AuthorizationEngine {
     /// # Errors
     /// Returns [`AuthError::UnknownPrincipal`] if the principal has
     /// no assignments.
-    pub fn check_role(
-        &mut self,
-        principal: PrincipalId,
-        role_id: u16,
-    ) -> Result<bool, AuthError> {
+    pub fn check_role(&mut self, principal: PrincipalId, role_id: u16) -> Result<bool, AuthError> {
         let Some(role_ids) = self.assignments.get(&principal) else {
             return Err(AuthError::UnknownPrincipal(principal));
         };
@@ -260,7 +252,11 @@ mod tests {
         authz.register_role(role);
         authz.assign_role(PrincipalId::new(1), 1).unwrap();
 
-        assert!(authz.authorize(PrincipalId::new(1), make_perm(1, 1)).is_ok());
+        assert!(
+            authz
+                .authorize(PrincipalId::new(1), make_perm(1, 1))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -272,7 +268,11 @@ mod tests {
         authz.register_role(role);
         authz.assign_role(PrincipalId::new(1), 1).unwrap();
 
-        assert!(authz.authorize(PrincipalId::new(1), make_perm(1, 2)).is_err());
+        assert!(
+            authz
+                .authorize(PrincipalId::new(1), make_perm(1, 2))
+                .is_err()
+        );
     }
 
     #[test]
@@ -301,8 +301,16 @@ mod tests {
         authz.assign_role(PrincipalId::new(1), 2).unwrap();
 
         // Should have both read (inherited) and write (direct).
-        assert!(authz.authorize(PrincipalId::new(1), make_perm(1, 1)).is_ok()); // read
-        assert!(authz.authorize(PrincipalId::new(1), make_perm(1, 2)).is_ok()); // write
+        assert!(
+            authz
+                .authorize(PrincipalId::new(1), make_perm(1, 1))
+                .is_ok()
+        ); // read
+        assert!(
+            authz
+                .authorize(PrincipalId::new(1), make_perm(1, 2))
+                .is_ok()
+        ); // write
     }
 
     #[test]
@@ -345,8 +353,16 @@ mod tests {
         authz.assign_role(PrincipalId::new(1), 1).unwrap();
         authz.assign_role(PrincipalId::new(1), 2).unwrap();
 
-        assert!(authz.authorize(PrincipalId::new(1), make_perm(1, 1)).is_ok());
-        assert!(authz.authorize(PrincipalId::new(1), make_perm(1, 2)).is_ok());
+        assert!(
+            authz
+                .authorize(PrincipalId::new(1), make_perm(1, 1))
+                .is_ok()
+        );
+        assert!(
+            authz
+                .authorize(PrincipalId::new(1), make_perm(1, 2))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -366,6 +382,10 @@ mod tests {
         authz.assign_role(PrincipalId::new(1), 1).unwrap();
 
         // Should not hang, should still find the permission via role A.
-        assert!(authz.authorize(PrincipalId::new(1), make_perm(1, 1)).is_ok());
+        assert!(
+            authz
+                .authorize(PrincipalId::new(1), make_perm(1, 1))
+                .is_ok()
+        );
     }
 }

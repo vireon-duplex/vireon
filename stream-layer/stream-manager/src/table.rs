@@ -28,6 +28,7 @@ use crate::config::StreamManagerConfig;
 use crate::error::StreamManagerError;
 use crate::id::StreamId;
 use crate::slab::{SlotGeneration, SlotIndex};
+use profiler::profile;
 
 /// Maximum number of slots a single [`StreamTable`] can hold. The
 /// slab uses `u32` indices, so this is the practical cap. In
@@ -100,6 +101,7 @@ impl StreamTable {
     /// # Errors
     /// Returns [`StreamManagerError::ResourceExhausted`] when the
     /// table is full.
+    #[profile]
     pub fn try_reserve_slot(&mut self) -> Result<SlotGeneration, StreamManagerError> {
         if self.is_full() {
             return Err(StreamManagerError::ResourceExhausted("stream table full"));

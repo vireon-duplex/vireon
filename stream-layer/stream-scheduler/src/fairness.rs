@@ -24,6 +24,8 @@
 
 use std::collections::HashMap;
 
+use profiler::profile;
+
 /// Default window size (number of recent streams tracked).
 pub const DEFAULT_WINDOW_SIZE: usize = 64;
 /// Minimum number of samples before fairness is reported.
@@ -67,6 +69,7 @@ impl FairnessMetrics {
     }
 
     /// Record `bytes_sent` for the given stream.
+    #[profile]
     pub fn record(&mut self, stream_id: stream_manager::StreamId, bytes_sent: u64) {
         let key = stream_id.raw();
         if let Some(v) = self.bytes_per_stream.get_mut(&key) {
@@ -83,6 +86,7 @@ impl FairnessMetrics {
     /// Jain's fairness index over the current window. Returns `1.0`
     /// when there are fewer than [`MIN_SAMPLES_FOR_REPORT`] samples.
     #[must_use]
+    #[profile]
     pub fn jain_index(&self) -> f64 {
         if self.bytes_per_stream.len() < MIN_SAMPLES_FOR_REPORT {
             return 1.0;
@@ -105,6 +109,7 @@ impl FairnessMetrics {
     /// Min/max ratio (smallest share / largest share). Returns `0.0`
     /// when there are no samples and `1.0` when only one sample.
     #[must_use]
+    #[profile]
     pub fn min_max_ratio(&self) -> f64 {
         let mut iter = self.bytes_per_stream.values().copied();
         let Some(first) = iter.next() else {
@@ -131,6 +136,7 @@ impl FairnessMetrics {
         self.bytes_per_stream.clear();
     }
 
+    #[profile]
     fn evict_smallest(&mut self) {
         let min_key = self
             .bytes_per_stream

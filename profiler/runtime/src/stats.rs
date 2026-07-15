@@ -10,7 +10,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::histogram::{bucket_for, LatencyHistogram, NUM_BUCKETS};
+use crate::histogram::{LatencyHistogram, NUM_BUCKETS, bucket_for};
 
 // ── Atomic min/max helpers ────────────────────────────────────────
 
@@ -19,12 +19,7 @@ use crate::histogram::{bucket_for, LatencyHistogram, NUM_BUCKETS};
 fn atomic_fetch_min(target: &AtomicU64, new: u64) {
     let mut current = target.load(Ordering::Relaxed);
     while new < current {
-        match target.compare_exchange_weak(
-            current,
-            new,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match target.compare_exchange_weak(current, new, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => break,
             Err(actual) => current = actual,
         }
@@ -36,12 +31,7 @@ fn atomic_fetch_min(target: &AtomicU64, new: u64) {
 fn atomic_fetch_max(target: &AtomicU64, new: u64) {
     let mut current = target.load(Ordering::Relaxed);
     while new > current {
-        match target.compare_exchange_weak(
-            current,
-            new,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match target.compare_exchange_weak(current, new, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => break,
             Err(actual) => current = actual,
         }
@@ -97,13 +87,11 @@ impl FunctionStats {
     pub fn merge_local(&self, local: &LocalEntry) {
         self.call_count
             .fetch_add(local.call_count, Ordering::Relaxed);
-        self.total_ns
-            .fetch_add(local.total_ns, Ordering::Relaxed);
+        self.total_ns.fetch_add(local.total_ns, Ordering::Relaxed);
         if local.call_count > 0 {
             atomic_fetch_min(&self.min_ns, local.min_ns);
             atomic_fetch_max(&self.max_ns, local.max_ns);
-            self.last_ns
-                .store(local.last_ns, Ordering::Relaxed);
+            self.last_ns.store(local.last_ns, Ordering::Relaxed);
             self.histogram.merge_counts(&local.buckets);
         }
     }

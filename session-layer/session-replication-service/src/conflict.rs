@@ -97,11 +97,7 @@ impl ConflictResolver {
                 // Heuristic: longer value wins. Tie-break: lexicographic max.
                 candidates
                     .into_iter()
-                    .max_by(|a, b| {
-                        a.len()
-                            .cmp(&b.len())
-                            .then_with(|| a.cmp(b))
-                    })
+                    .max_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
                     .unwrap_or(&[])
             }
             ConflictStrategy::VectorClocks => {
@@ -230,11 +226,7 @@ mod tests {
     #[test]
     fn conflict_resolve_multiple_pairs() {
         let mut resolver = ConflictResolver::new();
-        let pairs: [(&[u8], &[u8]); 3] = [
-            (b"a", b"bb"),
-            (b"ccc", b"dd"),
-            (b"e", b"ffff"),
-        ];
+        let pairs: [(&[u8], &[u8]); 3] = [(b"a", b"bb"), (b"ccc", b"dd"), (b"e", b"ffff")];
         let result = resolver.resolve("key", &pairs).unwrap();
         // "ffff" is the longest.
         assert_eq!(result, b"ffff");

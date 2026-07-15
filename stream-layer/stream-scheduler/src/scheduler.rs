@@ -20,6 +20,7 @@ use crate::error::SchedulerError;
 use crate::queue::{ReadyEntry, ReadyQueue};
 use crate::selector::{Selection, StreamSelector};
 use crate::stats::SchedulerStats;
+use profiler::profile;
 use stream_manager::StreamId;
 
 /// Per-connection stream scheduler.
@@ -85,6 +86,7 @@ impl StreamScheduler {
     ///
     /// # Errors
     /// Returns the first enqueue error.
+    #[profile]
     pub fn submit_batch(
         &mut self,
         entries: impl IntoIterator<Item = ReadyEntry>,
@@ -112,6 +114,7 @@ impl StreamScheduler {
     /// - [`SchedulerError::NoStreamsReady`] when the queue is empty.
     /// - [`SchedulerError::BudgetExhausted`] when the budget is
     ///   already spent at entry.
+    #[profile]
     pub fn tick(
         &mut self,
         budget: &mut SchedulingBudget,
@@ -126,16 +129,15 @@ impl StreamScheduler {
             return Err(SchedulerError::NoStreamsReady);
         }
 
-        let max_selections = budget
-            .remaining_streams()
-            .min(self.cfg.batch_size_max);
+        let max_selections = budget.remaining_streams().min(self.cfg.batch_size_max);
 
         let mut selections = Vec::with_capacity(max_selections as usize);
 
         for _ in 0..max_selections {
             match self.selector.select(&mut self.queue, budget) {
                 Ok(sel) => {
-                    self.stats.record_selection(sel.effective_urgency, sel.bytes);
+                    self.stats
+                        .record_selection(sel.effective_urgency, sel.bytes);
                     selections.push(sel);
                 }
                 Err(SchedulerError::NoStreamsReady) | Err(SchedulerError::BudgetExhausted) => {

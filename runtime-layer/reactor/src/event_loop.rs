@@ -18,6 +18,7 @@
 use crate::error::ReactorError;
 use crate::reactor::Reactor;
 use crate::tick::TickResult;
+use profiler::profile;
 
 /// Stateless event-loop helper. The actual state lives on
 /// [`Reactor`]; this type only namespaces the drive method.
@@ -29,6 +30,7 @@ impl EventLoop {
     ///
     /// Phase 0 returns an idle [`TickResult`]; Phase 1 implements
     /// the full loop (see module docs).
+    #[profile]
     pub fn run_one_tick(_reactor: &mut Reactor) -> Result<TickResult, ReactorError> {
         // TODO(phase-1): park → drain_cq → drain_expired → flush
         //   → task_queue.tick → shard.drain_closed → on_tick_complete

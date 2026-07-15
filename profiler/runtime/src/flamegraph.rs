@@ -33,9 +33,7 @@ pub fn merge_edges(edges: Vec<(EdgeKey, u64)>) {
     if edges.is_empty() {
         return;
     }
-    let mut global = GLOBAL_EDGES
-        .write()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut global = GLOBAL_EDGES.write().unwrap_or_else(|e| e.into_inner());
     for ((parent, child), count) in edges {
         *global.entry((parent, child)).or_insert(0) += count;
     }
@@ -52,9 +50,7 @@ pub fn reset() {
 /// Takes a snapshot of all edges (sorted by count descending).
 #[must_use]
 pub fn snapshot_edges() -> Vec<(EdgeKey, u64)> {
-    let read = GLOBAL_EDGES
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
+    let read = GLOBAL_EDGES.read().unwrap_or_else(|e| e.into_inner());
     let mut edges: Vec<_> = read.iter().map(|(&k, &v)| (k, v)).collect();
     edges.sort_by(|a, b| b.1.cmp(&a.1));
     edges
@@ -72,15 +68,11 @@ pub fn export_folded() -> String {
     }
 
     // Build adjacency list and child set.
-    let mut children: FxHashMap<&'static str, Vec<(&'static str, u64)>> =
-        FxHashMap::default();
+    let mut children: FxHashMap<&'static str, Vec<(&'static str, u64)>> = FxHashMap::default();
     let mut all_children: std::collections::HashSet<&'static str> =
         std::collections::HashSet::new();
     for &((parent, child), count) in &edges {
-        children
-            .entry(parent)
-            .or_default()
-            .push((child, count));
+        children.entry(parent).or_default().push((child, count));
         all_children.insert(child);
     }
 
@@ -105,8 +97,7 @@ pub fn export_folded() -> String {
     }
 
     // Also include orphan child-only functions as single-node paths.
-    let parents: std::collections::HashSet<&'static str> =
-        children.keys().copied().collect();
+    let parents: std::collections::HashSet<&'static str> = children.keys().copied().collect();
     for &child in &all_children {
         if !parents.contains(&child) && !roots.contains(&child) {
             // This function is only ever a child, never a parent or root.
@@ -201,11 +192,7 @@ mod tests {
     #[test]
     fn snapshot_sorted_by_count() {
         reset_all();
-        merge_edges(vec![
-            (("a", "b"), 5),
-            (("c", "d"), 100),
-            (("e", "f"), 50),
-        ]);
+        merge_edges(vec![(("a", "b"), 5), (("c", "d"), 100), (("e", "f"), 50)]);
         let edges = snapshot_edges();
         assert_eq!(edges[0].1, 100);
         assert_eq!(edges[1].1, 50);

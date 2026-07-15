@@ -116,7 +116,12 @@ pub trait AppDispatcher {
     fn on_data_frame(&mut self, ctx: &FrameContext, frame: &FrameRef<'_>);
 
     /// Called when a session is destroyed (connection closed).
-    fn on_connection_closed(&mut self, conn_idx: usize, session_id: SessionId, reason: Option<&str>);
+    fn on_connection_closed(
+        &mut self,
+        conn_idx: usize,
+        session_id: SessionId,
+        reason: Option<&str>,
+    );
 
     /// Drains queued outgoing frames (responses produced by the modules).
     fn drain_outbox(&mut self) -> Vec<OutgoingFrame>;
@@ -193,7 +198,13 @@ impl VireonDispatcher {
         msg_type: MessageType,
         payload: Bytes,
     ) {
-        self.enqueue_frame(ctx.conn_idx, ctx.quic_stream_id, logical_stream, msg_type, payload);
+        self.enqueue_frame(
+            ctx.conn_idx,
+            ctx.quic_stream_id,
+            logical_stream,
+            msg_type,
+            payload,
+        );
     }
 
     /// Enqueues a frame targeting an explicit connection + QUIC stream.
@@ -296,8 +307,11 @@ impl VireonDispatcher {
                                      stream={}",
                                     ctx.conn_idx, ctx.quic_stream_id
                                 );
-                                self.subscriptions
-                                    .push((pattern, ctx.conn_idx, ctx.quic_stream_id));
+                                self.subscriptions.push((
+                                    pattern,
+                                    ctx.conn_idx,
+                                    ctx.quic_stream_id,
+                                ));
                                 let ack = format!("{{\"subscribed\":\"{pattern_str}\"}}");
                                 self.enqueue_response(
                                     ctx,
@@ -320,8 +334,7 @@ impl VireonDispatcher {
                 }
                 "publish" => {
                     if let Some(topic) = extract_json_string(&text, "topic") {
-                        let msg_payload =
-                            extract_json_string(&text, "payload").unwrap_or_default();
+                        let msg_payload = extract_json_string(&text, "payload").unwrap_or_default();
 
                         let targets: Vec<(usize, u64)> = self
                             .subscriptions
@@ -492,7 +505,12 @@ impl AppDispatcher for VireonDispatcher {
         }
     }
 
-    fn on_connection_closed(&mut self, conn_idx: usize, session_id: SessionId, reason: Option<&str>) {
+    fn on_connection_closed(
+        &mut self,
+        conn_idx: usize,
+        session_id: SessionId,
+        reason: Option<&str>,
+    ) {
         let before = self.subscriptions.len();
         self.subscriptions.retain(|(_, c, _)| *c != conn_idx);
         let removed = before - self.subscriptions.len();
@@ -865,7 +883,8 @@ impl ApplicationLayer {
 
         let released = self.session.on_close(conn_idx);
 
-        self.dispatcher.on_connection_closed(conn_idx, session_id, reason);
+        self.dispatcher
+            .on_connection_closed(conn_idx, session_id, reason);
 
         tracing::info!(
             conn_idx,

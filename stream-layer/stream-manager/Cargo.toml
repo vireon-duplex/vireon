@@ -11,6 +11,7 @@ autobenches = false
 [dependencies]
 thiserror = { workspace = true }
 tracing  = { workspace = true }
+profiler = { workspace = true }
 
 # Phase 1+ will add:
 # bytes = { workspace = true }

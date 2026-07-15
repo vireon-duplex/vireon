@@ -12,8 +12,7 @@ use crate::stats::{FunctionSnapshot, FunctionStats, LocalEntry};
 
 type StatsMap = HashMap<&'static str, Box<FunctionStats>>;
 
-static GLOBAL_REGISTRY: LazyLock<RwLock<StatsMap>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+static GLOBAL_REGISTRY: LazyLock<RwLock<StatsMap>> = LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Merges a thread-local entry into the global stats for `name`.
 ///
@@ -23,9 +22,7 @@ static GLOBAL_REGISTRY: LazyLock<RwLock<StatsMap>> =
 pub fn merge(name: &'static str, local: &LocalEntry) {
     // Fast path: function already registered.
     {
-        let read = GLOBAL_REGISTRY
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
+        let read = GLOBAL_REGISTRY.read().unwrap_or_else(|e| e.into_inner());
         if let Some(stats) = read.get(name) {
             stats.merge_local(local);
             return;
@@ -33,9 +30,7 @@ pub fn merge(name: &'static str, local: &LocalEntry) {
     }
     // Slow path: register new function.
     {
-        let mut write = GLOBAL_REGISTRY
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut write = GLOBAL_REGISTRY.write().unwrap_or_else(|e| e.into_inner());
         let stats = write
             .entry(name)
             .or_insert_with(|| Box::new(FunctionStats::new(name)));
@@ -48,20 +43,15 @@ pub fn merge(name: &'static str, local: &LocalEntry) {
 /// Returns a `Vec` sorted by total time descending (most expensive first).
 #[must_use]
 pub fn snapshot_all() -> Vec<FunctionSnapshot> {
-    let read = GLOBAL_REGISTRY
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
-    let mut snapshots: Vec<FunctionSnapshot> =
-        read.values().map(|s| s.snapshot()).collect();
+    let read = GLOBAL_REGISTRY.read().unwrap_or_else(|e| e.into_inner());
+    let mut snapshots: Vec<FunctionSnapshot> = read.values().map(|s| s.snapshot()).collect();
     snapshots.sort_by(|a, b| b.total_ns.cmp(&a.total_ns));
     snapshots
 }
 
 /// Resets every function's stats to zero.
 pub fn reset_all() {
-    let read = GLOBAL_REGISTRY
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
+    let read = GLOBAL_REGISTRY.read().unwrap_or_else(|e| e.into_inner());
     for stats in read.values() {
         stats.reset();
     }

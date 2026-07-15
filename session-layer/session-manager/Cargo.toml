@@ -13,6 +13,7 @@ stream-manager   = { path = "../../stream-layer/stream-manager" }
 connection-shard = { path = "../../runtime-layer/connection-shard" }
 thiserror = { workspace = true }
 tracing  = { workspace = true }
+profiler = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

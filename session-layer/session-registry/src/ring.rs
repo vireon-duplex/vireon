@@ -26,6 +26,7 @@
 //! hash-flooding attacks.
 
 use crate::node::NodeId;
+use profiler::profile;
 use session_manager::SessionId;
 
 /// Default number of virtual nodes per physical node. 150 is the
@@ -157,6 +158,7 @@ impl ConsistentHash {
     /// Add a physical node to the ring. Places `self.vnodes` virtual
     /// nodes at hashed positions. No-op if the node is already on
     /// the ring.
+    #[profile]
     pub fn add_node(&mut self, node: NodeId) {
         if node.is_nil() || self.nodes.contains(&node) {
             return;
@@ -171,6 +173,7 @@ impl ConsistentHash {
 
     /// Remove a physical node from the ring. Removes all of its
     /// virtual nodes. No-op if the node isn't on the ring.
+    #[profile]
     pub fn remove_node(&mut self, node: NodeId) {
         let idx = match self.nodes.iter().position(|n| *n == node) {
             Some(i) => i,
@@ -190,6 +193,7 @@ impl ConsistentHash {
     /// `hash(session_id)`. Wraps around to the first ring entry if
     /// `hash(session_id)` exceeds all ring entries.
     #[must_use]
+    #[profile]
     pub fn lookup(&self, key: &SessionId) -> Option<NodeId> {
         if self.ring.is_empty() {
             return None;
@@ -209,6 +213,7 @@ impl ConsistentHash {
     /// (for replication / fallback). Returns fewer if the ring has
     /// fewer distinct nodes.
     #[must_use]
+    #[profile]
     pub fn lookup_n(&self, key: &SessionId, n: usize) -> Vec<NodeId> {
         if self.ring.is_empty() || n == 0 {
             return Vec::new();

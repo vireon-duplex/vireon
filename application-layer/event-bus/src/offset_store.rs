@@ -69,7 +69,10 @@ impl OffsetStore {
         partition: PartitionId,
         offset: Offset,
     ) -> Result<(), EventError> {
-        let entry = self.offsets.entry((group, partition)).or_insert(Offset::ZERO);
+        let entry = self
+            .offsets
+            .entry((group, partition))
+            .or_insert(Offset::ZERO);
         if offset.raw() > entry.raw() {
             *entry = offset;
         }
@@ -130,7 +133,11 @@ mod tests {
     fn commit_then_fetch() {
         let mut store = OffsetStore::new(EventBusConfig::new());
         store
-            .commit(ConsumerGroupId::new(1), PartitionId::new(0), Offset::new(42))
+            .commit(
+                ConsumerGroupId::new(1),
+                PartitionId::new(0),
+                Offset::new(42),
+            )
             .unwrap();
 
         let offset = store
@@ -165,13 +172,46 @@ mod tests {
     fn multiple_groups_and_partitions() {
         let mut store = OffsetStore::new(EventBusConfig::new());
 
-        store.commit(ConsumerGroupId::new(1), PartitionId::new(0), Offset::new(10)).unwrap();
-        store.commit(ConsumerGroupId::new(1), PartitionId::new(1), Offset::new(20)).unwrap();
-        store.commit(ConsumerGroupId::new(2), PartitionId::new(0), Offset::new(30)).unwrap();
+        store
+            .commit(
+                ConsumerGroupId::new(1),
+                PartitionId::new(0),
+                Offset::new(10),
+            )
+            .unwrap();
+        store
+            .commit(
+                ConsumerGroupId::new(1),
+                PartitionId::new(1),
+                Offset::new(20),
+            )
+            .unwrap();
+        store
+            .commit(
+                ConsumerGroupId::new(2),
+                PartitionId::new(0),
+                Offset::new(30),
+            )
+            .unwrap();
 
-        assert_eq!(store.fetch(ConsumerGroupId::new(1), PartitionId::new(0)).unwrap(), Offset::new(10));
-        assert_eq!(store.fetch(ConsumerGroupId::new(1), PartitionId::new(1)).unwrap(), Offset::new(20));
-        assert_eq!(store.fetch(ConsumerGroupId::new(2), PartitionId::new(0)).unwrap(), Offset::new(30));
+        assert_eq!(
+            store
+                .fetch(ConsumerGroupId::new(1), PartitionId::new(0))
+                .unwrap(),
+            Offset::new(10)
+        );
+        assert_eq!(
+            store
+                .fetch(ConsumerGroupId::new(1), PartitionId::new(1))
+                .unwrap(),
+            Offset::new(20)
+        );
+        assert_eq!(
+            store
+                .fetch(ConsumerGroupId::new(2), PartitionId::new(0))
+                .unwrap(),
+            Offset::new(30)
+        );
         assert_eq!(store.tracked_count(), 3);
     }
 
@@ -179,7 +219,11 @@ mod tests {
     fn reset_clears_all() {
         let mut store = OffsetStore::new(EventBusConfig::new());
         store
-            .commit(ConsumerGroupId::new(1), PartitionId::new(0), Offset::new(10))
+            .commit(
+                ConsumerGroupId::new(1),
+                PartitionId::new(0),
+                Offset::new(10),
+            )
             .unwrap();
         assert_eq!(store.tracked_count(), 1);
 

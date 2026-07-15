@@ -18,6 +18,7 @@ use crate::budget::SchedulingBudget;
 use crate::error::SchedulerError;
 use crate::policy::SchedulingPolicy;
 use crate::queue::ReadyQueue;
+use profiler::profile;
 use stream_manager::StreamId;
 
 /// The result of a single stream selection.
@@ -76,6 +77,7 @@ impl StreamSelector {
     /// - [`SchedulerError::NoStreamsReady`] when the queue is empty.
     /// - [`SchedulerError::BudgetExhausted`] when the tick budget
     ///   is spent or the entry doesn't fit.
+    #[profile]
     pub fn select(
         &mut self,
         queue: &mut ReadyQueue,
@@ -119,6 +121,7 @@ impl StreamSelector {
 
     /// Round-robin dequeue: rotate the starting band each call to
     /// give each urgency band a fair turn.
+    #[profile]
     fn dequeue_round_robin(&mut self, queue: &mut ReadyQueue) -> Option<crate::queue::ReadyEntry> {
         let start = self.rr_cursor as usize % crate::queue::URGENCY_BANDS;
         self.rr_cursor = (self.rr_cursor + 1) % crate::queue::URGENCY_BANDS as u8;
