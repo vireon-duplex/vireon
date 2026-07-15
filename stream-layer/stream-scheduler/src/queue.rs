@@ -323,10 +323,19 @@ mod tests {
     fn capacity_rejects() {
         let mut q = ReadyQueue::new(2);
         let pri = StreamPriority::with_urgency(1);
-        assert!(q.enqueue(ReadyEntry::new(StreamId::new_unchecked(1), pri, 0)).is_ok());
-        assert!(q.enqueue(ReadyEntry::new(StreamId::new_unchecked(2), pri, 0)).is_ok());
+        assert!(
+            q.enqueue(ReadyEntry::new(StreamId::new_unchecked(1), pri, 0))
+                .is_ok()
+        );
+        assert!(
+            q.enqueue(ReadyEntry::new(StreamId::new_unchecked(2), pri, 0))
+                .is_ok()
+        );
         // Third should fail.
-        assert!(q.enqueue(ReadyEntry::new(StreamId::new_unchecked(3), pri, 0)).is_err());
+        assert!(
+            q.enqueue(ReadyEntry::new(StreamId::new_unchecked(3), pri, 0))
+                .is_err()
+        );
         assert_eq!(q.total(), 2);
     }
 
@@ -347,13 +356,14 @@ mod tests {
         ))
         .unwrap();
         // Band 1 should still accept.
-        assert!(q
-            .enqueue(ReadyEntry::new(
+        assert!(
+            q.enqueue(ReadyEntry::new(
                 StreamId::new_unchecked(3),
                 StreamPriority::with_urgency(1),
                 0
             ))
-            .is_ok());
+            .is_ok()
+        );
     }
 
     #[test]
@@ -408,10 +418,7 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(q.dequeue_band(0), None);
-        assert_eq!(
-            q.dequeue_band(3).unwrap().id,
-            StreamId::new_unchecked(1)
-        );
+        assert_eq!(q.dequeue_band(3).unwrap().id, StreamId::new_unchecked(1));
         assert!(q.is_empty());
     }
 }

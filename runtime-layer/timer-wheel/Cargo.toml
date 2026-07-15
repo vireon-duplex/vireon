@@ -12,6 +12,7 @@ autobenches = false
 [dependencies]
 thiserror = { workspace = true }
 tracing = { workspace = true }
+profiler = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

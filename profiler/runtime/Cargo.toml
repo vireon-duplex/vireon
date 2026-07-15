@@ -1,0 +1,31 @@
+[package]
+name = "profiler"
+version = { workspace = true }
+edition = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+description = "Production-grade function profiler with thread-local accumulation and lock-free aggregation"
+
+[features]
+default = []
+# When enabled, instrumentation records timing data.
+# When disabled, Guard compiles to a zero-cost no-op.
+enabled = ["dep:serde", "dep:serde_json"]
+
+[dependencies]
+profiler-macro = { path = "../macro" }
+rustc-hash = { workspace = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "overhead"
+path = "benches/overhead.rs"
+harness = false
+required-features = ["enabled"]
+
+[lints]
+workspace = true

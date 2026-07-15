@@ -210,9 +210,7 @@ impl XdpConfig {
             }
         }
         if self.ifindex == 0 {
-            return Err(KernelNicError::InvalidConfig(
-                "ifindex must be > 0".into(),
-            ));
+            return Err(KernelNicError::InvalidConfig("ifindex must be > 0".into()));
         }
         Ok(())
     }
@@ -570,17 +568,13 @@ impl XdpSocket {
     pub fn create(config: &XdpConfig) -> Result<Self, KernelNicError> {
         config.validate()?;
 
-        let fd = unsafe {
-            libc::socket(
-                AF_XDP,
-                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-                SOCK_XDP,
-            )
-        };
+        let fd = unsafe { libc::socket(AF_XDP, libc::SOCK_RAW | libc::SOCK_CLOEXEC, SOCK_XDP) };
 
         if fd < 0 {
             let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EAFNOSUPPORT) || err.raw_os_error() == Some(libc::EPROTONOSUPPORT) {
+            if err.raw_os_error() == Some(libc::EAFNOSUPPORT)
+                || err.raw_os_error() == Some(libc::EPROTONOSUPPORT)
+            {
                 return Err(KernelNicError::FeatureUnsupported(
                     "AF_XDP not supported by this kernel (requires ≥ 4.18)",
                 ));

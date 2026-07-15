@@ -75,10 +75,7 @@ impl MethodDispatcher {
     /// - [`RpcError::MethodNotFound`] — no handler registered for `id`.
     /// - Any error from the handler itself.
     pub fn dispatch(&self, id: RpcMethodId, request: &[u8]) -> Result<Vec<u8>, RpcError> {
-        let handler = self
-            .handlers
-            .get(&id)
-            .ok_or(RpcError::MethodNotFound(id))?;
+        let handler = self.handlers.get(&id).ok_or(RpcError::MethodNotFound(id))?;
 
         self.stats.record_bytes_received(request.len() as u64);
         match handler(request) {
@@ -170,9 +167,8 @@ mod tests {
     fn multiple_methods() {
         let mut dispatcher = MethodDispatcher::new(RpcConfig::new());
         let echo: RpcHandler = Arc::new(|req: &[u8]| Ok(req.to_vec()));
-        let upper: RpcHandler = Arc::new(|req: &[u8]| {
-            Ok(req.iter().map(|b| b.to_ascii_uppercase()).collect())
-        });
+        let upper: RpcHandler =
+            Arc::new(|req: &[u8]| Ok(req.iter().map(|b| b.to_ascii_uppercase()).collect()));
         dispatcher.register(RpcMethodId::new(1), echo);
         dispatcher.register(RpcMethodId::new(2), upper);
 

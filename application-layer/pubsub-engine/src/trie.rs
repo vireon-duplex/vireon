@@ -229,8 +229,16 @@ mod tests {
         let mut trie = TopicTrie::new(PubSubConfig::new());
         trie.insert("sensor.*", SubscriptionId::new(1)).unwrap();
 
-        assert!(trie.lookup("sensor.temp").unwrap().contains(&SubscriptionId::new(1)));
-        assert!(trie.lookup("sensor.humidity").unwrap().contains(&SubscriptionId::new(1)));
+        assert!(
+            trie.lookup("sensor.temp")
+                .unwrap()
+                .contains(&SubscriptionId::new(1))
+        );
+        assert!(
+            trie.lookup("sensor.humidity")
+                .unwrap()
+                .contains(&SubscriptionId::new(1))
+        );
         assert!(trie.lookup("sensor").unwrap().is_empty()); // too few segments
         assert!(trie.lookup("sensor.temp.extra").unwrap().is_empty()); // too many
     }

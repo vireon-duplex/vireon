@@ -18,6 +18,7 @@ use std::time::Instant;
 use io::completion::{Completion, CompletionDecoder};
 use io::ops::decode_kind;
 use io_uring::IoUring;
+use profiler::profile;
 
 use crate::cache::HotState;
 use crate::config::{CqeProcessorConfig, OverflowPolicy};
@@ -215,6 +216,7 @@ impl CqeProcessor {
     /// dispatches via the dispatch table. Returns a [`TickResult`] summarising
     /// the work and accumulates pending events accessible via the
     /// `drain_pending_*` methods.
+    #[profile]
     pub fn drain_cq(&mut self, ring: &mut IoUring, now_ns: u64) -> TickResult {
         let start = Instant::now();
 
@@ -348,6 +350,7 @@ impl CqeProcessor {
     ///
     /// Updates internal stats and accumulates pending events just like
     /// [`drain_cq`](Self::drain_cq), but does not advance any ring head.
+    #[profile]
     pub fn dispatch_one(
         &mut self,
         user_data: u64,

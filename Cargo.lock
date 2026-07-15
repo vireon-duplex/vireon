@@ -193,6 +193,7 @@ dependencies = [
  "libc",
  "opentelemetry",
  "parking_lot",
+ "profiler",
  "prometheus",
  "thiserror 2.0.18",
  "tracing",
@@ -347,6 +348,7 @@ dependencies = [
  "io",
  "io-uring",
  "libc",
+ "profiler",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -524,6 +526,7 @@ dependencies = [
  "buffer-pool",
  "bytes",
  "criterion",
+ "profiler",
  "thiserror 2.0.18",
 ]
 
@@ -996,6 +999,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "profiler"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "profiler-macro",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "profiler-macro"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "prometheus"
 version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1038,6 +1061,7 @@ dependencies = [
  "ctrlc",
  "frame",
  "libc",
+ "profiler",
  "quiche",
  "tracing",
  "tracing-subscriber",
@@ -1056,6 +1080,7 @@ dependencies = [
  "io",
  "libc",
  "mio",
+ "profiler",
  "quiche",
  "rustc-hash",
  "send-queue",
@@ -1096,6 +1121,7 @@ dependencies = [
  "observability-sdk",
  "ops-dashboard",
  "plugin-manager",
+ "profiler",
  "pubsub-engine",
  "quic-engine",
  "quiche",
@@ -1186,6 +1212,7 @@ dependencies = [
  "criterion",
  "io",
  "libc",
+ "profiler",
  "send-queue",
  "task-queue",
  "thiserror 2.0.18",
@@ -1390,6 +1417,7 @@ version = "0.1.0"
 dependencies = [
  "connection-shard",
  "criterion",
+ "profiler",
  "stream-manager",
  "thiserror 2.0.18",
  "tracing",
@@ -1413,6 +1441,7 @@ version = "0.1.0"
 dependencies = [
  "connection-shard",
  "criterion",
+ "profiler",
  "session-manager",
  "thiserror 2.0.18",
  "tracing",
@@ -1496,6 +1525,7 @@ name = "stream-manager"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "profiler",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -1505,6 +1535,7 @@ name = "stream-scheduler"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "profiler",
  "stream-manager",
  "thiserror 2.0.18",
  "tracing",
@@ -1603,6 +1634,7 @@ name = "timer-wheel"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "profiler",
  "thiserror 2.0.18",
  "tracing",
 ]

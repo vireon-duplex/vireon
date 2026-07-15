@@ -94,13 +94,10 @@ impl AdaptiveBitrateController {
             return Err(MediaError::BitrateUnavailable);
         }
         let clamped = new_bitrate.clamp(self.cfg.min_bps, self.cfg.max_bps);
-        let state = self
-            .tracks
-            .entry(track)
-            .or_insert_with(|| TrackAbrState {
-                current_bitrate: self.cfg.start_bps,
-                ladder: BitrateLadder::new(),
-            });
+        let state = self.tracks.entry(track).or_insert_with(|| TrackAbrState {
+            current_bitrate: self.cfg.start_bps,
+            ladder: BitrateLadder::new(),
+        });
         state.current_bitrate = clamped;
         Ok(())
     }
@@ -127,13 +124,10 @@ impl AdaptiveBitrateController {
 
     /// Registers a bitrate ladder for a track (for layer selection).
     pub fn set_ladder(&mut self, track: MediaTrackId, ladder: BitrateLadder) {
-        let state = self
-            .tracks
-            .entry(track)
-            .or_insert_with(|| TrackAbrState {
-                current_bitrate: self.cfg.start_bps,
-                ladder: BitrateLadder::new(),
-            });
+        let state = self.tracks.entry(track).or_insert_with(|| TrackAbrState {
+            current_bitrate: self.cfg.start_bps,
+            ladder: BitrateLadder::new(),
+        });
         state.ladder = ladder;
     }
 

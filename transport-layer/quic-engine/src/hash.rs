@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
 use frame::crc32c;
+use profiler::profile;
 
 /// Hasher backed by hardware-accelerated CRC32C.
 ///
@@ -20,6 +21,7 @@ pub struct Crc32cHasher {
 }
 
 impl Hasher for Crc32cHasher {
+    #[profile]
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
         // CRC32C produces a u32; fold into 64-bit with a golden-ratio

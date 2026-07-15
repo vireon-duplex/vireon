@@ -13,10 +13,13 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use profiler::profile;
+
 /// Computes CRC32C of `data`.
 ///
 /// Returns the checksum in the standard iSCSI convention:
 /// init `0xFFFFFFFF`, final XOR `0xFFFFFFFF`.
+#[profile]
 #[inline]
 pub fn crc32c(data: &[u8]) -> u32 {
     #[cfg(target_arch = "x86_64")]

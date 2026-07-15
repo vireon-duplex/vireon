@@ -9,6 +9,8 @@
 
 use std::time::Duration;
 
+use profiler::profile;
+
 use crate::config::{CongestionAlgorithm, QuicConfig};
 use crate::error::QuicError;
 
@@ -21,6 +23,7 @@ use crate::error::QuicError;
 /// - `quiche::Config::new` fails (unsupported version)
 /// - cert / key loading fails (file not found, malformed PEM)
 /// - ALPN or congestion-control configuration fails
+#[profile]
 pub fn build_quiche_config(
     quic_cfg: &QuicConfig,
     cert_path: &str,

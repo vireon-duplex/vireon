@@ -8,6 +8,7 @@
 
 use io_uring::IoUring;
 use io_uring::cqueue::Entry;
+use profiler::profile;
 
 /// Owns the drain scratch + head-advance logic. Stateless across calls
 /// aside from the reused buffer.
@@ -44,6 +45,7 @@ impl CqDrainer {
     /// io-uring crate's iterator Drop.
     ///
     /// Returns a slice of the drained entries.
+    #[profile]
     pub fn drain<'s>(&'s mut self, ring: &mut IoUring) -> &'s [Entry] {
         self.scratch.clear();
         let cap = self.batch_max;

@@ -24,6 +24,7 @@ use std::net::SocketAddr;
 
 use io::Sender;
 use io::error::IoError;
+use profiler::profile;
 
 /// Maximum number of packets coalesced into a single GSO burst.
 /// Matches Cloudflare's quiche-server default.
@@ -84,6 +85,7 @@ impl GsoBatcher {
     /// Pushes a packet. If it doesn't match the current batch's
     /// `(dest, seg_size)`, or the batch is full, the pending batch is
     /// flushed first via `sender`.
+    #[profile]
     pub fn push(&mut self, pkt: &[u8], dest: SocketAddr, sender: &Sender) -> Result<(), IoError> {
         let needs_flush = self.count >= GSO_MAX_BATCH
             || (self.count > 0 && (self.dest != Some(dest) || pkt.len() != self.seg_size));
@@ -110,6 +112,7 @@ impl GsoBatcher {
     /// pending, uses `send_blocking` (no GSO benefit for a single
     /// packet). If GSO is unsupported, falls back to `send_blocking`
     /// for each segment.
+    #[profile]
     pub fn flush(&mut self, sender: &Sender) -> Result<(), IoError> {
         if self.count == 0 {
             return Ok(());
@@ -164,6 +167,7 @@ impl GsoBatcher {
     ///
     /// Resets the batch state even on error to prevent duplicate sends
     /// when the caller retries.
+    #[profile]
     fn flush_individual(&mut self, sender: &Sender, dest: SocketAddr) -> Result<(), IoError> {
         let seg = self.seg_size;
         let total = self.buf.len();
