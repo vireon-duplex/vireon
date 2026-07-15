@@ -162,6 +162,9 @@ pub struct QuicConfig {
     /// Whether the engine is shutting down. Set by the runtime; the
     /// engine rejects all new connections while true.
     pub shutting_down: bool,
+    /// Skip CRC32C verification on received frames. Use only in trusted
+    /// environments where the transport layer guarantees integrity.
+    pub skip_crc: bool,
 }
 
 impl QuicConfig {
@@ -226,6 +229,7 @@ impl Default for QuicConfig {
             initial_congestion_window_packets: 100,
             extensions: ExtensionFlags::production(),
             shutting_down: false,
+            skip_crc: false,
         }
     }
 }

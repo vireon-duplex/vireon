@@ -42,6 +42,7 @@ pub struct ServerConfig {
     pub queue_depth: u32,
     pub echo: bool,
     pub sqpoll: bool,
+    pub skip_crc: bool,
 }
 
 /// Default queue depth if the CLI passes 0.
@@ -60,7 +61,8 @@ impl ServerConfig {
             .map_err(|e| anyhow::anyhow!("invalid bind address '{}': {e}", cli.bind))?;
 
         let preset = preset_from_arg(&cli.preset);
-        let quic_config = preset.to_config();
+        let mut quic_config = preset.to_config();
+        quic_config.skip_crc = cli.skip_crc;
 
         let workers = resolve_workers(cli.workers, &cli.mode);
 
@@ -80,6 +82,7 @@ impl ServerConfig {
             },
             echo: cli.echo,
             sqpoll: cli.sqpoll,
+            skip_crc: cli.skip_crc,
         })
     }
 
