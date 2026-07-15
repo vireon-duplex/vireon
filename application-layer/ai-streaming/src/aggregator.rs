@@ -83,10 +83,7 @@ impl TokenAggregator {
             return Err(AiStreamError::TokenFailed("nil stream id"));
         }
 
-        let buf = self
-            .buffers
-            .entry(stream)
-            .or_insert_with(StreamBuffer::new);
+        let buf = self.buffers.entry(stream).or_insert_with(StreamBuffer::new);
 
         if buf.final_received {
             // Stream already completed — ignore late chunks.
@@ -123,9 +120,7 @@ impl TokenAggregator {
     /// Returns `true` if the stream has received its final chunk.
     #[must_use]
     pub fn is_complete(&self, stream: AiStreamId) -> bool {
-        self.buffers
-            .get(&stream)
-            .is_some_and(|b| b.final_received)
+        self.buffers.get(&stream).is_some_and(|b| b.final_received)
     }
 
     /// Returns the number of active stream buffers.

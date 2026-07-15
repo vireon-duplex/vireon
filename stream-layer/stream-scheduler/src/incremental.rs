@@ -25,6 +25,8 @@
 /// Default share of each tick reserved for incremental streams.
 pub const DEFAULT_INCREMENTAL_SHARE_PCT: u8 = 25;
 
+use profiler::profile;
+
 /// Tracks the incremental-stream budget share within a tick.
 #[derive(Clone, Copy, Debug)]
 pub struct IncrementalScheduler {
@@ -73,6 +75,7 @@ impl IncrementalScheduler {
 
     /// Start a new tick: compute the incremental share from the
     /// total tick byte budget.
+    #[profile]
     pub fn start_tick(&mut self, total_tick_bytes: u64) {
         self.allotted_bytes = (total_tick_bytes * self.share_pct as u64) / 100;
         self.consumed_bytes = 0;
@@ -80,6 +83,7 @@ impl IncrementalScheduler {
 
     /// Attempt to consume `bytes` from the incremental share.
     /// Returns `true` if the consumption succeeded.
+    #[profile]
     pub fn consume(&mut self, bytes: u64) -> bool {
         if bytes > self.remaining() {
             return false;

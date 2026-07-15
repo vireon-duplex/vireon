@@ -8,15 +8,15 @@
 
 use std::io::{BufRead, Write};
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::{Parser, ValueEnum};
 
 use bytes::BytesMut;
-use frame::codec::{self, Frame, FrameDecoder, FrameHeader, HEADER_SIZE, CRC_SIZE};
+use frame::codec::{self, CRC_SIZE, Frame, FrameDecoder, FrameHeader, HEADER_SIZE};
 use frame::header::{FrameFlags, MessageType, StreamId};
 
 // ── Constants ─────────────────────────────────────────────────────
@@ -62,7 +62,6 @@ struct Cli {
     mode: Mode,
 
     // ── Pub/Sub mode args ──────────────────────────────────────────
-
     /// Pub/Sub action: subscribe or publish.
     #[arg(long, default_value = "publish")]
     action: String,
@@ -80,7 +79,6 @@ struct Cli {
     listen: Option<u64>,
 
     // ── RPC mode args ──────────────────────────────────────────────
-
     /// RPC method name.
     #[arg(long)]
     method: Option<String>,
@@ -153,7 +151,10 @@ impl ClientConn {
             c.flush()?;
         }
 
-        eprintln!("[client] connected to {peer} (handshake {}ms)", hs_start.elapsed().as_millis());
+        eprintln!(
+            "[client] connected to {peer} (handshake {}ms)",
+            hs_start.elapsed().as_millis()
+        );
         Ok(c)
     }
 
@@ -162,7 +163,10 @@ impl ClientConn {
         loop {
             match self.socket.recv(&mut self.recv_buf) {
                 Ok(n) => {
-                    let info = quiche::RecvInfo { from: self.peer, to: self.local };
+                    let info = quiche::RecvInfo {
+                        from: self.peer,
+                        to: self.local,
+                    };
                     match self.conn.recv(&mut self.recv_buf[..n], info) {
                         Ok(_) | Err(quiche::Error::Done) => {}
                         Err(e) => bail!("quiche recv: {e}"),
@@ -206,8 +210,8 @@ impl ClientConn {
 
     /// Encodes and sends a Vireon frame on QUIC stream 0.
     fn send_frame(&mut self, msg_type: MessageType, payload: &[u8]) -> Result<()> {
-        let header = FrameHeader::new(StreamId::new(LOGICAL_STREAM), msg_type)
-            .with_flags(FrameFlags::NONE);
+        let header =
+            FrameHeader::new(StreamId::new(LOGICAL_STREAM), msg_type).with_flags(FrameFlags::NONE);
         let wire_size = HEADER_SIZE + payload.len() + CRC_SIZE;
         let mut buf = BytesMut::with_capacity(wire_size);
         codec::encode_into(&mut buf, header, payload)?;
@@ -452,14 +456,15 @@ fn pubsub_mode(conn: &mut ClientConn, cli: &Cli) -> Result<()> {
         "publish" => {
             let topic = cli.topic.as_deref().unwrap_or("default");
             let text = cli.text.as_deref().unwrap_or("");
-            let payload = format!(
-                r#"{{"action":"publish","topic":"{topic}","payload":"{text}"}}"#
-            );
+            let payload = format!(r#"{{"action":"publish","topic":"{topic}","payload":"{text}"}}"#);
             eprintln!("[pubsub] >> publishing to '{topic}': {text}");
             conn.send_frame(MessageType::StateUpdate, payload.as_bytes())?;
 
             // Interactive: keep alive and listen for a bit
-            let listen_duration = cli.listen.map(Duration::from_secs).unwrap_or(Duration::from_secs(2));
+            let listen_duration = cli
+                .listen
+                .map(Duration::from_secs)
+                .unwrap_or(Duration::from_secs(2));
             let deadline = Instant::now() + listen_duration;
             let mut decoder = FrameDecoder::new();
             while Instant::now() < deadline {
@@ -490,7 +495,10 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let sni = cli.sni.clone().unwrap_or_else(|| cli.host.clone());
 
-    eprintln!("[client] connecting to {}:{} (mode={:?})", cli.host, cli.port, cli.mode);
+    eprintln!(
+        "[client] connecting to {}:{} (mode={:?})",
+        cli.host, cli.port, cli.mode
+    );
 
     let mut conn = ClientConn::connect(&cli.host, cli.port, &sni)?;
 

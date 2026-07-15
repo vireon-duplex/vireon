@@ -194,6 +194,10 @@ pub fn install_signal_handler(shutdown_requested: Arc<AtomicBool>) -> Result<(),
             shutdown_requested.store(true, Ordering::Release);
         } else {
             tracing::warn!("received second SIGINT/SIGTERM — forcing immediate exit");
+            #[cfg(feature = "profiling")]
+            {
+                crate::profiler_force_dump();
+            }
             std::process::exit(130);
         }
     })

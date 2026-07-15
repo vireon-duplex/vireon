@@ -5,7 +5,7 @@
 
 use std::sync::{Mutex, MutexGuard};
 
-use profiler::{profile, Profiler, ProfilerConfig};
+use profiler::{Profiler, ProfilerConfig, profile};
 
 // Serialize all integration tests — they share global profiler state.
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -72,11 +72,7 @@ mod recursive {
 
     #[profile]
     fn factorial(n: u64) -> u64 {
-        if n <= 1 {
-            1
-        } else {
-            n * factorial(n - 1)
-        }
+        if n <= 1 { 1 } else { n * factorial(n - 1) }
     }
 
     #[test]

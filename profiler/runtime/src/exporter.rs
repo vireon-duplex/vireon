@@ -136,10 +136,7 @@ pub fn export_json(snapshots: &[FunctionSnapshot]) -> String {
         if i > 0 {
             out.push(',');
         }
-        out.push_str(&format!(
-            r#"{{"name":"{}","calls":{}}}"#,
-            s.name, s.calls
-        ));
+        out.push_str(&format!(r#"{{"name":"{}","calls":{}}}"#, s.name, s.calls));
     }
     out.push(']');
     out

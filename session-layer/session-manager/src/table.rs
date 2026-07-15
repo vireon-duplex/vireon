@@ -26,6 +26,7 @@
 use crate::config::SessionManagerConfig;
 use crate::error::SessionManagerError;
 use crate::id::SessionId;
+use profiler::profile;
 
 /// Generation counter type stamped on every slot handle.
 pub type SlotGeneration = u32;
@@ -139,6 +140,7 @@ impl SessionTable {
     /// # Errors
     /// Returns [`SessionManagerError::ResourceExhausted`] when the
     /// table is full.
+    #[profile]
     pub fn try_reserve_slot(&mut self) -> Result<SlotGeneration, SessionManagerError> {
         if self.is_full() {
             return Err(SessionManagerError::ResourceExhausted("session table full"));

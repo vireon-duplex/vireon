@@ -86,8 +86,8 @@ pub use profiler_macro::profile;
 
 // ── Internal imports ──────────────────────────────────────────────
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
 use collector::{bump_tick, set_enabled, set_flush_threshold, set_sampling};
@@ -158,9 +158,7 @@ impl Profiler {
             .name("profiler-bg".into())
             .spawn(move || {
                 while !BG_STOP.load(Ordering::Relaxed) {
-                    thread::sleep(std::time::Duration::from_millis(
-                        flush_interval_ms.max(1),
-                    ));
+                    thread::sleep(std::time::Duration::from_millis(flush_interval_ms.max(1)));
                     if BG_STOP.load(Ordering::Relaxed) {
                         break;
                     }
@@ -169,9 +167,7 @@ impl Profiler {
             })
             .ok();
 
-        let mut guard = BG_HANDLE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut guard = BG_HANDLE.lock().unwrap_or_else(|e| e.into_inner());
         *guard = handle;
     }
 
@@ -181,9 +177,7 @@ impl Profiler {
         BG_RUNNING.store(false, Ordering::SeqCst);
 
         let handle = {
-            let mut guard = BG_HANDLE
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut guard = BG_HANDLE.lock().unwrap_or_else(|e| e.into_inner());
             guard.take()
         };
         if let Some(h) = handle {

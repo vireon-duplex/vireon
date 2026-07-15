@@ -71,6 +71,9 @@ socket2 = { version = "0.5", features = ["all"] }
 # thread-per-core with no untrusted keys).
 rustc-hash = "2.1"
 
+# Production-grade function profiler (#[profile] attribute macro).
+profiler = { path = "profiler/runtime" }
+
 [dependencies]
 anyhow = { workspace = true }
 tracing = { workspace = true }

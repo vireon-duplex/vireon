@@ -5,6 +5,8 @@
 //! `BufferPool::refill_buffer` call — fine individually but noisy at
 //! 40 Gbps line rate.
 
+use profiler::profile;
+
 /// Pre-allocated scratch of pending buf_ids awaiting return.
 pub struct RecyclePipeline {
     pending: Vec<u16>,
@@ -40,6 +42,7 @@ impl RecyclePipeline {
     /// The actual `BufferPool::refill_buffer` calls are the caller's
     /// responsibility (the caller owns the pool).
     #[must_use]
+    #[profile]
     pub fn drain_pending(&mut self) -> Vec<u16> {
         let out = std::mem::take(&mut self.pending);
         // Restore capacity for the next batch.

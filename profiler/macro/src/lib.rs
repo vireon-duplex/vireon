@@ -44,8 +44,8 @@
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
-use quote::{quote, ToTokens};
-use syn::{parse_macro_input, ItemFn};
+use quote::{ToTokens, quote};
+use syn::{ItemFn, parse_macro_input};
 
 /// Instruments a function with a timing guard.
 ///
@@ -137,8 +137,7 @@ mod tests {
     #[test]
     fn expand_async_fn() {
         let input: ItemFn =
-            parse_str("async fn send(id: u64) -> Result<(), Error> { Ok(()) }")
-                .unwrap();
+            parse_str("async fn send(id: u64) -> Result<(), Error> { Ok(()) }").unwrap();
         let output = expand(&input).unwrap();
         let n = norm(&output.to_string());
         assert!(n.contains("async"));
@@ -148,8 +147,7 @@ mod tests {
 
     #[test]
     fn expand_generic_fn() {
-        let input: ItemFn =
-            parse_str("fn identity<T>(x: T) -> T { x }").unwrap();
+        let input: ItemFn = parse_str("fn identity<T>(x: T) -> T { x }").unwrap();
         let output = expand(&input).unwrap();
         let n = norm(&output.to_string());
         assert!(n.contains("Guard::enter"));
@@ -158,8 +156,7 @@ mod tests {
 
     #[test]
     fn expand_unsafe_fn() {
-        let input: ItemFn =
-            parse_str("unsafe fn raw(x: *const u8) -> u8 { *x }").unwrap();
+        let input: ItemFn = parse_str("unsafe fn raw(x: *const u8) -> u8 { *x }").unwrap();
         let output = expand(&input).unwrap();
         let n = norm(&output.to_string());
         assert!(n.contains("unsafe"));
@@ -168,8 +165,7 @@ mod tests {
 
     #[test]
     fn expand_pub_fn() {
-        let input: ItemFn =
-            parse_str("pub fn public() -> () { }").unwrap();
+        let input: ItemFn = parse_str("pub fn public() -> () { }").unwrap();
         let output = expand(&input).unwrap();
         let n = norm(&output.to_string());
         assert!(n.contains("pub"));
@@ -177,8 +173,7 @@ mod tests {
 
     #[test]
     fn expand_pub_crate_fn() {
-        let input: ItemFn =
-            parse_str("pub(crate) fn internal() { }").unwrap();
+        let input: ItemFn = parse_str("pub(crate) fn internal() { }").unwrap();
         let output = expand(&input).unwrap();
         let n = norm(&output.to_string());
         assert!(n.contains("pub(crate)"));
@@ -187,8 +182,7 @@ mod tests {
 
     #[test]
     fn expand_const_fn_is_noop() {
-        let input: ItemFn =
-            parse_str("const fn constant() -> u32 { 42 }").unwrap();
+        let input: ItemFn = parse_str("const fn constant() -> u32 { 42 }").unwrap();
         let output = expand(&input).unwrap();
         let n = norm(&output.to_string());
         // Should not contain Guard for const fn.
@@ -199,8 +193,7 @@ mod tests {
 
     #[test]
     fn expand_preserves_attrs() {
-        let input: ItemFn =
-            parse_str("#[inline] fn with_attr() { }").unwrap();
+        let input: ItemFn = parse_str("#[inline] fn with_attr() { }").unwrap();
         let output = expand(&input).unwrap();
         let n = norm(&output.to_string());
         assert!(n.contains("inline"));
@@ -217,9 +210,7 @@ mod tests {
 
     #[test]
     fn expand_lifetime_fn() {
-        let input: ItemFn =
-            parse_str("fn borrow<'a>(x: &'a [u8]) -> &'a u8 { &x[0] }")
-                .unwrap();
+        let input: ItemFn = parse_str("fn borrow<'a>(x: &'a [u8]) -> &'a u8 { &x[0] }").unwrap();
         let output = expand(&input).unwrap();
         let n = norm(&output.to_string());
         assert!(n.contains("Guard::enter"));

@@ -150,9 +150,7 @@ mod tests {
         }
         collector::flush_local();
         let snaps = registry::snapshot_all();
-        let snap = snaps
-            .iter()
-            .find(|s| s.name == "guard_records_timing");
+        let snap = snaps.iter().find(|s| s.name == "guard_records_timing");
         assert!(snap.is_some(), "snapshot should exist after flush");
         let snap = snap.unwrap();
         assert!(snap.calls >= 1);

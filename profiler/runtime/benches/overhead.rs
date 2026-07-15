@@ -8,8 +8,8 @@
 //! Measures: empty function call, nested calls (5 deep), and
 //! a computational workload.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use profiler::{profile, Guard, Profiler, ProfilerConfig};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use profiler::{Guard, Profiler, ProfilerConfig, profile};
 
 // ── Instrumented functions ────────────────────────────────────────
 
@@ -72,9 +72,7 @@ fn bench_single_call(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("single_call");
 
-    group.bench_function("plain", |b| {
-        b.iter(|| black_box(plain_empty()))
-    });
+    group.bench_function("plain", |b| b.iter(|| black_box(plain_empty())));
 
     group.bench_function("profiler_enabled", |b| {
         Profiler::enable();
@@ -94,9 +92,7 @@ fn bench_nested_calls(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("nested_5_deep");
 
-    group.bench_function("plain", |b| {
-        b.iter(|| black_box(plain_nested_a()))
-    });
+    group.bench_function("plain", |b| b.iter(|| black_box(plain_nested_a())));
 
     group.bench_function("profiler_enabled", |b| {
         Profiler::enable();
