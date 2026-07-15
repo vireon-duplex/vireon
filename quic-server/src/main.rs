@@ -76,6 +76,9 @@ fn print_banner(config: &ServerConfig) {
     if config.echo {
         tracing::info!("  Echo:     ENABLED (benchmark mode)");
     }
+    if config.skip_crc {
+        tracing::info!("  Skip CRC: ENABLED (trusted mode — no integrity check)");
+    }
     tracing::info!("============================================================");
 }
 
