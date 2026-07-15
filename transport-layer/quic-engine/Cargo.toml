@@ -44,6 +44,9 @@ io = { path = "../../io-layer/io" }
 # Message layer — frame codec for stream data parsing.
 frame = { path = "../../message-layer/frame" }
 
+# Profiler — #[profile] instrumentation.
+profiler = { workspace = true }
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 

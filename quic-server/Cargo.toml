@@ -88,5 +88,14 @@ rustc-hash = { workspace = true }
 # Refcounted byte slices for zero-copy frame payloads.
 bytes = { workspace = true }
 
+# Function profiler (#[profile] instrumentation).
+profiler = { workspace = true }
+
+[features]
+default = []
+# Activate profiler instrumentation at compile time.
+# Usage: cargo run -p quic-server --features profiling
+profiling = ["profiler/enabled"]
+
 [lints]
 workspace = true

@@ -56,6 +56,13 @@ pub struct Cli {
     /// Falls back to standard mode if the kernel denies SQPOLL.
     #[arg(long)]
     pub sqpoll: bool,
+
+    /// Dump profiler report to this file on shutdown.
+    /// Requires building with --features profiling.
+    /// Formats: .json, .csv, .ctrace (Chrome trace), .folded (flamegraph),
+    /// .dot (Graphviz), anything else = text report.
+    #[arg(long)]
+    pub profile_output: Option<String>,
 }
 
 /// CLI worker-mode selector.

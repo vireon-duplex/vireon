@@ -12,6 +12,7 @@ autobenches = false
 stream-manager = { path = "../stream-manager" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+profiler = { workspace = true }
 
 # Phase 1+ will add:
 # send-queue = { path = "../../runtime-layer/send-queue" }

@@ -52,12 +52,7 @@ impl Role {
         result
     }
 
-    fn collect_inherited_permissions(
-        &self,
-        result: &mut PermissionSet,
-        roles: &[Role],
-        depth: u8,
-    ) {
+    fn collect_inherited_permissions(&self, result: &mut PermissionSet, roles: &[Role], depth: u8) {
         if depth >= 4 {
             return;
         }

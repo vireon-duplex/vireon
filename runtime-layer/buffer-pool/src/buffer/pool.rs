@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use profiler::profile;
+
 use crate::allocator::allocator::{Allocation, Allocator};
 use crate::allocator::classifier::{Classification, classify_request};
 use crate::allocator::size_class::{ClassId, NUM_CLASSES, object_size};
@@ -56,6 +58,7 @@ impl PoolInner {
     /// Acquires memory for `size` bytes.
     ///
     /// Fast path: thread-local → global → arena. Huge sizes bypass caches.
+    #[profile]
     fn acquire(&self, size: usize) -> Result<Allocation, BufferPoolError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(BufferPoolError::PoolClosed);
@@ -147,6 +150,7 @@ impl PoolInner {
 }
 
 impl ReleaseSink for PoolInner {
+    #[profile]
     fn release_buffer(
         &self,
         ptr: NonNull<u8>,
@@ -261,6 +265,7 @@ impl BufferPool {
     /// elapses. Returns [`Err(Timeout)`](BufferPoolError::Timeout) on timeout
     /// and [`Err(PoolClosed)`](BufferPoolError::PoolClosed) if the pool was
     /// closed while waiting.
+    #[profile]
     pub fn get(&self, size: usize) -> Result<Buffer, BufferPoolError> {
         let deadline = Instant::now() + self.inner.bp_policy.wait_timeout;
         loop {
@@ -288,6 +293,7 @@ impl BufferPool {
     /// `bytes_outstanding + size` would exceed the pool's byte ceiling,
     /// [`Err(PoolClosed)`](BufferPoolError::PoolClosed) when the pool is
     /// closed.
+    #[profile]
     pub fn try_get(&self, size: usize) -> Result<Buffer, BufferPoolError> {
         let outstanding = self.inner.counters.bytes_outstanding() as usize;
         if self.inner.bp_policy.would_exceed(outstanding, size) {
@@ -298,6 +304,7 @@ impl BufferPool {
 
     /// Shared allocation path used by both [`get`](Self::get) and
     /// [`try_get`](Self::try_get).
+    #[profile]
     fn acquire_buffer(&self, size: usize) -> Result<Buffer, BufferPoolError> {
         let start = Instant::now();
         let alloc = self.inner.acquire(size)?;
@@ -325,6 +332,7 @@ impl BufferPool {
     ///
     /// Call this before a thread that used the pool exits, or when you want to
     /// return cached memory to the global pool.
+    #[profile]
     pub fn flush(&self) {
         let drained = flush_current_thread(self.inner.pool_id);
         for (class_idx, slots) in drained.into_iter().enumerate() {

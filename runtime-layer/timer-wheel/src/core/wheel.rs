@@ -18,6 +18,7 @@
 use crate::core::allocator::SlabAllocator;
 use crate::core::bucket::{drain_all, push_front};
 use crate::core::timer_entry::TimerEntry;
+use profiler::profile;
 
 /// Hierarchical timing wheel state (single-threaded).
 pub struct HierarchicalWheel {
@@ -75,6 +76,7 @@ impl HierarchicalWheel {
     /// Caller obligation: `deadline > last_tick`. The shard must fire any
     /// already-due timer itself rather than calling this.
     #[inline]
+    #[profile]
     pub fn add(&mut self, slab: &mut SlabAllocator<TimerEntry>, slot: u32, deadline: u64) {
         debug_assert!(
             deadline > self.last_tick,
@@ -111,6 +113,7 @@ impl HierarchicalWheel {
     /// parent levels on wrap. Returns the slot indices that must be reclaimed
     /// by the caller (fired or cancelled) — the shard frees them and routes
     /// non-cancelled ones to the expired queue.
+    #[profile]
     pub fn advance(
         &mut self,
         slab: &mut SlabAllocator<TimerEntry>,
@@ -170,6 +173,7 @@ impl HierarchicalWheel {
     /// cascade brings them down within one level-0 revolution), which is the
     /// safe direction: the worker wakes, re-advances, and re-evaluates.
     #[must_use]
+    #[profile]
     pub fn next_deadline(&self) -> Option<u64> {
         if self.count == 0 {
             return None;

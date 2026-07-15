@@ -142,10 +142,7 @@ impl GossipEngine {
     /// Whether all peers have acknowledged a given key.
     pub fn is_fully_disseminated(&self, key: &str) -> bool {
         match self.messages.get(key) {
-            Some(entry) => {
-                !self.peers.is_empty()
-                    && entry.acked_by.len() == self.peers.len()
-            }
+            Some(entry) => !self.peers.is_empty() && entry.acked_by.len() == self.peers.len(),
             None => false,
         }
     }
@@ -156,9 +153,8 @@ impl GossipEngine {
     pub fn purge_disseminated(&mut self) -> usize {
         let before = self.messages.len();
         let peers = &self.peers;
-        self.messages.retain(|_, entry| {
-            !(!peers.is_empty() && entry.acked_by.len() == peers.len())
-        });
+        self.messages
+            .retain(|_, entry| !(!peers.is_empty() && entry.acked_by.len() == peers.len()));
         before - self.messages.len()
     }
 

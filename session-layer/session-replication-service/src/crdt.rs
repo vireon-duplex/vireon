@@ -247,9 +247,6 @@ mod tests {
         let a_val = a.read("k").unwrap().unwrap();
         b.merge("k", &a_val).unwrap();
 
-        assert_eq!(
-            a.read("k").unwrap().unwrap(),
-            b.read("k").unwrap().unwrap()
-        );
+        assert_eq!(a.read("k").unwrap().unwrap(), b.read("k").unwrap().unwrap());
     }
 }

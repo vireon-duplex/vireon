@@ -232,6 +232,9 @@ mod tests {
     #[test]
     fn rate_limit_per_minute_exposed() {
         let auth = fresh();
-        assert_eq!(auth.rate_limit_per_minute(), Preset::Standard.to_config().rate_limit_per_minute);
+        assert_eq!(
+            auth.rate_limit_per_minute(),
+            Preset::Standard.to_config().rate_limit_per_minute
+        );
     }
 }
