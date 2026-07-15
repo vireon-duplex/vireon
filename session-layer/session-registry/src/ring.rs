@@ -25,6 +25,8 @@
 //! Phase 1+ may switch to a keyed hash (SipHash-2-4) to prevent
 //! hash-flooding attacks.
 
+use rustc_hash::FxHashSet;
+
 use crate::node::NodeId;
 use profiler::profile;
 use session_manager::SessionId;
@@ -111,8 +113,9 @@ pub struct ConsistentHash {
     /// Virtual nodes per physical node.
     vnodes: u32,
     /// Distinct physical node ids currently on the ring.
-    /// (Kept as a sorted Vec for fast add/remove.)
     nodes: Vec<NodeId>,
+    /// O(1) dedup set for add_node / remove_node.
+    node_set: FxHashSet<NodeId>,
 }
 
 impl Default for ConsistentHash {
@@ -134,6 +137,7 @@ impl ConsistentHash {
             ring: Vec::new(),
             vnodes,
             nodes: Vec::new(),
+            node_set: FxHashSet::default(),
         }
     }
 
@@ -158,28 +162,34 @@ impl ConsistentHash {
     /// Add a physical node to the ring. Places `self.vnodes` virtual
     /// nodes at hashed positions. No-op if the node is already on
     /// the ring.
+    ///
+    /// Each vnode is inserted via binary search (`partition_point`) to
+    /// keep the ring sorted — O(vnodes × log n) instead of O(n log n)
+    /// full re-sort.
     #[profile]
     pub fn add_node(&mut self, node: NodeId) {
-        if node.is_nil() || self.nodes.contains(&node) {
+        if node.is_nil() || !self.node_set.insert(node) {
             return;
         }
         for i in 0..self.vnodes {
-            let hash = fxhash_pair(node.raw() as u64, i as u64);
-            self.ring.push(RingEntry::new(hash, node));
+            let entry = RingEntry::new(fxhash_pair(node.raw() as u64, i as u64), node);
+            let pos = self.ring.partition_point(|e| e < &entry);
+            self.ring.insert(pos, entry);
         }
         self.nodes.push(node);
-        self.ring.sort_unstable();
     }
 
     /// Remove a physical node from the ring. Removes all of its
     /// virtual nodes. No-op if the node isn't on the ring.
     #[profile]
     pub fn remove_node(&mut self, node: NodeId) {
-        let idx = match self.nodes.iter().position(|n| *n == node) {
-            Some(i) => i,
-            None => return,
-        };
-        self.nodes.swap_remove(idx);
+        if !self.node_set.remove(&node) {
+            return;
+        }
+        let idx = self.nodes.iter().position(|n| *n == node);
+        if let Some(i) = idx {
+            self.nodes.swap_remove(i);
+        }
         self.ring.retain(|e| e.node_id != node);
         // swap_remove breaks sort order relative to original indices,
         // but ring sort is unaffected since we retain + sort below.

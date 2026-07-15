@@ -10,6 +10,7 @@ autobenches = false
 
 [dependencies]
 stream-manager = { path = "../stream-manager" }
+rustc-hash = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 profiler = { workspace = true }

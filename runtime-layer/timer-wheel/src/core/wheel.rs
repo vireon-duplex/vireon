@@ -16,7 +16,7 @@
 //!   `levels - 1`). `r ≥ 1` is required.
 
 use crate::core::allocator::SlabAllocator;
-use crate::core::bucket::{drain_all, push_front};
+use crate::core::bucket::{drain_all_into, push_front};
 use crate::core::timer_entry::TimerEntry;
 use profiler::profile;
 
@@ -120,16 +120,21 @@ impl HierarchicalWheel {
         now: u64,
         reclaimed: &mut Vec<u32>,
     ) {
+        // Reusable scratch buffer for cascade drain — avoids per-tick allocation.
+        let mut cascade_buf: Vec<u32> = Vec::new();
+
         while self.last_tick < now {
             self.last_tick += 1;
             let t = self.last_tick;
 
-            // Fire the level-0 bucket for this tick.
+            // Fire the level-0 bucket for this tick — drain directly into
+            // `reclaimed` to avoid an intermediate Vec allocation.
             let l0_slot = (t as usize) & self.slot_mask;
-            let drained = drain_all(slab, &mut self.buckets[l0_slot]);
-            if !drained.is_empty() {
-                self.count = self.count.saturating_sub(drained.len() as u64);
-                reclaimed.extend(drained);
+            let before = reclaimed.len();
+            drain_all_into(slab, &mut self.buckets[l0_slot], reclaimed);
+            let drained_count = reclaimed.len() - before;
+            if drained_count > 0 {
+                self.count = self.count.saturating_sub(drained_count as u64);
             }
 
             // On a level-0 wrap, cascade the parent level's current slot, and
@@ -137,18 +142,20 @@ impl HierarchicalWheel {
             if l0_slot == 0 {
                 for lvl in 1..self.levels {
                     let sidx = ((t >> (lvl * self.bits)) as usize) & self.slot_mask;
-                    let cascaded = drain_all(
+                    cascade_buf.clear();
+                    drain_all_into(
                         slab,
                         &mut self.buckets[(lvl as usize) * self.slots_per_level + sidx],
+                        &mut cascade_buf,
                     );
-                    if cascaded.is_empty() {
+                    if cascade_buf.is_empty() {
                         // nothing to do at this level; still respect wrap chain
                         if sidx != 0 {
                             break;
                         }
                         continue;
                     }
-                    for slot in cascaded {
+                    for &slot in &cascade_buf {
                         let dl = slab.get(slot).deadline;
                         if dl <= self.last_tick {
                             // became due during the same tick — fire/reclaim now

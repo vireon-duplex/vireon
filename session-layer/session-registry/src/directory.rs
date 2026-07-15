@@ -14,7 +14,7 @@
 //! - a [`MembershipList`] (node liveness),
 //! - a [`RegistryStats`] (observability).
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::config::RegistryConfig;
 use crate::error::RegistryError;
@@ -39,7 +39,7 @@ pub struct SessionDirectory {
     ownership: OwnershipTable,
     membership: MembershipList,
     /// Lookup cache for the hot path.
-    cache: HashMap<SessionId, SessionLocator>,
+    cache: FxHashMap<SessionId, SessionLocator>,
     /// Current cluster epoch (bumped on topology change).
     epoch: Epoch,
     stats: RegistryStats,
@@ -57,7 +57,7 @@ impl SessionDirectory {
             ring: ConsistentHash::new(cfg.ring_vnodes),
             ownership: OwnershipTable::new(),
             membership: MembershipList::new(),
-            cache: HashMap::new(),
+            cache: FxHashMap::default(),
             epoch: Epoch::INITIAL,
             stats: RegistryStats::new(),
             cfg,
