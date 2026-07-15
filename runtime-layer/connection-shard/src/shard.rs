@@ -175,9 +175,16 @@ impl ConnectionShard {
     /// Returns the [`ConnectionId`] (slot + generation) if found.
     #[inline]
     pub fn lookup_by_stream(&self, stream_id: u64) -> Option<ConnectionId> {
-        let hit = self.stream_index.get(&stream_id).copied().is_some();
-        self.stats.record_lookup(hit);
-        let slot = self.stream_index.get(&stream_id).copied()?;
+        let slot = match self.stream_index.get(&stream_id).copied() {
+            Some(s) => {
+                self.stats.record_lookup(true);
+                s
+            }
+            None => {
+                self.stats.record_lookup(false);
+                return None;
+            }
+        };
         let slot_idx = slot as usize;
         if slot_idx >= self.slab.len() {
             return None;

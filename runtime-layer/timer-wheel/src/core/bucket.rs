@@ -49,27 +49,36 @@ pub fn unlink(slab: &mut SlabAllocator<TimerEntry>, head: &mut u32, slot: u32) {
     e.next = 0;
 }
 
+/// Drains every entry from the bucket at `*head`, appending slot indices
+/// to `out` in front-to-back order. Resets `*head` to the null sentinel.
+///
+/// Unlike [`drain_all`], this does not allocate — the caller provides
+/// a reusable buffer.
+pub fn drain_all_into(slab: &mut SlabAllocator<TimerEntry>, head: &mut u32, out: &mut Vec<u32>) {
+    let mut cur = *head;
+    *head = 0;
+    while cur != 0 {
+        debug_assert_eq!(slab.get(cur).prev, 0, "drain walked a non-head node");
+        out.push(cur);
+        let next = slab.get(cur).next;
+        if next != 0 {
+            slab.get_mut(next).prev = 0;
+        }
+        cur = next;
+    }
+}
+
 /// Drains every entry from the bucket at `*head`, returning the slot indices
 /// in front-to-back order. Resets `*head` to the null sentinel.
+///
+/// Allocates a new `Vec` — for hot paths prefer [`drain_all_into`].
 ///
 /// Does not touch each entry's own `next` link (the slots are about to be
 /// fired or freed), which is safe because a freed slot is re-written before
 /// its next use.
 pub fn drain_all(slab: &mut SlabAllocator<TimerEntry>, head: &mut u32) -> Vec<u32> {
     let mut out = Vec::new();
-    let mut cur = *head;
-    *head = 0;
-    while cur != 0 {
-        // Walk via `next`. `cur`'s prev must be 0 (head of the remaining chain).
-        debug_assert_eq!(slab.get(cur).prev, 0, "drain walked a non-head node");
-        out.push(cur);
-        let next = slab.get(cur).next;
-        // clear this node's prev so the next iteration's debug_assert holds
-        if next != 0 {
-            slab.get_mut(next).prev = 0;
-        }
-        cur = next;
-    }
+    drain_all_into(slab, head, &mut out);
     out
 }
 

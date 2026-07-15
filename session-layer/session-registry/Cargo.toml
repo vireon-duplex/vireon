@@ -11,6 +11,7 @@ autobenches = false
 [dependencies]
 session-manager   = { path = "../session-manager" }
 connection-shard  = { path = "../../runtime-layer/connection-shard" }
+rustc-hash = { workspace = true }
 thiserror = { workspace = true }
 tracing  = { workspace = true }
 profiler = { workspace = true }
