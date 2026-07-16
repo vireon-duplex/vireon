@@ -16,7 +16,7 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use io::completion::{Completion, CompletionDecoder};
-use io::ops::decode_kind;
+use io::ops::{OpKind, decode_kind};
 use io_uring::IoUring;
 use profiler::profile;
 
@@ -248,9 +248,15 @@ impl CqeProcessor {
             // Hot-state record.
             self.hot.record_cqe(kind as usize);
 
-            // Dispatch via the table.
-            let handler = self.dispatch_table.get(kind);
-            let outcome: Outcome = handler(self, &completion);
+            // Dispatch via direct match — enables inlining of handlers.
+            // (The dispatch_table is retained for test-path dispatch_one and
+            // custom handler overrides via DispatchTable::set.)
+            let outcome: Outcome = match kind {
+                OpKind::Recv => crate::handlers::process_recv(self, &completion),
+                OpKind::Send => crate::handlers::process_send(self, &completion),
+                OpKind::Timeout => crate::handlers::process_timeout(self, &completion),
+                OpKind::Cancel => crate::handlers::process_cancel(self, &completion),
+            };
 
             // Tally.
             if outcome.consumed {

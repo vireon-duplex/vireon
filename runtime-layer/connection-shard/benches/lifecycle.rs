@@ -64,12 +64,12 @@ fn bench_touch(c: &mut Criterion) {
     g.throughput(Throughput::Elements(1));
     g.bench_function("recv", |b| {
         b.iter(|| {
-            shard.touch_recv(black_box(id), 1024).expect("recv");
+            shard.touch_recv(black_box(id), 1024, 1000).expect("recv");
         });
     });
     g.bench_function("send", |b| {
         b.iter(|| {
-            shard.touch_send(black_box(id), 1024).expect("send");
+            shard.touch_send(black_box(id), 1024, 2000).expect("send");
         });
     });
     g.finish();

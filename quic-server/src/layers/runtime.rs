@@ -134,8 +134,9 @@ impl RuntimeLayer {
 
     /// Updates recv stats and resets the idle timer.
     pub fn on_frame(&mut self, conn_idx: usize, conn_id: ConnectionId, frame_len: usize) {
-        // Update connection recv stats.
-        let _ = self.shard.touch_recv(conn_id, frame_len);
+        // Compute time once — reused for both touch and timer.
+        let now_ns = connection_shard::shard::monotonic_now_ns();
+        let _ = self.shard.touch_recv(conn_id, frame_len, now_ns);
 
         // Reset idle timer (cancel old + start new).
         if let Some(old) = self.timer_handles.remove(&conn_idx) {
