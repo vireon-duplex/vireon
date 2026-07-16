@@ -89,6 +89,25 @@ pub fn rss_kib() -> u64 {
     0
 }
 
+/// Returns any freed memory to the OS by asking glibc to `malloc_trim(0)`.
+///
+/// Between sweep steps, glibc malloc arenas retain peak heap segments even
+/// after the allocations are freed. `malloc_trim(0)` releases the topmost
+/// free chunk of every arena back to the OS via `munmap`/`MADV_DONTNEED`.
+///
+/// This is essential for sweep-mode RSS accuracy: without it, RSS measured
+/// at the end of step N includes retained arena memory from all steps 1..N,
+/// making `rss_per_conn` misleading across a sweep.
+///
+/// No-op on non-glibc allocators (returns `false`).
+#[allow(unused_variables)]
+pub fn malloc_trim() {
+    #[cfg(target_env = "gnu")]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

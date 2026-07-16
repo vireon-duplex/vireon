@@ -143,9 +143,9 @@ pub struct Summary {
     pub cpu_cores: f64,
     /// CPU cores per GiB/s of throughput — lower is better.
     pub cpu_per_gibps: f64,
-    /// Process RSS in KiB at end of measurement.
+    /// Peak process RSS (KiB) sampled during the run — true working set.
     pub rss_kib: u64,
-    /// RSS (KiB) divided by successful connections.
+    /// Peak RSS (KiB) per successful connection.
     pub rss_per_conn_kib: f64,
 }
 
@@ -265,8 +265,8 @@ impl Summary {
     ///
     /// - `cpu_delta_secs`: total CPU time (all threads) consumed during the run.
     /// - `wall_secs`: wall-clock duration of the measurement window.
-    /// - `rss_kib`: process RSS sampled at the end of the run.
-    pub fn attach_resources(&mut self, cpu_delta_secs: f64, wall_secs: f64, rss_kib: u64) {
+    /// - `rss_peak_kib`: peak process RSS (KiB) sampled during the run.
+    pub fn attach_resources(&mut self, cpu_delta_secs: f64, wall_secs: f64, rss_peak_kib: u64) {
         self.cpu_cores = if wall_secs > 0.0 {
             cpu_delta_secs / wall_secs
         } else {
@@ -278,9 +278,9 @@ impl Summary {
         } else {
             0.0
         };
-        self.rss_kib = rss_kib;
+        self.rss_kib = rss_peak_kib;
         self.rss_per_conn_kib = if self.connections_ok > 0 {
-            rss_kib as f64 / self.connections_ok as f64
+            rss_peak_kib as f64 / self.connections_ok as f64
         } else {
             0.0
         };
@@ -300,7 +300,7 @@ pub struct SweepPoint {
     pub latency_max: Duration,
     /// CPU cores per GiB/s.
     pub cpu_per_gibps: f64,
-    /// RSS (KiB) per connection.
+    /// Peak RSS (KiB) per connection — true per-conn memory cost.
     pub rss_per_conn_kib: f64,
 }
 
@@ -331,8 +331,8 @@ fn print_resource_stats(s: &Summary) {
         "  CPU per GiB/s       {:>10.2}  (cores per GiB/s — lower is better)",
         s.cpu_per_gibps
     );
-    println!("  RSS                 {:>10.0} KiB", s.rss_kib);
-    println!("  RSS per Connection  {:>10.0} KiB", s.rss_per_conn_kib);
+    println!("  RSS (peak)          {:>10.0} KiB", s.rss_kib);
+    println!("  RSS/conn (peak)     {:>10.0} KiB", s.rss_per_conn_kib);
 }
 
 /// Prints the connections-sweep comparison table.
