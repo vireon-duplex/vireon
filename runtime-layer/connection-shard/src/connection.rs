@@ -24,8 +24,6 @@ pub(crate) struct ConnectionEntry {
     pub priority: ConnectionPriority,
     /// The logical stream identifier from the protocol frame header.
     pub stream_id: u64,
-    /// Remote peer address.
-    pub peer_addr: SocketAddr,
     /// CPU / core that owns this connection.
     pub owner_cpu: u32,
     /// NUMA node of the owning core.
@@ -46,7 +44,6 @@ impl ConnectionEntry {
     /// Creates a new entry in the `Init` state.
     pub(crate) fn new(
         stream_id: u64,
-        peer_addr: SocketAddr,
         owner_cpu: u32,
         numa_node: u32,
         tenant_id: u32,
@@ -57,7 +54,6 @@ impl ConnectionEntry {
             state: ConnectionState::Init,
             priority,
             stream_id,
-            peer_addr,
             owner_cpu,
             numa_node,
             tenant_id,
@@ -85,7 +81,6 @@ impl ConnectionEntry {
         self.state = ConnectionState::Init;
         self.priority = ConnectionPriority::Normal;
         self.stream_id = 0;
-        self.peer_addr = SocketAddr::from(([0u8, 0, 0, 0], 0));
         self.owner_cpu = 0;
         self.numa_node = 0;
         self.tenant_id = 0;
@@ -96,12 +91,14 @@ impl ConnectionEntry {
     }
 
     /// Produces a read-only [`ConnectionSnapshot`] copy.
-    pub(crate) fn snapshot(&self) -> ConnectionSnapshot {
+    ///
+    /// `peer_addr` is passed from the shard's parallel side table.
+    pub(crate) fn snapshot(&self, peer_addr: SocketAddr) -> ConnectionSnapshot {
         ConnectionSnapshot {
             state: self.state,
             priority: self.priority,
             stream_id: self.stream_id,
-            peer_addr: self.peer_addr,
+            peer_addr,
             owner_cpu: self.owner_cpu,
             numa_node: self.numa_node,
             tenant_id: self.tenant_id,
@@ -115,15 +112,7 @@ impl ConnectionEntry {
 
 impl Default for ConnectionEntry {
     fn default() -> Self {
-        Self::new(
-            0,
-            SocketAddr::from(([0u8, 0, 0, 0], 0)),
-            0,
-            0,
-            0,
-            ConnectionPriority::Normal,
-            0,
-        )
+        Self::new(0, 0, 0, 0, ConnectionPriority::Normal, 0)
     }
 }
 
@@ -167,7 +156,7 @@ mod tests {
 
     #[test]
     fn new_entry_is_init() {
-        let e = ConnectionEntry::new(42, sample_addr(), 0, 0, 0, ConnectionPriority::Normal, 1000);
+        let e = ConnectionEntry::new(42, 0, 0, 0, ConnectionPriority::Normal, 1000);
         assert_eq!(e.state, ConnectionState::Init);
         assert_eq!(e.stream_id, 42);
         assert_eq!(e.bytes_sent, 0);
@@ -178,8 +167,7 @@ mod tests {
 
     #[test]
     fn add_recv_updates_bytes_and_time() {
-        let mut e =
-            ConnectionEntry::new(1, sample_addr(), 0, 0, 0, ConnectionPriority::Normal, 100);
+        let mut e = ConnectionEntry::new(1, 0, 0, 0, ConnectionPriority::Normal, 100);
         e.add_recv(1024, 200);
         assert_eq!(e.bytes_recv, 1024);
         assert_eq!(e.last_active_ns, 200);
@@ -187,8 +175,7 @@ mod tests {
 
     #[test]
     fn add_send_updates_bytes_and_time() {
-        let mut e =
-            ConnectionEntry::new(1, sample_addr(), 0, 0, 0, ConnectionPriority::Normal, 100);
+        let mut e = ConnectionEntry::new(1, 0, 0, 0, ConnectionPriority::Normal, 100);
         e.add_send(2048, 300);
         assert_eq!(e.bytes_sent, 2048);
         assert_eq!(e.last_active_ns, 300);
@@ -196,7 +183,7 @@ mod tests {
 
     #[test]
     fn byte_counters_saturate() {
-        let mut e = ConnectionEntry::new(1, sample_addr(), 0, 0, 0, ConnectionPriority::Normal, 0);
+        let mut e = ConnectionEntry::new(1, 0, 0, 0, ConnectionPriority::Normal, 0);
         e.add_recv(u64::MAX, 0);
         e.add_recv(1, 0);
         assert_eq!(e.bytes_recv, u64::MAX);
@@ -204,7 +191,7 @@ mod tests {
 
     #[test]
     fn reset_clears_all_fields() {
-        let mut e = ConnectionEntry::new(99, sample_addr(), 3, 1, 5, ConnectionPriority::High, 999);
+        let mut e = ConnectionEntry::new(99, 3, 1, 5, ConnectionPriority::High, 999);
         e.add_recv(500, 1000);
         e.reset_for_reuse();
         assert_eq!(e.state, ConnectionState::Init);
@@ -215,8 +202,8 @@ mod tests {
 
     #[test]
     fn snapshot_copies_all_fields() {
-        let e = ConnectionEntry::new(7, sample_addr(), 2, 1, 3, ConnectionPriority::RealTime, 500);
-        let s = e.snapshot();
+        let e = ConnectionEntry::new(7, 2, 1, 3, ConnectionPriority::RealTime, 500);
+        let s = e.snapshot(sample_addr());
         assert_eq!(s.stream_id, 7);
         assert_eq!(s.peer_addr, sample_addr());
         assert_eq!(s.owner_cpu, 2);
