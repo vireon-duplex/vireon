@@ -276,6 +276,139 @@ The following functions carry `#[profile]` across the workspace:
 | `session-registry` | `ConsistentHash::add_node`, `lookup`, `lookup_n` |
 | `reactor` | `EventLoop::run_one_tick` |
 
+## 🔥 Flamegraph Profiling
+
+The in-process profiler above only captures **annotated** functions. For the complete picture — including stdlib, `quiche`, and `io_uring` syscalls — use the **`perf`-based flamegraph** workflow ([`flamegraph-rs/flamegraph`](https://github.com/flamegraph-rs/flamegraph)). It samples the entire call stack via the kernel with zero code changes.
+
+### Prerequisites
+
+```bash
+# 1. Linux perf (kernel symbols for your running kernel).
+sudo apt install linux-tools-common "linux-tools-$(uname -r)"
+
+# 2. Allow userspace sampling without root.
+sudo sysctl kernel.perf_event_paranoid=1
+
+# 3. A folded-stack renderer (pick one):
+cargo install inferno          # preferred — Rust port, no Perl needed
+# — or —
+# install flamegraph.pl (Perl) from https://github.com/brendangregg/FlameGraph
+```
+
+### Option A — Server Under Load (recommended)
+
+The `scripts/flamegraph.sh` orchestrator builds both binaries with the `flamegraph` profile, starts the server, records it under realistic bench-harness traffic, then renders the SVG:
+
+```bash
+# Default: 15s, 64 connections, single worker.
+make flamegraph
+# — or with custom parameters —
+./scripts/flamegraph.sh --duration 30 --conns 256 --port 4433
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--duration` | `15` | Recording window in seconds |
+| `--conns` | `64` | Concurrent connections from bench-harness |
+| `--mode` | `single` | Worker mode (`single` / `multi`) |
+| `--port` | `4433` | Server UDP port |
+| `--out` | `flamegraph.svg` | Output SVG path |
+
+The resulting `flamegraph.svg` shows real function names (e.g. `quic_engine::engine`, `quiche::Connection::recv`, io_uring ops) — not raw hex addresses.
+
+The script also keeps the raw `perf.data` next to the SVG (pass `--no-data` to skip it). Use `perf` to inspect it interactively:
+
+```bash
+perf report -i profiles/flamegraph.data          # interactive TUI (navigate + zoom)
+perf report -i profiles/flamegraph.data --stdio | less   # text dump
+```
+
+### Reading `perf report` — Finding Hotspots
+
+The TUI lists functions sorted by **Overhead %** (share of CPU samples). A handful of functions usually account for 80%+ of CPU — those are your optimization targets.
+
+**The key distinction — press `H` to toggle:**
+
+| View | What it shows |
+|---|---|
+| **Children** (default) | Time in this function **plus** everything it calls |
+| **Self** | Time the function spends in its **own** body (excludes sub-calls) |
+
+`main` has Children ~99% but Self ~0% — it's not the bottleneck. A function with high **Self %** is where the CPU actually burns. Use **Self** to find real hotspots, **Children** to understand who drives them.
+
+**Navigation:**
+
+| Key | Action |
+|---|---|
+| `Enter` | Zoom into a function / view call graph / annotate |
+| `+` / `-` | Expand / collapse call-graph nodes |
+| `a` | Annotate **assembly** — see which instructions burn CPU |
+| `s` | Annotate **source** (works because the `flamegraph` profile keeps debug info) |
+| `/` | Filter by symbol name |
+| `H` | Toggle Self / Children |
+
+**Typical workflow:**
+
+1. Open `perf report`, press `H` for **Self** view.
+2. Note the top 3–5 functions (Self > 5%).
+3. `Enter` → zoom in → see the call graph (who calls it, what it calls).
+4. Press `a` to annotate — find the specific loop / instruction that dominates.
+
+**What "hot" usually looks like in vireon:**
+
+| Symbol | Meaning | Action if unexpectedly high |
+|---|---|---|
+| `quiche::Connection::recv/send` | QUIC packet processing | Normal under load |
+| `crc32c::compute` | Frame checksum | Use `--skip-crc` in trusted mode |
+| `frame::encode_into` / `decode_frame` | Codec | Check for copies |
+| `memcpy` / `__rust_alloc` | Hidden allocation/copy | Should be zero-copy |
+| `io_uring_enter` / `entry_SYSCALL` | Syscall overhead | SQPOLL should reduce this |
+| `parking_lot` / mutex | Lock contention | Should not appear on hot path |
+
+**Quick text export (no TUI):**
+
+```bash
+# Top-25 hotspots as text.
+perf report -i profiles/flamegraph.data --stdio | grep -A30 'Overhead' | head -35
+
+# Only vireon's own functions (filter out stdlib/quiche).
+perf report -i profiles/flamegraph.data --symbol-filter='quic_engine|frame::|crc32c|reactor'
+
+# Before/after comparison.
+perf report -i profiles/before.data --stdio > before.txt
+perf report -i profiles/after.data  --stdio > after.txt
+diff before.txt after.txt
+```
+
+### Option B — Ad-hoc Single Process
+
+For quick profiling of a single binary (no load orchestration), use `cargo-flamegraph` directly with the `flamegraph` profile:
+
+```bash
+# Install the cargo subcommand (one-time).
+cargo install flamegraph
+
+# Profile the bench-harness client itself.
+cargo flamegraph --profile flamegraph -p bench-harness -- -c 64 -d 10
+
+# Profile the server (Ctrl-C to stop after applying external load).
+cargo flamegraph --profile flamegraph -p quic-server -- \
+    --cert cert.pem --key key.pem --port 4433
+```
+
+### How the `flamegraph` Profile Works
+
+The workspace defines a dedicated `[profile.flamegraph]` that inherits the release optimizations (`opt-level = 3`, LTO, `panic = "abort"`) while keeping debug symbols for `perf` symbol resolution:
+
+```toml
+[profile.flamegraph]
+inherits = "release"
+debug = "line-tables-only"   # function names + line numbers
+strip = false                # keep symbols for perf
+```
+
+Production release binaries remain fully stripped — only the `flamegraph` profile carries symbols.
+
 ## 🤝 Contributing
 
 Contributions are what make the open-source community an amazing place to learn, inspire, and build robust software. Any contributions to Vireon are **greatly appreciated**.
