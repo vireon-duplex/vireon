@@ -426,16 +426,16 @@ impl Reactor {
                         self.metrics.record_bytes_rx(len as u64);
 
                         // Extract the raw buffer pointer (no lifetime borrow).
-                        if let Some(ptr) = self.pool.buffer_ptr(bid) {
+                        if let Some(ptr) = self.pool.buffer_ptr_mut(bid) {
                             // SAFETY: `ptr` points into the pool's backing
                             // store; the kernel just wrote `len` bytes. The
                             // slice is only used within this block — before
                             // `refill_buffer` reclaims the buffer.
-                            let raw = unsafe { std::slice::from_raw_parts(ptr, len) };
+                            let raw = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
 
-                            // Parse io_uring header to get UDP payload + peer.
-                            if let Ok(meta) = self.receiver.parse_raw(raw) {
-                                handler.on_datagram(meta.payload, meta.peer_addr);
+                            // Parse io_uring header to get mutable UDP payload + peer.
+                            if let Ok((payload, peer_addr)) = self.receiver.parse_raw_mut(raw) {
+                                handler.on_datagram(payload, peer_addr);
                             }
                         }
 

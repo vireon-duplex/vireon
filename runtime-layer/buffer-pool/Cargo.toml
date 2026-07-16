@@ -10,7 +10,7 @@ license.workspace = true
 autobenches = false
 
 [features]
-default = []
+default = ["numa"]
 # Telemetry export backends (Layer 15). Counters and histograms are always
 # captured; a feature only pulls in the matching export crate.
 prometheus = ["dep:prometheus"]
