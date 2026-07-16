@@ -9,16 +9,16 @@
 //! by id and panics on out-of-order reclaim — surfacing application bugs
 //! that would otherwise silently leak buffers.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 /// Tracks `id → buf_id` mappings for SEND_ZC completions, plus (in debug)
 /// the lifecycle phase of each in-flight send.
 pub struct SendZcTracker {
     /// Maps the 60-bit id portion of user_data to the application-provided
     /// `buf_index`. Set on `register`, consumed on `SendBufferReclaim`.
-    buf_map: HashMap<u64, u16>,
+    buf_map: FxHashMap<u64, u16>,
     #[cfg(debug_assertions)]
-    phases: HashMap<u64, SendZcPhase>,
+    phases: FxHashMap<u64, SendZcPhase>,
 }
 
 /// Lifecycle phase of a SEND_ZC operation (debug-only).
@@ -38,9 +38,9 @@ impl SendZcTracker {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            buf_map: HashMap::new(),
+            buf_map: FxHashMap::default(),
             #[cfg(debug_assertions)]
-            phases: HashMap::new(),
+            phases: FxHashMap::default(),
         }
     }
 
@@ -48,9 +48,9 @@ impl SendZcTracker {
     #[must_use]
     pub fn with_capacity(cap: usize) -> Self {
         Self {
-            buf_map: HashMap::with_capacity(cap),
+            buf_map: FxHashMap::with_capacity_and_hasher(cap, Default::default()),
             #[cfg(debug_assertions)]
-            phases: HashMap::with_capacity(cap),
+            phases: FxHashMap::with_capacity_and_hasher(cap, Default::default()),
         }
     }
 

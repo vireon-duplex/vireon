@@ -16,7 +16,7 @@
 //!   `levels - 1`). `r ≥ 1` is required.
 
 use crate::core::allocator::SlabAllocator;
-use crate::core::bucket::{drain_all, push_front};
+use crate::core::bucket::{drain_all_into, push_front};
 use crate::core::timer_entry::TimerEntry;
 use profiler::profile;
 
@@ -28,6 +28,9 @@ pub struct HierarchicalWheel {
     slot_mask: usize,
     /// Flat bucket-head vector: `buckets[level * slots_per_level + slot]`.
     buckets: Vec<u32>,
+    /// Per-level occupancy bitmap: bit `s` set when bucket `(level, s)` is
+    /// non-empty. Enables O(levels) `next_deadline` via `trailing_zeros`.
+    level_bitmaps: Vec<u64>,
     last_tick: u64,
     count: u64,
 }
@@ -37,6 +40,10 @@ impl HierarchicalWheel {
     /// so the first [`add`](Self::add) computes `remaining` correctly.
     #[must_use]
     pub fn new(bits: u32, levels: u32, initial_tick: u64) -> Self {
+        assert!(
+            bits <= 6,
+            "occupancy bitmap requires bits <= 6 (slots_per_level <= 64)"
+        );
         let slots_per_level = 1usize << bits;
         let slot_mask = slots_per_level - 1;
         let total_slots = levels as usize * slots_per_level;
@@ -46,6 +53,7 @@ impl HierarchicalWheel {
             slots_per_level,
             slot_mask,
             buckets: vec![0u32; total_slots],
+            level_bitmaps: vec![0u64; levels as usize],
             last_tick: initial_tick,
             count: 0,
         }
@@ -93,6 +101,7 @@ impl HierarchicalWheel {
         let slot_idx = ((deadline >> (level * self.bits)) as usize) & self.slot_mask;
         let head = &mut self.buckets[(level as usize) * self.slots_per_level + slot_idx];
         push_front(slab, head, slot);
+        self.level_bitmaps[level as usize] |= 1u64 << slot_idx;
     }
 
     /// Returns the wheel level for a given `remaining` (≥ 1) tick count.
@@ -120,16 +129,22 @@ impl HierarchicalWheel {
         now: u64,
         reclaimed: &mut Vec<u32>,
     ) {
+        // Reusable scratch buffer for cascade drain — avoids per-tick allocation.
+        let mut cascade_buf: Vec<u32> = Vec::new();
+
         while self.last_tick < now {
             self.last_tick += 1;
             let t = self.last_tick;
 
-            // Fire the level-0 bucket for this tick.
+            // Fire the level-0 bucket for this tick — drain directly into
+            // `reclaimed` to avoid an intermediate Vec allocation.
             let l0_slot = (t as usize) & self.slot_mask;
-            let drained = drain_all(slab, &mut self.buckets[l0_slot]);
-            if !drained.is_empty() {
-                self.count = self.count.saturating_sub(drained.len() as u64);
-                reclaimed.extend(drained);
+            let before = reclaimed.len();
+            drain_all_into(slab, &mut self.buckets[l0_slot], reclaimed);
+            self.level_bitmaps[0] &= !(1u64 << l0_slot);
+            let drained_count = reclaimed.len() - before;
+            if drained_count > 0 {
+                self.count = self.count.saturating_sub(drained_count as u64);
             }
 
             // On a level-0 wrap, cascade the parent level's current slot, and
@@ -137,18 +152,21 @@ impl HierarchicalWheel {
             if l0_slot == 0 {
                 for lvl in 1..self.levels {
                     let sidx = ((t >> (lvl * self.bits)) as usize) & self.slot_mask;
-                    let cascaded = drain_all(
+                    cascade_buf.clear();
+                    drain_all_into(
                         slab,
                         &mut self.buckets[(lvl as usize) * self.slots_per_level + sidx],
+                        &mut cascade_buf,
                     );
-                    if cascaded.is_empty() {
+                    self.level_bitmaps[lvl as usize] &= !(1u64 << sidx);
+                    if cascade_buf.is_empty() {
                         // nothing to do at this level; still respect wrap chain
                         if sidx != 0 {
                             break;
                         }
                         continue;
                     }
-                    for slot in cascaded {
+                    for &slot in &cascade_buf {
                         let dl = slab.get(slot).deadline;
                         if dl <= self.last_tick {
                             // became due during the same tick — fire/reclaim now
@@ -180,18 +198,20 @@ impl HierarchicalWheel {
         }
         let mut best: u64 = u64::MAX;
         for lvl in 0..self.levels {
-            let cursor = ((self.last_tick >> (lvl * self.bits)) as usize) & self.slot_mask;
-            for off in 1..=self.slots_per_level {
-                let s = (cursor + off) & self.slot_mask;
-                if self.buckets[(lvl as usize) * self.slots_per_level + s] != 0 {
-                    // ticks until this level's cursor reaches `s`: `off * 2^(lvl*bits)`.
-                    let ticks_ahead = (off as u64) << (lvl * self.bits);
-                    let candidate = self.last_tick.saturating_add(ticks_ahead);
-                    if candidate < best {
-                        best = candidate;
-                    }
-                    break;
-                }
+            let bitmap = self.level_bitmaps[lvl as usize];
+            if bitmap == 0 {
+                continue;
+            }
+            let cursor = ((self.last_tick >> (lvl * self.bits)) as u32) & self.slot_mask as u32;
+            // Rotate so that slot (cursor+1) becomes bit 0, then find first set.
+            let rotated = bitmap.rotate_right(cursor.wrapping_add(1).rem_euclid(64));
+            if rotated == 0 {
+                continue;
+            }
+            let off = rotated.trailing_zeros() as u64 + 1; // 1..=64
+            let candidate = self.last_tick.saturating_add(off << (lvl * self.bits));
+            if candidate < best {
+                best = candidate;
             }
         }
         (best != u64::MAX).then_some(best)
@@ -200,6 +220,7 @@ impl HierarchicalWheel {
     /// Clears the wheel (used on shutdown; abandons pending timers).
     pub fn clear(&mut self) {
         self.buckets.iter_mut().for_each(|h| *h = 0);
+        self.level_bitmaps.iter_mut().for_each(|b| *b = 0);
         self.count = 0;
     }
 }

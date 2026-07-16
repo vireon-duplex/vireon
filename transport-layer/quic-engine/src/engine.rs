@@ -500,6 +500,12 @@ impl QuicEngine {
     /// datagram (ACKs / flow-control updates) or when application data is
     /// queued via [`send_stream`](Self::send_stream).
     pub fn flush_sends(&mut self, ctx: &mut TickContext) {
+        if self.dirty_senders.len() <= 1 {
+            // 0 or 1 entries — no dedup needed.
+        } else {
+            self.dirty_senders.sort_unstable();
+            self.dirty_senders.dedup();
+        }
         let n = self.dirty_senders.len();
         if n == 0 {
             return;

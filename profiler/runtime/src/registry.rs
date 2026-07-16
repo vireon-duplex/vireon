@@ -5,14 +5,15 @@
 //! first time. All subsequent flushes take a read lock and merge via
 //! atomic operations — no contention.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::{LazyLock, RwLock};
 
 use crate::stats::{FunctionSnapshot, FunctionStats, LocalEntry};
 
-type StatsMap = HashMap<&'static str, Box<FunctionStats>>;
+type StatsMap = FxHashMap<&'static str, Box<FunctionStats>>;
 
-static GLOBAL_REGISTRY: LazyLock<RwLock<StatsMap>> = LazyLock::new(|| RwLock::new(HashMap::new()));
+static GLOBAL_REGISTRY: LazyLock<RwLock<StatsMap>> =
+    LazyLock::new(|| RwLock::new(FxHashMap::default()));
 
 /// Merges a thread-local entry into the global stats for `name`.
 ///

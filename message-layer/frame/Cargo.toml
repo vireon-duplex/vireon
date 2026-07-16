@@ -17,6 +17,7 @@ buffer-pool = ["dep:buffer-pool"]
 [dependencies]
 bytes = { workspace = true }
 thiserror = { workspace = true }
+rustc-hash = { workspace = true }
 buffer-pool = { path = "../../runtime-layer/buffer-pool", optional = true }
 profiler = { workspace = true }
 

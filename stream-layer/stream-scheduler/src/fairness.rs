@@ -22,7 +22,7 @@
 //! largest share. `1.0` = perfectly fair; `0.0` = at least one
 //! stream got nothing.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use profiler::profile;
 
@@ -37,7 +37,12 @@ pub const MIN_SAMPLES_FOR_REPORT: usize = 2;
 pub struct FairnessMetrics {
     window_size: usize,
     /// `stream_id.raw() → bytes scheduled in the window`.
-    bytes_per_stream: HashMap<u64, u64>,
+    bytes_per_stream: FxHashMap<u64, u64>,
+    /// Running sum of all `bytes_per_stream` values — enables O(1)
+    /// `jain_index()` instead of O(n) iteration per tick.
+    running_sum: u64,
+    /// Running sum of squares — same incremental strategy.
+    running_sum_sq: u64,
 }
 
 impl FairnessMetrics {
@@ -46,7 +51,9 @@ impl FairnessMetrics {
     pub fn new(window_size: usize) -> Self {
         Self {
             window_size,
-            bytes_per_stream: HashMap::with_capacity(window_size),
+            bytes_per_stream: FxHashMap::with_capacity_and_hasher(window_size, Default::default()),
+            running_sum: 0,
+            running_sum_sq: 0,
         }
     }
 
@@ -73,7 +80,15 @@ impl FairnessMetrics {
     pub fn record(&mut self, stream_id: stream_manager::StreamId, bytes_sent: u64) {
         let key = stream_id.raw();
         if let Some(v) = self.bytes_per_stream.get_mut(&key) {
-            *v = v.saturating_add(bytes_sent);
+            let old = *v;
+            let new = old.saturating_add(bytes_sent);
+            *v = new;
+            // Incrementally update running sums with the delta.
+            self.running_sum = self.running_sum.saturating_add(new - old);
+            self.running_sum_sq = self
+                .running_sum_sq
+                .saturating_sub(old.saturating_mul(old))
+                .saturating_add(new.saturating_mul(new));
             return;
         }
         // New entry — evict if window full.
@@ -81,29 +96,30 @@ impl FairnessMetrics {
             self.evict_smallest();
         }
         self.bytes_per_stream.insert(key, bytes_sent);
+        self.running_sum = self.running_sum.saturating_add(bytes_sent);
+        self.running_sum_sq = self
+            .running_sum_sq
+            .saturating_add(bytes_sent.saturating_mul(bytes_sent));
     }
 
     /// Jain's fairness index over the current window. Returns `1.0`
     /// when there are fewer than [`MIN_SAMPLES_FOR_REPORT`] samples.
+    ///
+    /// Uses pre-computed running sums → O(1).
     #[must_use]
     #[profile]
     pub fn jain_index(&self) -> f64 {
-        if self.bytes_per_stream.len() < MIN_SAMPLES_FOR_REPORT {
+        let n = self.bytes_per_stream.len();
+        if n < MIN_SAMPLES_FOR_REPORT {
             return 1.0;
         }
-        let mut sum: u64 = 0;
-        let mut sum_sq: u64 = 0;
-        let n = self.bytes_per_stream.len() as f64;
-        for &x in self.bytes_per_stream.values() {
-            sum = sum.saturating_add(x);
-            sum_sq = sum_sq.saturating_add(x.saturating_mul(x));
-        }
-        if sum == 0 || sum_sq == 0 {
+        if self.running_sum == 0 || self.running_sum_sq == 0 {
             return 1.0;
         }
-        let sum_f = sum as f64;
-        let sum_sq_f = sum_sq as f64;
-        (sum_f * sum_f) / (n * sum_sq_f)
+        let n_f = n as f64;
+        let sum_f = self.running_sum as f64;
+        let sum_sq_f = self.running_sum_sq as f64;
+        (sum_f * sum_f) / (n_f * sum_sq_f)
     }
 
     /// Min/max ratio (smallest share / largest share). Returns `0.0`
@@ -134,17 +150,21 @@ impl FairnessMetrics {
     /// Clear all recorded bytes (called on window rollover).
     pub fn reset(&mut self) {
         self.bytes_per_stream.clear();
+        self.running_sum = 0;
+        self.running_sum_sq = 0;
     }
 
     #[profile]
     fn evict_smallest(&mut self) {
-        let min_key = self
+        let min_entry = self
             .bytes_per_stream
             .iter()
             .min_by_key(|(_, v)| *v)
-            .map(|(k, _)| *k);
-        if let Some(key) = min_key {
+            .map(|(k, v)| (*k, *v));
+        if let Some((key, val)) = min_entry {
             self.bytes_per_stream.remove(&key);
+            self.running_sum = self.running_sum.saturating_sub(val);
+            self.running_sum_sq = self.running_sum_sq.saturating_sub(val.saturating_mul(val));
         }
     }
 }
