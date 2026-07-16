@@ -22,7 +22,7 @@ mod worker;
 mod workload;
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
@@ -172,7 +172,26 @@ fn run_benchmark(
     let barrier = Barrier::new(conns + 1);
 
     let cpu_start = resource::cpu_time_secs();
-    let rss_before = resource::rss_kib();
+
+    // Peak-RSS sampler: a background thread polls VmRSS every 50ms during
+    // the run and tracks the maximum. This captures the true working set
+    // when all connections are active, regardless of cleanup that happens
+    // after threads exit (munmap, MADV_FREE reclamation, arena trimming).
+    let rss_baseline = resource::rss_kib();
+    let peak_rss = Arc::new(AtomicU64::new(rss_baseline));
+    let sampler_stop = Arc::new(AtomicBool::new(false));
+    let sampler_peak = Arc::clone(&peak_rss);
+    let sampler_stop_ref = Arc::clone(&sampler_stop);
+    let sampler_handle = thread::spawn(move || {
+        while !sampler_stop_ref.load(Ordering::Relaxed) {
+            let current = resource::rss_kib();
+            let prev = sampler_peak.load(Ordering::Relaxed);
+            if current > prev {
+                sampler_peak.store(current, Ordering::Relaxed);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
 
     let coalesce = workload.coalesce;
 
@@ -214,8 +233,12 @@ fn run_benchmark(
             .collect::<Vec<_>>()
     });
 
+    // Stop the sampler and collect peak.
+    sampler_stop.store(true, Ordering::Relaxed);
+    sampler_handle.join().ok();
+    let rss_peak = peak_rss.load(Ordering::Relaxed);
+
     let cpu_end = resource::cpu_time_secs();
-    let rss_after = resource::rss_kib();
 
     let mut summary = aggregate(
         results,
@@ -229,7 +252,7 @@ fn run_benchmark(
 
     let wall_secs = duration.as_secs_f64().max(0.001);
     let cpu_delta = (cpu_end - cpu_start).max(0.0);
-    summary.attach_resources(cpu_delta, wall_secs, rss_before, rss_after);
+    summary.attach_resources(cpu_delta, wall_secs, rss_peak);
 
     Ok(summary)
 }

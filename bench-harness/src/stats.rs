@@ -143,14 +143,10 @@ pub struct Summary {
     pub cpu_cores: f64,
     /// CPU cores per GiB/s of throughput — lower is better.
     pub cpu_per_gibps: f64,
-    /// Process RSS in KiB at end of measurement (absolute).
+    /// Peak process RSS (KiB) sampled during the run — true working set.
     pub rss_kib: u64,
-    /// RSS (KiB) divided by successful connections (absolute — misleading in sweep mode).
+    /// Peak RSS (KiB) per successful connection.
     pub rss_per_conn_kib: f64,
-    /// RSS delta (after − before) in KiB — isolates this step's memory cost.
-    pub rss_delta_kib: i64,
-    /// RSS delta per connection in KiB — the accurate per-conn metric for sweep mode.
-    pub rss_delta_per_conn_kib: f64,
 }
 
 /// Merges per-worker results into a [`Summary`].
@@ -252,8 +248,6 @@ pub fn aggregate(
         cpu_per_gibps: 0.0,
         rss_kib: 0,
         rss_per_conn_kib: 0.0,
-        rss_delta_kib: 0,
-        rss_delta_per_conn_kib: 0.0,
     }
 }
 
@@ -271,14 +265,12 @@ impl Summary {
     ///
     /// - `cpu_delta_secs`: total CPU time (all threads) consumed during the run.
     /// - `wall_secs`: wall-clock duration of the measurement window.
-    /// - `rss_before_kib`: process RSS sampled before threads spawned.
-    /// - `rss_after_kib`: process RSS sampled after threads joined.
+    /// - `rss_peak_kib`: peak process RSS (KiB) sampled during the run.
     pub fn attach_resources(
         &mut self,
         cpu_delta_secs: f64,
         wall_secs: f64,
-        rss_before_kib: u64,
-        rss_after_kib: u64,
+        rss_peak_kib: u64,
     ) {
         self.cpu_cores = if wall_secs > 0.0 {
             cpu_delta_secs / wall_secs
@@ -291,16 +283,9 @@ impl Summary {
         } else {
             0.0
         };
-        self.rss_kib = rss_after_kib;
+        self.rss_kib = rss_peak_kib;
         self.rss_per_conn_kib = if self.connections_ok > 0 {
-            rss_after_kib as f64 / self.connections_ok as f64
-        } else {
-            0.0
-        };
-        let delta = rss_after_kib as i64 - rss_before_kib as i64;
-        self.rss_delta_kib = delta;
-        self.rss_delta_per_conn_kib = if self.connections_ok > 0 {
-            delta as f64 / self.connections_ok as f64
+            rss_peak_kib as f64 / self.connections_ok as f64
         } else {
             0.0
         };
@@ -320,8 +305,8 @@ pub struct SweepPoint {
     pub latency_max: Duration,
     /// CPU cores per GiB/s.
     pub cpu_per_gibps: f64,
-    /// RSS delta (KiB) per connection — isolated per-step cost.
-    pub rss_delta_per_conn_kib: f64,
+    /// Peak RSS (KiB) per connection — true per-conn memory cost.
+    pub rss_per_conn_kib: f64,
 }
 
 impl SweepPoint {
@@ -336,7 +321,7 @@ impl SweepPoint {
             latency_p99: s.latency_p99,
             latency_max: s.latency_max,
             cpu_per_gibps: s.cpu_per_gibps,
-            rss_delta_per_conn_kib: s.rss_delta_per_conn_kib,
+            rss_per_conn_kib: s.rss_per_conn_kib,
         }
     }
 }
@@ -351,9 +336,8 @@ fn print_resource_stats(s: &Summary) {
         "  CPU per GiB/s       {:>10.2}  (cores per GiB/s — lower is better)",
         s.cpu_per_gibps
     );
-    println!("  RSS (absolute)      {:>10.0} KiB", s.rss_kib);
-    println!("  RSS Delta           {:>10.0} KiB  (this step's memory cost)", s.rss_delta_kib);
-    println!("  RSS/conn (delta)    {:>10.0} KiB", s.rss_delta_per_conn_kib);
+    println!("  RSS (peak)          {:>10.0} KiB", s.rss_kib);
+    println!("  RSS/conn (peak)     {:>10.0} KiB", s.rss_per_conn_kib);
 }
 
 /// Prints the connections-sweep comparison table.
@@ -365,7 +349,7 @@ pub fn print_conn_sweep(points: &[SweepPoint]) {
     println!("╚══════════════════════════════════════════════════════════════════╝");
     println!();
     println!("┌────────┬───────────┬──────────┬──────────┬──────────┬──────────────┐");
-    println!("│ Conns  │ MiB/s     │ p50 (us) │ p99 (us) │ CPU/GiB  │ KiB/conn (Δ) │");
+    println!("│ Conns  │ MiB/s     │ p50 (us) │ p99 (us) │ CPU/GiB  │ KiB/conn     │");
     println!("├────────┼───────────┼──────────┼──────────┼──────────┼──────────────┤");
     for p in points {
         println!(
@@ -375,7 +359,7 @@ pub fn print_conn_sweep(points: &[SweepPoint]) {
             us(p.latency_p50),
             us(p.latency_p99),
             p.cpu_per_gibps,
-            p.rss_delta_per_conn_kib,
+            p.rss_per_conn_kib,
         );
     }
     println!("└────────┴───────────┴──────────┴──────────┴──────────┴──────────────┘");
