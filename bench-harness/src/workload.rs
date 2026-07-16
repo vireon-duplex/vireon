@@ -262,7 +262,7 @@ fn realistic_payload(mt: MessageType) -> Vec<u8> {
 fn realistic_flags(mt: MessageType) -> FrameFlags {
     match mt {
         MessageType::Heartbeat => FrameFlags::URGENT,
-        MessageType::Fragment => FrameFlags::FRAGMENT,
+        MessageType::Fragment => FrameFlags::FRAGMENT | FrameFlags::FIN,
         MessageType::StreamClose => FrameFlags::FIN,
         MessageType::ToolCall | MessageType::Ack => FrameFlags::ACK_REQ,
         _ => FrameFlags::NONE,
