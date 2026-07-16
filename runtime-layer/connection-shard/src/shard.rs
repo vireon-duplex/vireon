@@ -192,19 +192,16 @@ impl ConnectionShard {
                 self.stats.record_lookup(true);
                 s
             }
-            None => {
-                self.stats.record_lookup(false);
-                return None;
-            }
+            None => return self.lookup_miss(),
         };
         let slot_idx = slot as usize;
         if slot_idx >= self.slab.len() {
-            return None;
+            return self.lookup_miss();
         }
         // Verify the slot is live (not Closed/free).
         let entry = &self.slab[slot_idx];
         if !entry.state.is_live() && entry.state != ConnectionState::Migrating {
-            return None;
+            return self.lookup_miss();
         }
         Some(make_id(slot, self.generations[slot_idx]))
     }
@@ -212,6 +209,16 @@ impl ConnectionShard {
     // ════════════════════════════════════════════════════════════
     //  Fast path — touch
     // ════════════════════════════════════════════════════════════
+
+    /// Records a lookup miss and returns `None`. Marked `#[cold]` so the
+    /// compiler lays out the miss path away from the hot path, improving
+    /// instruction-cache locality for the hit path.
+    #[cold]
+    #[inline(never)]
+    fn lookup_miss(&self) -> Option<ConnectionId> {
+        self.stats.record_lookup(false);
+        None
+    }
 
     /// Validates a [`ConnectionId`] against the current generation.
     ///
