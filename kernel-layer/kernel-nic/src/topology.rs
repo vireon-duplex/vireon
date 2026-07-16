@@ -4,8 +4,13 @@
 //! `/sys/devices/system/cpu/*` and `/sys/devices/system/node/*`. The
 //! result is frozen for the process lifetime — every downstream
 //! component (IRQ policy, RSS, XPS) consults it via `&`.
+//!
+//! [`CpuTopology::discover`] caches its result in a process-wide
+//! [`OnceLock`], so repeated calls (e.g. one per worker thread) do not
+//! re-read sysfs — they return a cheap clone of the first discovery.
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use crate::config::MAX_CPUS;
 use crate::error::KernelNicError;
@@ -43,10 +48,29 @@ pub struct LlcDomain {
     pub cpus: Box<[u32]>,
 }
 
+/// Process-wide cache of the discovered topology. Populated on the first
+/// [`CpuTopology::discover`] call; all subsequent callers receive a clone
+/// of this value without touching sysfs.
+static TOPOLOGY: OnceLock<CpuTopology> = OnceLock::new();
+
 impl CpuTopology {
     /// Discover the running host's topology. Reads `sysfs` only.
+    ///
+    /// The result is cached process-wide: the first call performs the
+    /// (expensive — thousands of sysfs reads) discovery, while every
+    /// later call returns a cheap clone. This makes redundant calls
+    /// (e.g. per worker thread) essentially free.
     pub fn discover() -> Result<Self, KernelNicError> {
-        Self::discover_from_root(std::path::Path::new("/sys/devices/system"))
+        // Fast path: already cached (after the first call).
+        if let Some(cached) = TOPOLOGY.get() {
+            return Ok(cached.clone());
+        }
+        // Slow path: read sysfs, then cache. A concurrent first-call
+        // race is harmless — both discover the same immutable topology;
+        // `set` keeps whichever thread wins.
+        let topo = Self::discover_from_root(std::path::Path::new("/sys/devices/system"))?;
+        let _ = TOPOLOGY.set(topo.clone());
+        Ok(topo)
     }
 
     /// Test-friendly entry point: read from `root/cpu` and `root/node`.
