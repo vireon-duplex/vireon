@@ -64,7 +64,7 @@ pub fn process_readable(
     events: &mut Vec<QuicEvent>,
     readable_buf: &mut Vec<u64>,
     pool: &BufferPool,
-    carryover: &mut FxHashMap<u64, StreamCarry>,
+    carryover: &mut FxHashMap<(usize, u64), StreamCarry>,
     skip_crc: bool,
 ) {
     // Collect readable stream IDs into the caller-provided buffer to
@@ -106,7 +106,7 @@ fn process_single_stream(
     conn_idx: usize,
     events: &mut Vec<QuicEvent>,
     pool: &BufferPool,
-    carryover: &mut FxHashMap<u64, StreamCarry>,
+    carryover: &mut FxHashMap<(usize, u64), StreamCarry>,
     skip_crc: bool,
 ) {
     let mut read_buf = [0u8; STREAM_READ_BUF_SIZE];
@@ -129,7 +129,7 @@ fn process_single_stream(
                     finished = true;
                 }
 
-                let cs = carryover.entry(stream_id).or_default();
+                let cs = carryover.entry((conn_idx, stream_id)).or_default();
                 cs.buf.extend_from_slice(&read_buf[..len]);
 
                 // Defense-in-depth: cap carryover to prevent unbounded
@@ -247,12 +247,12 @@ fn process_single_stream(
     // IMPORTANT: keep the entry alive if warning flags are set — removing
     // it would reset `oversized_warned`/`overflow_warned`, causing the next
     // oversized frame to log again (defeating the per-stream suppression).
-    let remove = match carryover.get(&stream_id) {
+    let remove = match carryover.get(&(conn_idx, stream_id)) {
         Some(cs) => finished || (cs.buf.is_empty() && !cs.oversized_warned && !cs.overflow_warned),
         None => false,
     };
     if remove {
-        carryover.remove(&stream_id);
+        carryover.remove(&(conn_idx, stream_id));
     }
 
     if finished {
@@ -263,7 +263,7 @@ fn process_single_stream(
     }
 
     if total_frames > 0 {
-        let remaining = carryover.get(&stream_id).map_or(0, |cs| cs.buf.len());
+        let remaining = carryover.get(&(conn_idx, stream_id)).map_or(0, |cs| cs.buf.len());
         tracing::trace!(
             reactor_id,
             conn_idx,
