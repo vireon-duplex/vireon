@@ -349,6 +349,7 @@ dependencies = [
  "io-uring",
  "libc",
  "profiler",
+ "rustc-hash",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -527,6 +528,7 @@ dependencies = [
  "bytes",
  "criterion",
  "profiler",
+ "rustc-hash",
  "thiserror 2.0.18",
 ]
 

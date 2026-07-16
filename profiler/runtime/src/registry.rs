@@ -12,7 +12,8 @@ use crate::stats::{FunctionSnapshot, FunctionStats, LocalEntry};
 
 type StatsMap = FxHashMap<&'static str, Box<FunctionStats>>;
 
-static GLOBAL_REGISTRY: LazyLock<RwLock<StatsMap>> = LazyLock::new(|| RwLock::new(FxHashMap::default()));
+static GLOBAL_REGISTRY: LazyLock<RwLock<StatsMap>> =
+    LazyLock::new(|| RwLock::new(FxHashMap::default()));
 
 /// Merges a thread-local entry into the global stats for `name`.
 ///
