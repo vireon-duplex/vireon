@@ -41,7 +41,9 @@
 //! assert_eq!(result.as_ref(), b"Hello World!");
 //! ```
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+
+use rustc_hash::FxHashMap;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -159,7 +161,7 @@ impl PendingReassembly {
 /// Stale incomplete chains can be evicted via [`evict_timeouts`](Self::evict_timeouts).
 pub struct FragmentReassembler {
     /// Pending reassemblies keyed by `stream_id`.
-    pending: HashMap<StreamId, PendingReassembly>,
+    pending: FxHashMap<StreamId, PendingReassembly>,
     /// Maximum bytes buffered per individual stream.
     max_bytes_per_stream: usize,
     /// Maximum number of concurrent pending entries.
@@ -192,7 +194,7 @@ impl FragmentReassembler {
         debug_assert!(max_bytes_per_stream > 0);
         debug_assert!(max_pending_entries > 0);
         Self {
-            pending: HashMap::new(),
+            pending: FxHashMap::default(),
             max_bytes_per_stream,
             max_pending_entries,
             total_pending_bytes: 0,
