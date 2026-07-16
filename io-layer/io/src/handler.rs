@@ -37,7 +37,11 @@ pub trait IoHandler {
     /// `peer` is the source address. The slice is only valid for the
     /// duration of this call — the reactor recycles the buffer immediately
     /// after the handler returns.
-    fn on_datagram(&mut self, data: &[u8], peer: SocketAddr);
+    ///
+    /// The buffer is mutable so the handler can pass it directly to
+    /// libraries that require `&mut [u8]` (e.g. `quiche::Connection::recv`),
+    /// avoiding an extra copy.
+    fn on_datagram(&mut self, data: &mut [u8], peer: SocketAddr);
 
     /// Called at the end of each event-loop tick.
     ///

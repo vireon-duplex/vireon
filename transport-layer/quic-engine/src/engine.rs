@@ -11,12 +11,11 @@
 //! │                      QuicEngine (Reactor N)                      │
 //! │                                                                  │
 //! │  on_datagram(data, peer):                                        │
-//! │    1. Copy data → pkt_buf                                        │
-//! │    2. quiche::Header::from_slice → extract DCID                  │
-//! │    3. Route by DCID:                                             │
-//! │       a. Found  → conn.recv(pkt_buf, RecvInfo)                   │
+//! │    1. quiche::Header::from_slice(data) → extract DCID            │
+//! │    2. Route by DCID:                                             │
+//! │       a. Found  → conn.recv(data, RecvInfo)  [zero-copy]        │
 //! │       b. Initial → quiche::accept() → insert into table          │
-//! │    4. Process readable streams                                   │
+//! │    3. Process readable streams                                   │
 //! │                                                                  │
 //! │  on_tick(ctx):                                                   │
 //! │    For each connection:                                          │
@@ -316,22 +315,20 @@ impl QuicEngine {
     }
 
     /// Processes a received datagram: routes by DCID and feeds to quiche.
-    fn process_datagram(&mut self, data: &[u8], peer: SocketAddr) {
+    fn process_datagram(&mut self, data: &mut [u8], peer: SocketAddr) {
         self.datagrams_recv += 1;
 
-        let len = data.len().min(self.pkt_buf.len());
-        self.pkt_buf[..len].copy_from_slice(&data[..len]);
+        let len = data.len();
 
-        // Parse the QUIC header from pkt_buf.  `from_slice` only advances
-        // a cursor and does NOT modify the underlying bytes, so pkt_buf
-        // is safe to pass to `conn.recv()` afterwards.
+        // Parse the QUIC header directly from the provided buffer — no
+        // intermediate copy needed. `from_slice` only advances a cursor
+        // and does NOT modify the underlying bytes, so `data` is safe to
+        // pass to `conn.recv()` afterwards.
         let (dcid_key, dcid_len, is_initial) = {
-            let hdr =
-                match quiche::Header::from_slice(&mut self.pkt_buf[..len], quiche::MAX_CONN_ID_LEN)
-                {
-                    Ok(h) => h,
-                    Err(_) => return,
-                };
+            let hdr = match quiche::Header::from_slice(&mut data[..len], quiche::MAX_CONN_ID_LEN) {
+                Ok(h) => h,
+                Err(_) => return,
+            };
             let mut key = [0u8; quiche::MAX_CONN_ID_LEN];
             key[..hdr.dcid.len()].copy_from_slice(&hdr.dcid);
             (key, hdr.dcid.len(), hdr.ty == quiche::Type::Initial)
@@ -339,21 +336,21 @@ impl QuicEngine {
 
         // Route by DCID (zero-alloc: dcid_key is a stack array).
         if let Some(&idx) = self.dcid_to_idx.get(&dcid_key) {
-            self.feed_existing(idx, len, peer);
+            self.feed_existing(idx, data, len, peer);
         } else if is_initial && !self.is_shutting_down() {
             if let Some(idx) = self.accept_new(&dcid_key[..dcid_len], peer) {
-                self.feed_existing(idx, len, peer);
+                self.feed_existing(idx, data, len, peer);
             }
         }
         // Non-Initial from unknown DCID → drop (stateless reset or garbage).
     }
 
     /// Feeds a packet to an existing connection.
-    fn feed_existing(&mut self, idx: usize, len: usize, peer: SocketAddr) {
-        // Disjoint field borrows: pkt_buf, events, readable_buf, pool, and
+    fn feed_existing(&mut self, idx: usize, data: &mut [u8], len: usize, peer: SocketAddr) {
+        // Disjoint field borrows: events, readable_buf, pool, and
         // connections are separate fields of Self, so the borrow checker
         // allows holding all mutable references simultaneously.
-        let pkt_buf = &mut self.pkt_buf;
+        // `data` is passed in directly — no pkt_buf copy needed.
         let events = &mut self.events;
         let readable_buf = &mut self.readable_buf;
         let pool = &self.pool;
@@ -374,7 +371,7 @@ impl QuicEngine {
             to: local_addr,
         };
 
-        match entry.conn.recv(&mut pkt_buf[..len], info) {
+        match entry.conn.recv(&mut data[..len], info) {
             Ok(_) => {
                 // Mark dirty — recv may have generated ACKs, flow-control
                 // updates, or probe packets that need to be flushed.
@@ -645,7 +642,7 @@ impl QuicEngine {
 }
 
 impl IoHandler for QuicEngine {
-    fn on_datagram(&mut self, data: &[u8], peer: SocketAddr) {
+    fn on_datagram(&mut self, data: &mut [u8], peer: SocketAddr) {
         self.process_datagram(data, peer);
     }
 
@@ -701,7 +698,7 @@ mod tests {
         );
 
         // Feed garbage data — should not panic, should not create a connection.
-        engine.on_datagram(&[0xFF; 10], "127.0.0.1:9999".parse().unwrap());
+        engine.on_datagram(&mut [0xFF; 10], "127.0.0.1:9999".parse().unwrap());
         assert_eq!(engine.active_count, 0);
         assert_eq!(engine.datagrams_recv, 1);
     }
