@@ -13,7 +13,7 @@
 //! Timer handles are tracked internally so the upper layers never
 //! need to manage timer lifecycle directly.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -44,7 +44,7 @@ pub struct RuntimeLayer {
     #[allow(dead_code)]
     pool: BufferPool,
     /// Per-connection idle timer handles.
-    timer_handles: HashMap<usize, TimerHandle>,
+    timer_handles: FxHashMap<usize, TimerHandle>,
     /// Outbound packet queue (runtime-layer) — metrics + backpressure.
     pub send_queue: SendQueue,
     /// Reactor-local task execution (runtime-layer).
@@ -99,7 +99,7 @@ impl RuntimeLayer {
             shard,
             timer,
             pool: BufferPool::default(),
-            timer_handles: HashMap::new(),
+            timer_handles: FxHashMap::default(),
             send_queue,
             task_queue,
             cqe_processor,

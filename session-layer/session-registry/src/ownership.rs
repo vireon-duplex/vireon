@@ -4,7 +4,7 @@
 //! See `DESIGN.md` Part 3 (session ownership) and Part 7 (ownership
 //! transfer).
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::error::RegistryError;
 use crate::node::NodeId;
@@ -78,7 +78,7 @@ impl OwnershipEntry {
 ///
 /// Backed by a `HashMap` for O(1) lookups on the hot path.
 pub struct OwnershipTable {
-    entries: HashMap<SessionId, OwnershipEntry>,
+    entries: FxHashMap<SessionId, OwnershipEntry>,
 }
 
 impl OwnershipTable {
@@ -86,7 +86,7 @@ impl OwnershipTable {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: FxHashMap::default(),
         }
     }
 

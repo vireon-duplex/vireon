@@ -44,7 +44,7 @@
 //! comments below mark remaining architectural decisions (ring-buffer
 //! decoder, `FrameRef`-returning decode) that require larger API changes.
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use profiler::profile;
 
@@ -571,6 +571,81 @@ impl FrameDecoder {
         // SAFETY: caller guarantees the first `n` bytes of the last
         // `spare_capacity_mut` slice have been initialised.
         unsafe { self.buf.advance_mut(n) };
+    }
+
+    /// Peeks at the next complete frame **without consuming** it from the
+    /// internal buffer. Returns a [`FrameRef`] that borrows the payload
+    /// zero-copy from `self.buf`.
+    ///
+    /// After processing the returned `FrameRef`, call [`consume`](Self::consume)
+    /// with `frame_ref.wire_size()` to advance past it.
+    ///
+    /// This avoids the `split_to().freeze()` Arc increments that
+    /// [`decode_frame`](Self::decode_frame) performs — use on hot paths.
+    pub fn peek_frame_ref(&self) -> Result<Option<FrameRef<'_>>, FrameError> {
+        if self.buf.len() < HEADER_SIZE {
+            return Ok(None);
+        }
+        let (stream_id, seq, msg_type, flags, payload_len) = unsafe {
+            let p = self.buf.as_ptr();
+            let stream_id = StreamId(u64::from_be(core::ptr::read_unaligned(p as *const u64)));
+            let seq = Seq(u64::from_be(core::ptr::read_unaligned(
+                p.add(8) as *const u64
+            )));
+            let msg_type_byte = *p.add(16);
+            let flags = FrameFlags::from_bits(*p.add(17));
+            let payload_len =
+                u32::from_be(core::ptr::read_unaligned(p.add(18) as *const u32)) as usize;
+            let msg_type = MessageType::try_from(msg_type_byte)?;
+            (stream_id, seq, msg_type, flags, payload_len)
+        };
+        if payload_len > self.max_payload_len {
+            return Err(FrameError::PayloadTooLarge {
+                len: payload_len,
+                max: self.max_payload_len,
+            });
+        }
+        let frame_end = HEADER_SIZE
+            .checked_add(payload_len)
+            .and_then(|v| v.checked_add(CRC_SIZE))
+            .ok_or(FrameError::PayloadTooLarge {
+                len: payload_len,
+                max: self.max_payload_len,
+            })?;
+        if self.buf.len() < frame_end {
+            return Ok(None);
+        }
+        let data_end = HEADER_SIZE + payload_len;
+        let expected = unsafe {
+            u32::from_be(core::ptr::read_unaligned(
+                self.buf.as_ptr().add(data_end) as *const u32
+            ))
+        };
+        let actual = crc32c::crc32c(&self.buf[..data_end]);
+        if expected != actual {
+            return Err(FrameError::CrcMismatch { expected, actual });
+        }
+        Ok(Some(FrameRef {
+            stream_id,
+            seq,
+            msg_type,
+            flags,
+            payload: &self.buf[HEADER_SIZE..data_end],
+        }))
+    }
+
+    /// Advances the internal buffer by `n` bytes, discarding them.
+    /// Pair with [`peek_frame_ref`](Self::peek_frame_ref):
+    ///
+    /// ```ignore
+    /// if let Some(frame_ref) = decoder.peek_frame_ref()? {
+    ///     process(&frame_ref);
+    ///     decoder.consume(frame_ref.wire_size());
+    /// }
+    /// ```
+    #[inline]
+    pub fn consume(&mut self, n: usize) {
+        self.buf.advance(n);
     }
 
     /// Attempts to decode the next complete frame.
@@ -1314,5 +1389,63 @@ mod tests {
         // A cheap clone should share the allocation (same pointer).
         let cloned = frame.payload.clone();
         assert_eq!(cloned.as_ptr(), frame.payload.as_ptr());
+    }
+
+    #[test]
+    fn peek_frame_ref_zero_copy_then_consume() {
+        let mut wire = BytesMut::new();
+        encode_into(
+            &mut wire,
+            FrameHeader::new(StreamId::new(1), MessageType::TextToken).with_seq(Seq::new(7)),
+            b"payload",
+        )
+        .unwrap();
+
+        let mut dec = FrameDecoder::new();
+        dec.push(&wire);
+
+        // Peek — should return a FrameRef without consuming.
+        let frame_ref = dec.peek_frame_ref().unwrap().unwrap();
+        assert_eq!(frame_ref.stream_id, StreamId::new(1));
+        assert_eq!(frame_ref.seq, Seq::new(7));
+        assert_eq!(frame_ref.payload, b"payload");
+
+        // Buffer still holds the full frame.
+        assert_eq!(dec.remaining().len(), wire.len());
+
+        // Consume the frame.
+        let consumed = frame_ref.wire_size();
+        dec.consume(consumed);
+
+        // Now buffer is empty, peek returns None.
+        assert_eq!(dec.remaining().len(), 0);
+        assert_eq!(dec.peek_frame_ref().unwrap(), None);
+    }
+
+    #[test]
+    fn peek_frame_ref_drains_multiple_frames() {
+        let mut wire = BytesMut::new();
+        for i in 0..3 {
+            encode_into(
+                &mut wire,
+                FrameHeader::new(StreamId::new(i), MessageType::TextToken)
+                    .with_seq(Seq::new(i * 10)),
+                &[i as u8 + 1; 3],
+            )
+            .unwrap();
+        }
+
+        let mut dec = FrameDecoder::new();
+        dec.push(&wire);
+
+        let mut streams = Vec::new();
+        while let Some(frame_ref) = dec.peek_frame_ref().unwrap() {
+            streams.push(frame_ref.stream_id);
+            dec.consume(frame_ref.wire_size());
+        }
+        assert_eq!(
+            streams,
+            vec![StreamId::new(0), StreamId::new(1), StreamId::new(2)]
+        );
     }
 }

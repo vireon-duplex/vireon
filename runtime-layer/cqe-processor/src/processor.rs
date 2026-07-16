@@ -103,6 +103,8 @@ pub struct CqeProcessor {
     pub(crate) pending_sendq: Vec<SendQueueEvent>,
     /// Timer ids pending retirement across the current drain call.
     pub(crate) pending_timers: Vec<u64>,
+    /// Reusable buffer for raw CQE entries — avoids per-drain allocation.
+    pub(crate) entries_buf: Vec<io_uring::cqueue::Entry>,
 }
 
 impl CqeProcessor {
@@ -125,6 +127,7 @@ impl CqeProcessor {
             pending_recycle: Vec::with_capacity(batch_max),
             pending_sendq: Vec::with_capacity(batch_max),
             pending_timers: Vec::with_capacity(batch_max),
+            entries_buf: Vec::with_capacity(batch_max),
         }
         .with_rearm_cooldown())
     }
@@ -220,12 +223,16 @@ impl CqeProcessor {
     pub fn drain_cq(&mut self, ring: &mut IoUring, now_ns: u64) -> TickResult {
         let start = Instant::now();
 
-        // Phase 1: drain raw entries (head advanced once by io-uring crate's
-        // iterator Drop).
-        let entries: Vec<io_uring::cqueue::Entry> = {
+        // Phase 1: drain raw entries into the reusable buffer (head advanced
+        // once by io-uring crate's iterator Drop). `mem::take` moves the Vec
+        // out of self so we can iterate it without conflicting with `&mut self`
+        // in the dispatch loop.
+        let mut entries = std::mem::take(&mut self.entries_buf);
+        entries.clear();
+        {
             let slice = self.drainer.drain(ring);
-            slice.to_vec()
-        };
+            entries.extend_from_slice(slice);
+        }
 
         let mut result = TickResult {
             drained: entries.len(),
@@ -320,7 +327,7 @@ impl CqeProcessor {
             }
         }
 
-        if entries.is_empty() {
+        if result.drained == 0 {
             self.consecutive_empty = self.consecutive_empty.saturating_add(1);
             if self.consecutive_empty >= self.config.starvation_threshold_ticks {
                 self.stats
@@ -340,6 +347,9 @@ impl CqeProcessor {
             let pending = self.recycle.drain_pending();
             self.pending_recycle.extend(pending);
         }
+
+        // Return the reusable entry buffer.
+        self.entries_buf = entries;
 
         result.drain_latency_ns = start.elapsed().as_nanos() as u64;
         result
