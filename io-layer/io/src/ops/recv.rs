@@ -124,6 +124,33 @@ impl Receiver {
         Ok(DatagramMeta { payload, peer_addr })
     }
 
+    /// Mutable variant of [`parse_raw`](Self::parse_raw).
+    ///
+    /// Returns a `&mut [u8]` payload slice so the caller can pass it
+    /// directly to APIs that require `&mut [u8]` (e.g. `quiche::recv`),
+    /// avoiding an intermediate copy.
+    pub fn parse_raw_mut<'a>(
+        &self,
+        raw: &'a mut [u8],
+    ) -> Result<(&'a mut [u8], SocketAddr), IoError> {
+        // Parse header using an immutable reborrow — all borrowed
+        // references die at the end of this block, freeing `raw` for
+        // mutable splitting afterwards.
+        let (payload_off, payload_len, peer_addr) = {
+            let (payload, name) = self.split_buffer(&*raw)?;
+            let payload_off = payload.as_ptr() as usize - raw.as_ptr() as usize;
+            (payload_off, payload.len(), decode_peer_addr(name))
+        };
+
+        let end = payload_off
+            .checked_add(payload_len)
+            .ok_or_else(|| IoError::InvalidConfig("payload range overflow".into()))?;
+        let payload = raw
+            .get_mut(payload_off..end)
+            .ok_or_else(|| IoError::InvalidConfig("payload slice out of bounds".into()))?;
+        Ok((payload, peer_addr))
+    }
+
     /// Splits a kernel-filled provided buffer into (payload, name) slices.
     ///
     /// Shared helper for [`parse`](Self::parse) and

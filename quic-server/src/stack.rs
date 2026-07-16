@@ -515,7 +515,7 @@ impl VireonStack {
 // ── IoHandler implementation ───────────────────────────────────────
 
 impl IoHandler for VireonStack {
-    fn on_datagram(&mut self, data: &[u8], peer: SocketAddr) {
+    fn on_datagram(&mut self, data: &mut [u8], peer: SocketAddr) {
         // [transport-layer] Feed raw datagram to QUIC engine.
         // During shutdown, existing connections still receive packets
         // (needed for CONNECTION_CLOSE acks). Only new Initial packets

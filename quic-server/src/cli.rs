@@ -60,7 +60,7 @@ pub struct Cli {
     /// Enable SQPOLL kernel thread (kernel ≥ 5.11, requires CAP_SYS_NICE).
     /// The kernel thread polls the SQ ring, eliminating submit syscalls.
     /// Falls back to standard mode if the kernel denies SQPOLL.
-    #[arg(long)]
+    #[arg(long, default_value_t = true)]
     pub sqpoll: bool,
 
     /// Dump profiler report to this file on shutdown.
