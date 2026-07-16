@@ -68,6 +68,9 @@ pub struct ReadyQueue {
     capacity_per_band: usize,
     bands: [VecDeque<ReadyEntry>; URGENCY_BANDS],
     total_occupancy: u64,
+    /// Bitmap: bit `i` set when band `i` is non-empty.
+    /// Enables O(1) first-non-empty-band via `trailing_zeros()`.
+    band_bitmap: u8,
 }
 
 impl ReadyQueue {
@@ -78,6 +81,7 @@ impl ReadyQueue {
             capacity_per_band,
             bands: std::array::from_fn(|_| VecDeque::new()),
             total_occupancy: 0,
+            band_bitmap: 0,
         }
     }
 
@@ -110,14 +114,14 @@ impl ReadyQueue {
     }
 
     /// Lowest non-empty urgency band, or `None` if empty.
+    #[inline]
     #[must_use]
     pub fn first_non_empty_band(&self) -> Option<u8> {
-        for i in 0..URGENCY_BANDS {
-            if !self.bands[i].is_empty() {
-                return Some(i as u8);
-            }
+        if self.band_bitmap == 0 {
+            None
+        } else {
+            Some(self.band_bitmap.trailing_zeros() as u8)
         }
-        None
     }
 
     /// Enqueue a ready stream into its urgency band.
@@ -135,21 +139,27 @@ impl ReadyQueue {
         }
         self.bands[band].push_back(entry);
         self.total_occupancy += 1;
+        self.band_bitmap |= 1 << band;
         Ok(())
     }
 
     /// Dequeue the highest-priority entry.
     ///
-    /// Scans bands 0 → 7 and returns the first available entry.
-    /// This is the strict-priority selection across bands.
+    /// Uses the occupancy bitmap + `trailing_zeros()` for O(1) band
+    /// selection instead of scanning up to 8 bands.
     pub fn dequeue(&mut self) -> Option<ReadyEntry> {
-        for band in 0..URGENCY_BANDS {
-            if let Some(entry) = self.bands[band].pop_front() {
-                self.total_occupancy = self.total_occupancy.saturating_sub(1);
-                return Some(entry);
+        if self.band_bitmap == 0 {
+            return None;
+        }
+        let band = self.band_bitmap.trailing_zeros() as usize;
+        let entry = self.bands[band].pop_front();
+        if entry.is_some() {
+            self.total_occupancy = self.total_occupancy.saturating_sub(1);
+            if self.bands[band].is_empty() {
+                self.band_bitmap &= !(1 << band);
             }
         }
-        None
+        entry
     }
 
     /// Dequeue from a specific urgency band (used for testing and
@@ -158,6 +168,9 @@ impl ReadyQueue {
         if band < URGENCY_BANDS {
             if let Some(entry) = self.bands[band].pop_front() {
                 self.total_occupancy = self.total_occupancy.saturating_sub(1);
+                if self.bands[band].is_empty() {
+                    self.band_bitmap &= !(1 << band);
+                }
                 return Some(entry);
             }
         }
@@ -172,6 +185,9 @@ impl ReadyQueue {
             if let Some(pos) = self.bands[band].iter().position(|e| e.id == id) {
                 self.bands[band].remove(pos);
                 self.total_occupancy = self.total_occupancy.saturating_sub(1);
+                if self.bands[band].is_empty() {
+                    self.band_bitmap &= !(1 << band);
+                }
                 return true;
             }
         }
@@ -184,6 +200,7 @@ impl ReadyQueue {
             self.bands[band].clear();
         }
         self.total_occupancy = 0;
+        self.band_bitmap = 0;
     }
 }
 
@@ -201,6 +218,7 @@ impl Clone for ReadyQueue {
             capacity_per_band: self.capacity_per_band,
             bands: self.bands.clone(),
             total_occupancy: self.total_occupancy,
+            band_bitmap: self.band_bitmap,
         }
     }
 }
