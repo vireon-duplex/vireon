@@ -86,6 +86,7 @@ fn main() -> Result<()> {
                     break;
                 }
                 tracing::info!("=== connections sweep: {c} conns ===");
+                resource::malloc_trim();
                 let summary = run_benchmark(
                     args.target,
                     &sni,
@@ -117,6 +118,7 @@ fn main() -> Result<()> {
                     break;
                 }
                 tracing::info!("=== payload sweep: {label} ===");
+                resource::malloc_trim();
                 let workload = workload::build_fixed_size(sz)?;
                 let summary = run_benchmark(
                     args.target,
@@ -170,6 +172,7 @@ fn run_benchmark(
     let barrier = Barrier::new(conns + 1);
 
     let cpu_start = resource::cpu_time_secs();
+    let rss_before = resource::rss_kib();
 
     let coalesce = workload.coalesce;
 
@@ -212,7 +215,7 @@ fn run_benchmark(
     });
 
     let cpu_end = resource::cpu_time_secs();
-    let rss = resource::rss_kib();
+    let rss_after = resource::rss_kib();
 
     let mut summary = aggregate(
         results,
@@ -226,7 +229,7 @@ fn run_benchmark(
 
     let wall_secs = duration.as_secs_f64().max(0.001);
     let cpu_delta = (cpu_end - cpu_start).max(0.0);
-    summary.attach_resources(cpu_delta, wall_secs, rss);
+    summary.attach_resources(cpu_delta, wall_secs, rss_before, rss_after);
 
     Ok(summary)
 }
