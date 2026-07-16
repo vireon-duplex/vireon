@@ -180,6 +180,22 @@ impl BufferPool {
         Some(self.backing_address_of(buf_id).as_ptr())
     }
 
+    /// Same as [`buffer_ptr`](Self::buffer_ptr) but returns a `*mut u8`
+    /// so the caller can construct a `&mut [u8]` for zero-copy processing.
+    ///
+    /// # Safety invariant
+    ///
+    /// Same as [`buffer_ptr`](Self::buffer_ptr): the caller must ensure
+    /// the slice is not used after `refill_buffer` or any other operation
+    /// that may overwrite the buffer's contents.
+    #[must_use]
+    pub fn buffer_ptr_mut(&self, buf_id: u16) -> Option<*mut u8> {
+        if u32::from(buf_id) >= self.buf_count {
+            return None;
+        }
+        Some(self.backing_address_of(buf_id).as_ptr())
+    }
+
     /// Returns the raw address of `buf_id`'s backing storage, or `None`
     /// if `buf_id` is out of range.
     #[must_use]
