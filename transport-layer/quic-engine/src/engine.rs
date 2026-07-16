@@ -170,8 +170,11 @@ pub struct QuicEngine {
     /// Duplicates are harmless: a second `conn.send()` returns `Done`.
     dirty_senders: Vec<usize>,
     /// Per-stream reassembly buffer for frames spanning multiple
-    /// `stream_recv` calls. Keyed by QUIC stream ID.
-    stream_carryover: FxHashMap<u64, StreamCarry>,
+    /// `stream_recv` calls. Keyed by (conn_idx, QUIC stream ID) to
+    /// prevent cross-connection data mixing — without the conn_idx
+    /// disambiguator, two connections sending on stream 0 would
+    /// share the same carryover entry, producing decode garbage.
+    stream_carryover: FxHashMap<(usize, u64), StreamCarry>,
 
     // ── Buffer pool ───────────────────────────────────────────────
     /// Pool for frame payload buffers (zero-alloc hot path).
