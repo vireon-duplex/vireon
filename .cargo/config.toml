@@ -12,12 +12,11 @@ jobs = 8
 rustflags = [
     # --- Performance ---
     "-C", "target-cpu=native",
-    "-C", "link-arg=-s",
-    
+
     # --- Safety: Deny all warnings as errors in CI ---
     # Uncomment for stricter CI builds:
     # "-D", "warnings",
-    
+
     # --- Overflow checks (even in release) ---
     "-C", "overflow-checks=on",
 ]
