@@ -18,8 +18,9 @@
 //! │    3. Process readable streams                                   │
 //! │                                                                  │
 //! │  on_tick(ctx):                                                   │
-//! │    For each connection:                                          │
-//! │      conn.send(out_buf) → (len, SendInfo) → send_blocking()      │
+//! │    For each dirty connection:                                    │
+//! │      conn.send(out_buf) → (len, SendInfo) → gso_batcher.push()   │
+//! │    gso_batcher.flush() → sendmsg(UDP_SEGMENT)                    │
 //! │    Clean up closed connections.                                  │
 //! └──────────────────────────────────────────────────────────────────┘
 //! ```
@@ -522,22 +523,29 @@ impl QuicEngine {
         if n == 0 {
             return;
         }
+
+        let connections = &mut self.connections;
+        let out_buf = &mut self.out_buf;
+        let gso = &mut self.gso_batcher;
+        let sender = &ctx.sender;
+
         for i in 0..n {
             let idx = self.dirty_senders[i];
-            let Some(Some(entry)) = self.connections.get_mut(idx) else {
+            let Some(Some(entry)) = connections.get_mut(idx) else {
                 continue;
             };
             loop {
-                match entry.conn.send(&mut self.out_buf) {
+                match entry.conn.send(out_buf) {
                     Ok((len, info)) => {
                         self.datagrams_sent += 1;
-                        let _ = ctx.sender.send_blocking(&self.out_buf[..len], info.to);
+                        let _ = gso.push(&out_buf[..len], info.to, sender);
                     }
                     Err(quiche::Error::Done) => break,
-                    Err(_) => break, // Non-fatal: try next connection.
+                    Err(_) => break,
                 }
             }
         }
+        let _ = gso.flush(sender);
     }
 
     /// Removes closed connections from the slab and routing table,
