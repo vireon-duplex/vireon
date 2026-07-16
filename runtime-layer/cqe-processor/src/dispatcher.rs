@@ -83,6 +83,7 @@ pub mod handlers {
 
     /// Handler for `Completion::Receive` / `ReceiveError`. Records RX
     /// metrics and schedules a re-arm when the multishot terminates.
+    #[inline]
     pub fn process_recv(proc: &mut CqeProcessor, c: &Completion) -> Outcome {
         match c {
             Completion::Receive {
@@ -131,6 +132,7 @@ pub mod handlers {
 
     /// Handler for `Completion::Send` (first CQE of SEND_ZC) and
     /// `Completion::SendBufferReclaim` (second CQE).
+    #[inline]
     pub fn process_send(proc: &mut CqeProcessor, c: &Completion) -> Outcome {
         match c {
             Completion::Send { id, res: _ } => {
@@ -184,6 +186,7 @@ pub mod handlers {
     }
 
     /// Handler for `Completion::Timeout`.
+    #[inline]
     pub fn process_timeout(proc: &mut CqeProcessor, c: &Completion) -> Outcome {
         let Completion::Timeout { id } = c else {
             return Outcome::default();
@@ -199,6 +202,7 @@ pub mod handlers {
     }
 
     /// Handler for `Completion::Cancel`.
+    #[inline]
     pub fn process_cancel(proc: &mut CqeProcessor, c: &Completion) -> Outcome {
         let Completion::Cancel { id, res: _ } = c else {
             return Outcome::default();

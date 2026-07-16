@@ -33,6 +33,9 @@ pub struct HierarchicalWheel {
     level_bitmaps: Vec<u64>,
     last_tick: u64,
     count: u64,
+    /// Reusable scratch buffer for cascade operations — avoids per-tick
+    /// allocation in `advance()`.
+    cascade_buf: Vec<u32>,
 }
 
 impl HierarchicalWheel {
@@ -56,6 +59,7 @@ impl HierarchicalWheel {
             level_bitmaps: vec![0u64; levels as usize],
             last_tick: initial_tick,
             count: 0,
+            cascade_buf: Vec::with_capacity(64),
         }
     }
 
@@ -129,9 +133,6 @@ impl HierarchicalWheel {
         now: u64,
         reclaimed: &mut Vec<u32>,
     ) {
-        // Reusable scratch buffer for cascade drain — avoids per-tick allocation.
-        let mut cascade_buf: Vec<u32> = Vec::new();
-
         while self.last_tick < now {
             self.last_tick += 1;
             let t = self.last_tick;
@@ -152,21 +153,25 @@ impl HierarchicalWheel {
             if l0_slot == 0 {
                 for lvl in 1..self.levels {
                     let sidx = ((t >> (lvl * self.bits)) as usize) & self.slot_mask;
-                    cascade_buf.clear();
+                    self.cascade_buf.clear();
                     drain_all_into(
                         slab,
                         &mut self.buckets[(lvl as usize) * self.slots_per_level + sidx],
-                        &mut cascade_buf,
+                        &mut self.cascade_buf,
                     );
                     self.level_bitmaps[lvl as usize] &= !(1u64 << sidx);
-                    if cascade_buf.is_empty() {
+                    if self.cascade_buf.is_empty() {
                         // nothing to do at this level; still respect wrap chain
                         if sidx != 0 {
                             break;
                         }
                         continue;
                     }
-                    for &slot in &cascade_buf {
+                    // Index-based iteration to avoid borrow conflict with
+                    // self.place() inside the loop.
+                    let cascade_len = self.cascade_buf.len();
+                    for i in 0..cascade_len {
+                        let slot = self.cascade_buf[i];
                         let dl = slab.get(slot).deadline;
                         if dl <= self.last_tick {
                             // became due during the same tick — fire/reclaim now

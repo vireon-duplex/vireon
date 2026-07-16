@@ -122,6 +122,7 @@ impl CompletionDecoder {
     }
 
     /// Decodes a single CQE entry into a [`Completion`].
+    #[inline]
     #[must_use]
     pub fn decode(&self, cqe: &cqueue::Entry) -> Completion {
         Self::decode_raw(cqe.user_data(), cqe.result(), cqe.flags())
@@ -129,6 +130,7 @@ impl CompletionDecoder {
 
     /// Decodes from raw CQE field values (used by [`decode`](Self::decode)
     /// and by unit tests that cannot construct `cqueue::Entry` directly).
+    #[inline]
     fn decode_raw(user_data: u64, res: i32, flags: u32) -> Completion {
         let kind = decode_kind(user_data);
         let id = decode_id(user_data);
@@ -141,6 +143,7 @@ impl CompletionDecoder {
         }
     }
 
+    #[inline]
     fn decode_recv(id: u64, res: i32, flags: u32) -> Completion {
         if res < 0 {
             return Completion::ReceiveError {
@@ -159,6 +162,7 @@ impl CompletionDecoder {
         }
     }
 
+    #[inline]
     fn decode_send(id: u64, res: i32, flags: u32) -> Completion {
         // Notification CQE (second half of SEND_ZC lifecycle).
         if cqueue::notif(flags) {
