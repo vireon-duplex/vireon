@@ -266,12 +266,7 @@ impl Summary {
     /// - `cpu_delta_secs`: total CPU time (all threads) consumed during the run.
     /// - `wall_secs`: wall-clock duration of the measurement window.
     /// - `rss_peak_kib`: peak process RSS (KiB) sampled during the run.
-    pub fn attach_resources(
-        &mut self,
-        cpu_delta_secs: f64,
-        wall_secs: f64,
-        rss_peak_kib: u64,
-    ) {
+    pub fn attach_resources(&mut self, cpu_delta_secs: f64, wall_secs: f64, rss_peak_kib: u64) {
         self.cpu_cores = if wall_secs > 0.0 {
             cpu_delta_secs / wall_secs
         } else {
