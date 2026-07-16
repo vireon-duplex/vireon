@@ -12,6 +12,8 @@
 //! performs zero allocation and no locking. Lookup is a HashMap probe
 //! + generation check; touch is a slab index + counter add.
 
+use std::net::SocketAddr;
+
 use rustc_hash::FxHashMap;
 
 use crate::backpressure::BackpressureLevel;
@@ -58,6 +60,11 @@ pub struct ConnectionShard {
     /// Slots in `Closed` state awaiting reclamation by `drain_closed`.
     /// Avoids O(capacity) full-slab scan — drain is O(closed_count).
     closed_slots: Vec<u32>,
+    /// Parallel side table: `peer_addr` per slot. Kept out of
+    /// [`ConnectionEntry`] so each entry fits in exactly one cache line
+    /// (64 bytes). Peer addresses are cold data — only needed for
+    /// snapshots and migration, not on the per-packet hot path.
+    peer_addrs: Vec<SocketAddr>,
 }
 
 impl ConnectionShard {
@@ -96,6 +103,7 @@ impl ConnectionShard {
             strategy: Box::new(LocalSharding::new(reactor_id)),
             shutting_down,
             closed_slots: Vec::new(),
+            peer_addrs: vec![SocketAddr::from(([0, 0, 0, 0], 0)); capacity],
         })
     }
 
@@ -288,13 +296,13 @@ impl ConnectionShard {
         let entry = &mut self.slab[slot_idx];
         *entry = ConnectionEntry::new(
             spec.stream_id,
-            spec.peer_addr,
             self.reactor_id,
             self.numa_node,
             spec.tenant_id,
             spec.priority,
             now_ns,
         );
+        self.peer_addrs[slot_idx] = spec.peer_addr;
 
         self.stream_index.insert(spec.stream_id, slot);
         let id = make_id(slot, self.generations[slot_idx]);
@@ -421,6 +429,7 @@ impl ConnectionShard {
         let stream_id = self.slab[slot_idx].stream_id;
         self.stream_index.remove(&stream_id);
         self.slab[slot_idx].reset_for_reuse();
+        self.peer_addrs[slot_idx] = SocketAddr::from(([0, 0, 0, 0], 0));
         // Bump generation (wrapping at 16 bits). A generation of 0
         // would produce the nil id — skip it.
         let new_gen = (self.generations[slot_idx].wrapping_add(1)) & GEN_MASK as u16;
@@ -480,7 +489,7 @@ impl ConnectionShard {
         let stream_id = entry.stream_id;
         let req = MigrationRequest {
             stream_id,
-            peer_addr: entry.peer_addr,
+            peer_addr: self.peer_addrs[slot],
             source_cpu: self.reactor_id,
             target_cpu,
             bytes_sent: entry.bytes_sent,
@@ -526,13 +535,13 @@ impl ConnectionShard {
         let entry = &mut self.slab[slot_idx];
         *entry = ConnectionEntry::new(
             req.stream_id,
-            req.peer_addr,
             self.reactor_id,
             self.numa_node,
             req.tenant_id,
             req.priority,
             req.created_at_ns,
         );
+        self.peer_addrs[slot_idx] = req.peer_addr;
         entry.state = ConnectionState::Active;
         entry.bytes_sent = req.bytes_sent;
         entry.bytes_recv = req.bytes_recv;
@@ -638,7 +647,7 @@ impl ConnectionShard {
     #[must_use]
     pub fn view(&self, id: ConnectionId) -> Option<crate::connection::ConnectionSnapshot> {
         let slot = self.validate_id(id)?;
-        Some(self.slab[slot].snapshot())
+        Some(self.slab[slot].snapshot(self.peer_addrs[slot]))
     }
 
     /// Returns a statistics snapshot.
