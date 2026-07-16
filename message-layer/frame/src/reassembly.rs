@@ -54,8 +54,9 @@ use crate::header::{FrameFlags, MessageType, StreamId};
 // ── Constants ───────────────────────────────────────────────────────
 
 /// Default maximum bytes buffered per stream before rejecting fragments.
-/// 16 MiB — large enough for realistic multi-fragment messages.
-const DEFAULT_MAX_BYTES_PER_STREAM: usize = 16 * 1024 * 1024;
+/// 256 MiB — generous enough for large multi-fragment messages while still
+/// bounding memory under DoS.
+const DEFAULT_MAX_BYTES_PER_STREAM: usize = 256 * 1024 * 1024;
 
 /// Default maximum number of concurrent pending reassemblies.
 const DEFAULT_MAX_PENDING_ENTRIES: usize = 4096;
@@ -155,7 +156,7 @@ impl PendingReassembly {
 /// # DoS protection
 ///
 /// Two limits prevent unbounded memory growth:
-/// - `max_bytes_per_stream`: total bytes buffered per stream (default 16 MiB)
+/// - `max_bytes_per_stream`: total bytes buffered per stream (default 256 MiB)
 /// - `max_pending_entries`: number of concurrent incomplete chains (default 4096)
 ///
 /// Stale incomplete chains can be evicted via [`evict_timeouts`](Self::evict_timeouts).
@@ -178,7 +179,7 @@ impl Default for FragmentReassembler {
 
 impl FragmentReassembler {
     /// Creates a reassembler with default limits
-    /// (16 MiB/stream, 4096 pending entries).
+    /// (256 MiB/stream, 4096 pending entries).
     #[must_use]
     pub fn new() -> Self {
         Self::with_limits(DEFAULT_MAX_BYTES_PER_STREAM, DEFAULT_MAX_PENDING_ENTRIES)
