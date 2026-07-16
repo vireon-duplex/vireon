@@ -590,7 +590,7 @@ impl FrameDecoder {
             let p = self.buf.as_ptr();
             let stream_id = StreamId(u64::from_be(core::ptr::read_unaligned(p as *const u64)));
             let seq = Seq(u64::from_be(core::ptr::read_unaligned(
-                p.add(8) as *const u64,
+                p.add(8) as *const u64
             )));
             let msg_type_byte = *p.add(16);
             let flags = FrameFlags::from_bits(*p.add(17));
@@ -618,7 +618,7 @@ impl FrameDecoder {
         let data_end = HEADER_SIZE + payload_len;
         let expected = unsafe {
             u32::from_be(core::ptr::read_unaligned(
-                self.buf.as_ptr().add(data_end) as *const u32,
+                self.buf.as_ptr().add(data_end) as *const u32
             ))
         };
         let actual = crc32c::crc32c(&self.buf[..data_end]);

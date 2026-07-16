@@ -164,9 +164,7 @@ impl FairnessMetrics {
         if let Some((key, val)) = min_entry {
             self.bytes_per_stream.remove(&key);
             self.running_sum = self.running_sum.saturating_sub(val);
-            self.running_sum_sq = self
-                .running_sum_sq
-                .saturating_sub(val.saturating_mul(val));
+            self.running_sum_sq = self.running_sum_sq.saturating_sub(val.saturating_mul(val));
         }
     }
 }
