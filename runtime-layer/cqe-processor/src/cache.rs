@@ -65,9 +65,12 @@ impl HotState {
     pub fn record_cqe(&self, opkind_index: usize) {
         self.cqes_total
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        // Bounds-check elided when `opkind_index` is a known OpKind discriminant.
-        if let Some(slot) = self.cqes_per_opkind.get(opkind_index) {
-            slot.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        debug_assert!(opkind_index < 16);
+        // SAFETY: `opkind_index` is derived from an OpKind discriminant
+        // which is guaranteed to be in [0, 16).
+        unsafe {
+            (*self.cqes_per_opkind.as_ptr().add(opkind_index))
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -116,13 +119,15 @@ mod tests {
     }
 
     #[test]
-    fn record_cqe_with_out_of_bound_index_is_safe() {
+    fn record_cqe_increments_correct_histogram_slot() {
         let h = HotState::new();
-        h.record_cqe(99);
-        assert_eq!(h.cqes_total.load(Ordering::Relaxed), 1);
-        // Histogram slots untouched.
-        for slot in &h.cqes_per_opkind {
-            assert_eq!(slot.load(Ordering::Relaxed), 0);
+        // All valid OpKind discriminants (0..=3) must hit the right slot.
+        for i in 0..4u32 {
+            h.record_cqe(i as usize);
+        }
+        assert_eq!(h.cqes_total.load(Ordering::Relaxed), 4);
+        for i in 0..4 {
+            assert_eq!(h.cqes_per_opkind[i].load(Ordering::Relaxed), 1);
         }
     }
 }

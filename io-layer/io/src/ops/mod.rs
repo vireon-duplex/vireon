@@ -60,6 +60,7 @@ pub const fn encode(kind: OpKind, id: u64) -> u64 {
 ///
 /// Returns [`OpKind::Recv`] for values with invalid high bits (defensive
 /// default — should not occur with correctly-encoded `user_data`).
+#[inline]
 #[must_use]
 pub const fn decode_kind(user_data: u64) -> OpKind {
     match user_data >> OP_SHIFT {
@@ -72,6 +73,7 @@ pub const fn decode_kind(user_data: u64) -> OpKind {
 }
 
 /// Extracts the ID from a `user_data` value (low 60 bits).
+#[inline]
 #[must_use]
 pub const fn decode_id(user_data: u64) -> u64 {
     user_data & ID_MASK

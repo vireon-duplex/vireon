@@ -242,8 +242,6 @@ impl CqeProcessor {
         // Phase 2: decode + dispatch.
         for entry in &entries {
             let user_data = entry.user_data();
-            let res = entry.result();
-            let flags = entry.flags();
             let completion = self.decoder.decode(entry);
             let kind = decode_kind(user_data);
 
@@ -263,7 +261,7 @@ impl CqeProcessor {
 
             // Outcome → pending queues.
             if outcome.schedule_task {
-                self.scheduler.push(completion.clone(), now_ns);
+                self.scheduler.push(completion, now_ns);
                 result.tasks_scheduled += 1;
             }
             if let Some(buf_id) = outcome.return_buffer {
@@ -286,14 +284,13 @@ impl CqeProcessor {
             }
 
             // Update per-OpKind stats (mirror hot-state into cold).
-            self.stats
-                .cqes_per_opkind
-                .get(kind as usize)
-                .map(|a| a.fetch_add(1, Ordering::Relaxed));
+            // SAFETY: `kind` is an OpKind discriminant, guaranteed in [0, OP_KIND_COUNT).
+            debug_assert!((kind as usize) < crate::user_data::OP_KIND_COUNT);
+            unsafe {
+                (*self.stats.cqes_per_opkind.as_ptr().add(kind as usize))
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             self.stats.cqes_total.fetch_add(1, Ordering::Relaxed);
-
-            // Suppress unused-variable warning when debug-only fields exist.
-            let _ = (res, flags, &completion);
         }
 
         // Phase 3: record drain cycle.
@@ -342,10 +339,7 @@ impl CqeProcessor {
         // Phase 5: recycle flush if threshold reached (the reactor still
         // pulls via `drain_pending_recycles`; this is just informational).
         if self.recycle.should_flush() {
-            // Drain into pending_recycle so the next `drain_pending_recycles`
-            // picks them up.
-            let pending = self.recycle.drain_pending();
-            self.pending_recycle.extend(pending);
+            self.recycle.drain_into(&mut self.pending_recycle);
         }
 
         // Return the reusable entry buffer.
@@ -383,10 +377,11 @@ impl CqeProcessor {
         if let Some(id) = outcome.retire_timer {
             self.pending_timers.push(id);
         }
-        self.stats
-            .cqes_per_opkind
-            .get(kind as usize)
-            .map(|a| a.fetch_add(1, Ordering::Relaxed));
+        debug_assert!((kind as usize) < crate::user_data::OP_KIND_COUNT);
+        unsafe {
+            (*self.stats.cqes_per_opkind.as_ptr().add(kind as usize))
+                .fetch_add(1, Ordering::Relaxed);
+        }
         self.stats.cqes_total.fetch_add(1, Ordering::Relaxed);
         outcome
     }
