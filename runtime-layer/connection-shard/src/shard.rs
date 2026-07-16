@@ -192,19 +192,16 @@ impl ConnectionShard {
                 self.stats.record_lookup(true);
                 s
             }
-            None => {
-                self.stats.record_lookup(false);
-                return None;
-            }
+            None => return self.lookup_miss(),
         };
         let slot_idx = slot as usize;
         if slot_idx >= self.slab.len() {
-            return None;
+            return self.lookup_miss();
         }
         // Verify the slot is live (not Closed/free).
         let entry = &self.slab[slot_idx];
         if !entry.state.is_live() && entry.state != ConnectionState::Migrating {
-            return None;
+            return self.lookup_miss();
         }
         Some(make_id(slot, self.generations[slot_idx]))
     }
@@ -212,6 +209,16 @@ impl ConnectionShard {
     // ════════════════════════════════════════════════════════════
     //  Fast path — touch
     // ════════════════════════════════════════════════════════════
+
+    /// Records a lookup miss and returns `None`. Marked `#[cold]` so the
+    /// compiler lays out the miss path away from the hot path, improving
+    /// instruction-cache locality for the hit path.
+    #[cold]
+    #[inline(never)]
+    fn lookup_miss(&self) -> Option<ConnectionId> {
+        self.stats.record_lookup(false);
+        None
+    }
 
     /// Validates a [`ConnectionId`] against the current generation.
     ///
@@ -232,9 +239,16 @@ impl ConnectionShard {
     ///
     /// This is the per-packet fast path. Returns
     /// [`NotFound`](ShardError::NotFound) if the id is stale.
+    ///
+    /// `now_ns` should be a monotonic timestamp — ideally cached from the
+    /// reactor's drain cycle rather than re-computed per call.
     #[inline]
-    pub fn touch_recv(&mut self, id: ConnectionId, bytes: usize) -> Result<(), ShardError> {
-        let now_ns = monotonic_now_ns();
+    pub fn touch_recv(
+        &mut self,
+        id: ConnectionId,
+        bytes: usize,
+        now_ns: u64,
+    ) -> Result<(), ShardError> {
         let slot = self.validate_id(id).ok_or(ShardError::NotFound)?;
         self.slab[slot].add_recv(bytes as u64, now_ns);
         self.stats.record_recv(bytes as u64);
@@ -245,9 +259,16 @@ impl ConnectionShard {
     ///
     /// This is the per-packet fast path. Returns
     /// [`NotFound`](ShardError::NotFound) if the id is stale.
+    ///
+    /// `now_ns` should be a monotonic timestamp — ideally cached from the
+    /// reactor's drain cycle rather than re-computed per call.
     #[inline]
-    pub fn touch_send(&mut self, id: ConnectionId, bytes: usize) -> Result<(), ShardError> {
-        let now_ns = monotonic_now_ns();
+    pub fn touch_send(
+        &mut self,
+        id: ConnectionId,
+        bytes: usize,
+        now_ns: u64,
+    ) -> Result<(), ShardError> {
         let slot = self.validate_id(id).ok_or(ShardError::NotFound)?;
         self.slab[slot].add_send(bytes as u64, now_ns);
         self.stats.record_send(bytes as u64);
@@ -699,7 +720,7 @@ impl std::fmt::Debug for ConnectionShard {
 /// Uses `Instant` internally; the absolute value is arbitrary but
 /// monotonically increasing within a process lifetime.
 #[inline]
-fn monotonic_now_ns() -> u64 {
+pub fn monotonic_now_ns() -> u64 {
     use std::sync::OnceLock;
     static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
     let epoch = EPOCH.get_or_init(std::time::Instant::now);
@@ -793,7 +814,7 @@ mod tests {
             .create(ConnectionSpec::new(5, sample_addr()))
             .expect("create");
         shard.destroy(id).expect("destroy");
-        let err = shard.touch_recv(id, 100).unwrap_err();
+        let err = shard.touch_recv(id, 100, 1000).unwrap_err();
         assert!(matches!(err, ShardError::NotFound));
     }
 
@@ -857,8 +878,8 @@ mod tests {
         let id = shard
             .create(ConnectionSpec::new(1, sample_addr()))
             .expect("create");
-        shard.touch_recv(id, 1024).expect("recv");
-        shard.touch_send(id, 2048).expect("send");
+        shard.touch_recv(id, 1024, 1000).expect("recv");
+        shard.touch_send(id, 2048, 2000).expect("send");
         let snap = shard.view(id).expect("view");
         assert_eq!(snap.bytes_recv, 1024);
         assert_eq!(snap.bytes_sent, 2048);
@@ -1007,8 +1028,8 @@ mod tests {
         let id = shard
             .create(ConnectionSpec::new(1, sample_addr()))
             .expect("create");
-        shard.touch_recv(id, 100).expect("recv");
-        shard.touch_send(id, 200).expect("send");
+        shard.touch_recv(id, 100, 1000).expect("recv");
+        shard.touch_send(id, 200, 2000).expect("send");
         shard.lookup_by_stream(1);
         shard.lookup_by_stream(999); // miss
 

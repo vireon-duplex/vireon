@@ -38,16 +38,13 @@ impl RecyclePipeline {
         self.pending.len() >= self.threshold
     }
 
-    /// Drains the pending buf_ids and returns how many were queued.
-    /// The actual `BufferPool::refill_buffer` calls are the caller's
+    /// Drains the pending buf_ids into the provided destination vector.
+    /// Avoids allocating a new Vec per drain — the caller reuses its own
+    /// buffer. The actual `BufferPool::refill_buffer` calls are the caller's
     /// responsibility (the caller owns the pool).
-    #[must_use]
     #[profile]
-    pub fn drain_pending(&mut self) -> Vec<u16> {
-        let out = std::mem::take(&mut self.pending);
-        // Restore capacity for the next batch.
-        self.pending = Vec::with_capacity(self.threshold.max(16) * 2);
-        out
+    pub fn drain_into(&mut self, dest: &mut Vec<u16>) {
+        dest.append(&mut self.pending);
     }
 
     /// Current pending count.
@@ -86,7 +83,8 @@ mod tests {
         p.push(2);
         p.push(3);
         assert_eq!(p.pending_count(), 3);
-        let drained = p.drain_pending();
+        let mut drained = Vec::new();
+        p.drain_into(&mut drained);
         assert_eq!(drained, vec![1, 2, 3]);
         assert_eq!(p.pending_count(), 0);
     }
@@ -107,7 +105,8 @@ mod tests {
         for i in 0..5 {
             p.push(i);
         }
-        let _ = p.drain_pending();
+        let mut sink = Vec::new();
+        p.drain_into(&mut sink);
         // After drain we can push again without reallocation.
         p.push(10);
         p.push(11);
