@@ -30,6 +30,12 @@ use profiler::profile;
 /// Matches Cloudflare's quiche-server default.
 pub const GSO_MAX_BATCH: usize = 64;
 
+/// Flush threshold in bytes. Prevents oversized kernel send buffers when
+/// packets are large (e.g. jumbo frames). With standard 1400-byte QUIC
+/// packets this rarely triggers before `GSO_MAX_BATCH`; it acts as a
+/// safety net for high-MTU paths.
+const GSO_FLUSH_BYTES: usize = 64 * 1024;
+
 /// Pre-allocated batch buffer capacity. Large enough for
 /// `GSO_MAX_BATCH` full-size jumbo packets.
 const BATCH_BUF_CAPACITY: usize = GSO_MAX_BATCH * 65_535;
@@ -88,6 +94,7 @@ impl GsoBatcher {
     #[profile]
     pub fn push(&mut self, pkt: &[u8], dest: SocketAddr, sender: &Sender) -> Result<(), IoError> {
         let needs_flush = self.count >= GSO_MAX_BATCH
+            || self.buf.len() + pkt.len() >= GSO_FLUSH_BYTES
             || (self.count > 0 && (self.dest != Some(dest) || pkt.len() != self.seg_size));
 
         if needs_flush {
@@ -144,6 +151,11 @@ impl GsoBatcher {
                     // a non-blocking socket. Transient: fall back to
                     // individual sends WITHOUT permanently disabling GSO.
                     Some(11) => self.flush_individual(sender, dest),
+                    // EMSGSIZE (90) — total GSO buffer exceeds the kernel's
+                    // max send size for this interface (common on loopback
+                    // with large segments). Fall back to individual sends;
+                    // each packet alone is within the UDP max datagram size.
+                    Some(90) => self.flush_individual(sender, dest),
                     // EOPNOTSUPP (95), EINVAL (22), ENOTSUP (251) — kernel
                     // doesn't support UDP_SEGMENT. Disable GSO permanently.
                     Some(95) | Some(22) | Some(251) => {
@@ -154,10 +166,9 @@ impl GsoBatcher {
                         self.gso_supported = false;
                         self.flush_individual(sender, dest)
                     }
-                    _ => {
-                        self.reset();
-                        Err(e)
-                    }
+                    // Any other error: fall back to individual sends rather
+                    // than dropping the entire batch.
+                    _ => self.flush_individual(sender, dest),
                 }
             }
         }
