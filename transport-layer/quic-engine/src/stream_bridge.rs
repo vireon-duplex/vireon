@@ -263,7 +263,9 @@ fn process_single_stream(
     }
 
     if total_frames > 0 {
-        let remaining = carryover.get(&(conn_idx, stream_id)).map_or(0, |cs| cs.buf.len());
+        let remaining = carryover
+            .get(&(conn_idx, stream_id))
+            .map_or(0, |cs| cs.buf.len());
         tracing::trace!(
             reactor_id,
             conn_idx,
