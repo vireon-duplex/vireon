@@ -29,8 +29,6 @@ pub struct Worker {
 impl Worker {
     /// Creates a new worker pinned to `core_id`, bound to `config.port`.
     ///
-    /// Uses kernel-nic topology to verify CPU pinning and log NIC info.
-    ///
     /// # Errors
     ///
     /// Returns [`ServerError`] if reactor or engine initialization fails.
@@ -39,18 +37,6 @@ impl Worker {
         core_id: u32,
         shutdown_requested: Arc<AtomicBool>,
     ) -> Result<Self, ServerError> {
-        // [kernel-layer] Discover NIC topology for this core (RSS/IRQ affinity info).
-        if let Ok(topo) = kernel_nic::CpuTopology::discover() {
-            let cpu_count = topo.cpus().len();
-            let numa_nodes = topo.numa_nodes().len();
-            tracing::debug!(
-                core_id,
-                cpu_count,
-                numa_nodes,
-                "[kernel-nic] topology available for worker pinning"
-            );
-        }
-
         tracing::info!(core_id, port = config.port, "initializing reactor");
 
         let reactor = Reactor::init(core_id, config.port, config.queue_depth, config.sqpoll)
