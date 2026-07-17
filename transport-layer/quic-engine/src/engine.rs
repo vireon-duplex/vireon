@@ -35,8 +35,17 @@ use frame::codec;
 use io::handler::{IoHandler, TickContext};
 
 use crate::config::QuicConfig;
+use crate::dirty::{Control, DirtyBitset};
 use crate::gso::GsoBatcher;
 use crate::stream_bridge::StreamCarry;
+
+/// Per-tick cap on the number of dirty connections whose sends are flushed.
+///
+/// Bounds worst-case tick latency under connection storms: excess dirty
+/// connections keep their bits set and are processed on subsequent ticks.
+/// Sized to match a typical GSO batch burst (≤64 packets per flush), so a
+/// full budget rarely exceeds one `sendmsg` per connection.
+const DIRTY_FLUSH_BUDGET: usize = 64;
 
 /// Maximum QUIC packet size — covers full IPv4 UDP jumbo payload
 /// (65535 - IP/UDP overhead). Must match the io-layer receive buffer
@@ -163,12 +172,20 @@ pub struct QuicEngine {
     /// Reusable scratch for collecting closed connection indices (avoids
     /// per-tick Vec allocation).
     closed_buf: Vec<usize>,
+    /// Reusable scratch recording the connections flushed this tick, so
+    /// `cleanup_closed` can scan only active connections instead of the
+    /// whole slab. Cleared at the start of each `flush_sends`.
+    flushed_this_tick: Vec<usize>,
     /// Connections with pending sends — avoids O(N) flush scan of idle
     /// connections every tick. Populated by `feed_existing` (ACKs, flow
     /// control after recv), `send_stream` (application data), and
     /// `close_connection` / `begin_shutdown` (CONNECTION_CLOSE).
-    /// Duplicates are harmless: a second `conn.send()` returns `Done`.
-    dirty_senders: Vec<usize>,
+    ///
+    /// Packed bitset: setting a dirty bit is O(1) and idempotent, and the
+    /// flush loop clears each bit in place as it is processed (up to
+    /// [`DIRTY_FLUSH_BUDGET`]). Unprocessed bits roll forward to the next
+    /// tick — no sort or dedup pass is needed.
+    dirty: DirtyBitset,
     /// Per-stream reassembly buffer for frames spanning multiple
     /// `stream_recv` calls. Keyed by (conn_idx, QUIC stream ID) to
     /// prevent cross-connection data mixing — without the conn_idx
@@ -249,7 +266,8 @@ impl QuicEngine {
             },
             readable_buf: Vec::with_capacity(16),
             closed_buf: Vec::with_capacity(16),
-            dirty_senders: Vec::with_capacity(64),
+            flushed_this_tick: Vec::with_capacity(DIRTY_FLUSH_BUDGET),
+            dirty: DirtyBitset::new(),
             stream_carryover: FxHashMap::default(),
             pool,
             gso_batcher: GsoBatcher::new(),
@@ -307,7 +325,7 @@ impl QuicEngine {
         match entry.conn.stream_send(stream_id, data, fin) {
             Ok(n) => {
                 // Mark dirty so flush_sends picks this connection up.
-                self.dirty_senders.push(conn_idx);
+                self.dirty.set(conn_idx);
                 Ok(n)
             }
             Err(quiche::Error::Done) => Err(QuicSendError::FlowBlocked),
@@ -358,7 +376,7 @@ impl QuicEngine {
         let local_addr = self.local_addr;
         let reactor_id = self.reactor_id;
         let carryover = &mut self.stream_carryover;
-        let dirty = &mut self.dirty_senders;
+        let dirty = &mut self.dirty;
 
         let Some(Some(entry)) = self.connections.get_mut(idx) else {
             return;
@@ -376,7 +394,7 @@ impl QuicEngine {
             Ok(_) => {
                 // Mark dirty — recv may have generated ACKs, flow-control
                 // updates, or probe packets that need to be flushed.
-                dirty.push(idx);
+                dirty.set(idx);
 
                 // Emit ConnectionEstablished on handshake completion (once).
                 if !entry.established && entry.conn.is_established() {
@@ -508,19 +526,23 @@ impl QuicEngine {
 
     /// Flushes outgoing packets for connections that have pending sends.
     ///
-    /// Only iterates [`dirty_senders`](Self.dirty_senders) instead of all
-    /// connections — a connection enters the dirty set when it receives a
-    /// datagram (ACKs / flow-control updates) or when application data is
-    /// queued via [`send_stream`](Self::send_stream).
+    /// Only iterates the dirty bitset instead of all connections — a
+    /// connection enters the dirty set when it receives a datagram (ACKs /
+    /// flow-control updates) or when application data is queued via
+    /// [`send_stream`](Self::send_stream).
+    ///
+    /// At most [`DIRTY_FLUSH_BUDGET`] connections are processed per tick;
+    /// any remaining dirty bits stay set and roll forward, bounding
+    /// worst-case tick latency under connection storms. Each processed
+    /// connection's bit is cleared in place; if `conn.send()` or a
+    /// concurrent recv re-marks it dirty during the flush, that new bit
+    /// survives and is revisited next tick.
     pub fn flush_sends(&mut self, ctx: &mut TickContext) {
-        if self.dirty_senders.len() <= 1 {
-            // 0 or 1 entries — no dedup needed.
-        } else {
-            self.dirty_senders.sort_unstable();
-            self.dirty_senders.dedup();
-        }
-        let n = self.dirty_senders.len();
-        if n == 0 {
+        // Record which connections we flush this tick so cleanup_closed can
+        // scan only the active set (the bitset is cleared as we drain).
+        self.flushed_this_tick.clear();
+
+        if self.dirty.is_empty() {
             return;
         }
 
@@ -528,41 +550,52 @@ impl QuicEngine {
         let out_buf = &mut self.out_buf;
         let gso = &mut self.gso_batcher;
         let sender = &ctx.sender;
+        let flushed = &mut self.flushed_this_tick;
+        let budget = DIRTY_FLUSH_BUDGET;
 
-        for i in 0..n {
-            let idx = self.dirty_senders[i];
-            let Some(Some(entry)) = connections.get_mut(idx) else {
-                continue;
-            };
-            loop {
-                match entry.conn.send(out_buf) {
-                    Ok((len, info)) => {
-                        self.datagrams_sent += 1;
-                        let _ = gso.push(&out_buf[..len], info.to, sender);
+        let mut processed = 0usize;
+        self.dirty.drain(|idx| {
+            flushed.push(idx);
+            if let Some(Some(entry)) = connections.get_mut(idx) {
+                loop {
+                    match entry.conn.send(out_buf) {
+                        Ok((len, info)) => {
+                            self.datagrams_sent += 1;
+                            let _ = gso.push(&out_buf[..len], info.to, sender);
+                        }
+                        Err(quiche::Error::Done) => break,
+                        Err(_) => break,
                     }
-                    Err(quiche::Error::Done) => break,
-                    Err(_) => break,
                 }
             }
-        }
+            processed += 1;
+            if processed >= budget {
+                Control::Break
+            } else {
+                Control::Continue
+            }
+        });
         let _ = gso.flush(sender);
     }
 
     /// Removes closed connections from the slab and routing table,
     /// emitting `ConnectionClosed` events for each.
     ///
-    /// Only checks connections in [`dirty_senders`](Self.dirty_senders)
-    /// — connections that were active this tick (received datagrams,
-    /// had sends queued, or were explicitly closed). Idle connections
-    /// that closed without traffic are handled by the higher-level
-    /// idle-timeout reaper in `VireonStack::reap_idle`.
+    /// Only checks connections flushed this tick (recorded in
+    /// [`flushed_this_tick`](Self.flushed_this_tick)) — connections that
+    /// were active (received datagrams, had sends queued, or were
+    /// explicitly closed). Idle connections that closed without traffic
+    /// are handled by the higher-level idle-timeout reaper in
+    /// `VireonStack::reap_idle`. Connections that exceeded the flush
+    /// budget and kept their dirty bit set are checked on the tick they
+    /// are actually flushed.
     fn cleanup_closed(&mut self) {
         self.closed_buf.clear();
 
-        // Check only dirty connections (not all slots).
-        let dirty_n = self.dirty_senders.len();
-        for i in 0..dirty_n {
-            let idx = self.dirty_senders[i];
+        // Check only connections flushed this tick (not all slots).
+        let n = self.flushed_this_tick.len();
+        for i in 0..n {
+            let idx = self.flushed_this_tick[i];
             if let Some(Some(entry)) = self.connections.get(idx) {
                 if entry.conn.is_closed() {
                     self.closed_buf.push(idx);
@@ -613,11 +646,11 @@ impl QuicEngine {
         let reason = b"server shutting down";
         // Mark all active connections dirty so CONNECTION_CLOSE frames
         // are flushed by the next `flush_sends`.
-        self.dirty_senders.clear();
+        self.dirty.clear();
         for (idx, entry) in self.connections.iter_mut().enumerate() {
             if let Some(e) = entry {
                 let _ = e.conn.close(true, 0x00, reason);
-                self.dirty_senders.push(idx);
+                self.dirty.set(idx);
             }
         }
         tracing::info!(
@@ -638,7 +671,7 @@ impl QuicEngine {
     pub fn close_connection(&mut self, conn_idx: usize, app_error: u64, reason: &[u8]) {
         if let Some(Some(entry)) = self.connections.get_mut(conn_idx) {
             let _ = entry.conn.close(true, app_error, reason);
-            self.dirty_senders.push(conn_idx);
+            self.dirty.set(conn_idx);
             tracing::debug!(
                 reactor_id = self.reactor_id,
                 conn_idx,
@@ -657,8 +690,9 @@ impl IoHandler for QuicEngine {
     fn on_tick(&mut self, ctx: &mut TickContext) {
         self.flush_sends(ctx);
         self.cleanup_closed();
-        // Clear dirty list after both flush + cleanup have consumed it.
-        self.dirty_senders.clear();
+        // No blanket clear: flush_sends already cleared every bit it
+        // processed. Bits for connections that exceeded the flush budget
+        // stay set and roll forward to the next tick.
     }
 }
 
