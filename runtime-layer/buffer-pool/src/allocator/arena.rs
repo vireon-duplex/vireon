@@ -6,14 +6,11 @@
 //!
 //! ## Concurrency
 //!
-//! A single `Mutex` serialises slab mutation. This is deliberate (per
-//! `SKILLS.md` §28: default to `std::sync::Mutex` until profiling proves
-//! contention) — the slab path runs only on cache refill and maintenance, never
-//! on the per-buffer fast path.
+//! Single-threaded (`RefCell` interior mutability). The arena is owned by
+//! one reactor thread exclusively — no locks needed.
 
+use std::cell::RefCell;
 use std::ptr::NonNull;
-
-use parking_lot::Mutex;
 
 use crate::allocator::size_class::{CLASS_TABLE, ClassId, NUM_CLASSES};
 use crate::allocator::slab::{Slab, SlabGeometry, slab_geometry_for};
@@ -36,7 +33,7 @@ impl ArenaState {
 
 /// Owns all slabs for every size class.
 pub struct Arena {
-    state: Mutex<ArenaState>,
+    state: RefCell<ArenaState>,
     geometry: Vec<SlabGeometry>,
 }
 
@@ -48,7 +45,7 @@ impl Arena {
             .map(|c| slab_geometry_for(c.size))
             .collect();
         Self {
-            state: Mutex::new(ArenaState::new()),
+            state: RefCell::new(ArenaState::new()),
             geometry,
         }
     }
@@ -57,7 +54,7 @@ impl Arena {
     /// existing slab of that class is full.
     pub fn allocate_slot(&self, class: ClassId) -> Result<NonNull<u8>, BufferPoolError> {
         let idx = class_index(class)?;
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         let slabs = &mut state.slabs[idx];
         for slab in slabs.iter_mut() {
             if let Some(ptr) = slab.alloc_slot() {
@@ -76,11 +73,11 @@ impl Arena {
 
     /// Returns a slot to its owning slab.
     ///
-    /// Used by the release path when the global cache overflows, and by the
+    /// Used by the release path when the free-list overflows, and by the
     /// shrinker when draining caches.
     pub fn mark_free(&self, ptr: NonNull<u8>, class: ClassId) -> Result<(), BufferPoolError> {
         let idx = class_index(class)?;
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         for slab in state.slabs[idx].iter_mut() {
             if slab.contains(ptr) {
                 slab.mark_free_slot(ptr);
@@ -94,11 +91,10 @@ impl Arena {
     /// Drops every fully-free slab and returns the total bytes reclaimed.
     ///
     /// A slab is fully free only when none of its slots are outstanding — i.e.
-    /// not held by a live buffer and not sitting in any cache. Thread-local
-    /// caches are not drained here, so their slots keep their slabs alive.
+    /// not held by a live buffer and not sitting in any free-list.
     pub fn purge(&self) -> usize {
         let mut freed = 0;
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         for class_slabs in state.slabs.iter_mut() {
             class_slabs.retain(|slab| {
                 if slab.is_empty() {
@@ -118,7 +114,7 @@ impl Arena {
         let idx = class_index(class)?;
         let geometry = self.geometry[idx];
         let class_info = CLASS_TABLE[idx];
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         while free_slots_in(&state.slabs[idx]) < count {
             let slab = Slab::new(class, class_info.size, class_info.align, geometry)?;
             state.slabs[idx].push(slab);
@@ -131,12 +127,12 @@ impl Arena {
         let Ok(idx) = class_index(class) else {
             return 0;
         };
-        self.state.lock().slabs[idx].len()
+        self.state.borrow().slabs[idx].len()
     }
 
     /// Total bytes of backing memory currently held.
     pub fn memory_usage(&self) -> usize {
-        let state = self.state.lock();
+        let state = self.state.borrow();
         state.slabs.iter().flatten().map(|s| s.slab_bytes()).sum()
     }
 
@@ -145,7 +141,7 @@ impl Arena {
         let Ok(idx) = class_index(class) else {
             return 0;
         };
-        free_slots_in(&self.state.lock().slabs[idx])
+        free_slots_in(&self.state.borrow().slabs[idx])
     }
 }
 

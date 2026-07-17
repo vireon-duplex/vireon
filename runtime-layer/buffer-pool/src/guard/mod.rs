@@ -26,7 +26,7 @@ use crate::allocator::size_class::ClassId;
 /// cache → arena/huge as appropriate.
 ///
 /// The trait is object-safe so the guard can store `Weak<dyn ReleaseSink>`.
-pub trait ReleaseSink: Send + Sync {
+pub trait ReleaseSink {
     /// Receives ownership of a slot back from a dropping [`Buffer`].
     ///
     /// # Parameters

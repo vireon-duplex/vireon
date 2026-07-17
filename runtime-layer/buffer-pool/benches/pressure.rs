@@ -12,11 +12,6 @@
 #[path = "common.rs"]
 mod common;
 
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
-
-use criterion::BatchSize;
 use criterion::BenchmarkId;
 use criterion::Criterion;
 use criterion::Throughput;
@@ -116,12 +111,13 @@ fn bench_try_get_rejected(c: &mut Criterion) {
 }
 
 // ============================================================================
-// Backpressure: multi-thread throughput under tight cap (Category 13)
+// Backpressure: throughput under tight cap (Category 13)
 // ============================================================================
+//
+// Was multi-threaded; now single-threaded because BufferPool is `!Send`.
+// Each iteration runs `num_threads * 1000` get+drop cycles sequentially,
+// preserving the same total work.
 
-/// N threads share a pool capped at 256 KiB. Each thread does get+drop
-/// cycles. When the cap is hit, `get` parks until a release frees room.
-/// Measures effective throughput under backpressure.
 fn bench_backpressure_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("backpressure/throughput");
 
@@ -137,20 +133,14 @@ fn bench_backpressure_throughput(c: &mut Criterion) {
                     .max_memory(256 * 1024) // ~64 × 4 KiB
                     .build()
                     .expect("build");
-                let pool_ref = &pool;
+                let total_ops = num_threads * 1000;
 
                 b.iter(|| {
-                    thread::scope(|s| {
-                        for _ in 0..num_threads {
-                            s.spawn(|| {
-                                for _ in 0..1000 {
-                                    let buf = pool_ref.get(SIZE).expect("get");
-                                    black_box(buf.as_ptr());
-                                    drop(buf);
-                                }
-                            });
-                        }
-                    });
+                    for _ in 0..total_ops {
+                        let buf = pool.get(SIZE).expect("get");
+                        black_box(buf.as_ptr());
+                        drop(buf);
+                    }
                 });
 
                 assert_eq!(pool.stats().counters.outstanding, 0);
@@ -164,13 +154,20 @@ fn bench_backpressure_throughput(c: &mut Criterion) {
 // ============================================================================
 // Backpressure: coordinated wait + wake latency (Category 13)
 // ============================================================================
-
-/// Measures the park → notify → wake round-trip. A helper thread holds the
+//
+// DISABLED: This benchmark fundamentally requires multi-threading (one
+// thread holds the buffer while the main thread parks on `get`). BufferPool
+// is now `!Send` (uses `Rc` internally), so sharing a pool across threads
+// is no longer possible. The park/notify mechanism has been removed from
+// the pool, so this benchmark would not be meaningful even if it compiled.
+//
+/*
+/// Measures the park -> notify -> wake round-trip. A helper thread holds the
 /// sole buffer; the benchmark thread signals release, then calls `get`
 /// which parks until the helper drops.
 ///
 /// **Caveat**: the measured time includes thread-scheduling overhead and a
-/// small artificial delay (~10 µs) that ensures the main thread actually
+/// small artificial delay (~10 us) that ensures the main thread actually
 /// enters the park state. Compare against `pressure/try_get_ok` to isolate
 /// the wake-up penalty.
 fn bench_wait_wake(c: &mut Criterion) {
@@ -211,6 +208,7 @@ fn bench_wait_wake(c: &mut Criterion) {
 
     group.finish();
 }
+*/
 
 criterion_group!(
     benches,
@@ -218,6 +216,5 @@ criterion_group!(
     bench_try_get_ok,
     bench_try_get_rejected,
     bench_backpressure_throughput,
-    bench_wait_wake,
 );
 criterion_main!(benches);
