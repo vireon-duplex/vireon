@@ -154,11 +154,13 @@ impl BufferPool {
     pub fn new(config: BufferPoolConfig) -> Self {
         let pool_id = POOL_ID_SEQ.fetch_add(1, Ordering::Relaxed);
         let bp_policy = BackpressurePolicy::from_max_memory(config.max_memory);
+        // Capture the preferred NUMA node before `config` is moved into the struct.
+        let numa_node = config.numa_node;
         let free_lists = (0..NUM_CLASSES).map(|_| Vec::new()).collect();
         let inner = Rc::new(PoolInner {
             pool_id,
             config,
-            allocator: Allocator::new(),
+            allocator: Allocator::with_numa_node(numa_node),
             free_lists: RefCell::new(free_lists),
             counters: Counters::new(),
             histogram: LatencyHistogram::new(),

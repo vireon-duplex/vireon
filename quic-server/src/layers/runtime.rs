@@ -70,6 +70,7 @@ impl RuntimeLayer {
 
         let timer = TimerWheelBuilder::new()
             .shards(1)
+            .cpu_pin(reactor_id)
             .spawn()
             .map_err(|e| ServerError::EngineInit(format!("timer-wheel: {e:?}")))?;
 
