@@ -130,7 +130,7 @@ impl Sender {
                 let cmsg_len =
                     unsafe { libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as usize };
 
-                let mut msg = libc::msghdr {
+                let msg = libc::msghdr {
                     msg_name: &sin as *const _ as *mut libc::c_void,
                     msg_namelen: std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
                     msg_iov: &iov as *const _ as *mut libc::iovec,

@@ -24,17 +24,33 @@ impl Worker {
     /// (or drop) is called.
     ///
     /// `idle_interval` bounds the sleep between ticks (and therefore
-    /// command-ingestion latency).
+    /// command-ingestion latency). When `cpu_pin` is `Some(core)`, the worker
+    /// thread is pinned to that core via `sched_setaffinity` before entering
+    /// the run loop — this co-locates the timer worker with its owning
+    /// reactor on multi-socket NUMA systems.
     pub fn spawn(
         name: String,
         mut shard: Shard,
         idle_interval: Duration,
         stop: Arc<AtomicBool>,
+        cpu_pin: Option<u32>,
     ) -> Result<Self, TimerError> {
         let stop_for_thread = Arc::clone(&stop);
         let handle = thread::Builder::new()
             .name(name)
-            .spawn(move || run_loop(&mut shard, idle_interval, &stop_for_thread))
+            .spawn(move || {
+                if let Some(core) = cpu_pin {
+                    // Best-effort: log on failure but don't abort the worker.
+                    if let Err(e) = pin_to_core(core) {
+                        tracing::warn!(
+                            core,
+                            error = %e,
+                            "failed to pin timer-wheel worker; continuing unpinned"
+                        );
+                    }
+                }
+                run_loop(&mut shard, idle_interval, &stop_for_thread)
+            })
             .map_err(|e| {
                 TimerError::InvalidConfig(format!("failed to spawn worker thread: {e}"))
             })?;
@@ -79,6 +95,27 @@ fn run_loop(shard: &mut Shard, idle_interval: Duration, stop: &AtomicBool) {
     }
 }
 
+/// Pins the calling thread to a single CPU core via `sched_setaffinity(2)`.
+///
+/// Returns a string describing the errno on failure. Best-effort: callers
+/// log but do not abort.
+fn pin_to_core(core: u32) -> Result<(), String> {
+    // SAFETY: `cpu_set_t` is a POD bitset; `CPU_ZERO`/`CPU_SET` initialise it
+    // in place. `sched_setaffinity(0, ..)` targets the calling thread.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    unsafe { libc::CPU_ZERO(&mut set) };
+    unsafe { libc::CPU_SET(core as usize, &mut set) };
+    let rc = unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        let errno = unsafe { *libc::__errno_location() };
+        Err(format!(
+            "sched_setaffinity(cpu={core}) failed (errno={errno})"
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,8 +150,14 @@ mod tests {
         )
         .expect("shard");
         let stop = Arc::new(AtomicBool::new(false));
-        let mut worker =
-            Worker::spawn("tw-test".into(), shard, Duration::from_millis(5), stop).expect("spawn");
+        let mut worker = Worker::spawn(
+            "tw-test".into(),
+            shard,
+            Duration::from_millis(5),
+            stop,
+            None,
+        )
+        .expect("spawn");
         std::thread::sleep(Duration::from_millis(10));
         worker.shutdown();
         assert!(worker.is_stopped());
@@ -137,8 +180,14 @@ mod tests {
         .expect("shard");
         let stop = Arc::new(AtomicBool::new(false));
         {
-            let _worker = Worker::spawn("tw-drop".into(), shard, Duration::from_millis(5), stop)
-                .expect("spawn");
+            let _worker = Worker::spawn(
+                "tw-drop".into(),
+                shard,
+                Duration::from_millis(5),
+                stop,
+                None,
+            )
+            .expect("spawn");
             std::thread::sleep(Duration::from_millis(8));
             // worker dropped here
         }
@@ -166,8 +215,14 @@ mod tests {
             deadline_ticks: now + 3,
         });
         let stop = Arc::new(AtomicBool::new(false));
-        let mut worker =
-            Worker::spawn("tw-fire".into(), shard, Duration::from_millis(2), stop).expect("spawn");
+        let mut worker = Worker::spawn(
+            "tw-fire".into(),
+            shard,
+            Duration::from_millis(2),
+            stop,
+            None,
+        )
+        .expect("spawn");
         // wait long enough for the 3-tick (3 ms) timer to fire
         std::thread::sleep(Duration::from_millis(40));
         let mut fired = Vec::new();

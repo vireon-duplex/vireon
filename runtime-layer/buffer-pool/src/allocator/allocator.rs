@@ -12,6 +12,7 @@ use crate::allocator::classifier::classify_request;
 use crate::allocator::huge::{HugeAllocation, HugeAllocator, HugeStatsSnapshot};
 use crate::allocator::size_class::ClassId;
 use crate::error::BufferPoolError;
+use crate::numa::NodeId;
 
 /// The outcome of a successful allocation.
 ///
@@ -46,10 +47,18 @@ pub struct Allocator {
 }
 
 impl Allocator {
-    /// Creates a new allocator with empty arena and zeroed huge counters.
+    /// Creates a new allocator with empty arena and zeroed huge counters,
+    /// using the kernel's default memory policy.
     pub fn new() -> Self {
+        Self::with_numa_node(None)
+    }
+
+    /// Creates a new allocator whose arena binds each new slab's backing
+    /// memory to `numa_node` via `mbind(MPOL_PREFERRED)`. Best-effort.
+    #[must_use]
+    pub fn with_numa_node(numa_node: Option<NodeId>) -> Self {
         Self {
-            arena: Arena::new(),
+            arena: Arena::with_numa_node(numa_node),
             huge: HugeAllocator::new(),
         }
     }

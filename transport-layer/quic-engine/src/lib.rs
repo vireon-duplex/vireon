@@ -77,6 +77,7 @@ pub mod congestion;
 pub mod conn_id_table;
 pub mod connection;
 pub mod crypto;
+pub mod dirty;
 pub mod engine;
 pub mod error;
 pub mod flow_control;

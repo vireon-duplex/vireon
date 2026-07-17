@@ -1,65 +1,60 @@
-//! Atomic counters (Layer 13).
+//! Single-threaded counters (Layer 13).
 //!
-//! [`Counters`] holds a set of [`AtomicU64`]
-//! fields updated on every acquire / release. All updates use `Relaxed`
-//! ordering — they are independent statistics, not publication markers — so
-//! `Relaxed` is correct and fastest.
+//! [`Counters`] holds a set of [`Cell<u64>`] fields updated on every
+//! acquire / release. Since the pool is single-threaded (`Rc`-based),
+//! `Cell` is sufficient — no atomic overhead.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::Cell;
 
 use crate::stats::snapshot::CountersSnapshot;
 
-/// Monotonic counters for the pool.
-///
-/// All fields use `Relaxed` ordering; callers that need to observe a
-/// consistent view across fields must take a [`snapshot`](Counters::snapshot)
-/// (still only cross-field consistent, not a transaction).
+/// Monotonic counters for the pool (single-threaded).
 pub struct Counters {
-    hits: AtomicU64,
-    misses: AtomicU64,
-    reuses: AtomicU64,
-    allocations: AtomicU64,
-    frees: AtomicU64,
-    outstanding: AtomicU64,
-    peak_outstanding: AtomicU64,
-    bytes_allocated: AtomicU64,
-    bytes_freed: AtomicU64,
-    bytes_outstanding: AtomicU64,
+    hits: Cell<u64>,
+    misses: Cell<u64>,
+    reuses: Cell<u64>,
+    allocations: Cell<u64>,
+    frees: Cell<u64>,
+    outstanding: Cell<u64>,
+    peak_outstanding: Cell<u64>,
+    bytes_allocated: Cell<u64>,
+    bytes_freed: Cell<u64>,
+    bytes_outstanding: Cell<u64>,
 }
 
 impl Counters {
     /// Creates zeroed counters.
     pub fn new() -> Self {
         Self {
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-            reuses: AtomicU64::new(0),
-            allocations: AtomicU64::new(0),
-            frees: AtomicU64::new(0),
-            outstanding: AtomicU64::new(0),
-            peak_outstanding: AtomicU64::new(0),
-            bytes_allocated: AtomicU64::new(0),
-            bytes_freed: AtomicU64::new(0),
-            bytes_outstanding: AtomicU64::new(0),
+            hits: Cell::new(0),
+            misses: Cell::new(0),
+            reuses: Cell::new(0),
+            allocations: Cell::new(0),
+            frees: Cell::new(0),
+            outstanding: Cell::new(0),
+            peak_outstanding: Cell::new(0),
+            bytes_allocated: Cell::new(0),
+            bytes_freed: Cell::new(0),
+            bytes_outstanding: Cell::new(0),
         }
     }
 
-    /// Thread-local cache hit.
+    /// Free-list hit.
     #[inline]
     pub fn record_hit(&self) {
-        self.hits.fetch_add(1, Ordering::Relaxed);
+        self.hits.set(self.hits.get() + 1);
     }
 
-    /// Thread-local cache miss (may still be served from global/arena).
+    /// Free-list miss (served from arena).
     #[inline]
     pub fn record_miss(&self) {
-        self.misses.fetch_add(1, Ordering::Relaxed);
+        self.misses.set(self.misses.get() + 1);
     }
 
-    /// Served from the global shard cache.
+    /// Served from the free-list (kept for API compatibility).
     #[inline]
     pub fn record_reuse(&self) {
-        self.reuses.fetch_add(1, Ordering::Relaxed);
+        self.reuses.set(self.reuses.get() + 1);
     }
 
     /// New allocation from the arena or huge allocator.
@@ -70,51 +65,55 @@ impl Counters {
     /// [`record_acquire`]: Counters::record_acquire
     #[inline]
     pub fn record_alloc(&self, bytes: usize) {
-        self.allocations.fetch_add(1, Ordering::Relaxed);
+        self.allocations.set(self.allocations.get() + 1);
         self.bytes_allocated
-            .fetch_add(bytes as u64, Ordering::Relaxed);
+            .set(self.bytes_allocated.get() + bytes as u64);
     }
 
-    /// Marks one live buffer after a successful acquire (hit, reuse, or alloc).
+    /// Marks one live buffer after a successful acquire.
     ///
     /// Updates `outstanding`, `peak_outstanding`, and `bytes_outstanding`.
     #[inline]
     pub fn record_acquire(&self, bytes: usize) {
-        let now = self.outstanding.fetch_add(1, Ordering::Relaxed) + 1;
-        let _prev = self.peak_outstanding.fetch_max(now, Ordering::Relaxed);
+        let now = self.outstanding.get() + 1;
+        self.outstanding.set(now);
+        if now > self.peak_outstanding.get() {
+            self.peak_outstanding.set(now);
+        }
         self.bytes_outstanding
-            .fetch_add(bytes as u64, Ordering::Relaxed);
+            .set(self.bytes_outstanding.get() + bytes as u64);
     }
 
     /// Buffer released back to the pool.
     #[inline]
     pub fn record_free(&self, bytes: usize) {
-        self.frees.fetch_add(1, Ordering::Relaxed);
-        self.bytes_freed.fetch_add(bytes as u64, Ordering::Relaxed);
-        self.outstanding.fetch_sub(1, Ordering::Relaxed);
+        self.frees.set(self.frees.get() + 1);
+        self.bytes_freed.set(self.bytes_freed.get() + bytes as u64);
+        self.outstanding
+            .set(self.outstanding.get().saturating_sub(1));
         self.bytes_outstanding
-            .fetch_sub(bytes as u64, Ordering::Relaxed);
+            .set(self.bytes_outstanding.get().saturating_sub(bytes as u64));
     }
 
     /// Current outstanding byte count (used by the backpressure gate).
     #[inline]
     pub fn bytes_outstanding(&self) -> u64 {
-        self.bytes_outstanding.load(Ordering::Relaxed)
+        self.bytes_outstanding.get()
     }
 
     /// Reads all counters into a snapshot.
     pub fn snapshot(&self) -> CountersSnapshot {
         CountersSnapshot {
-            hits: self.hits.load(Ordering::Relaxed),
-            misses: self.misses.load(Ordering::Relaxed),
-            reuses: self.reuses.load(Ordering::Relaxed),
-            allocations: self.allocations.load(Ordering::Relaxed),
-            frees: self.frees.load(Ordering::Relaxed),
-            outstanding: self.outstanding.load(Ordering::Relaxed),
-            peak_outstanding: self.peak_outstanding.load(Ordering::Relaxed),
-            bytes_allocated: self.bytes_allocated.load(Ordering::Relaxed),
-            bytes_freed: self.bytes_freed.load(Ordering::Relaxed),
-            bytes_outstanding: self.bytes_outstanding.load(Ordering::Relaxed),
+            hits: self.hits.get(),
+            misses: self.misses.get(),
+            reuses: self.reuses.get(),
+            allocations: self.allocations.get(),
+            frees: self.frees.get(),
+            outstanding: self.outstanding.get(),
+            peak_outstanding: self.peak_outstanding.get(),
+            bytes_allocated: self.bytes_allocated.get(),
+            bytes_freed: self.bytes_freed.get(),
+            bytes_outstanding: self.bytes_outstanding.get(),
         }
     }
 
@@ -122,16 +121,16 @@ impl Counters {
     ///
     /// Useful for benchmarks and test isolation.
     pub fn reset(&self) {
-        self.hits.store(0, Ordering::Relaxed);
-        self.misses.store(0, Ordering::Relaxed);
-        self.reuses.store(0, Ordering::Relaxed);
-        self.allocations.store(0, Ordering::Relaxed);
-        self.frees.store(0, Ordering::Relaxed);
-        self.outstanding.store(0, Ordering::Relaxed);
-        self.peak_outstanding.store(0, Ordering::Relaxed);
-        self.bytes_allocated.store(0, Ordering::Relaxed);
-        self.bytes_freed.store(0, Ordering::Relaxed);
-        self.bytes_outstanding.store(0, Ordering::Relaxed);
+        self.hits.set(0);
+        self.misses.set(0);
+        self.reuses.set(0);
+        self.allocations.set(0);
+        self.frees.set(0);
+        self.outstanding.set(0);
+        self.peak_outstanding.set(0);
+        self.bytes_allocated.set(0);
+        self.bytes_freed.set(0);
+        self.bytes_outstanding.set(0);
     }
 }
 
@@ -214,28 +213,5 @@ mod tests {
         c.reset();
         let s = c.snapshot();
         assert_eq!(s, CountersSnapshot::default());
-    }
-
-    #[test]
-    fn counters_are_thread_safe_under_stress() {
-        let c = Counters::new();
-        let c_ref = &c;
-        std::thread::scope(|s| {
-            for _ in 0..4 {
-                s.spawn(move || {
-                    for _ in 0..1000 {
-                        c_ref.record_alloc(64);
-                        c_ref.record_acquire(64);
-                        c_ref.record_hit();
-                        c_ref.record_free(64);
-                    }
-                });
-            }
-        });
-        let s = c.snapshot();
-        assert_eq!(s.allocations, 4000);
-        assert_eq!(s.hits, 4000);
-        assert_eq!(s.frees, 4000);
-        assert_eq!(s.outstanding, 0);
     }
 }

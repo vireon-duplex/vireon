@@ -4,8 +4,6 @@
 //! so the wheel's `user_data` encoding stays consistent with the
 //! [`ops`](crate::ops) scheme.
 
-use std::time::Duration;
-
 use io_uring::opcode::{AsyncCancel, Timeout, TimeoutRemove};
 use io_uring::squeue::Entry;
 use io_uring::types::{TimeoutFlags, Timespec};

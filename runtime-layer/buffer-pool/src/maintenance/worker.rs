@@ -1,83 +1,51 @@
-//! Background maintenance worker (Layer 19).
+//! Maintenance worker (Layer 19).
 //!
-//! [`MaintenanceWorker`] spawns a named `std::thread` that periodically reads
-//! stats, checks memory pressure, shrinks caches, and logs tuning
-//! recommendations. The worker is stopped via an [`AtomicBool`] flag and joined
-//! on [`Drop`].
+//! Previously a background thread; now a **no-op stub** since the pool is
+//! single-threaded (`Rc`-based). The reactor should call [`run_tick`]
+//! inline during its event loop if maintenance is needed.
+//!
+//! [`MaintenanceWorker`] is kept as a type for API compatibility but does
+//! not spawn a thread.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::sync::atomic::AtomicBool;
 
 use crate::buffer::pool::BufferPool;
 use crate::maintenance::pressure::{classify_pressure, resident_memory};
 use crate::maintenance::shrink::maybe_shrink;
 use crate::maintenance::tuning::analyze;
 
-/// Background maintenance thread for a [`BufferPool`].
+/// Maintenance handle for a [`BufferPool`].
 ///
-/// Construct via [`BufferPool::start_maintenance`]. The worker runs until
-/// [`stop`](MaintenanceWorker::stop) is called or it is dropped.
+/// No longer spawns a background thread — the pool is single-threaded.
+/// Dropping this is a no-op.
 pub struct MaintenanceWorker {
-    handle: Option<JoinHandle<()>>,
-    stop: Arc<AtomicBool>,
+    _stop: Arc<AtomicBool>,
 }
 
 impl MaintenanceWorker {
-    /// Spawns the maintenance thread for `pool`.
+    /// Returns a no-op maintenance handle.
     ///
-    /// The thread ticks every `pool.config().maintenance_interval_ms`
-    /// milliseconds.
-    ///
-    /// Returns [`std::io::Error`] if the OS could not create the thread.
-    pub fn start(pool: BufferPool) -> std::io::Result<Self> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_clone = Arc::clone(&stop);
-        let interval_ms = pool.config().maintenance_interval_ms;
-        let handle = thread::Builder::new()
-            .name("bp-maintenance".into())
-            .spawn(move || {
-                worker_loop(pool, stop_clone, interval_ms);
-            })?;
+    /// The caller should call [`run_tick`] manually from the reactor's
+    /// event loop if periodic maintenance is desired.
+    pub fn start(_pool: BufferPool) -> std::io::Result<Self> {
         Ok(Self {
-            handle: Some(handle),
-            stop,
+            _stop: Arc::new(AtomicBool::new(false)),
         })
     }
 
-    /// Signals the worker to stop and waits for the thread to finish.
-    pub fn stop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
+    /// No-op (kept for API compatibility).
+    pub fn stop(&mut self) {}
 
-    /// `true` after [`stop`](MaintenanceWorker::stop) has been called.
+    /// Always `false` (no background thread to stop).
     pub fn is_stopped(&self) -> bool {
-        self.stop.load(Ordering::Acquire)
-    }
-}
-
-impl Drop for MaintenanceWorker {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-/// The worker's main loop.
-fn worker_loop(pool: BufferPool, stop: Arc<AtomicBool>, interval_ms: u64) {
-    let interval = Duration::from_millis(interval_ms);
-    while !stop.load(Ordering::Relaxed) {
-        run_tick(&pool);
-        thread::sleep(interval);
+        false
     }
 }
 
 /// Runs one maintenance tick.
 ///
-/// Exposed so tests can exercise the logic without spawning a thread.
+/// Exposed so the reactor can call it inline during its event loop.
 pub fn run_tick(pool: &BufferPool) {
     let stats = pool.stats();
     let rss = resident_memory().unwrap_or(0);
@@ -116,24 +84,13 @@ mod tests {
         let pool = BufferPool::default();
         let buffers: Vec<_> = (0..8).map(|_| pool.get(256).unwrap()).collect();
         drop(buffers);
-        pool.flush();
         run_tick(&pool);
     }
 
     #[test]
-    fn worker_starts_and_stops() {
+    fn worker_starts_and_drops_cleanly() {
         let pool = BufferPool::default();
-        let mut worker = MaintenanceWorker::start(pool).expect("spawn");
-        assert!(!worker.is_stopped());
-        worker.stop();
-        assert!(worker.is_stopped());
-    }
-
-    #[test]
-    fn worker_drops_cleanly() {
-        let pool = BufferPool::default();
-        let worker = MaintenanceWorker::start(pool).expect("spawn");
+        let worker = MaintenanceWorker::start(pool).expect("start");
         drop(worker);
-        // If we reach here, Drop joined the thread without deadlock.
     }
 }

@@ -30,7 +30,9 @@ targeting 1 M+ concurrent connections with sub-ms tail latency.
 ```no_run
 use io::Reactor;
 
-let mut reactor = Reactor::init(0, 8080, 0, false)?;
+let features = kernel_nic::KernelFeatures::detect()?;
+let busy_poll = kernel_nic::BusyPollPolicy::default();
+let mut reactor = Reactor::init(0, 8080, 0, false, features, busy_poll)?;
 reactor.run()?;
 # Ok::<(), io::IoError>(())
 ```

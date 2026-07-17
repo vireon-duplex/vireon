@@ -5,6 +5,7 @@
 //! case zero-config.
 
 use crate::buffer::policy::{ShrinkPolicy, ZeroingPolicy};
+use crate::numa::NodeId;
 
 /// Default threshold above which allocations go through the huge path.
 pub const DEFAULT_HUGE_THRESHOLD: usize = 1 << 20; // 1 MiB
@@ -46,6 +47,13 @@ pub struct BufferPoolConfig {
     pub shrink: ShrinkPolicy,
     /// Background maintenance tick interval (milliseconds).
     pub maintenance_interval_ms: u64,
+    /// Preferred NUMA node for arena slab backing memory.
+    ///
+    /// When `Some`, each new slab's backing allocation is bound to this node
+    /// via `mbind(MPOL_PREFERRED)` after `alloc`. Best-effort: on single-NUMA
+    /// hosts this is a no-op, and a pinned reactor thread already gets
+    /// first-touch locality. `None` leaves the kernel's default policy.
+    pub numa_node: Option<NodeId>,
 }
 
 impl Default for BufferPoolConfig {
@@ -60,6 +68,7 @@ impl Default for BufferPoolConfig {
             zeroing: ZeroingPolicy::default(),
             shrink: ShrinkPolicy::default(),
             maintenance_interval_ms: DEFAULT_MAINTENANCE_INTERVAL_MS,
+            numa_node: None,
         }
     }
 }

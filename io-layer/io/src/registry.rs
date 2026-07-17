@@ -32,6 +32,10 @@ const IORING_UNREGISTER_BUFFERS: u32 = 1;
 /// `io_uring_register(fd, IORING_UNREGISTER_FILES, NULL, 0)`
 const IORING_UNREGISTER_FILES: u32 = 3;
 
+/// `io_uring_register(fd, IORING_UNREGISTER_NAPI, &io_uring_napi, 1)`
+/// (kernel ≥ 6.6).
+const IORING_UNREGISTER_NAPI: u32 = 28;
+
 /// Tracks registered kernel resources for one io_uring ring.
 ///
 /// Lives inside [`IoUringCtx`](crate::context::IoUringCtx) and is
@@ -45,6 +49,8 @@ pub struct IoRegistry {
     buffers_registered: bool,
     /// `true` once `IORING_REGISTER_FILES` (or sparse variant) succeeded.
     files_registered: bool,
+    /// `true` once `IORING_REGISTER_NAPI` succeeded (kernel ≥ 6.6).
+    napi_registered: bool,
 }
 
 impl IoRegistry {
@@ -56,6 +62,7 @@ impl IoRegistry {
             ring_fd,
             buffers_registered: false,
             files_registered: false,
+            napi_registered: false,
         }
     }
 
@@ -77,6 +84,12 @@ impl IoRegistry {
         self.files_registered
     }
 
+    /// Returns whether ring-level NAPI busy poll is registered.
+    #[must_use]
+    pub const fn napi_registered(&self) -> bool {
+        self.napi_registered
+    }
+
     /// Marks buffers as registered (called by `IoUringCtx` after a
     /// successful `submitter.register_buffers()`).
     pub(crate) fn set_buffers_registered(&mut self, registered: bool) {
@@ -87,6 +100,12 @@ impl IoRegistry {
     /// successful `submitter.register_files_sparse()`).
     pub(crate) fn set_files_registered(&mut self, registered: bool) {
         self.files_registered = registered;
+    }
+
+    /// Marks NAPI busy poll as registered (called by `IoUringCtx` after a
+    /// successful `IORING_REGISTER_NAPI`).
+    pub(crate) fn set_napi_registered(&mut self, registered: bool) {
+        self.napi_registered = registered;
     }
 
     /// Explicitly unregisters all fixed buffers.
@@ -140,6 +159,34 @@ impl IoRegistry {
         self.files_registered = false;
         Ok(())
     }
+
+    /// Explicitly unregisters ring-level NAPI busy poll.
+    ///
+    /// Kernel 6.6+ `IORING_UNREGISTER_NAPI` accepts a NULL argument for
+    /// a pure unregister (no copy-back of resolved values).
+    pub fn unregister_napi(&mut self) -> Result<(), IoError> {
+        if !self.napi_registered {
+            return Ok(());
+        }
+        // SAFETY: `ring_fd` is a valid open io_uring fd. The NAPI
+        // unregister opcode accepts NULL/0 args for a pure teardown.
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_io_uring_register,
+                self.ring_fd,
+                IORING_UNREGISTER_NAPI,
+                std::ptr::null::<libc::c_void>(),
+                0u32,
+            )
+        };
+        if ret < 0 {
+            return Err(IoError::UnregistrationFailed(
+                std::io::Error::last_os_error(),
+            ));
+        }
+        self.napi_registered = false;
+        Ok(())
+    }
 }
 
 impl Drop for IoRegistry {
@@ -152,6 +199,9 @@ impl Drop for IoRegistry {
         if self.files_registered {
             let _ = self.unregister_files();
         }
+        if self.napi_registered {
+            let _ = self.unregister_napi();
+        }
     }
 }
 
@@ -161,6 +211,7 @@ impl std::fmt::Debug for IoRegistry {
             .field("ring_fd", &self.ring_fd)
             .field("buffers_registered", &self.buffers_registered)
             .field("files_registered", &self.files_registered)
+            .field("napi_registered", &self.napi_registered)
             .finish()
     }
 }
@@ -188,6 +239,7 @@ mod tests {
         assert_eq!(reg.ring_fd(), 42);
         assert!(!reg.buffers_registered());
         assert!(!reg.files_registered());
+        assert!(!reg.napi_registered());
     }
 
     #[test]
@@ -197,6 +249,10 @@ mod tests {
         assert!(reg.buffers_registered());
         reg.set_buffers_registered(false);
         assert!(!reg.buffers_registered());
+        reg.set_napi_registered(true);
+        assert!(reg.napi_registered());
+        reg.set_napi_registered(false);
+        assert!(!reg.napi_registered());
     }
 
     #[test]
@@ -204,6 +260,7 @@ mod tests {
         let mut reg = IoRegistry::new(-1); // invalid fd, but won't be called
         assert!(reg.unregister_buffers().is_ok());
         assert!(reg.unregister_files().is_ok());
+        assert!(reg.unregister_napi().is_ok());
     }
 
     #[test]
@@ -213,6 +270,7 @@ mod tests {
         // Simulate registered state without actually registering.
         reg.set_buffers_registered(false);
         reg.set_files_registered(false);
+        reg.set_napi_registered(false);
         // Drop should be a no-op since nothing is registered.
         drop(reg);
     }
