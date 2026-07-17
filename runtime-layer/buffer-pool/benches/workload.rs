@@ -219,11 +219,13 @@ fn bench_codec_roundtrip(c: &mut Criterion) {
 }
 
 // ============================================================================
-// Concurrent event bus (Category 18 — multi-thread publish)
+// Concurrent event bus (Category 18 — was multi-thread publish, now sequential)
 // ============================================================================
 
-/// Multiple threads publishing events simultaneously. Measures how the pool
-/// handles concurrent acquire + serialize + release.
+/// Was: multiple threads publishing events simultaneously.
+/// Now: single-threaded equivalent running the same total message count.
+/// BufferPool is `!Send` (uses `Rc` internally) so cross-thread sharing is
+/// no longer possible.
 fn bench_eventbus_concurrent(c: &mut Criterion) {
     let mut group = c.benchmark_group("eventbus/concurrent");
     const SIZE: usize = 1024;
@@ -238,26 +240,18 @@ fn bench_eventbus_concurrent(c: &mut Criterion) {
             &num_threads,
             |b, &num_threads| {
                 let pool = BufferPool::default();
-                let pool_ref = &pool;
+                let total_msgs = num_threads * MSGS_PER_THREAD;
 
                 b.iter(|| {
-                    std::thread::scope(|s| {
-                        for tid in 0..num_threads {
-                            s.spawn(move || {
-                                for i in 0..MSGS_PER_THREAD {
-                                    let mut buf = pool_ref.get(SIZE).expect("get");
-                                    // Minimal framing.
-                                    buf[0..4].copy_from_slice(b"QICB");
-                                    buf[4..12].copy_from_slice(
-                                        &((tid as u64) << 32 | i as u64).to_le_bytes(),
-                                    );
-                                    buf[12] = 0;
-                                    black_box(buf.as_ptr());
-                                    drop(buf);
-                                }
-                            });
-                        }
-                    });
+                    for i in 0..total_msgs {
+                        let mut buf = pool.get(SIZE).expect("get");
+                        // Minimal framing.
+                        buf[0..4].copy_from_slice(b"QICB");
+                        buf[4..12].copy_from_slice(&(i as u64).to_le_bytes());
+                        buf[12] = 0;
+                        black_box(buf.as_ptr());
+                        drop(buf);
+                    }
                 });
 
                 assert_eq!(pool.stats().counters.outstanding, 0);

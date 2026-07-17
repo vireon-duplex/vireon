@@ -37,9 +37,7 @@
 //! | `get/cold` | Arena allocation (fresh pool each batch) |
 //! | `drop/per_size` | Release path only (zeroing + cache push) |
 //! | `roundtrip/workload` | All 11 sizes back-to-back (FluxIO batch) |
-//! | `concurrent/roundtrip` | N-thread get+drop stress (1/2/4/8) |
-
-use std::thread;
+//! | `concurrent/roundtrip` | Sequential get+drop (was N-thread; pool is now !Send) |
 
 use criterion::BatchSize;
 use criterion::BenchmarkId;
@@ -269,8 +267,13 @@ fn bench_roundtrip_workload(c: &mut Criterion) {
 }
 
 // ============================================================================
-// concurrent/roundtrip — multi-threaded get+drop stress
+// concurrent/roundtrip — single-threaded equivalent (was multi-threaded)
 // ============================================================================
+//
+// BufferPool is now `!Send` (uses `Rc` internally). The original benchmark
+// spawned N threads each doing `WORKLOAD.len()` get+drop cycles. We now run
+// the same total number of iterations (`num_threads * WORKLOAD.len()`)
+// sequentially on a single thread so throughput numbers remain comparable.
 
 fn bench_concurrent_roundtrip(c: &mut Criterion) {
     let mut group = c.benchmark_group("concurrent/roundtrip");
@@ -281,26 +284,21 @@ fn bench_concurrent_roundtrip(c: &mut Criterion) {
             &num_threads,
             |b, &num_threads| {
                 let pool = BufferPool::default();
-                let pool_ref = &pool;
+                let total_iters = num_threads * WORKLOAD.len();
 
                 b.iter(|| {
-                    thread::scope(|s| {
-                        for _ in 0..num_threads {
-                            s.spawn(move || {
-                                for &(size, _) in WORKLOAD {
-                                    let buf = pool_ref.get(size).expect("get");
-                                    black_box(buf.as_ptr());
-                                    drop(buf);
-                                }
-                            });
-                        }
-                    });
+                    for i in 0..total_iters {
+                        let (size, _) = WORKLOAD[i % WORKLOAD.len()];
+                        let buf = pool.get(size).expect("get");
+                        black_box(buf.as_ptr());
+                        drop(buf);
+                    }
                 });
 
                 let stats = pool.stats();
                 assert_eq!(
                     stats.counters.outstanding, 0,
-                    "outstanding should be 0 after concurrent roundtrip"
+                    "outstanding should be 0 after roundtrip"
                 );
             },
         );

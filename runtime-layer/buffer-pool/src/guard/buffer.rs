@@ -7,7 +7,7 @@ use core::alloc::Layout;
 use core::fmt;
 use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
-use std::sync::Weak;
+use std::rc::Weak;
 
 use bytes::Bytes;
 
@@ -41,15 +41,6 @@ pub struct Buffer {
     /// Weak ref to the pool's release sink.
     sink: Weak<dyn ReleaseSink>,
 }
-
-// SAFETY: `Buffer` owns its slot exclusively for the duration of its lifetime.
-// No other reference to the slot exists while the `Buffer` is live, so moving
-// the guard across threads is sound.
-unsafe impl Send for Buffer {}
-
-// SAFETY: `&Buffer` only grants read access via `Deref`. There is no interior
-// mutability, so sharing `&Buffer` across threads is sound.
-unsafe impl Sync for Buffer {}
 
 impl Buffer {
     /// Creates a new guard wrapping `ptr`.
@@ -169,29 +160,29 @@ impl Drop for Buffer {
 mod tests {
     use super::*;
     use std::alloc::{Layout, alloc, dealloc};
-    use std::sync::{Arc, Mutex};
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     /// Test sink that records every release.
     struct RecordingSink {
-        releases: Mutex<Vec<(usize, usize, ClassId, bool)>>,
+        releases: RefCell<Vec<(usize, usize, ClassId, bool)>>,
     }
 
     impl RecordingSink {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                releases: Mutex::new(Vec::new()),
+        fn new() -> Rc<Self> {
+            Rc::new(Self {
+                releases: RefCell::new(Vec::new()),
             })
         }
 
         fn count(&self) -> usize {
-            self.releases.lock().expect("lock").len()
+            self.releases.borrow().len()
         }
 
         fn last(&self) -> (usize, usize, ClassId, bool) {
             *self
                 .releases
-                .lock()
-                .expect("lock")
+                .borrow()
                 .last()
                 .expect("at least one release")
         }
@@ -205,7 +196,7 @@ mod tests {
             class: ClassId,
             huge_layout: Option<Layout>,
         ) {
-            self.releases.lock().expect("lock").push((
+            self.releases.borrow_mut().push((
                 ptr.as_ptr() as usize,
                 len,
                 class,
@@ -224,7 +215,7 @@ mod tests {
         (ptr, layout)
     }
 
-    fn make_buffer(len: usize, cap: usize) -> (Buffer, Arc<RecordingSink>) {
+    fn make_buffer(len: usize, cap: usize) -> (Buffer, Rc<RecordingSink>) {
         let (ptr, _) = alloc_slot(cap);
         let sink = RecordingSink::new();
         let buf = Buffer::new(
@@ -233,7 +224,7 @@ mod tests {
             cap,
             ClassId(1),
             None,
-            Arc::downgrade(&sink) as Weak<dyn ReleaseSink>,
+            Rc::downgrade(&sink) as Weak<dyn ReleaseSink>,
         );
         (buf, sink)
     }
@@ -298,7 +289,7 @@ mod tests {
     // --- Pool-gone behaviour ------------------------------------------------
 
     /// A no-op sink used to construct a [`Weak<dyn ReleaseSink>`] that will
-    /// never upgrade — the `Arc` is dropped immediately after downgrade.
+    /// never upgrade — the `Rc` is dropped immediately after downgrade.
     struct DeadSink;
 
     impl ReleaseSink for DeadSink {
@@ -307,9 +298,9 @@ mod tests {
 
     /// Creates a weak that never upgrades (simulates a dropped pool).
     fn dead_weak() -> Weak<dyn ReleaseSink> {
-        let arc: Arc<dyn ReleaseSink> = Arc::new(DeadSink);
-        let weak = Arc::downgrade(&arc);
-        drop(arc);
+        let rc: Rc<dyn ReleaseSink> = Rc::new(DeadSink);
+        let weak = Rc::downgrade(&rc);
+        drop(rc);
         weak
     }
 
