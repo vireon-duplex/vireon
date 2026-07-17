@@ -10,7 +10,7 @@
 //! thread owns its pool exclusively — no cross-core sharing, no locks.
 
 use std::alloc::Layout;
-use std::cell::RefCell;
+use std::cell::UnsafeCell;
 use std::ptr::NonNull;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -34,8 +34,67 @@ use crate::stats::{Counters, LatencyHistogram, StatsSnapshot};
 /// no longer used for thread-local cache keying).
 static POOL_ID_SEQ: AtomicUsize = AtomicUsize::new(0);
 
+/// Per-class free-list storage with zero-overhead interior mutability.
+///
+/// Wraps `UnsafeCell<Vec<Vec<SlotPtr>>>`. We avoid `RefCell` here because
+/// the borrow-flag load+store on every acquire/release showed up as a
+/// measurable hot-path cost under single-core profiling. Safety rests on
+/// two invariants:
+///
+/// 1. **`!Send` pool.** `PoolInner` is held inside `Rc<PoolInner>`; `Rc` is
+///    `!Send`/`!Sync`, so the pool never crosses threads. All access is
+///    serialized on its owning reactor thread.
+/// 2. **No re-entrancy.** Neither [`PoolInner::acquire`] nor
+///    [`ReleaseSink::release_buffer`] drops a `Buffer` (the only path that
+///    re-enters the free-list). Therefore an in-flight `pop`/`push` cannot
+///    be interleaved with another mutation through the same `&self`.
+///
+/// Iteration accessors (`iter`, `iter_mut`) borrow `&self` for the duration
+/// of the returned iterator — the caller must not hold another mutable
+/// access to the same `FreeLists` while iterating.
+struct FreeLists(UnsafeCell<Vec<Vec<SlotPtr>>>);
+
+impl FreeLists {
+    fn with_class_count(n: usize) -> Self {
+        Self(UnsafeCell::new((0..n).map(|_| Vec::new()).collect()))
+    }
+
+    /// Pops a slot from the given class free-list.
+    #[inline]
+    fn pop(&self, class_idx: usize) -> Option<SlotPtr> {
+        // SAFETY: see type-level docs — single-threaded + no re-entrancy.
+        unsafe { (&mut *self.0.get())[class_idx].pop() }
+    }
+
+    /// Pushes a slot back onto the given class free-list.
+    #[inline]
+    fn push(&self, class_idx: usize, slot: SlotPtr) {
+        // SAFETY: see type-level docs — single-threaded + no re-entrancy.
+        unsafe { (&mut *self.0.get())[class_idx].push(slot) }
+    }
+
+    /// Drains every class's free-list, returning slots one at a time with
+    /// its class index. Used by `shrink`/`close`.
+    fn drain_all(&self) -> impl Iterator<Item = (usize, SlotPtr)> + '_ {
+        // SAFETY: caller (shrink/close) holds no overlapping access — the
+        // returned iterator borrows `&self` for its whole lifetime, and no
+        // other pool method runs while shrink/close is executing.
+        let outer = unsafe { &mut *self.0.get() };
+        outer
+            .iter_mut()
+            .enumerate()
+            .flat_map(|(idx, list)| list.drain(..).map(move |s| (idx, s)))
+    }
+
+    /// Per-class length snapshot (used by stats).
+    fn class_len(&self, class_idx: usize) -> usize {
+        // SAFETY: see type-level docs.
+        unsafe { (&*self.0.get())[class_idx].len() }
+    }
+}
+
 /// Internal state — single-threaded (`!Send`). All mutable fields use
-/// `RefCell`/`Cell` interior mutability since the pool is only ever
+/// `UnsafeCell`/`Cell` interior mutability since the pool is only ever
 /// accessed from its owning reactor thread.
 pub(crate) struct PoolInner {
     #[allow(dead_code)]
@@ -44,7 +103,7 @@ pub(crate) struct PoolInner {
     allocator: Allocator,
     /// Per-class free-list. Replaces the old two-tier (thread-local +
     /// global sharded) cache. Single-owner → no locks.
-    free_lists: RefCell<Vec<Vec<SlotPtr>>>,
+    free_lists: FreeLists,
     counters: Counters,
     histogram: LatencyHistogram,
     closed: AtomicBool,
@@ -70,8 +129,9 @@ impl PoolInner {
             Classification::Classed { id, class } => {
                 let class_idx = usize::from(id.0);
 
-                // Fast path: direct free-list pop (no Mutex, no thread_local).
-                if let Some(slot) = self.free_lists.borrow_mut()[class_idx].pop() {
+                // Fast path: direct free-list pop (no Mutex, no thread_local,
+                // no RefCell borrow flag — see `FreeLists` safety docs).
+                if let Some(slot) = self.free_lists.pop(class_idx) {
                     self.counters.record_hit();
                     return Ok(Allocation {
                         ptr: slot.as_nonnull(),
@@ -131,8 +191,9 @@ impl ReleaseSink for PoolInner {
             prepare(ptr.as_ptr(), len, self.config.zeroing);
         }
 
-        // Push directly to the free-list (no Mutex, no thread_local).
-        self.free_lists.borrow_mut()[class_idx].push(SlotPtr::new(ptr));
+        // Push directly to the free-list (no Mutex, no thread_local, no
+        // RefCell borrow flag — see `FreeLists` safety docs).
+        self.free_lists.push(class_idx, SlotPtr::new(ptr));
 
         self.counters.record_free(cap);
     }
@@ -156,12 +217,11 @@ impl BufferPool {
         let bp_policy = BackpressurePolicy::from_max_memory(config.max_memory);
         // Capture the preferred NUMA node before `config` is moved into the struct.
         let numa_node = config.numa_node;
-        let free_lists = (0..NUM_CLASSES).map(|_| Vec::new()).collect();
         let inner = Rc::new(PoolInner {
             pool_id,
             config,
             allocator: Allocator::with_numa_node(numa_node),
-            free_lists: RefCell::new(free_lists),
+            free_lists: FreeLists::with_class_count(NUM_CLASSES),
             counters: Counters::new(),
             histogram: LatencyHistogram::new(),
             closed: AtomicBool::new(false),
@@ -234,26 +294,20 @@ impl BufferPool {
 
     /// Trims free-lists and purges fully-free slabs.
     pub fn shrink(&self) {
-        let mut freed_lists = self.inner.free_lists.borrow_mut();
-        for (class_idx, list) in freed_lists.iter_mut().enumerate() {
+        for (class_idx, slot) in self.inner.free_lists.drain_all() {
             let class = ClassId(class_idx as u8);
-            while let Some(slot) = list.pop() {
-                let _ = self.inner.allocator.return_slot(slot.as_nonnull(), class);
-            }
+            let _ = self.inner.allocator.return_slot(slot.as_nonnull(), class);
         }
-        drop(freed_lists);
         let _ = self.inner.allocator.purge();
     }
 
     /// Returns a point-in-time snapshot of pool statistics.
     pub fn stats(&self) -> StatsSnapshot {
-        let cached_bytes: u64 = self
-            .inner
-            .free_lists
-            .borrow()
-            .iter()
-            .enumerate()
-            .map(|(idx, list)| (list.len() as u64) * object_size(ClassId(idx as u8)) as u64)
+        let cached_bytes: u64 = (0..NUM_CLASSES)
+            .map(|idx| {
+                (self.inner.free_lists.class_len(idx) as u64)
+                    * object_size(ClassId(idx as u8)) as u64
+            })
             .sum();
         StatsSnapshot {
             counters: self.inner.counters.snapshot(),
@@ -274,14 +328,10 @@ impl BufferPool {
     /// [`PoolClosed`](BufferPoolError::PoolClosed).
     pub fn close(&self) {
         self.inner.closed.store(true, Ordering::Release);
-        let mut freed_lists = self.inner.free_lists.borrow_mut();
-        for (class_idx, list) in freed_lists.iter_mut().enumerate() {
+        for (class_idx, slot) in self.inner.free_lists.drain_all() {
             let class = ClassId(class_idx as u8);
-            while let Some(slot) = list.pop() {
-                let _ = self.inner.allocator.return_slot(slot.as_nonnull(), class);
-            }
+            let _ = self.inner.allocator.return_slot(slot.as_nonnull(), class);
         }
-        drop(freed_lists);
         let _ = self.inner.allocator.purge();
     }
 

@@ -88,8 +88,7 @@ impl Counters {
     #[inline]
     pub fn record_free(&self, bytes: usize) {
         self.frees.set(self.frees.get() + 1);
-        self.bytes_freed
-            .set(self.bytes_freed.get() + bytes as u64);
+        self.bytes_freed.set(self.bytes_freed.get() + bytes as u64);
         self.outstanding
             .set(self.outstanding.get().saturating_sub(1));
         self.bytes_outstanding

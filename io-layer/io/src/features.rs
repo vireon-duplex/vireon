@@ -22,6 +22,7 @@
 //! | `FIXED_FILE_SPARSE` | 5.19 |
 //! | `MULTISHOT_ACCEPT`  | 5.19 |
 //! | `SQPOLL`            | 5.11 |
+//! | `NAPI_BUSY_POLL`    | 6.6  |
 
 use io_uring::IoUring;
 
@@ -50,6 +51,11 @@ impl IoFeatures {
 
     /// `IORING_SETUP_SQPOLL` — kernel-side SQ poll thread (kernel ≥ 5.11).
     pub const SQPOLL: Self = Self(1 << 5);
+
+    /// `IORING_REGISTER_NAPI` (opcode 27) — ring-level NAPI busy poll
+    /// (kernel ≥ 6.6). Distinct from socket-level `SO_BUSY_POLL`; lets
+    /// the ring itself drive NAPI polling without softirq wakeups.
+    pub const NAPI_BUSY_POLL: Self = Self(1 << 6);
 
     /// Returns an empty feature set (no features detected).
     #[must_use]
@@ -113,6 +119,11 @@ impl IoFeatures {
             f.insert(Self::SQPOLL);
         }
 
+        // IORING_REGISTER_NAPI (opcode 27): kernel ≥ 6.6
+        if kernel_ge(major, minor, 6, 6) {
+            f.insert(Self::NAPI_BUSY_POLL);
+        }
+
         f
     }
 
@@ -152,6 +163,12 @@ impl IoFeatures {
     #[must_use]
     pub fn supports_sqpoll(self) -> bool {
         self.contains(Self::SQPOLL)
+    }
+
+    /// `IORING_REGISTER_NAPI` is available (kernel ≥ 6.6).
+    #[must_use]
+    pub fn supports_napi_busy_poll(self) -> bool {
+        self.contains(Self::NAPI_BUSY_POLL)
     }
 }
 
@@ -196,6 +213,9 @@ impl std::fmt::Display for IoFeatures {
         }
         if self.contains(Self::SQPOLL) {
             emit(f, "SQPOLL", &mut first)?;
+        }
+        if self.contains(Self::NAPI_BUSY_POLL) {
+            emit(f, "NAPI_BUSY_POLL", &mut first)?;
         }
         if first {
             f.write_str("(empty)")?;

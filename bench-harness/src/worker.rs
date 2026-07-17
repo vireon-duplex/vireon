@@ -75,7 +75,26 @@ fn max_coalesce_capacity(entries: &[WorkloadEntry], coalesce: usize) -> usize {
         .unwrap_or(64 * 1024)
 }
 
+/// Output of the pre-barrier setup+handshake phase. Owned by the worker
+/// function and moved into the measurement phase on success.
+struct EstablishedConn {
+    socket: UdpSocket,
+    conn: quiche::Connection,
+    recv_buf: Vec<u8>,
+    send_buf: Vec<u8>,
+    local: SocketAddr,
+    handshake_ok: bool,
+    handshake_time: Duration,
+}
+
 /// Runs one connection's lifecycle. Returns a [`WorkerResult`] — never panics.
+///
+/// **Barrier contract**: every failure path before the measurement phase
+/// still calls `barrier.wait()` before returning. Without this, a single
+/// worker failing in bind/connect/handshake would block the main thread
+/// on `Barrier::wait()` forever — at 1000 conns this happens often enough
+/// (ephemeral port pressure, server reject, slow TLS) that the bench
+/// appears to "hang at N connections".
 pub fn worker(
     idx: usize,
     target: SocketAddr,
@@ -90,61 +109,104 @@ pub fn worker(
 ) -> WorkerResult {
     let run_start = Instant::now();
 
-    let socket = match bind_and_connect(target) {
-        Ok(s) => s,
-        Err(e) => {
-            return WorkerResult::failed(format!("socket: {e}"), run_start.elapsed());
+    // Phase 1 — setup + handshake. Wrapped in a closure so every failure
+    // path produces a `WorkerResult` without bypassing `barrier.wait()`.
+    // The closure owns the buffers so we can move them into the
+    // measurement phase on success.
+    let setup: Result<EstablishedConn, WorkerResult> = (|run_start: Instant| {
+        let socket = bind_and_connect(target)
+            .map_err(|e| WorkerResult::failed(format!("socket: {e}"), run_start.elapsed()))?;
+        let local = socket.local_addr().unwrap_or(target);
+        let mut config = build_client_config()
+            .map_err(|e| WorkerResult::failed(format!("config: {e}"), run_start.elapsed()))?;
+
+        let scid = quiche::ConnectionId::from_vec(gen_scid());
+        let mut conn = quiche::connect(Some(sni), &scid, local, target, &mut config)
+            .map_err(|e| WorkerResult::failed(format!("connect: {e}"), run_start.elapsed()))?;
+
+        let mut recv_buf = vec![0u8; DGRAM_BUF];
+        let mut send_buf = vec![0u8; DGRAM_BUF];
+
+        // --- Handshake ---------------------------------------------------
+        let handshake_start = Instant::now();
+        flush_outbound(&mut conn, &socket, &mut send_buf).map_err(|e| {
+            WorkerResult::failed(format!("handshake send: {e}"), handshake_start.elapsed())
+        })?;
+        let handshake_ok = loop {
+            if conn.is_established() {
+                break true;
+            }
+            if conn.is_closed() {
+                let reason = conn
+                    .peer_error()
+                    .map(|e| format!("{e:?}"))
+                    .or_else(|| conn.local_error().map(|e| format!("{e:?}")))
+                    .unwrap_or_else(|| "unknown".into());
+                tracing::warn!(worker = idx, %reason, "connection closed during handshake");
+                break false;
+            }
+            if handshake_start.elapsed() > HANDSHAKE_DEADLINE {
+                break false;
+            }
+            recv_inbound(&mut conn, &socket, &mut recv_buf, target, local).map_err(|e| {
+                WorkerResult::failed(format!("handshake recv: {e}"), handshake_start.elapsed())
+            })?;
+            flush_outbound(&mut conn, &socket, &mut send_buf).map_err(|e| {
+                WorkerResult::failed(format!("handshake send: {e}"), handshake_start.elapsed())
+            })?;
+        };
+        let handshake_time = handshake_start.elapsed();
+
+        Ok(EstablishedConn {
+            socket,
+            conn,
+            recv_buf,
+            send_buf,
+            local,
+            handshake_ok,
+            handshake_time,
+        })
+    })(run_start);
+
+    let EstablishedConn {
+        socket,
+        conn,
+        recv_buf,
+        send_buf,
+        local,
+        handshake_ok,
+        handshake_time,
+    } = match setup {
+        Ok(v) => v,
+        Err(failure) => {
+            // CRITICAL: release the main thread's barrier before
+            // returning the failure. Otherwise the main thread blocks
+            // on Barrier::wait() forever — looks like a "hang at N
+            // connections" from the outside.
+            tracing::warn!(
+                worker = idx,
+                reason = failure.reason(),
+                elapsed_ms = failure.handshake_time.as_millis(),
+                "pre-barrier failure — releasing barrier and returning failure"
+            );
+            barrier.wait();
+            return failure;
         }
     };
 
-    let local = socket.local_addr().unwrap_or(target);
-    let mut config = match build_client_config() {
-        Ok(c) => c,
-        Err(e) => {
-            return WorkerResult::failed(format!("config: {e}"), run_start.elapsed());
-        }
-    };
-
-    let scid = quiche::ConnectionId::from_vec(gen_scid());
-    let mut conn = match quiche::connect(Some(sni), &scid, local, target, &mut config) {
-        Ok(c) => c,
-        Err(e) => {
-            return WorkerResult::failed(format!("connect: {e}"), run_start.elapsed());
-        }
-    };
-
-    let mut recv_buf = vec![0u8; DGRAM_BUF];
-    let mut send_buf = vec![0u8; DGRAM_BUF];
-
-    // --- Handshake -------------------------------------------------------
-    let handshake_start = Instant::now();
-    if let Err(e) = flush_outbound(&mut conn, &socket, &mut send_buf) {
-        return WorkerResult::failed(format!("handshake send: {e}"), handshake_start.elapsed());
+    if !handshake_ok {
+        tracing::warn!(
+            worker = idx,
+            elapsed_ms = handshake_time.as_millis(),
+            "handshake failed — calling barrier anyway to avoid hanging main thread"
+        );
+    } else if idx % 100 == 0 {
+        tracing::info!(
+            worker = idx,
+            elapsed_ms = handshake_time.as_millis(),
+            "handshake ok (sampled)"
+        );
     }
-    let handshake_ok = loop {
-        if conn.is_established() {
-            break true;
-        }
-        if conn.is_closed() {
-            let reason = conn
-                .peer_error()
-                .map(|e| format!("{e:?}"))
-                .or_else(|| conn.local_error().map(|e| format!("{e:?}")))
-                .unwrap_or_else(|| "unknown".into());
-            tracing::warn!(worker = idx, %reason, "connection closed during handshake");
-            break false;
-        }
-        if handshake_start.elapsed() > HANDSHAKE_DEADLINE {
-            break false;
-        }
-        if let Err(e) = recv_inbound(&mut conn, &socket, &mut recv_buf, target, local) {
-            return WorkerResult::failed(format!("handshake recv: {e}"), handshake_start.elapsed());
-        }
-        if let Err(e) = flush_outbound(&mut conn, &socket, &mut send_buf) {
-            return WorkerResult::failed(format!("handshake send: {e}"), handshake_start.elapsed());
-        }
-    };
-    let handshake_time = handshake_start.elapsed();
 
     barrier.wait();
 
@@ -168,6 +230,15 @@ pub fn worker(
         hs_us = handshake_time.as_micros(),
         "handshake ok"
     );
+
+    // Move into mutable handles for the measurement phase.
+    let mut conn = conn;
+    let mut recv_buf = recv_buf;
+    let mut send_buf = send_buf;
+    let _ = local;
+    // socket is borrowed immutably by measurement fns; bind to a stable
+    // name so callers see `&socket`.
+    let socket = socket;
 
     // --- Create client layer stack --------------------------------------
     let mut stack = ClientStack::new(max_coalesce_capacity(entries, coalesce));

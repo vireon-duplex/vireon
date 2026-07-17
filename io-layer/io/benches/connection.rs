@@ -83,10 +83,13 @@ fn bench_setup_socket(c: &mut Criterion) {
     });
 
     g.bench_function("with_reuseport", |b| {
+        let features = kernel_nic::KernelFeatures::detect().expect("features");
+        let policy =
+            kernel_nic::BusyPollPolicy::new(kernel_nic::BusyPollMode::Latency { us: 50 }, true);
         b.iter_batched(
             || (),
             |()| {
-                let sock = Socket::bind_with_reuseport(0, 0).expect("bind");
+                let sock = Socket::bind_with_reuseport(0, 0, features, policy).expect("bind");
                 black_box(sock);
             },
             BatchSize::PerIteration,
