@@ -67,6 +67,11 @@ pub enum IoError {
     /// Usually best-effort in Drop — the error is logged but ignored.
     #[error("io_uring resource unregistration failed: {0}")]
     UnregistrationFailed(std::io::Error),
+
+    /// The kernel-nic layer rejected a socket build or capability probe.
+    /// Surfaces `KernelNicError` from `SocketBuilder::build` etc.
+    #[error("kernel-nic error: {0}")]
+    KernelNic(#[from] kernel_nic::KernelNicError),
 }
 
 #[cfg(test)]

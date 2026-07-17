@@ -95,6 +95,12 @@ impl WorkerResult {
             error: Some(msg),
         }
     }
+
+    /// Returns the failure reason, or `"ok"` if this result is successful.
+    /// Used for pre-barrier failure logging in `worker::worker`.
+    pub fn reason(&self) -> &str {
+        self.error.as_deref().unwrap_or("ok")
+    }
 }
 
 /// Aggregated summary across all workers.

@@ -22,7 +22,7 @@ fn bench_init_ring(c: &mut Criterion) {
             b.iter_batched(
                 || (),
                 |()| {
-                    let ctx = IoUringCtx::init_ring(entries, false).expect("ring");
+                    let ctx = IoUringCtx::init_ring(entries, false, None).expect("ring");
                     black_box(ctx);
                 },
                 BatchSize::PerIteration,
@@ -31,13 +31,13 @@ fn bench_init_ring(c: &mut Criterion) {
     }
 
     // SQPOLL requires CAP_SYS_ADMIN; skip gracefully if denied.
-    match IoUringCtx::init_ring(64, true) {
+    match IoUringCtx::init_ring(64, true, None) {
         Ok(_) => {
             g.bench_function("entries=64/sqpoll=true", |b| {
                 b.iter_batched(
                     || (),
                     |()| {
-                        let ctx = IoUringCtx::init_ring(64, true).expect("ring");
+                        let ctx = IoUringCtx::init_ring(64, true, None).expect("ring");
                         black_box(ctx);
                     },
                     BatchSize::PerIteration,
