@@ -13,6 +13,7 @@ autobenches = false
 thiserror = { workspace = true }
 tracing = { workspace = true }
 profiler = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

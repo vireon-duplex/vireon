@@ -1638,6 +1638,7 @@ name = "timer-wheel"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "libc",
  "profiler",
  "thiserror 2.0.18",
  "tracing",

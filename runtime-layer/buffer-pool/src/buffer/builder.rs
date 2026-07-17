@@ -99,6 +99,18 @@ impl BufferPoolBuilder {
         self
     }
 
+    /// Preferred NUMA node for arena slab backing memory.
+    ///
+    /// Best-effort: each new slab's backing allocation is bound to `node`
+    /// via `mbind(MPOL_PREFERRED)`. A pinned reactor thread already gets
+    /// first-touch locality — this is explicit defense-in-depth that
+    /// matters most on multi-socket systems.
+    #[must_use]
+    pub fn numa_node(mut self, node: crate::numa::NodeId) -> Self {
+        self.config.numa_node = Some(node);
+        self
+    }
+
     /// Validates the accumulated config and constructs the pool.
     ///
     /// Returns [`BufferPoolError::InvalidConfig`] when a constraint is

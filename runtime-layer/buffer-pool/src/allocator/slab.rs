@@ -16,6 +16,7 @@ use std::ptr::NonNull;
 use crate::allocator::size_class::ClassId;
 use crate::error::BufferPoolError;
 use crate::memory::alignment::MIN_ALIGN;
+use crate::numa::{NodeId, bind as numa_bind};
 
 /// Geometry of a slab, derived from the size class.
 #[derive(Clone, Copy, Debug)]
@@ -64,11 +65,17 @@ unsafe impl Send for Slab {}
 impl Slab {
     /// Allocates a fresh slab with `geometry.slot_count` slots of
     /// `slot_size` bytes, backed by an allocation aligned to `align`.
+    ///
+    /// When `numa_node` is `Some(node)`, the backing allocation is bound to
+    /// that node via `mbind(MPOL_PREFERRED)` after `alloc`. Best-effort: a
+    /// failure to bind is logged but does not prevent the slab from being
+    /// used (the kernel's default first-touch policy still applies).
     pub fn new(
         class: ClassId,
         slot_size: usize,
         align: usize,
         geometry: SlabGeometry,
+        numa_node: Option<NodeId>,
     ) -> Result<Self, BufferPoolError> {
         if slot_size == 0 || geometry.slot_count == 0 {
             return Err(BufferPoolError::InvalidConfig(
@@ -87,6 +94,25 @@ impl Slab {
         let backing_ptr = NonNull::new(ptr).ok_or(BufferPoolError::OutOfMemory {
             size: geometry.slab_bytes,
         })?;
+
+        // Bind the backing range to the preferred NUMA node. Best-effort:
+        // without the `numa` feature this is a no-op; on single-NUMA hosts
+        // it's a cheap kernel no-op. A pinned reactor thread already gets
+        // first-touch locality — this is explicit defense-in-depth.
+        if let Some(node) = numa_node {
+            // SAFETY: `backing_ptr` was just allocated with `geometry.slab_bytes`
+            // bytes via `alloc(layout)` where `layout.size() == slab_bytes`.
+            if let Err(e) = unsafe { numa_bind(backing_ptr, geometry.slab_bytes, node) } {
+                tracing::debug!(
+                    class = ?class,
+                    node = node.0,
+                    bytes = geometry.slab_bytes,
+                    error = %e,
+                    "numa mbind failed on new slab; relying on first-touch policy"
+                );
+            }
+        }
+
         let base = backing_ptr.as_ptr() as usize;
         let free_list = (0..geometry.slot_count as u32).collect();
         Ok(Self {
@@ -203,7 +229,7 @@ mod tests {
 
     fn make_slab(slot_size: usize, align: usize) -> Slab {
         let geometry = slab_geometry_for(slot_size);
-        Slab::new(ClassId(0), slot_size, align, geometry).unwrap()
+        Slab::new(ClassId(0), slot_size, align, geometry, None).unwrap()
     }
 
     #[test]
@@ -274,6 +300,6 @@ mod tests {
             slot_count: 0,
             slab_bytes: 0,
         };
-        assert!(Slab::new(ClassId(0), 0, 64, geometry).is_err());
+        assert!(Slab::new(ClassId(0), 0, 64, geometry, None).is_err());
     }
 }

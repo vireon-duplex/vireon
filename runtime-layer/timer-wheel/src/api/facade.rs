@@ -159,6 +159,8 @@ impl Drop for TimerWheel {
 pub struct TimerWheelBuilder {
     config: TimerWheelConfig,
     handler: Option<Arc<dyn TimerHandler>>,
+    /// CPU core to pin each worker thread to (None = no pinning).
+    cpu_pin: Option<u32>,
 }
 
 impl TimerWheelBuilder {
@@ -224,6 +226,18 @@ impl TimerWheelBuilder {
         self
     }
 
+    /// Pins each worker thread to `core` via `sched_setaffinity` before
+    /// entering its run loop. Use to co-locate a timer worker with its
+    /// owning reactor on the same core / NUMA node.
+    ///
+    /// When the wheel has multiple shards, all workers pin to the same
+    /// core — typical usage is `shards(1)` per reactor.
+    #[must_use]
+    pub fn cpu_pin(mut self, core: u32) -> Self {
+        self.cpu_pin = Some(core);
+        self
+    }
+
     /// Validates the configuration and constructs the wheel, spawning one
     /// worker thread per shard.
     pub fn spawn(self) -> Result<TimerWheel, TimerError> {
@@ -256,7 +270,13 @@ impl TimerWheelBuilder {
             }
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let idle = Duration::from_nanos(config.idle_interval_ns);
-            let worker = Worker::spawn(format!("timer-wheel-{sid}"), shard, idle, stop)?;
+            let worker = Worker::spawn(
+                format!("timer-wheel-{sid}"),
+                shard,
+                idle,
+                stop,
+                self.cpu_pin,
+            )?;
             channels_vec.push(channels);
             workers.push(worker);
         }

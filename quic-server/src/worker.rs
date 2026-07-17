@@ -60,6 +60,13 @@ impl Worker {
             "buffer pool sized for container memory"
         );
 
+        // Derive the local NUMA node from the now-pinned reactor thread and
+        // bind arena slab memory to it. On single-NUMA hosts this is node 0
+        // and `mbind` is a cheap kernel no-op; on multi-socket systems it
+        // keeps each per-core pool's backing memory local to its reactor.
+        let numa_node = buffer_pool::numa::current_node();
+        tracing::info!(core_id, numa_node = numa_node.0, "buffer pool NUMA node");
+
         let engine = QuicEngineBuilder::from_config(config.quic_config.clone())
             .reactor_id(core_id)
             .local_addr(local_addr)
@@ -68,6 +75,7 @@ impl Worker {
             .buffer_pool(
                 buffer_pool::BufferPoolBuilder::new()
                     .max_memory(pool_budget)
+                    .numa_node(numa_node)
                     .build()
                     .expect("pool config is valid"),
             )

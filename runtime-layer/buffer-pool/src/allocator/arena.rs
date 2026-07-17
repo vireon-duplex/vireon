@@ -15,6 +15,7 @@ use std::ptr::NonNull;
 use crate::allocator::size_class::{CLASS_TABLE, ClassId, NUM_CLASSES};
 use crate::allocator::slab::{Slab, SlabGeometry, slab_geometry_for};
 use crate::error::BufferPoolError;
+use crate::numa::NodeId;
 
 /// Internal mutable state of the arena.
 #[derive(Default)]
@@ -35,11 +36,21 @@ impl ArenaState {
 pub struct Arena {
     state: RefCell<ArenaState>,
     geometry: Vec<SlabGeometry>,
+    /// Preferred NUMA node passed to each new [`Slab`] (None = default policy).
+    numa_node: Option<NodeId>,
 }
 
 impl Arena {
-    /// Creates an empty arena with no pre-allocated slabs.
+    /// Creates an empty arena with no pre-allocated slabs and the kernel's
+    /// default memory policy.
     pub fn new() -> Self {
+        Self::with_numa_node(None)
+    }
+
+    /// Creates an empty arena that binds each new slab's backing memory to
+    /// `node` via `mbind(MPOL_PREFERRED)`. Best-effort.
+    #[must_use]
+    pub fn with_numa_node(numa_node: Option<NodeId>) -> Self {
         let geometry: Vec<SlabGeometry> = CLASS_TABLE
             .iter()
             .map(|c| slab_geometry_for(c.size))
@@ -47,6 +58,7 @@ impl Arena {
         Self {
             state: RefCell::new(ArenaState::new()),
             geometry,
+            numa_node,
         }
     }
 
@@ -63,7 +75,8 @@ impl Arena {
         }
         let geometry = self.geometry[idx];
         let class_info = CLASS_TABLE[idx];
-        let mut new_slab = Slab::new(class, class_info.size, class_info.align, geometry)?;
+        let mut new_slab =
+            Slab::new(class, class_info.size, class_info.align, geometry, self.numa_node)?;
         let ptr = new_slab.alloc_slot().ok_or(BufferPoolError::OutOfMemory {
             size: class_info.size,
         })?;
@@ -116,7 +129,7 @@ impl Arena {
         let class_info = CLASS_TABLE[idx];
         let mut state = self.state.borrow_mut();
         while free_slots_in(&state.slabs[idx]) < count {
-            let slab = Slab::new(class, class_info.size, class_info.align, geometry)?;
+            let slab = Slab::new(class, class_info.size, class_info.align, geometry, self.numa_node)?;
             state.slabs[idx].push(slab);
         }
         Ok(())

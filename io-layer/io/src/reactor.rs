@@ -104,12 +104,13 @@ impl Reactor {
         // Try SQPOLL mode; fall back gracefully if the kernel denies it
         // (typically needs CAP_SYS_NICE / root).
         let mut ctx = if enable_sqpoll {
-            match IoUringCtx::init_ring(entries, true) {
+            match IoUringCtx::init_ring(entries, true, Some(core_id)) {
                 Ok(ctx) => {
                     tracing::info!(
                         core_id,
                         sqpoll = true,
-                        "SQPOLL enabled — kernel thread polling SQ ring"
+                        sq_aff = true,
+                        "SQPOLL enabled — kernel thread polling SQ ring (pinned to core)"
                     );
                     ctx
                 }
@@ -120,11 +121,11 @@ impl Reactor {
                         "SQPOLL denied by kernel — falling back to standard mode \
                          (needs CAP_SYS_NICE on kernels < 6.0)"
                     );
-                    IoUringCtx::init_ring(entries, false)?
+                    IoUringCtx::init_ring(entries, false, None)?
                 }
             }
         } else {
-            IoUringCtx::init_ring(entries, false)?
+            IoUringCtx::init_ring(entries, false, None)?
         };
         // SAFETY: we register a brand-new pool whose backing storage will
         // outlive the ring (pool is stored in the reactor, which is
