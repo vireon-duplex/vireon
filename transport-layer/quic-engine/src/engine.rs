@@ -39,14 +39,6 @@ use crate::dirty::{Control, DirtyBitset};
 use crate::gso::GsoBatcher;
 use crate::stream_bridge::StreamCarry;
 
-/// Per-tick cap on the number of dirty connections whose sends are flushed.
-///
-/// Bounds worst-case tick latency under connection storms: excess dirty
-/// connections keep their bits set and are processed on subsequent ticks.
-/// Sized to match a typical GSO batch burst (≤64 packets per flush), so a
-/// full budget rarely exceeds one `sendmsg` per connection.
-const DIRTY_FLUSH_BUDGET: usize = 64;
-
 /// Maximum QUIC packet size — covers full IPv4 UDP jumbo payload
 /// (65535 - IP/UDP overhead). Must match the io-layer receive buffer
 /// and the client's `max_send_udp_payload_size`.
@@ -266,7 +258,7 @@ impl QuicEngine {
             },
             readable_buf: Vec::with_capacity(16),
             closed_buf: Vec::with_capacity(16),
-            flushed_this_tick: Vec::with_capacity(DIRTY_FLUSH_BUDGET),
+            flushed_this_tick: Vec::with_capacity(64),
             dirty: DirtyBitset::new(),
             stream_carryover: FxHashMap::default(),
             pool,
@@ -551,9 +543,12 @@ impl QuicEngine {
         let gso = &mut self.gso_batcher;
         let sender = &ctx.sender;
         let flushed = &mut self.flushed_this_tick;
-        let budget = DIRTY_FLUSH_BUDGET;
 
-        let mut processed = 0usize;
+        // Process ALL dirty connections per tick. A previous budget cap
+        // (64/tick) throttled multi-connection throughput: connections
+        // beyond the budget waited for the next tick, creating artificial
+        // backpressure. On a single-core reactor the natural backpressure
+        // from io_uring (CQ overflow, EBUSY) is sufficient.
         self.dirty.drain(|idx| {
             flushed.push(idx);
             if let Some(Some(entry)) = connections.get_mut(idx) {
@@ -568,12 +563,7 @@ impl QuicEngine {
                     }
                 }
             }
-            processed += 1;
-            if processed >= budget {
-                Control::Break
-            } else {
-                Control::Continue
-            }
+            Control::Continue
         });
         let _ = gso.flush(sender);
     }

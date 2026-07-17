@@ -105,8 +105,7 @@ fn pin_to_core(core: u32) -> Result<(), String> {
     let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
     unsafe { libc::CPU_ZERO(&mut set) };
     unsafe { libc::CPU_SET(core as usize, &mut set) };
-    let rc =
-        unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) };
+    let rc = unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) };
     if rc == 0 {
         Ok(())
     } else {
@@ -151,8 +150,14 @@ mod tests {
         )
         .expect("shard");
         let stop = Arc::new(AtomicBool::new(false));
-        let mut worker =
-            Worker::spawn("tw-test".into(), shard, Duration::from_millis(5), stop, None).expect("spawn");
+        let mut worker = Worker::spawn(
+            "tw-test".into(),
+            shard,
+            Duration::from_millis(5),
+            stop,
+            None,
+        )
+        .expect("spawn");
         std::thread::sleep(Duration::from_millis(10));
         worker.shutdown();
         assert!(worker.is_stopped());
@@ -175,8 +180,14 @@ mod tests {
         .expect("shard");
         let stop = Arc::new(AtomicBool::new(false));
         {
-            let _worker = Worker::spawn("tw-drop".into(), shard, Duration::from_millis(5), stop, None)
-                .expect("spawn");
+            let _worker = Worker::spawn(
+                "tw-drop".into(),
+                shard,
+                Duration::from_millis(5),
+                stop,
+                None,
+            )
+            .expect("spawn");
             std::thread::sleep(Duration::from_millis(8));
             // worker dropped here
         }
@@ -204,8 +215,14 @@ mod tests {
             deadline_ticks: now + 3,
         });
         let stop = Arc::new(AtomicBool::new(false));
-        let mut worker =
-            Worker::spawn("tw-fire".into(), shard, Duration::from_millis(2), stop, None).expect("spawn");
+        let mut worker = Worker::spawn(
+            "tw-fire".into(),
+            shard,
+            Duration::from_millis(2),
+            stop,
+            None,
+        )
+        .expect("spawn");
         // wait long enough for the 3-tick (3 ms) timer to fire
         std::thread::sleep(Duration::from_millis(40));
         let mut fired = Vec::new();

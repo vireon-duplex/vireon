@@ -91,8 +91,18 @@ impl GsoBatcher {
     /// Pushes a packet. If it doesn't match the current batch's
     /// `(dest, seg_size)`, or the batch is full, the pending batch is
     /// flushed first via `sender`.
+    ///
+    /// When GSO has been permanently disabled (e.g. loopback EMSGSIZE),
+    /// this short-circuits to a direct `send_blocking` — skipping the
+    /// batch buffer entirely to avoid the double-memcpy
+    /// (`out_buf → gso.buf → kernel`) and the wasted `send_gso` syscall.
     #[profile]
     pub fn push(&mut self, pkt: &[u8], dest: SocketAddr, sender: &Sender) -> Result<(), IoError> {
+        // Fast path: GSO permanently disabled — direct send, no batch.
+        if !self.gso_supported {
+            return sender.send_blocking(pkt, dest).map(|_| ());
+        }
+
         let needs_flush = self.count >= GSO_MAX_BATCH
             || self.buf.len() + pkt.len() >= GSO_FLUSH_BYTES
             || (self.count > 0 && (self.dest != Some(dest) || pkt.len() != self.seg_size));
@@ -153,9 +163,18 @@ impl GsoBatcher {
                     Some(11) => self.flush_individual(sender, dest),
                     // EMSGSIZE (90) — total GSO buffer exceeds the kernel's
                     // max send size for this interface (common on loopback
-                    // with large segments). Fall back to individual sends;
-                    // each packet alone is within the UDP max datagram size.
-                    Some(90) => self.flush_individual(sender, dest),
+                    // with large segments). Permanently disable GSO so
+                    // subsequent push() calls short-circuit to direct
+                    // send_blocking — avoids retrying the failed syscall
+                    // and the double-memcpy through the batch buffer.
+                    Some(90) => {
+                        tracing::debug!(
+                            errno,
+                            "GSO EMSGSIZE — disabling GSO (loopback or small-MTU interface)"
+                        );
+                        self.gso_supported = false;
+                        self.flush_individual(sender, dest)
+                    }
                     // EOPNOTSUPP (95), EINVAL (22), ENOTSUP (251) — kernel
                     // doesn't support UDP_SEGMENT. Disable GSO permanently.
                     Some(95) | Some(22) | Some(251) => {

@@ -180,11 +180,7 @@ mod tests {
         }
 
         fn last(&self) -> (usize, usize, ClassId, bool) {
-            *self
-                .releases
-                .borrow()
-                .last()
-                .expect("at least one release")
+            *self.releases.borrow().last().expect("at least one release")
         }
     }
 

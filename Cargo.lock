@@ -635,6 +635,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "io-uring",
+ "kernel-nic",
  "libc",
  "socket2 0.6.4",
  "thiserror 2.0.18",

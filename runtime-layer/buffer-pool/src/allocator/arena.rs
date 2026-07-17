@@ -75,8 +75,13 @@ impl Arena {
         }
         let geometry = self.geometry[idx];
         let class_info = CLASS_TABLE[idx];
-        let mut new_slab =
-            Slab::new(class, class_info.size, class_info.align, geometry, self.numa_node)?;
+        let mut new_slab = Slab::new(
+            class,
+            class_info.size,
+            class_info.align,
+            geometry,
+            self.numa_node,
+        )?;
         let ptr = new_slab.alloc_slot().ok_or(BufferPoolError::OutOfMemory {
             size: class_info.size,
         })?;
@@ -129,7 +134,13 @@ impl Arena {
         let class_info = CLASS_TABLE[idx];
         let mut state = self.state.borrow_mut();
         while free_slots_in(&state.slabs[idx]) < count {
-            let slab = Slab::new(class, class_info.size, class_info.align, geometry, self.numa_node)?;
+            let slab = Slab::new(
+                class,
+                class_info.size,
+                class_info.align,
+                geometry,
+                self.numa_node,
+            )?;
             state.slabs[idx].push(slab);
         }
         Ok(())

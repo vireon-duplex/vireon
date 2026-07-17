@@ -10,7 +10,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use io::Reactor;
-use quic_engine::QuicEngineBuilder;
+use quic_engine::{QuicEngineBuilder, QuicPreset};
 
 use crate::config::ServerConfig;
 use crate::error::ServerError;
@@ -39,8 +39,19 @@ impl Worker {
     ) -> Result<Self, ServerError> {
         tracing::info!(core_id, port = config.port, "initializing reactor");
 
-        let reactor = Reactor::init(core_id, config.port, config.queue_depth, config.sqpoll)
-            .map_err(|e| ServerError::ReactorInit(format!("{e:?}")))?;
+        let features = kernel_nic::KernelFeatures::detect()
+            .map_err(|e| ServerError::ReactorInit(format!("feature detect: {e:?}")))?;
+        let busy_poll = busy_poll_policy_from_preset(config.preset, features);
+
+        let reactor = Reactor::init(
+            core_id,
+            config.port,
+            config.queue_depth,
+            config.sqpoll,
+            features,
+            busy_poll,
+        )
+        .map_err(|e| ServerError::ReactorInit(format!("{e:?}")))?;
 
         let local_addr = reactor
             .socket()
@@ -161,6 +172,38 @@ impl Worker {
             .map_err(|e| ServerError::ThreadSpawn(format!("{e}")))?;
         Ok((handle, rx))
     }
+}
+
+/// Maps a [`QuicPreset`] + detected [`kernel_nic::KernelFeatures`] to a
+/// [`kernel_nic::BusyPollPolicy`].
+///
+/// This is the **config-driven** busy-poll decision (phase 5): instead of
+/// hard-coding `SO_BUSY_POLL=50µs`, the preset selects the mode + µs
+/// budget. `SO_PREFER_BUSY_POLL` is applied only when both the mode
+/// requests it (`Latency`/`Throughput`/`Adaptive`) and the kernel reports
+/// the capability.
+///
+/// | Preset          | Mode              | `us` | `prefer` |
+/// |-----------------|-------------------|------|----------|
+/// | `Cloud`         | `Off`             | 0    | false    |
+/// | `BareMetal`     | `Latency`         | 50   | if cap.  |
+/// | `HundredGbe`    | `Throughput`      | 200  | if cap.  |
+/// | `LowLatency`    | `Latency`         | 50   | if cap.  |
+/// | `MaxThroughput` | `Throughput`      | 200  | if cap.  |
+fn busy_poll_policy_from_preset(
+    preset: QuicPreset,
+    features: kernel_nic::KernelFeatures,
+) -> kernel_nic::BusyPollPolicy {
+    use kernel_nic::{BusyPollMode, BusyPollPolicy};
+    let mode = match preset {
+        QuicPreset::Cloud => BusyPollMode::Off,
+        QuicPreset::BareMetal | QuicPreset::LowLatency => BusyPollMode::Latency { us: 50 },
+        QuicPreset::HundredGbe | QuicPreset::MaxThroughput => BusyPollMode::Throughput { us: 200 },
+        // `QuicPreset` is `#[non_exhaustive]`; unknown future variants
+        // fall back to the conservative Off policy.
+        _ => BusyPollMode::Off,
+    };
+    BusyPollPolicy::new(mode, features.supports_prefer_busy_poll())
 }
 
 /// Installs a Ctrl-C handler with graceful-to-forced escalation.

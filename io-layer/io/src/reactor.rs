@@ -8,12 +8,14 @@
 //! # Lifecycle
 //!
 //! ```text
-//! init(core_id, port, queue_depth, enable_sqpoll)
+//! init(core_id, port, queue_depth, enable_sqpoll, features, busy_poll)
 //!   1. sched_setaffinity(0, {core_id})
 //!   2. IoUringCtx::init_ring(queue_depth, sqpoll=enable_sqpoll)
 //!   3. BufferPool::init_buffer_ring(ring, bgid=1)
-//!   4. Socket::bind_with_reuseport(port, core_id)
-//!   5. socket.receiver(bgid).arm(ring, id=0)
+//!   4. Socket::bind_with_reuseport(port, core_id, features, busy_poll)
+//!   5. ctx.register_buffers(iovecs)
+//!   6. ctx.register_napi(busy_poll.mode.us(), busy_poll.should_prefer())  // kernel ≥ 6.6
+//!   7. socket.receiver(bgid).arm(ring, id=0)
 //! ```
 //!
 //! # Dispatch (per CQE)
@@ -84,6 +86,12 @@ impl Reactor {
     /// tests); production callers pass a fixed port. `queue_depth = 0`
     /// falls back to [`QUEUE_DEPTH`].
     ///
+    /// `features` is a `kernel_nic::KernelFeatures` snapshot (probed once
+    /// at process startup) — it gates both socket-option application and
+    /// io_uring NAPI register. `busy_poll` drives both socket-level
+    /// (`SO_BUSY_POLL` + `SO_PREFER_BUSY_POLL`) and ring-level
+    /// (`IORING_REGISTER_NAPI`) busy-poll configuration.
+    ///
     /// When `enable_sqpoll` is `true`, attempts to set up the ring with
     /// `IORING_SETUP_SQPOLL`. If the kernel denies it (e.g. insufficient
     /// privileges), falls back to standard mode and logs a warning.
@@ -92,6 +100,8 @@ impl Reactor {
         port: u16,
         queue_depth: u32,
         enable_sqpoll: bool,
+        features: kernel_nic::KernelFeatures,
+        busy_poll: kernel_nic::BusyPollPolicy,
     ) -> Result<Self, IoError> {
         pin_to_core(core_id)?;
 
@@ -137,7 +147,7 @@ impl Reactor {
             DEFAULT_BUF_SIZE,
         )?;
 
-        let socket = Socket::bind_with_reuseport(port, core_id)?;
+        let socket = Socket::bind_with_reuseport(port, core_id, features, busy_poll)?;
         let receiver = socket.receiver(pool.bgid());
         let sender = socket.sender();
 
@@ -161,6 +171,20 @@ impl Reactor {
                 .collect::<Result<Vec<_>, IoError>>()?;
             if !iovecs.is_empty() {
                 ctx.register_buffers(&iovecs)?;
+            }
+        }
+
+        // Ring-level NAPI busy poll (kernel ≥ 6.6). Distinct from
+        // socket-level SO_BUSY_POLL: lets the ring itself drive NAPI
+        // polling without softirq wakeups. Best-effort — loopback and
+        // pre-6.6 kernels reject with EINVAL; we log + continue.
+        if ctx.features().supports_napi_busy_poll() {
+            if let Err(e) = ctx.register_napi(busy_poll.mode.us(), busy_poll.should_prefer()) {
+                tracing::warn!(
+                    core_id,
+                    error = ?e,
+                    "io_uring NAPI register denied — softirq path active"
+                );
             }
         }
 
@@ -529,10 +553,17 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    /// Shared dev/test feature snapshot + Off busy-poll policy.
+    fn test_cfg() -> (kernel_nic::KernelFeatures, kernel_nic::BusyPollPolicy) {
+        let features = kernel_nic::KernelFeatures::detect().expect("features");
+        (features, kernel_nic::BusyPollPolicy::default())
+    }
+
     #[test]
     fn reactor_init_succeeds_on_ephemeral_port() {
         // core_id 0 is virtually always present.
-        let reactor = Reactor::init(0, 0, 32, false);
+        let (features, busy_poll) = test_cfg();
+        let reactor = Reactor::init(0, 0, 32, false, features, busy_poll);
         let reactor = match reactor {
             Ok(r) => r,
             Err(IoError::InvalidConfig(msg)) if msg.contains("sched_setaffinity") => {
@@ -548,7 +579,8 @@ mod tests {
 
     #[test]
     fn stop_flag_round_trips() {
-        let mut reactor = match Reactor::init(0, 0, 32, false) {
+        let (features, busy_poll) = test_cfg();
+        let mut reactor = match Reactor::init(0, 0, 32, false, features, busy_poll) {
             Ok(r) => r,
             Err(IoError::InvalidConfig(msg)) if msg.contains("sched_setaffinity") => return,
             Err(e) => panic!("init failed: {e:?}"),
@@ -562,7 +594,8 @@ mod tests {
 
     #[test]
     fn reactor_reaps_a_udp_packet() {
-        let mut reactor = match Reactor::init(0, 0, 64, false) {
+        let (features, busy_poll) = test_cfg();
+        let mut reactor = match Reactor::init(0, 0, 64, false, features, busy_poll) {
             Ok(r) => r,
             Err(IoError::InvalidConfig(msg)) if msg.contains("sched_setaffinity") => return,
             Err(e) => panic!("init failed: {e:?}"),

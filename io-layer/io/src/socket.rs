@@ -2,74 +2,48 @@
 //!
 //! [`Socket`] is the **only** owner of the underlying file descriptor.
 //! [`Receiver`] and [`Sender`] borrow the fd (via `RawFd` copy) but never
-//! close it — the [`Socket`] drop closes the fd when the reactor tears down.
+//! close it — the [`Socket`] drop closes the fd when the reactor tears
+//! down.
+//!
+//! # Policy ownership
+//!
+//! All socket-option policy (`SO_REUSEPORT`, `SO_INCOMING_CPU`,
+//! `SO_BUSY_POLL`, `SO_PREFER_BUSY_POLL`, …) lives in
+//! `kernel_nic::SocketBuilder`. The IO Layer's [`Socket::bind_with_reuseport`]
+//! is a thin shim that builds a [`kernel_nic::SocketSpec`], delegates to
+//! `SocketBuilder`, then reclaims the configured fd for io_uring use.
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use socket2::{Domain, Protocol, Socket as Sock, Type};
 
 use crate::error::IoError;
 use crate::ops::{Receiver, Sender};
 
-/// `SO_PREFER_BUSY_POLL` (kernel 5.11+) — pins the socket into busy-poll
-/// mode so the kernel skips the softirq wakeup path entirely. Not in all
-/// `libc` crate versions, so defined here by its protocol value.
-const SO_PREFER_BUSY_POLL: libc::c_int = 74;
-
-/// Default `SO_BUSY_POLL` window in microseconds. The kernel busy-polls the
-/// NIC's NAPI struct for this long before falling back to a softirq. Mirrors
-/// the kernel-nic "Balanced" / "LowLatency" preset (50 µs).
-const DEFAULT_BUSY_POLL_US: libc::c_int = 50;
-
 /// Owned UDP socket with `SO_REUSEPORT` binding.
 ///
-/// Created via [`Socket::bind`] or [`Socket::bind_with_reuseport`]. The
-/// socket is non-blocking (io_uring requirement) and bound to
+/// Created via [`Socket::bind`] (minimal dev/test path) or
+/// [`Socket::bind_with_reuseport`] (production per-core path that applies
+/// busy-poll + `SO_INCOMING_CPU` policy via `kernel_nic::SocketBuilder`).
+/// The socket is non-blocking (io_uring requirement) and bound to
 /// `0.0.0.0:{port}`. Port `0` requests an ephemeral port from the kernel.
 pub struct Socket {
     sock: Sock,
 }
 
 impl Socket {
-    /// Binds a UDP socket on `0.0.0.0:{port}` with `SO_REUSEADDR` +
-    /// `SO_REUSEPORT`. No CPU affinity or busy-poll options are applied —
-    /// use [`bind_with_reuseport`](Self::bind_with_reuseport) for the
+    /// Binds a minimal UDP socket on `0.0.0.0:{port}` with `SO_REUSEADDR`
+    /// and `SO_REUSEPORT`. No CPU affinity or busy-poll options are applied.
+    /// See [`bind_with_reuseport`](Self::bind_with_reuseport) for the
     /// per-core production path.
     pub fn bind(port: u16) -> Result<Self, IoError> {
-        Self::setup(port, None)
-    }
-
-    /// Binds a UDP socket on `0.0.0.0:{port}` with `SO_REUSEADDR` +
-    /// `SO_REUSEPORT`, and — when `cpu` is provided — applies the per-core
-    /// socket options that let the kernel steer packets and busy-poll
-    /// without softirq wakeups:
-    ///
-    /// - `SO_INCOMING_CPU` — hints the kernel to deliver packets received on
-    ///   the RSS queue owned by `cpu` to this socket.
-    /// - `SO_BUSY_POLL` — busy-poll the NIC NAPI struct for
-    ///   [`DEFAULT_BUSY_POLL_US`] µs before raising a softirq.
-    /// - `SO_PREFER_BUSY_POLL` — pin the socket into busy-poll mode so the
-    ///   softirq path is skipped entirely.
-    ///
-    /// All three are best-effort via raw `setsockopt(2)` and silently
-    /// ignored on kernels/devices that don't support them (loopback has no
-    /// NAPI struct; old kernels lack `SO_PREFER_BUSY_POLL`).
-    pub fn bind_with_reuseport(port: u16, cpu: u32) -> Result<Self, IoError> {
-        Self::setup(port, Some(cpu))
-    }
-
-    fn setup(port: u16, cpu: Option<u32>) -> Result<Self, IoError> {
         let sock =
             Sock::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).map_err(IoError::Socket)?;
         sock.set_reuse_address(true).map_err(IoError::Socket)?;
         // SO_REUSEPORT — kernel hashes (src_ip, src_port) across sockets.
         sock.set_reuse_port(true).map_err(IoError::Socket)?;
         sock.set_nonblocking(true).map_err(IoError::Socket)?;
-
-        if let Some(cpu) = cpu {
-            apply_per_core_options(sock.as_raw_fd(), cpu);
-        }
 
         let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
         sock.bind(&socket2::SockAddr::from(SocketAddr::V4(addr)))
@@ -78,11 +52,77 @@ impl Socket {
         Ok(Self { sock })
     }
 
+    /// Binds a per-core UDP socket via `kernel_nic::SocketBuilder`, which
+    /// is the single source of truth for socket-option policy. The
+    /// resulting socket has `SO_REUSEADDR` + `SO_REUSEPORT` plus — when
+    /// the kernel/device supports them and `busy_poll` requests them —
+    /// the per-core options that let the kernel steer packets and
+    /// busy-poll without softirq wakeups:
+    ///
+    /// - `SO_INCOMING_CPU` — steer packets from the RSS queue owned by
+    ///   `cpu` to this socket. **Conditionally applied**: only set when
+    ///   `features.supports_reuseport_ebpf()` reports the eBPF steering
+    ///   capability as present. Without eBPF, `SO_INCOMING_CPU` causes
+    ///   the kernel to pick sockets by the CPU running the RX softirq,
+    ///   which on loopback (no RSS) varies per packet and silently
+    ///   misroutes packets to workers that do not own the QUIC
+    ///   connection — collapsing multi-worker throughput by ~1000x.
+    /// - `SO_BUSY_POLL` — busy-poll the NIC NAPI struct for
+    ///   `busy_poll.mode.us()` µs before raising a softirq.
+    /// - `SO_PREFER_BUSY_POLL` — pin the socket into busy-poll mode so
+    ///   the softirq path is skipped entirely.
+    ///
+    /// `features` is a snapshot from `kernel_nic::KernelFeatures::detect()`
+    /// taken once at reactor startup; passing it in avoids re-probing the
+    /// kernel on every socket bind. `busy_poll` carries both the mode
+    /// (`Off`/`Static`/`Latency`/`Throughput`/`Adaptive`) and the
+    /// `SO_PREFER_BUSY_POLL` capability flag.
+    ///
+    /// All options are best-effort: `kernel_nic::SocketBuilder` silently
+    /// skips opts that the kernel rejects (loopback has no NAPI struct;
+    /// old kernels lack `SO_PREFER_BUSY_POLL`).
+    pub fn bind_with_reuseport(
+        port: u16,
+        cpu: u32,
+        features: kernel_nic::KernelFeatures,
+        busy_poll: kernel_nic::BusyPollPolicy,
+    ) -> Result<Self, IoError> {
+        let mut spec = kernel_nic::SocketSpec::for_reuseport(port, cpu, /* group_id */ 0);
+        spec.busy_poll_us = busy_poll.mode.us();
+        spec.prefer_busy_poll = busy_poll.should_prefer();
+        // SO_INCOMING_CPU is a kernel hint that on its own steers packets
+        // by the CPU running the RX softirq. On a loopback or
+        // non-RSS-configured NIC, that CPU varies per packet and the
+        // resulting socket pick can land on a worker that does not own
+        // the QUIC connection — silently dropping it. The opt is only
+        // safe when an eBPF `SK_REUSEPORT` program is going to be
+        // attached, because the program routes by QUIC DCID and ignores
+        // `SO_INCOMING_CPU`. Skip the hint when the probe in
+        // `KernelFeatures::detect` reported the capability as missing.
+        if !features.supports_reuseport_ebpf() {
+            spec.incoming_cpu = None;
+        }
+
+        let builder = kernel_nic::SocketBuilder::new(spec, features);
+        let configured = builder.build()?;
+        let fd = configured.into_raw_fd();
+        // SAFETY: `ConfiguredSocket::into_raw_fd` transferred exclusive fd
+        // ownership to us (it `forget`s itself). Wrapping in `OwnedFd`
+        // restores Drop-managed close semantics.
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        let sock = Sock::from(owned);
+        // io_uring requires non-blocking sockets; kernel-nic builds
+        // blocking sockets by default (its own clients may block).
+        sock.set_nonblocking(true).map_err(IoError::Socket)?;
+
+        Ok(Self { sock })
+    }
+
     /// Raw file descriptor for io_uring SQEs.
     #[inline]
     #[must_use]
     pub fn raw_fd(&self) -> RawFd {
-        <Sock as std::os::unix::io::AsRawFd>::as_raw_fd(&self.sock)
+        <Sock as AsRawFd>::as_raw_fd(&self.sock)
     }
 
     /// Returns the bound local address.
@@ -119,52 +159,6 @@ impl std::fmt::Debug for Socket {
     }
 }
 
-/// Applies the per-core socket options (`SO_INCOMING_CPU`, `SO_BUSY_POLL`,
-/// `SO_PREFER_BUSY_POLL`) to `fd`. Best-effort: every failure is logged at
-/// debug level and ignored, matching the kernel-nic policy. Loopback and
-/// older kernels reject these with `EINVAL`/`ENOPROTOOPT`; the socket still
-/// works via the normal softirq path.
-fn apply_per_core_options(fd: RawFd, cpu: u32) {
-    // SO_INCOMING_CPU — steer packets from the RSS queue owned by `cpu`.
-    setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_INCOMING_CPU, cpu as libc::c_int);
-    // SO_BUSY_POLL — busy-poll NAPI for DEFAULT_BUSY_POLL_US µs.
-    setsockopt_int(
-        fd,
-        libc::SOL_SOCKET,
-        libc::SO_BUSY_POLL,
-        DEFAULT_BUSY_POLL_US,
-    );
-    // SO_PREFER_BUSY_POLL — pin the socket into busy-poll mode.
-    setsockopt_int(fd, libc::SOL_UDP, SO_PREFER_BUSY_POLL, 1);
-}
-
-/// Sets an integer socket option. Returns the kernel errno on failure
-/// (caller decides whether to log or propagate). `value` is a raw `c_int`
-/// so callers don't have to cast at every site.
-fn setsockopt_int(fd: RawFd, level: libc::c_int, name: libc::c_int, value: libc::c_int) {
-    // SAFETY: `value` is a valid `c_int` by value; `setsockopt` copies it.
-    // `fd` is a valid open socket owned by the caller.
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            level,
-            name,
-            &value as *const libc::c_int as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
-        let errno = unsafe { *libc::__errno_location() };
-        tracing::debug!(
-            fd,
-            level,
-            opt = name,
-            errno,
-            "setsockopt ignored (unsupported on this kernel/device)"
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,7 +171,9 @@ mod tests {
 
     #[test]
     fn bind_with_reuseport_succeeds() {
-        let sock = Socket::bind_with_reuseport(0, 2).expect("bind");
+        let features = kernel_nic::KernelFeatures::detect().expect("features");
+        let policy = kernel_nic::BusyPollPolicy::new(kernel_nic::BusyPollMode::Off, false);
+        let sock = Socket::bind_with_reuseport(0, 2, features, policy).expect("bind");
         assert!(sock.raw_fd() > 0);
     }
 
@@ -196,5 +192,116 @@ mod tests {
         assert_eq!(recv.raw_fd(), sock.raw_fd());
         assert_eq!(send.raw_fd(), sock.raw_fd());
         assert_eq!(recv.bgid(), 7);
+    }
+
+    // ── Phase 5 verification: getsockopt round-trip ──────────────────
+    //
+    // These tests confirm the kernel actually *accepted* the per-core
+    // socket options (vs silently returning ENOPROTOOPT). Loopback
+    // devices accept the opts but they have no effect (no NAPI struct);
+    // a real NIC is needed to observe busy-poll behaviour. We only
+    // verify kernel acceptance here.
+
+    /// `getsockopt(SOL_SOCKET, SO_BUSY_POLL)` helper. Returns `None` if
+    /// the kernel rejects the option (old kernel / loopback quirk).
+    fn getsockopt_int(fd: RawFd, level: i32, opt: i32) -> Option<libc::c_int> {
+        let mut val: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `val` is a valid c_int by value; getsockopt writes ≤ len.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                level,
+                opt,
+                &mut val as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if rc == 0 { Some(val) } else { None }
+    }
+
+    #[test]
+    fn busy_poll_round_trips_via_getsockopt() {
+        let features = kernel_nic::KernelFeatures::detect().expect("features");
+        if !features.supports_busy_poll() {
+            eprintln!("skipping: SO_BUSY_POLL unsupported on this kernel");
+            return;
+        }
+        let policy =
+            kernel_nic::BusyPollPolicy::new(kernel_nic::BusyPollMode::Latency { us: 50 }, false);
+        let sock = Socket::bind_with_reuseport(0, 0, features, policy).expect("bind");
+        match getsockopt_int(sock.raw_fd(), libc::SOL_SOCKET, libc::SO_BUSY_POLL) {
+            Some(v) => assert_eq!(v, 50, "SO_BUSY_POLL did not round-trip"),
+            None => {
+                eprintln!("skipping assertion: getsockopt(SO_BUSY_POLL) denied (loopback quirk)")
+            }
+        }
+    }
+
+    #[test]
+    fn prefer_busy_poll_round_trips() {
+        // SO_PREFER_BUSY_POLL = 74 (not in all libc versions).
+        const SO_PREFER_BUSY_POLL: libc::c_int = 74;
+        let features = kernel_nic::KernelFeatures::detect().expect("features");
+        if !features.supports_prefer_busy_poll() {
+            eprintln!("skipping: SO_PREFER_BUSY_POLL unsupported on this kernel");
+            return;
+        }
+        let policy =
+            kernel_nic::BusyPollPolicy::new(kernel_nic::BusyPollMode::Latency { us: 50 }, true);
+        let sock = Socket::bind_with_reuseport(0, 0, features, policy).expect("bind");
+        match getsockopt_int(sock.raw_fd(), libc::SOL_UDP, SO_PREFER_BUSY_POLL) {
+            Some(v) => assert_eq!(v, 1, "SO_PREFER_BUSY_POLL did not round-trip"),
+            None => eprintln!("skipping assertion: getsockopt(SO_PREFER_BUSY_POLL) denied"),
+        }
+    }
+
+    #[test]
+    fn incoming_cpu_round_trips() {
+        let features = kernel_nic::KernelFeatures::detect().expect("features");
+        if !features.supports_incoming_cpu() {
+            eprintln!("skipping: SO_INCOMING_CPU unsupported on this kernel");
+            return;
+        }
+        // SO_INCOMING_CPU is only applied when eBPF REUSEPORT steering is
+        // available; otherwise it causes multi-worker misrouting on
+        // loopback. Skip the round-trip assertion when the eBPF
+        // capability is missing (the option is intentionally not set).
+        if !features.supports_reuseport_ebpf() {
+            eprintln!("skipping: SO_INCOMING_CPU intentionally not set (no eBPF capability)");
+            return;
+        }
+        let policy = kernel_nic::BusyPollPolicy::default();
+        let sock = Socket::bind_with_reuseport(0, 0, features, policy).expect("bind");
+        match getsockopt_int(sock.raw_fd(), libc::SOL_SOCKET, libc::SO_INCOMING_CPU) {
+            Some(v) => assert_eq!(v, 0, "SO_INCOMING_CPU did not round-trip"),
+            None => eprintln!("skipping assertion: getsockopt(SO_INCOMING_CPU) denied"),
+        }
+    }
+
+    /// Verifies that when eBPF REUSEPORT steering is unavailable, the
+    /// socket intentionally skips `SO_INCOMING_CPU` to avoid multi-worker
+    /// misrouting on loopback. The opt value defaults to -1 ("unset").
+    #[test]
+    fn no_incoming_cpu_when_ebpf_unavailable() {
+        let features = kernel_nic::KernelFeatures::detect().expect("features");
+        if !features.supports_incoming_cpu() {
+            eprintln!("skipping: SO_INCOMING_CPU unsupported on this kernel");
+            return;
+        }
+        if features.supports_reuseport_ebpf() {
+            eprintln!("skipping: eBPF REUSEPORT capability present (opt IS applied)");
+            return;
+        }
+        let policy = kernel_nic::BusyPollPolicy::default();
+        let sock = Socket::bind_with_reuseport(0, 0, features, policy).expect("bind");
+        match getsockopt_int(sock.raw_fd(), libc::SOL_SOCKET, libc::SO_INCOMING_CPU) {
+            // Kernel default for unset SO_INCOMING_CPU is -1.
+            Some(v) => assert_eq!(
+                v, -1,
+                "SO_INCOMING_CPU should be unset (-1) when eBPF is unavailable, got {v}"
+            ),
+            None => eprintln!("skipping assertion: getsockopt(SO_INCOMING_CPU) denied"),
+        }
     }
 }

@@ -25,7 +25,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
@@ -220,8 +220,43 @@ fn run_benchmark(
             })
             .collect();
 
-        tracing::info!("waiting for handshakes to complete...");
+        tracing::info!(
+            spawned = handles.len(),
+            "waiting for handshakes to complete..."
+        );
+
+        // Watchdog: if handshakes take longer than 30s, dump diagnostics
+        // so the user can see how many workers reached the barrier vs are
+        // still stuck in handshake. Without this the bench hangs silently.
+        let watchdog_shutdown = Arc::new(AtomicBool::new(false));
+        let watchdog_handle = {
+            let ws = Arc::clone(&watchdog_shutdown);
+            thread::spawn(move || {
+                let deadline = Duration::from_secs(30);
+                let poll = Duration::from_millis(100);
+                let start = Instant::now();
+                while !ws.load(Ordering::Relaxed) {
+                    if start.elapsed() >= deadline {
+                        tracing::error!(
+                            elapsed_secs = start.elapsed().as_secs(),
+                            "handshake watchdog fired — barrier did not release in 30s. \
+                             This usually means some worker threads are stuck in \
+                             recv_inbound (server not responding) or socket bind. \
+                             Check: (1) server is running, (2) SO_INCOMING_CPU fix \
+                             applied, (3) ephemeral port range, (4) per-process fd limit."
+                        );
+                        std::process::exit(2);
+                    }
+                    thread::sleep(poll);
+                }
+            })
+        };
+
         barrier.wait();
+        // Disarm watchdog.
+        watchdog_shutdown.store(true, Ordering::Relaxed);
+        let _ = watchdog_handle.join();
+
         tracing::info!("all connections ready — measurement started");
 
         handles

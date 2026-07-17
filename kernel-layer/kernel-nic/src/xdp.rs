@@ -422,7 +422,7 @@ impl XdpRing {
     /// # Errors
     /// Returns [`KernelNicError::InvalidConfig`] if size is invalid.
     pub fn new(ring_type: RingType, size: u32) -> Result<Self, KernelNicError> {
-        if size < MIN_RING_SIZE || size > MAX_RING_SIZE || !size.is_power_of_two() {
+        if !(MIN_RING_SIZE..=MAX_RING_SIZE).contains(&size) || !size.is_power_of_two() {
             return Err(KernelNicError::InvalidConfig(format!(
                 "ring size {size} must be a power of 2 in [{MIN_RING_SIZE}, {MAX_RING_SIZE}]"
             )));
