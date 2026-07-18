@@ -151,8 +151,14 @@ impl Reactor {
         let receiver = socket.receiver(pool.bgid());
         let sender = socket.sender();
 
-        // Build a single iovec spanning the whole backing store so
-        // `SendZc` can reference it by `buf_index`.
+        // Register pool backing store as fixed buffers so `SendZc` can
+        // reference them by `buf_index` without re-validating pointers.
+        //
+        // Non-fatal: the current send path uses `send_blocking`/`send_gso`
+        // (via GsoBatcher), not `send_zc`. If registration fails (e.g.
+        // RLIMIT_MEMLOCK exhaustion on hosts with restrictive limits, or
+        // AppArmor io_uring mediation), we log a warning and continue —
+        // SendZc is disabled but all other paths work normally.
         // SAFETY: `pool`'s backing storage lives as long as the reactor,
         // which outlives the ring registration.
         unsafe {
@@ -170,7 +176,16 @@ impl Reactor {
                 })
                 .collect::<Result<Vec<_>, IoError>>()?;
             if !iovecs.is_empty() {
-                ctx.register_buffers(&iovecs)?;
+                if let Err(e) = ctx.register_buffers(&iovecs) {
+                    tracing::warn!(
+                        core_id,
+                        error = ?e,
+                        buf_count = pool.buf_count(),
+                        "register_buffers failed — SendZc disabled, \
+                         falling back to send_blocking/send_gso. \
+                         Check RLIMIT_MEMLOCK (ulimit -l)."
+                    );
+                }
             }
         }
 
