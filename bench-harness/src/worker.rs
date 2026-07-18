@@ -45,8 +45,17 @@ pub enum BenchMode {
 /// spin loops don't waste wall-clock time, long enough that we don't
 /// burn 100% CPU in a pure busy loop.
 const READ_TIMEOUT: Duration = Duration::from_millis(1);
-/// Give up on the handshake after this many seconds.
-const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
+/// Give up on the handshake after this many seconds. Generous (30s) to
+/// tolerate server-side handshake CPU saturation at high connection
+/// counts — at 1000 conns the server's 16 workers each process ~62
+/// ECDSA P-256 handshakes, and retransmission stacking can push the
+/// slowest clients well past 10s.
+const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
+/// Per-worker stagger delay before sending the Initial packet. Spreads
+/// `N` clients over `N * STAGGER_PER_WORKER` so the server sees a wave
+/// instead of a thundering herd. At 1000 conns × 200µs = 200ms ramp,
+/// giving each worker time to drain Initials between waves.
+const STAGGER_PER_WORKER: Duration = Duration::from_micros(200);
 /// Echo deadline per batch.
 const ECHO_DEADLINE: Duration = Duration::from_secs(5);
 /// Client-initiated bidirectional QUIC stream IDs for the 15 logical streams.
@@ -119,6 +128,14 @@ pub fn worker(
         let local = socket.local_addr().unwrap_or(target);
         let mut config = build_client_config()
             .map_err(|e| WorkerResult::failed(format!("config: {e}"), run_start.elapsed()))?;
+
+        // Stagger handshake start to avoid thundering herd at high conn
+        // counts. Without this, 1000 clients send Initials within ~1ms,
+        // saturating server-side handshake CPU and causing packet loss
+        // that pushes the slowest clients past the deadline.
+        if idx > 0 {
+            std::thread::sleep(STAGGER_PER_WORKER * (idx as u32).min(1024));
+        }
 
         let scid = quiche::ConnectionId::from_vec(gen_scid());
         let mut conn = quiche::connect(Some(sni), &scid, local, target, &mut config)
