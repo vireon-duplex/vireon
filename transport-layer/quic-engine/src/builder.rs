@@ -44,6 +44,8 @@ pub struct QuicEngineBuilder {
     key_path: Option<String>,
     config: QuicConfig,
     pool: Option<BufferPool>,
+    forward_mesh: Option<crate::forward::ForwardMesh>,
+    num_workers: u32,
 }
 
 impl QuicEngineBuilder {
@@ -57,6 +59,8 @@ impl QuicEngineBuilder {
             key_path: None,
             config: QuicConfig::default(),
             pool: None,
+            forward_mesh: None,
+            num_workers: 1,
         }
     }
 
@@ -70,6 +74,8 @@ impl QuicEngineBuilder {
             key_path: None,
             config: preset.to_config(),
             pool: None,
+            forward_mesh: None,
+            num_workers: 1,
         }
     }
 
@@ -83,6 +89,8 @@ impl QuicEngineBuilder {
             key_path: None,
             config,
             pool: None,
+            forward_mesh: None,
+            num_workers: 1,
         }
     }
 
@@ -130,6 +138,24 @@ impl QuicEngineBuilder {
         self
     }
 
+    /// Set the inter-worker forwarding mesh for migration/misroute
+    /// safety. Only set in multi-worker mode; single-worker engines
+    /// leave this unset (`None`).
+    #[must_use]
+    pub fn forward_mesh(mut self, mesh: crate::forward::ForwardMesh) -> Self {
+        self.forward_mesh = Some(mesh);
+        self
+    }
+
+    /// Set the total worker count. Used to bounds-check target
+    /// `reactor_id` when forwarding packets. Defaults to 1
+    /// (single-worker).
+    #[must_use]
+    pub const fn num_workers(mut self, n: u32) -> Self {
+        self.num_workers = n;
+        self
+    }
+
     /// Build the engine. Validates config, constructs the
     /// `quiche::Config` from cert/key paths, and returns the engine.
     ///
@@ -158,13 +184,10 @@ impl QuicEngineBuilder {
         let quiche_config = build_quiche_config(&self.config, &cert_path, &key_path)?;
         let pool = self.pool.unwrap_or_default();
 
-        Ok(QuicEngine::new(
-            self.config,
-            quiche_config,
-            reactor_id,
-            local_addr,
-            pool,
-        ))
+        let mut engine = QuicEngine::new(self.config, quiche_config, reactor_id, local_addr, pool);
+        engine.forward_mesh = self.forward_mesh;
+        engine.num_workers = self.num_workers.max(1);
+        Ok(engine)
     }
 }
 
