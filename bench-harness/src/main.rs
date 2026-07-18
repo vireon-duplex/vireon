@@ -13,6 +13,12 @@
 
 #![allow(clippy::print_stdout)]
 
+// Global allocator: mimalloc replaces glibc malloc to eliminate arena
+// explosion under 1000-thread burst allocation. Per-thread heaps mean
+// no cross-thread contention and efficient memory return to the OS.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod config;
 mod gso;
 mod layers;
@@ -33,6 +39,12 @@ use tracing_subscriber::EnvFilter;
 use stats::{Summary, SweepPoint, WorkerResult, aggregate, print_summary};
 use worker::{BenchMode, worker};
 use workload::Workload;
+
+/// Worker thread stack size. 512 KiB is sufficient for BoringSSL TLS 1.3
+/// handshake (~128 KiB peak) + quiche processing (~32 KiB) + layer stack
+/// (~5 KiB) + tracing (~4 KiB), leaving ~340 KiB headroom. Reduces RSS
+/// by ~1.5 GiB vs default 2 MiB stacks at 1000 connections.
+const WORKER_STACK_SIZE: usize = 512 * 1024;
 
 struct Args {
     target: SocketAddr,
@@ -203,20 +215,23 @@ fn run_benchmark(
 
         let handles: Vec<_> = (0..conns)
             .map(|idx| {
-                s.spawn(move || {
-                    worker(
-                        idx,
-                        target,
-                        sni_ref,
-                        entries_ref,
-                        duration,
-                        mode,
-                        pipeline_depth,
-                        coalesce,
-                        shutdown_ref,
-                        barrier_ref,
-                    )
-                })
+                thread::Builder::new()
+                    .stack_size(WORKER_STACK_SIZE)
+                    .spawn_scoped(s, move || {
+                        worker(
+                            idx,
+                            target,
+                            sni_ref,
+                            entries_ref,
+                            duration,
+                            mode,
+                            pipeline_depth,
+                            coalesce,
+                            shutdown_ref,
+                            barrier_ref,
+                        )
+                    })
+                    .unwrap_or_else(|e| panic!("worker {idx} spawn failed: {e}"))
             })
             .collect();
 
