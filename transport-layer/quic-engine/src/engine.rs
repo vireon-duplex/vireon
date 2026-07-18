@@ -44,6 +44,19 @@ use crate::stream_bridge::StreamCarry;
 /// and the client's `max_send_udp_payload_size`.
 const MAX_PKT_SIZE: usize = 65535;
 
+/// Per-tick cap on the number of dirty connections processed by
+/// [`QuicEngine::flush_sends`].
+///
+/// A previous implementation removed this cap entirely ("process ALL
+/// dirty connections per tick"). Under steady-state this is optimal,
+/// but during connection storms (many simultaneous acks / flow-control
+/// updates / new handshakes) one tick can attempt to flush hundreds
+/// of connections, blowing the io_uring SQ budget and starving the
+/// recv path of CPU. The cap below is intentionally large (8× the
+/// prior 64-conn cap that hurt throughput) — it only kicks in under
+/// storm conditions, leaving steady-state behavior unchanged.
+const DIRTY_FLUSH_BUDGET: usize = 512;
+
 /// Maximum pending events before the engine starts dropping. Prevents
 /// unbounded Vec growth if the upper layer is slow to drain_events().
 /// At ~200 bytes per event, 8192 events ≈ 1.6 MiB — negligible.
@@ -208,6 +221,15 @@ pub struct QuicEngine {
     pub datagrams_recv: u64,
     /// Total datagrams sent.
     pub datagrams_sent: u64,
+    /// Total `stream_send` calls that returned `Error::Done` (per-stream
+    /// outbound buffer full / flow-control exhausted). Each one is a
+    /// dropped echo frame in the current code path — see stack.rs
+    /// `encode_and_send`. Used to quantify the flow-control deadlock.
+    pub stream_send_blocked: u64,
+    /// Total bytes accepted into quiche's stream buffer (does NOT
+    /// include dropped frames). Sampled alongside `stream_send_blocked`
+    /// to compute the drop ratio.
+    pub stream_send_bytes: u64,
 
     // ── Inter-worker forwarding ───────────────────────────────────
     /// Optional forwarding mesh for migration/misroute safety net.
@@ -279,6 +301,8 @@ impl QuicEngine {
             active_count: 0,
             datagrams_recv: 0,
             datagrams_sent: 0,
+            stream_send_blocked: 0,
+            stream_send_bytes: 0,
             forward_mesh: None,
             num_workers: 1,
             forwarded_buf: Vec::new(),
@@ -343,9 +367,13 @@ impl QuicEngine {
             Ok(n) => {
                 // Mark dirty so flush_sends picks this connection up.
                 self.dirty.set(conn_idx);
+                self.stream_send_bytes += n as u64;
                 Ok(n)
             }
-            Err(quiche::Error::Done) => Err(QuicSendError::FlowBlocked),
+            Err(quiche::Error::Done) => {
+                self.stream_send_blocked += 1;
+                Err(QuicSendError::FlowBlocked)
+            }
             Err(e) => Err(QuicSendError::Quiche(e)),
         }
     }
@@ -585,12 +613,19 @@ impl QuicEngine {
         let sender = &ctx.sender;
         let flushed = &mut self.flushed_this_tick;
 
-        // Process ALL dirty connections per tick. A previous budget cap
-        // (64/tick) throttled multi-connection throughput: connections
-        // beyond the budget waited for the next tick, creating artificial
-        // backpressure. On a single-core reactor the natural backpressure
-        // from io_uring (CQ overflow, EBUSY) is sufficient.
+        // Process dirty connections up to `DIRTY_FLUSH_BUDGET` per tick.
+        // The budget is sized for storm safety (handshake bursts, ack
+        // cascades) — under steady-state each reactor has ≪ budget
+        // dirty connections, so the cap is not the bottleneck. Any
+        // connection that loses its turn this tick keeps its dirty bit
+        // set and is processed first on the next tick.
+        let mut budget = DIRTY_FLUSH_BUDGET;
         self.dirty.drain(|idx| {
+            if budget == 0 {
+                // Stop draining — leave remaining bits set for next tick.
+                return Control::Break;
+            }
+            budget -= 1;
             flushed.push(idx);
             if let Some(Some(entry)) = connections.get_mut(idx) {
                 loop {

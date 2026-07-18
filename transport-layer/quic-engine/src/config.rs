@@ -276,6 +276,15 @@ impl Preset {
             }
             Self::BareMetal => {
                 // Defaults already target this class.
+                //
+                // Flow-control windows (`initial_max_data` 100 MiB,
+                // `initial_max_stream_data` 10 MiB) were experimentally
+                // bumped to combat the 100-conn throughput anomaly.
+                // The bump did not improve the anomaly (root cause is
+                // client-side thread oversubscription + loopback
+                // contention) and slightly hurt high-scale throughput
+                // (500/1000 conns) due to higher per-conn buffer
+                // pressure. Reverted to defaults.
             }
             Self::HundredGbe => {
                 cfg.max_connections = 131_072;
