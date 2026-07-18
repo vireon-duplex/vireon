@@ -14,8 +14,13 @@ pub const HIGH_WATERMARK: usize = 128 * 1024;
 /// Threshold below which the reactor lifts backpressure again.
 pub const LOW_WATERMARK: usize = 32 * 1024;
 
-/// Default number of provided buffers per `bgid` (per reactor).
-pub const DEFAULT_BUF_COUNT: u32 = 256;
+/// Default number of provided buffers per `bgid` (per reactor). Sized
+/// for burst tolerance during handshake storms: at 1000 conns across 16
+/// workers, each worker sees ~62 Initials + retransmissions within ~1ms.
+/// 512 buffers × 65600 B = ~32 MiB per worker — acceptable on a 32 GiB
+/// host, and gives 2× headroom over the steady-state ~186 packets/worker
+/// during a full TLS handshake burst.
+pub const DEFAULT_BUF_COUNT: u32 = 512;
 
 /// Default size of each provided buffer. Large enough for max-size
 /// QUIC/UDP datagrams (65507-byte payload) plus the `io_uring_recvmsg_out`
