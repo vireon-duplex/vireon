@@ -10,7 +10,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use io::Reactor;
-use quic_engine::{QuicEngineBuilder, QuicPreset};
+use quic_engine::{ForwardMesh, ForwardedPacket, QuicEngineBuilder, QuicPreset};
 
 use crate::config::ServerConfig;
 use crate::error::ServerError;
@@ -35,6 +35,9 @@ impl Worker {
     pub fn create(
         config: &ServerConfig,
         core_id: u32,
+        num_workers: u32,
+        inbox_rx: mpsc::Receiver<ForwardedPacket>,
+        outboxes: Vec<mpsc::SyncSender<ForwardedPacket>>,
         shutdown_requested: Arc<AtomicBool>,
     ) -> Result<Self, ServerError> {
         tracing::info!(core_id, port = config.port, "initializing reactor");
@@ -78,6 +81,8 @@ impl Worker {
         let numa_node = buffer_pool::numa::current_node();
         tracing::info!(core_id, numa_node = numa_node.0, "buffer pool NUMA node");
 
+        let mesh = ForwardMesh::new(core_id, num_workers, inbox_rx, outboxes);
+
         let engine = QuicEngineBuilder::from_config(config.quic_config.clone())
             .reactor_id(core_id)
             .local_addr(local_addr)
@@ -90,6 +95,8 @@ impl Worker {
                     .build()
                     .expect("pool config is valid"),
             )
+            .forward_mesh(mesh)
+            .num_workers(num_workers)
             .build()
             .map_err(|e| ServerError::EngineInit(format!("{e:?}")))?;
 
@@ -145,6 +152,9 @@ impl Worker {
     pub fn spawn(
         config: ServerConfig,
         core_id: u32,
+        num_workers: u32,
+        inbox_rx: mpsc::Receiver<ForwardedPacket>,
+        outboxes: Vec<mpsc::SyncSender<ForwardedPacket>>,
         shutdown_requested: Arc<AtomicBool>,
     ) -> Result<
         (
@@ -157,7 +167,14 @@ impl Worker {
         let builder = thread::Builder::new().name(format!("vireon-reactor-{core_id}"));
         let handle = builder
             .spawn(move || {
-                let worker = match Worker::create(&config, core_id, shutdown_requested) {
+                let worker = match Worker::create(
+                    &config,
+                    core_id,
+                    num_workers,
+                    inbox_rx,
+                    outboxes,
+                    shutdown_requested,
+                ) {
                     Ok(w) => w,
                     Err(e) => {
                         tracing::error!(core_id, error = %e, "failed to create worker");

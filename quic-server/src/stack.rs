@@ -541,6 +541,32 @@ impl IoHandler for VireonStack {
             );
         }
 
+        // ── Per-worker distribution stats (every 5000 ticks ≈ ~5s) ─
+        // Reports active connection count + forwarded packet metrics so
+        // operators can verify load balance across workers. Non-zero
+        // forwarded_out / forwarded_in indicates migration activity or
+        // kernel-hash misrouting (expected without eBPF steering).
+        if self.tick_count % 5000 == 0 {
+            let reactor_id = self.engine.reactor_id;
+            let active = self.engine.active_connections();
+            if let Some(mesh) = self.engine.forward_mesh() {
+                tracing::info!(
+                    reactor_id,
+                    active_conns = active,
+                    forwarded_out = mesh.forwarded_out,
+                    forwarded_in = mesh.forwarded_in,
+                    forward_drops = mesh.forward_drops,
+                    "[distribution] worker stats"
+                );
+            } else {
+                tracing::info!(
+                    reactor_id,
+                    active_conns = active,
+                    "[distribution] worker stats (single-worker mode)"
+                );
+            }
+        }
+
         // ── Memory-pressure monitoring ─────────────────────────────
         // Two independent pressure signals:
         //   1. Pool-internal: outstanding pool bytes vs pool capacity

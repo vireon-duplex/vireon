@@ -208,6 +208,17 @@ pub struct QuicEngine {
     pub datagrams_recv: u64,
     /// Total datagrams sent.
     pub datagrams_sent: u64,
+
+    // ── Inter-worker forwarding ───────────────────────────────────
+    /// Optional forwarding mesh for migration/misroute safety net.
+    /// `None` when there is only one worker (single-worker mode) or
+    /// when the builder did not configure forwarding.
+    pub forward_mesh: Option<crate::forward::ForwardMesh>,
+    /// Total worker count (for bounds-checking target reactor_id).
+    pub(crate) num_workers: u32,
+    /// Scratch buffer for draining forwarded packets (avoids per-tick
+    /// allocation). Cleared at the start of each `on_tick` drain.
+    forwarded_buf: Vec<crate::forward::ForwardedPacket>,
 }
 
 impl std::fmt::Debug for QuicEngine {
@@ -268,6 +279,9 @@ impl QuicEngine {
             active_count: 0,
             datagrams_recv: 0,
             datagrams_sent: 0,
+            forward_mesh: None,
+            num_workers: 1,
+            forwarded_buf: Vec::new(),
         }
     }
 
@@ -275,6 +289,17 @@ impl QuicEngine {
     #[must_use]
     pub fn active_connections(&self) -> usize {
         self.active_count
+    }
+
+    /// Returns a reference to the forward mesh, if configured.
+    #[must_use]
+    pub fn forward_mesh(&self) -> Option<&crate::forward::ForwardMesh> {
+        self.forward_mesh.as_ref()
+    }
+
+    /// Returns a mutable reference to the forward mesh, if configured.
+    pub fn forward_mesh_mut(&mut self) -> Option<&mut crate::forward::ForwardMesh> {
+        self.forward_mesh.as_mut()
     }
 
     /// Current outstanding bytes in the buffer pool.
@@ -352,8 +377,24 @@ impl QuicEngine {
             if let Some(idx) = self.accept_new(&dcid_key[..dcid_len], peer) {
                 self.feed_existing(idx, data, len, peer);
             }
+        } else if !is_initial && dcid_len >= 4 {
+            // Non-Initial from unknown DCID → check if the DCID encodes a
+            // different reactor_id (server SCID has reactor_id in bytes
+            // 0-3). If so, forward to the owning worker. This handles
+            // connection migration: when a client's 4-tuple changes, the
+            // kernel hash routes packets to the wrong worker. Without
+            // forwarding, these packets are silently dropped.
+            if let Some(mesh) = &mut self.forward_mesh {
+                let target =
+                    u32::from_le_bytes([dcid_key[0], dcid_key[1], dcid_key[2], dcid_key[3]]);
+                if target != self.reactor_id && target < self.num_workers {
+                    mesh.try_forward(target, &data[..len], peer);
+                    return;
+                }
+            }
         }
-        // Non-Initial from unknown DCID → drop (stateless reset or garbage).
+        // Non-Initial from unknown DCID with no matching reactor → drop
+        // (stateless reset, garbage, or connection already closed).
     }
 
     /// Feeds a packet to an existing connection.
@@ -678,6 +719,25 @@ impl IoHandler for QuicEngine {
     }
 
     fn on_tick(&mut self, ctx: &mut TickContext) {
+        // Drain forwarded packets first — they may generate ACKs or
+        // application data that flush_sends should include in this tick.
+        if self.forward_mesh.is_some() {
+            self.forwarded_buf.clear();
+            if let Some(mesh) = &mut self.forward_mesh {
+                mesh.drain_into(&mut self.forwarded_buf);
+            }
+            // Process each forwarded packet. Borrow checker: we borrow
+            // forwarded_buf mutably to drain it, then borrow self mutably
+            // for process_datagram — disjoint because forwarded_buf is
+            // emptied before process_datagraph runs.
+            while let Some(pkt) = self.forwarded_buf.pop() {
+                let len = pkt.data.len();
+                // SAFETY: we own the Box; the slice is valid for the call.
+                let mut data = pkt.data;
+                self.process_datagram(&mut data[..len], pkt.peer);
+            }
+        }
+
         self.flush_sends(ctx);
         self.cleanup_closed();
         // No blanket clear: flush_sends already cleared every bit it
