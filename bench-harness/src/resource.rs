@@ -102,10 +102,10 @@ pub fn rss_kib() -> u64 {
 /// No-op on non-glibc allocators (returns `false`).
 #[allow(unused_variables)]
 pub fn malloc_trim() {
-    #[cfg(target_env = "gnu")]
-    unsafe {
-        libc::malloc_trim(0);
-    }
+    // mimalloc returns freed memory to the OS automatically via its
+    // internal deferred-free mechanism. Forcing mi_collect between sweep
+    // steps was tested and actually INCREASES RSS because it causes
+    // re-allocation overhead in the next step.
 }
 
 #[cfg(test)]
