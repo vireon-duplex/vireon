@@ -22,6 +22,7 @@
 //! The reactor (io-layer) drives the event loop and calls
 //! `IoHandler::on_datagram` / `IoHandler::on_tick` on this struct.
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -30,7 +31,7 @@ use std::time::{Duration, Instant};
 use buffer_pool::Buffer;
 use frame::codec::{self, FrameHeader, FrameRef};
 use io::handler::{IoHandler, TickContext};
-use quic_engine::{QuicEngine, QuicEvent};
+use quic_engine::{QuicEngine, QuicEvent, QuicSendError};
 
 use crate::connection::{ConnState, ConnectionRegistry};
 use crate::error::ServerError;
@@ -40,6 +41,43 @@ use crate::layers::{ApplicationLayer, FrameContext, RuntimeLayer};
 /// before forcing reactor exit. 2 seconds covers 3 × PTO (Probe Timeout)
 /// for typical RTTs and retransmitted CONNECTION_CLOSE.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+// ── FlowBlocked retry queue ─────────────────────────────────────────
+//
+// When `engine.send_stream` returns `FlowBlocked`, the per-stream outbound
+// buffer is full (peer hasn't acked enough to free credit). Previously
+// the server silently dropped the frame, which (under sustained load)
+// starves the peer of ACKs and creates a flow-control deadlock: the
+// client never receives the echo, never advances its `MAX_STREAM_DATA`
+// credit, and the outbound buffer never drains.
+//
+// The retry queue holds blocked frames for one or more subsequent ticks,
+// giving the peer time to ACK and recharge flow-control credit. Caps:
+//
+//   * `RETRY_QUEUE_CAP`     — max entries (prevents unbounded growth)
+//   * `RETRY_MAX_ATTEMPTS`  — per-frame retry budget (then drop)
+//   * `RETRY_BYTE_CAP`      — total bytes bound (prevents OOM under
+//                              conn storms where every conn is blocked)
+//
+// Drops are accounted in `retry_drops` and surfaced in the periodic
+// `[distribution]` log so operators can spot chronic flow-control
+// starvation (a sign that `initial_max_stream_data` is too small for
+// the workload).
+const RETRY_QUEUE_CAP: usize = 1024;
+const RETRY_MAX_ATTEMPTS: u8 = 4;
+const RETRY_BYTE_CAP: usize = 64 * 1024 * 1024; // 64 MiB
+
+/// A frame pending retry after `QuicSendError::FlowBlocked`.
+///
+/// Owns the wire-encoded bytes (header + payload + CRC) so the encode
+/// work is not redone on each retry.
+#[derive(Debug)]
+struct PendingSend {
+    conn_idx: usize,
+    quic_stream_id: u64,
+    data: Vec<u8>,
+    attempts: u8,
+}
 
 /// The full multi-layer stack — owns the application chain, the
 /// runtime infrastructure, the QUIC engine, and the cross-layer
@@ -84,6 +122,17 @@ pub struct VireonStack {
     // ── Benchmark mode ───────────────────────────────────────────
     /// When true, echo every received frame back on the same stream.
     echo: bool,
+
+    // ── FlowBlocked retry queue ─────────────────────────────────
+    /// Frames waiting to be retried after `QuicSendError::FlowBlocked`.
+    /// Drained once per `on_tick` BEFORE `flush_sends` so retried sends
+    /// get picked up in the same tick's flush.
+    retry_queue: VecDeque<PendingSend>,
+    /// Total bytes currently held in `retry_queue` (for `RETRY_BYTE_CAP`).
+    retry_bytes: usize,
+    /// Frames dropped after exhausting `RETRY_MAX_ATTEMPTS` or hitting a
+    /// cap. Surfaced in the periodic `[distribution]` log.
+    retry_drops: u64,
 
     // ── Graceful shutdown ────────────────────────────────────────
     /// Set by the signal handler to request graceful shutdown.
@@ -166,6 +215,9 @@ impl VireonStack {
             eviction_cooldown: None,
             eviction_config: crate::eviction::EvictionConfig::default(),
             echo,
+            retry_queue: VecDeque::with_capacity(64),
+            retry_bytes: 0,
+            retry_drops: 0,
             shutdown_requested,
             reactor_stop: None,
             shutdown_state: ShutdownState::Running,
@@ -365,8 +417,10 @@ impl VireonStack {
     /// QUIC engine.
     ///
     /// Uses `set_len` instead of `resize` to avoid zeroing bytes that
-    /// `encode_into_slice` will immediately overwrite. Send failures
-    /// (flow-control blocked, unknown connection) are logged at debug.
+    /// `encode_into_slice` will immediately overwrite. On
+    /// [`QuicSendError::FlowBlocked`] the frame is enqueued on
+    /// `retry_queue` (subject to caps) and retried on subsequent ticks;
+    /// other errors are logged at debug.
     fn encode_and_send(
         &mut self,
         conn_idx: usize,
@@ -384,18 +438,36 @@ impl VireonStack {
         unsafe { self.send_scratch.set_len(wire_size) };
         match codec::encode_into_slice(&mut self.send_scratch, header, payload) {
             Ok(n) => {
-                if let Err(e) = self.engine.send_stream(
+                let outcome = self.engine.send_stream(
                     conn_idx,
                     quic_stream_id,
                     &self.send_scratch[..n],
                     false,
-                ) {
-                    tracing::debug!(
-                        conn_idx,
-                        quic_stream_id,
-                        error = ?e,
-                        "send_stream failed"
-                    );
+                );
+                match outcome {
+                    Ok(_) => {}
+                    Err(QuicSendError::FlowBlocked) => {
+                        // Per-stream outbound buffer full: peer hasn't
+                        // acked enough to free credit. Enqueue for retry
+                        // on a subsequent tick instead of dropping, so
+                        // the peer eventually receives the data and
+                        // recharges flow-control credit. Caps prevent
+                        // unbounded growth under chronic starvation.
+                        //
+                        // Clone out of `send_scratch` before enqueuing:
+                        // `enqueue_retry` takes `&mut self` and cannot
+                        // borrow the slice from `self.send_scratch`.
+                        let data = self.send_scratch[..n].to_vec();
+                        self.enqueue_retry_owned(conn_idx, quic_stream_id, data);
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            conn_idx,
+                            quic_stream_id,
+                            error = ?e,
+                            "send_stream failed"
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -407,6 +479,94 @@ impl VireonStack {
 
     fn on_stream_finished(&mut self, conn_idx: usize, stream_id: u64) {
         tracing::trace!(conn_idx, stream_id, "QUIC stream FIN");
+    }
+
+    // ── FlowBlocked retry queue ──────────────────────────────────
+
+    /// Enqueues an owned frame for retry, respecting caps.
+    ///
+    /// If the queue or byte cap is reached, the oldest entries are
+    /// dropped first (FIFO eviction) — under chronic flow-control
+    /// starvation, this means stalled streams lose their place in line
+    /// so freshly-blocked frames from healthier streams can still make
+    /// progress.
+    fn enqueue_retry_owned(&mut self, conn_idx: usize, quic_stream_id: u64, data: Vec<u8>) {
+        // Evict from the front until both caps are satisfied.
+        while self.retry_queue.len() >= RETRY_QUEUE_CAP
+            || self.retry_bytes + data.len() > RETRY_BYTE_CAP
+        {
+            match self.retry_queue.pop_front() {
+                Some(p) => self.retry_bytes -= p.data.len(),
+                None => break, // len cap satisfied, byte cap cannot be exceeded
+            }
+            self.retry_drops += 1;
+        }
+        self.retry_bytes += data.len();
+        self.retry_queue.push_back(PendingSend {
+            conn_idx,
+            quic_stream_id,
+            data,
+            attempts: 0,
+        });
+    }
+
+    /// Drains the retry queue, re-attempting each pending send.
+    ///
+    /// Called once per `on_tick` before `flush_sends`. Entries that
+    /// succeed are dropped; entries that are still `FlowBlocked` are
+    /// re-enqueued with an incremented attempt counter. Entries that
+    /// exhaust `RETRY_MAX_ATTEMPTS` (or hit a non-retryable error) are
+    /// dropped and counted in `retry_drops`.
+    fn drain_retry_queue(&mut self) {
+        if self.retry_queue.is_empty() {
+            return;
+        }
+        // Drain into a local vec to avoid borrow conflicts while we
+        // call `engine.send_stream` (which takes &mut self).
+        let pending: Vec<_> = self.retry_queue.drain(..).collect();
+        let pending_bytes_start = self.retry_bytes;
+        self.retry_bytes = 0;
+        let mut still_blocked = 0u32;
+        let mut succeeded = 0u32;
+        let mut dropped = 0u32;
+
+        for mut p in pending {
+            match self
+                .engine
+                .send_stream(p.conn_idx, p.quic_stream_id, &p.data, false)
+            {
+                Ok(_) => {
+                    succeeded += 1;
+                }
+                Err(QuicSendError::FlowBlocked) => {
+                    p.attempts += 1;
+                    if p.attempts >= RETRY_MAX_ATTEMPTS {
+                        dropped += 1;
+                    } else {
+                        self.retry_bytes += p.data.len();
+                        self.retry_queue.push_back(p);
+                        still_blocked += 1;
+                    }
+                }
+                Err(_) => {
+                    // Unknown connection or quiche error — drop silently.
+                    dropped += 1;
+                }
+            }
+        }
+
+        let _ = pending_bytes_start; // accounting: bytes already reset above
+        self.retry_drops += u64::from(dropped);
+        if succeeded > 0 || still_blocked > 0 || dropped > 0 {
+            tracing::trace!(
+                succeeded,
+                still_blocked,
+                dropped,
+                queue_len = self.retry_queue.len(),
+                queue_bytes = self.retry_bytes,
+                "retry queue drain"
+            );
+        }
     }
 
     // ── Idle-timeout reaping ──────────────────────────────────────
@@ -526,6 +686,13 @@ impl IoHandler for VireonStack {
     fn on_tick(&mut self, ctx: &mut TickContext) {
         self.tick_count = self.tick_count.wrapping_add(1);
 
+        // ── Retry flow-control-blocked sends BEFORE the engine tick ─
+        // Draining first lets successfully-retried frames ride the
+        // same tick's `engine.on_tick` → `flush_sends`, so a recovered
+        // stream re-enters the dirty bitset and emits packets without
+        // waiting an extra tick.
+        self.drain_retry_queue();
+
         // ── Periodic observability (every 1000 ticks ≈ ~1s) ────────
         if self.tick_count % 1000 == 0 && !self.connections.is_empty() {
             let sq_stats = self.runtime.send_queue_stats();
@@ -546,9 +713,16 @@ impl IoHandler for VireonStack {
         // operators can verify load balance across workers. Non-zero
         // forwarded_out / forwarded_in indicates migration activity or
         // kernel-hash misrouting (expected without eBPF steering).
+        // Also surfaces stream_send FlowBlocked counts to quantify the
+        // flow-control deadlock pattern (see encode_and_send drops).
         if self.tick_count % 5000 == 0 {
             let reactor_id = self.engine.reactor_id;
             let active = self.engine.active_connections();
+            let blocked = self.engine.stream_send_blocked;
+            let send_bytes = self.engine.stream_send_bytes;
+            let retry_len = self.retry_queue.len();
+            let retry_bytes = self.retry_bytes;
+            let retry_drops = self.retry_drops;
             if let Some(mesh) = self.engine.forward_mesh() {
                 tracing::info!(
                     reactor_id,
@@ -556,12 +730,22 @@ impl IoHandler for VireonStack {
                     forwarded_out = mesh.forwarded_out,
                     forwarded_in = mesh.forwarded_in,
                     forward_drops = mesh.forward_drops,
+                    stream_send_blocked = blocked,
+                    stream_send_bytes = send_bytes,
+                    retry_queue_len = retry_len,
+                    retry_queue_bytes = retry_bytes,
+                    retry_drops,
                     "[distribution] worker stats"
                 );
             } else {
                 tracing::info!(
                     reactor_id,
                     active_conns = active,
+                    stream_send_blocked = blocked,
+                    stream_send_bytes = send_bytes,
+                    retry_queue_len = retry_len,
+                    retry_queue_bytes = retry_bytes,
+                    retry_drops,
                     "[distribution] worker stats (single-worker mode)"
                 );
             }
