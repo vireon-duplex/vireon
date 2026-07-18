@@ -51,7 +51,17 @@ impl QuicServer {
 
     fn run_single(&self) -> Result<(), ServerError> {
         let shutdown_requested = Arc::new(AtomicBool::new(false));
-        let worker = Worker::create(&self.config, 0, shutdown_requested.clone())?;
+        // Single-worker mode: create a dummy mesh (never used — no other
+        // workers to forward to or receive from).
+        let (dummy_tx, dummy_rx) = std::sync::mpsc::sync_channel::<quic_engine::ForwardedPacket>(1);
+        let worker = Worker::create(
+            &self.config,
+            0,
+            1,
+            dummy_rx,
+            vec![dummy_tx],
+            shutdown_requested.clone(),
+        )?;
         install_signal_handler(shutdown_requested)?;
 
         tracing::info!("starting single-worker server (core 0)");
@@ -67,12 +77,27 @@ impl QuicServer {
         // One shared shutdown flag for all workers + signal handler.
         let shutdown_requested = Arc::new(AtomicBool::new(false));
 
+        // Build the inter-worker forwarding mesh. Each worker gets one
+        // inbox receiver + the shared sender vector. The mesh provides a
+        // migration safety net: when eBPF REUSEPORT steering is
+        // unavailable, the kernel hash may route a migrated client's
+        // packets to the wrong worker. That worker reads the target
+        // reactor_id from DCID[0..4] and forwards the packet.
+        let mesh_channels = quic_engine::ForwardMesh::build_channels(num_workers as u32);
+
         let mut handles = Vec::with_capacity(num_workers);
         let mut stop_rx_list = Vec::with_capacity(num_workers);
 
-        for core_id in 0..num_workers as u32 {
-            let (handle, stop_rx) =
-                Worker::spawn(self.config.clone(), core_id, shutdown_requested.clone())?;
+        for (core_id, (inbox_rx, outboxes)) in mesh_channels.into_iter().enumerate() {
+            let core_id = core_id as u32;
+            let (handle, stop_rx) = Worker::spawn(
+                self.config.clone(),
+                core_id,
+                num_workers as u32,
+                inbox_rx,
+                outboxes,
+                shutdown_requested.clone(),
+            )?;
             handles.push(handle);
             stop_rx_list.push(stop_rx);
         }
@@ -114,7 +139,12 @@ impl QuicServer {
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        "eBPF steering attach failed — falling back to kernel default hash"
+                        "eBPF REUSEPORT steering unavailable. Connection distribution uses \
+                         kernel (src_ip,src_port) hash — uniform but no migration support. \
+                         Inter-worker forwarding mesh is ACTIVE as migration safety net. \
+                         To enable optimal DCID-based routing: \
+                         sudo setcap cap_bpf,cap_net_admin+ep \
+                         ./target/x86_64-unknown-linux-gnu/release/quic-server"
                     );
                 }
             }
