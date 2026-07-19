@@ -16,8 +16,6 @@
 //! answers the question "given a `Seq` and a payload, what should the
 //! receiver do with it?".
 
-use std::collections::BTreeSet;
-
 use frame::header::Seq;
 use rustc_hash::FxHashMap;
 
@@ -317,37 +315,131 @@ impl ReliableOrderedState {
 
 /// State for [`DeliveryPolicy::ReliableUnordered`].
 ///
-/// Holds a sliding window of recently-delivered `Seq`s for dedup. The
-/// window is bounded by [`MAX_DEDUP_SET`]; when full, the smallest entry
-/// is evicted, which may allow a very late duplicate to slip through.
-/// This is accepted behaviour: unbounded growth would be a DoS vector.
+/// Holds a sliding-window bitmap of recently-delivered `Seq`s for dedup.
+/// The window covers exactly [`MAX_DEDUP_SET`] seqs starting from `base`;
+/// each seq occupies one bit. Test/set/clear are O(1) — a single word
+/// fetch + bit op.
+///
+/// When a seq arrives beyond the current window, the bitmap slides
+/// forward (in word-sized chunks) so the new seq maps to the last bit.
+/// Bits that fall off the bottom of the window are zeroed. As with the
+/// old `BTreeSet` design, a very late duplicate may slip through once
+/// its bit has been cleared — accepted behaviour, since unbounded
+/// growth would be a DoS vector.
+///
+/// Storage cost: 4096 bits = 512 bytes per ReliableUnordered stream
+/// (was ~32 bytes per entry × up to 4096 entries = up to 128 KiB for
+/// the `BTreeSet`). The per-stream cost is therefore higher for sparse
+/// windows but bounded and allocation-free.
 #[derive(Debug)]
 pub struct ReliableUnorderedState {
-    seen: BTreeSet<Seq>,
+    /// Fixed-size bit array. Bit `i` represents seq `base + i`.
+    words: [u64; MAX_DEDUP_SET / 64],
+    /// The seq at bit 0. Meaningful only after the first frame.
+    base: Seq,
+    initialized: bool,
 }
 
 impl ReliableUnorderedState {
     #[must_use]
     fn new() -> Self {
         Self {
-            seen: BTreeSet::new(),
+            words: [0; MAX_DEDUP_SET / 64],
+            base: Seq::ZERO,
+            initialized: false,
         }
     }
 
     fn apply(&mut self, seq: Seq, payload: FramePayload) -> Decision {
-        if self.seen.contains(&seq) {
+        if !self.initialized {
+            self.base = seq;
+            self.initialized = true;
+            self.set_bit(0);
+            return Decision::Deliver(payload);
+        }
+
+        // Seq below the window: the BTreeSet version would have evicted
+        // it by now, so treat as not-seen and deliver. (We do NOT try to
+        // extend the window backward — that would require clearing the
+        // whole bitmap.)
+        let offset = match seq.0.checked_sub(self.base.0) {
+            None => return Decision::Deliver(payload),
+            Some(o) => o as usize,
+        };
+
+        // Seq beyond the window: slide forward so it fits at the last bit.
+        if offset >= MAX_DEDUP_SET {
+            self.slide_window_to_fit(seq);
+        }
+
+        let offset = (seq.0 - self.base.0) as usize;
+        if self.test_bit(offset) {
             Decision::Drop
         } else {
-            // Insert; if at cap, evict the smallest first.
-            if self.seen.len() >= MAX_DEDUP_SET {
-                if let Some(&smallest) = self.seen.first() {
-                    if smallest < seq {
-                        self.seen.remove(&smallest);
-                    }
+            self.set_bit(offset);
+            Decision::Deliver(payload)
+        }
+    }
+
+    /// Advance `base` so that `seq` maps to the last bit of the window,
+    /// shifting the bitmap left and zeroing bits that fell off.
+    fn slide_window_to_fit(&mut self, seq: Seq) {
+        let new_base = Seq(seq.0 - (MAX_DEDUP_SET as u64 - 1));
+        let shift = (new_base.0 - self.base.0) as usize;
+
+        if shift >= MAX_DEDUP_SET {
+            // Whole window replaced — clear everything.
+            self.words.fill(0);
+        } else {
+            // Shift bits left by `shift`: bit[i + shift] in the old
+            // layout becomes bit[i] in the new layout. Done in two
+            // passes (whole-word then sub-word) so each pass is a
+            // simple forward scan reading only unmodified cells.
+            let word_shift = shift / 64;
+            let bit_shift = shift % 64;
+
+            if word_shift > 0 {
+                for i in 0..MAX_DEDUP_SET / 64 {
+                    self.words[i] = if i + word_shift < MAX_DEDUP_SET / 64 {
+                        self.words[i + word_shift]
+                    } else {
+                        0
+                    };
                 }
             }
-            self.seen.insert(seq);
-            Decision::Deliver(payload)
+
+            if bit_shift > 0 {
+                let words_len = MAX_DEDUP_SET / 64;
+                for i in 0..words_len {
+                    let high = if i + 1 < words_len {
+                        self.words[i + 1]
+                    } else {
+                        0
+                    };
+                    self.words[i] = (self.words[i] >> bit_shift) | (high << (64 - bit_shift));
+                }
+            }
+        }
+
+        self.base = new_base;
+    }
+
+    #[inline]
+    fn test_bit(&self, offset: usize) -> bool {
+        let word = offset / 64;
+        let bit = offset % 64;
+        if word >= MAX_DEDUP_SET / 64 {
+            return false;
+        }
+        self.words[word] & (1u64 << bit) != 0
+    }
+
+    #[inline]
+    fn set_bit(&mut self, offset: usize) {
+        let word = offset / 64;
+        let bit = offset % 64;
+        if word < MAX_DEDUP_SET / 64 {
+            self.words[word] |= 1u64 << bit;
         }
     }
 }
