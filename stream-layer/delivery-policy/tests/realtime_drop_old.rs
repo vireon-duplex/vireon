@@ -13,6 +13,7 @@ fn p(b: u8) -> FramePayload {
     FramePayload::new(
         MessageType::TextToken,
         FrameFlags::NONE,
+        0,
         Bytes::from(vec![b]),
     )
 }

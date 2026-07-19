@@ -14,6 +14,7 @@ pub fn payload(len: usize) -> FramePayload {
     FramePayload::new(
         MessageType::TextToken,
         FrameFlags::NONE,
+        0,
         Bytes::from(vec![0u8; len]),
     )
 }
