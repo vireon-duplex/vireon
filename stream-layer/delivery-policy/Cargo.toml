@@ -15,5 +15,20 @@ tracing    = { workspace = true }
 rustc-hash = { workspace = true }
 frame      = { path = "../../message-layer/frame" }
 
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "apply"
+harness = false
+
+[[bench]]
+name = "drain"
+harness = false
+
+[[bench]]
+name = "bind"
+harness = false
+
 [lints]
 workspace = true

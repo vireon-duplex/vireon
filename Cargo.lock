@@ -447,7 +447,6 @@ name = "delivery-policy"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "criterion",
  "frame",
  "rustc-hash",
  "thiserror 2.0.18",
