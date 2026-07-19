@@ -1,0 +1,18 @@
+[package]
+name = "topic-acl"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+autobenches = false
+description = "Topic-pattern based access control for Vireon pub/sub."
+
+[dependencies]
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+rustc-hash  = { workspace = true }
+auth-framework = { path = "../auth-framework" }
+
+[lints]
+workspace = true
