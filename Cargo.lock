@@ -342,6 +342,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "consumer-groups"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "rustc-hash",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "cqe-processor"
 version = "0.1.0"
 dependencies = [
