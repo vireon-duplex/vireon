@@ -16,9 +16,10 @@
 //! answers the question "given a `Seq` and a payload, what should the
 //! receiver do with it?".
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use frame::header::Seq;
+use rustc_hash::FxHashMap;
 
 use crate::decision::{Decision, FramePayload};
 use crate::policy::DeliveryPolicy;
@@ -151,6 +152,14 @@ impl PerStreamState {
 /// [`Decision::Deliver`]. The engine then calls `drain_ready` (typically
 /// at the end of the decode batch) to flush any frames that became
 /// deliverable as a result of the cursor advancing.
+///
+/// `reorder` is an `FxHashMap` rather than a `BTreeMap`: insert / lookup
+/// are O(1) average instead of O(log n), and drain walks forward by
+/// keyed remove starting at `last_delivered.next()` — that loop is also
+/// O(1) per delivered frame. The cost is finding the smallest seq on
+/// overflow eviction; that's mitigated by caching `min_buffered` so the
+/// O(window) scan only runs when the cache is invalidated (after an
+/// eviction or a drain that consumed the current min).
 #[derive(Debug)]
 pub struct ReliableOrderedState {
     /// The highest contiguous `Seq` delivered so far. `None` until the
@@ -158,8 +167,13 @@ pub struct ReliableOrderedState {
     /// and the next expected `Seq` is `last_delivered.next()`.
     last_delivered: Option<Seq>,
     /// Out-of-order frames held until their predecessors arrive, keyed
-    /// and sorted by `Seq`. Bounded by [`MAX_REORDER_WINDOW`].
-    reorder: BTreeMap<Seq, FramePayload>,
+    /// by `Seq`. Bounded by [`MAX_REORDER_WINDOW`].
+    reorder: FxHashMap<Seq, FramePayload>,
+    /// Cached smallest `Seq` currently in `reorder`, or `None` when the
+    /// map is empty *or* the cache has been invalidated. The invariant
+    /// is: if `Some(s)`, then `s` is in `reorder` and no smaller key is.
+    /// `None` is treated as "unknown — recompute on next eviction".
+    min_buffered: Option<Seq>,
 }
 
 impl ReliableOrderedState {
@@ -167,7 +181,8 @@ impl ReliableOrderedState {
     fn new() -> Self {
         Self {
             last_delivered: None,
-            reorder: BTreeMap::new(),
+            reorder: FxHashMap::default(),
+            min_buffered: None,
         }
     }
 
@@ -202,15 +217,22 @@ impl ReliableOrderedState {
     /// the newer payload.
     fn insert_bounded(&mut self, seq: Seq, payload: FramePayload) -> Decision {
         if self.reorder.len() >= MAX_REORDER_WINDOW {
+            // Cache may be stale (None) after a prior eviction or drain.
+            // Recompute on demand — the steady state skips this entirely.
+            if self.min_buffered.is_none() && !self.reorder.is_empty() {
+                self.min_buffered = self.reorder.keys().min().copied();
+            }
             // Evict the smallest entry to make room — but only if the
             // incoming seq is greater than the smallest (otherwise we'd
             // evict to make room for an even-older frame, which is
             // senseless).
-            if let Some(&smallest) = self.reorder.keys().next() {
-                if smallest < seq {
-                    self.reorder.remove(&smallest);
+            if let Some(s) = self.min_buffered {
+                if s < seq {
+                    self.reorder.remove(&s);
+                    // Invalidate the cache; the next overflow will recompute.
+                    self.min_buffered = None;
                     tracing::warn!(
-                        evicted_seq = smallest.get(),
+                        evicted_seq = s.get(),
                         new_seq = seq.get(),
                         window = self.reorder.len(),
                         max = MAX_REORDER_WINDOW,
@@ -220,7 +242,14 @@ impl ReliableOrderedState {
             }
         }
         match self.reorder.insert(seq, payload) {
-            None => Decision::Buffer,
+            None => {
+                // Update min cache on insert — single comparison, cheaper
+                // than recomputing later.
+                if self.min_buffered.map_or(true, |m| seq < m) {
+                    self.min_buffered = Some(seq);
+                }
+                Decision::Buffer
+            }
             // Already present — duplicate. Preserve the existing entry,
             // drop the new payload.
             Some(prev) => {
@@ -238,13 +267,17 @@ impl ReliableOrderedState {
         let Some(mut cursor) = self.last_delivered else {
             return;
         };
-        // Walk forward through the reorder map emitting contiguous seqs.
-        // BTreeMap iteration is ascending, so this is O(k) where k is the
-        // number of frames that became deliverable.
+        // Walk forward emitting contiguous seqs. Each iteration is an
+        // O(1) keyed remove — total cost is O(k) where k is the number
+        // of frames that became deliverable.
+        let mut drained_min = false;
         loop {
             let want = cursor.next();
             match self.reorder.remove_entry(&want) {
                 Some((s, p)) => {
+                    if self.min_buffered == Some(s) {
+                        drained_min = true;
+                    }
                     out.push((s, p));
                     cursor = s;
                 }
@@ -252,16 +285,29 @@ impl ReliableOrderedState {
             }
         }
         self.last_delivered = Some(cursor);
+        if drained_min {
+            // The cached min was consumed; invalidate so the next
+            // overflow-triggered eviction recomputes.
+            self.min_buffered = self.reorder.keys().min().copied();
+        }
     }
 
     fn flush_all(&mut self, out: &mut Vec<(Seq, FramePayload)>) {
         // Emit every buffered frame in ascending Seq order, regardless
         // of gap state. Used during policy upgrade so no in-flight data
         // is silently lost when the table swaps state.
+        //
+        // FxHashMap doesn't iterate in key order, so we collect + sort.
+        // This is O(k log k) for k buffered frames — rare (only on
+        // upgrade) so the sort cost is acceptable.
         let taken = std::mem::take(&mut self.reorder);
-        for (s, p) in taken {
-            out.push((s, p));
+        self.min_buffered = None;
+        if taken.is_empty() {
+            return;
         }
+        let mut sorted: Vec<(Seq, FramePayload)> = taken.into_iter().collect();
+        sorted.sort_by_key(|(s, _)| s.get());
+        out.extend(sorted);
     }
 }
 

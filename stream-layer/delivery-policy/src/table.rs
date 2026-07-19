@@ -199,16 +199,15 @@ impl DeliveryPolicyTable {
             .or_insert_with(|| PerStreamState::new(DeliveryPolicy::ReliableOrdered));
         let decision = state.apply(seq, payload);
 
-        // Maintain the dirty index. is_dirty() is a single-branch match
-        // against the enum — cheaper than letting drain_ready later walk
-        // every stream in the table just to discover there's nothing to do.
+        // Maintain the dirty index. `apply` can only transition a stream
+        // false → true (it never clears the reorder window or pending
+        // slot), so we skip the symmetric remove here — stale markers
+        // are cleaned by `drain_ready_for_connection`, `bind` (which
+        // flushes), and `remove_stream` / `remove_connection`. Skipping
+        // the remove avoids a per-apply hash lookup on the never-dirty
+        // policies (ReliableUnordered / RealtimeDropOld).
         if state.is_dirty() {
             self.dirty.insert(key);
-        } else {
-            // drain_ready may have run inside apply? No — but be safe.
-            // If apply drained everything (e.g. contiguous gap-fill left
-            // the reorder window empty), clear the marker.
-            self.dirty.remove(&key);
         }
 
         decision
