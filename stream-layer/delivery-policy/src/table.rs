@@ -136,6 +136,12 @@ impl DeliveryPolicyTable {
     /// If no `StreamOpen` has been seen yet for `(conn_idx, stream_id)`,
     /// the stream is lazy-inserted as `ReliableOrdered` (the only policy
     /// that never drops) with a one-shot `WARN` per stream.
+    ///
+    /// If the table is at [`MAX_TRACKED_STREAMS`] and this is a brand-new
+    /// stream, the frame is dropped silently with a per-table `WARN`. This
+    /// bounds both `entries` and `warned_default` and closes the lazy-default
+    /// DoS vector (an attacker flooding data frames with arbitrary stream
+    /// ids cannot exhaust memory).
     #[inline]
     pub fn apply(
         &mut self,
@@ -149,13 +155,29 @@ impl DeliveryPolicyTable {
         // Lazy-default path: check & warn OUTSIDE the entry() borrow to
         // avoid overlapping mutable borrows of `self`.
         let needs_default = !self.entries.contains_key(&key);
-        if needs_default && self.warned_default.insert(key) {
-            tracing::warn!(
-                conn_idx,
-                stream_id = stream_id.get(),
-                seq = seq.get(),
-                "data frame arrived before StreamOpen — defaulting to ReliableOrdered"
-            );
+        if needs_default {
+            // Bound both `entries` and `warned_default` — the lazy-default
+            // path is reachable without a `StreamOpen`, so an attacker can
+            // drive it directly. The cap matches `bind`'s contract.
+            if self.entries.len() >= MAX_TRACKED_STREAMS {
+                tracing::warn!(
+                    conn_idx,
+                    stream_id = stream_id.get(),
+                    seq = seq.get(),
+                    tracked = self.entries.len(),
+                    cap = MAX_TRACKED_STREAMS,
+                    "delivery-policy table full — dropping frame for unbound stream"
+                );
+                return Decision::Drop;
+            }
+            if self.warned_default.insert(key) {
+                tracing::warn!(
+                    conn_idx,
+                    stream_id = stream_id.get(),
+                    seq = seq.get(),
+                    "data frame arrived before StreamOpen — defaulting to ReliableOrdered"
+                );
+            }
         }
 
         let state = self
@@ -350,5 +372,32 @@ mod tests {
         let mut out2: Vec<(StreamId, Seq, FramePayload)> = Vec::new();
         t.drain_ready_for_connection(0, &mut out2);
         assert!(out2.is_empty());
+    }
+
+    #[test]
+    fn apply_caps_warned_default_at_max_tracked_streams() {
+        // Fill the table to capacity via explicit binds (one stream each).
+        let mut t = DeliveryPolicyTable::new();
+        for i in 0..MAX_TRACKED_STREAMS as u64 {
+            t.bind(0, StreamId::new(i), DeliveryPolicy::RealtimeDropOld)
+                .unwrap();
+        }
+        assert_eq!(t.len(), MAX_TRACKED_STREAMS);
+
+        // A new unbound stream arrives via apply → must Drop, must NOT
+        // grow `entries` or `warned_default`.
+        let before_len = t.len();
+        let d = t.apply(
+            0,
+            StreamId::new(MAX_TRACKED_STREAMS as u64 + 1),
+            Seq::new(0),
+            payload(0xEE),
+        );
+        assert!(matches!(d, Decision::Drop));
+        assert_eq!(t.len(), before_len, "entries must not grow past cap");
+
+        // An already-tracked stream is unaffected.
+        let d = t.apply(0, StreamId::new(0), Seq::new(0), payload(0xFF));
+        assert!(matches!(d, Decision::Deliver(_)));
     }
 }
