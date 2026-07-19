@@ -53,7 +53,10 @@ use module_lifecycle::coordinator::LifecycleCoordinator;
 use observability_sdk::registry::MetricsRegistry;
 use ops_dashboard::OpsDashboardService;
 use plugin_manager::manager::PluginManager;
-use pubsub_engine::{PubSubConfig, PubSubEngine, PubSubMessage, TopicPattern};
+use pubsub_engine::{
+    PubSubConfig, PubSubEngine, PubSubMessage, Subscriber, TopicCatalog, TopicConfig, TopicPattern,
+    TopicRegistry,
+};
 use resource_quotas::manager::QuotaManager;
 use rpc_framework::{RpcConfig, RpcServer};
 use scheduler_hooks::coordinator::HookCoordinator;
@@ -148,8 +151,12 @@ pub struct VireonDispatcher {
     media: MediaSession,
     /// [application-layer] Event bus.
     event_bus: EventBus,
-    /// [application-layer] Pub/Sub engine.
+    /// [application-layer] Pub/Sub engine (Phase 1 facade — counts only).
     pubsub: PubSubEngine,
+    /// [application-layer] Trie-backed subscription registry (Phase 2 hot path).
+    pubsub_registry: TopicRegistry,
+    /// [application-layer] Created-topic catalog (Phase 2 metadata only).
+    topic_catalog: TopicCatalog,
 
     /// Maps logical frame stream → AI stream id (lazily opened).
     ai_streams: FxHashMap<u64, AiStreamId>,
@@ -160,9 +167,6 @@ pub struct VireonDispatcher {
     outbox: Vec<OutgoingFrame>,
     /// Per-(conn_idx, QUIC-stream) response sequence counter.
     next_seq: FxHashMap<(usize, u64), Seq>,
-
-    /// Active pub/sub subscriptions: (pattern, subscriber conn_idx, subscriber quic_stream_id).
-    subscriptions: Vec<(TopicPattern, usize, u64)>,
 }
 
 impl VireonDispatcher {
@@ -185,11 +189,12 @@ impl VireonDispatcher {
             media: MediaSession::new(MediaStreamingConfig::new()),
             event_bus,
             pubsub,
+            pubsub_registry: TopicRegistry::new(PubSubConfig::new()),
+            topic_catalog: TopicCatalog::new(),
             ai_streams: FxHashMap::default(),
             default_topic,
             outbox: Vec::new(),
             next_seq: FxHashMap::default(),
-            subscriptions: Vec::new(),
         }
     }
 
@@ -337,7 +342,7 @@ impl VireonDispatcher {
     /// The payload is parsed by the frame layer into a structured type
     /// (see `frame::payload`); the dispatcher then invokes the same
     /// subscribe/publish helpers used by the legacy JSON path so both
-    /// paths share routing semantics until the JSON path is removed.
+    /// paths share routing semantics.
     fn route_native_pubsub(&mut self, ctx: &FrameContext, frame: &FrameRef<'_>) {
         match parse_payload(frame.msg_type, frame.payload) {
             Ok(Some(ParsedPayload::Subscribe(SubscribePayload { pattern, qos: _ }))) => {
@@ -354,29 +359,10 @@ impl VireonDispatcher {
                 partitions,
                 retention_ms,
             }))) => {
-                tracing::info!(
-                    conn_idx = ctx.conn_idx,
-                    topic = %topic,
-                    partitions,
-                    retention_ms,
-                    "[pubsub] TopicCreate (no-op until topic registry lands)"
-                );
-                let ack = format!("{{\"topic_created\":\"{topic}\"}}");
-                self.enqueue_response(
-                    ctx,
-                    frame.stream_id,
-                    MessageType::TopicCreate,
-                    Bytes::from(ack),
-                );
+                self.handle_topic_create(ctx, frame.stream_id, topic, partitions, retention_ms);
             }
             Ok(Some(ParsedPayload::TopicDelete(TopicDeletePayload { topic }))) => {
-                tracing::info!(
-                    conn_idx = ctx.conn_idx,
-                    topic = %topic,
-                    "[pubsub] TopicDelete (no-op until topic registry lands)"
-                );
-                let ack = format!("{{\"topic_deleted\":\"{topic}\"}}");
-                let _ = ack; // no-op until Phase 2 wires a real TopicRegistry
+                self.handle_topic_delete(ctx, frame.stream_id, topic);
             }
             Ok(Some(other)) => {
                 tracing::warn!(
@@ -407,17 +393,29 @@ impl VireonDispatcher {
     /// Registers a subscription for the calling connection.
     fn handle_subscribe(&mut self, ctx: &FrameContext, stream: StreamId, pattern_str: &str) {
         match TopicPattern::new(pattern_str) {
-            Ok(pattern) => {
+            Ok(_) => {
+                let subscriber = Subscriber {
+                    conn_idx: ctx.conn_idx,
+                    quic_stream_id: ctx.quic_stream_id,
+                };
+                if let Err(e) = self.pubsub_registry.subscribe(subscriber, pattern_str) {
+                    tracing::warn!(
+                        conn_idx = ctx.conn_idx,
+                        pattern = %pattern_str,
+                        error = ?e,
+                        "[pubsub] registry rejected subscribe"
+                    );
+                    return;
+                }
                 tracing::info!(
                     conn_idx = ctx.conn_idx,
                     pattern = %pattern_str,
                     quic_stream = ctx.quic_stream_id,
+                    active = self.pubsub_registry.len(),
                     "[pubsub] subscribe"
                 );
-                self.subscriptions
-                    .push((pattern, ctx.conn_idx, ctx.quic_stream_id));
                 let ack = format!("{{\"subscribed\":\"{pattern_str}\"}}");
-                self.enqueue_response(ctx, stream, MessageType::StateUpdate, Bytes::from(ack));
+                self.enqueue_response(ctx, stream, MessageType::Subscribe, Bytes::from(ack));
             }
             Err(e) => {
                 tracing::warn!(
@@ -433,14 +431,14 @@ impl VireonDispatcher {
     /// Removes any subscription for the calling connection whose pattern
     /// matches `pattern_str` exactly.
     fn handle_unsubscribe(&mut self, ctx: &FrameContext, stream: StreamId, pattern_str: &str) {
-        let before = self.subscriptions.len();
-        self.subscriptions
-            .retain(|(p, c, _)| !(*c == ctx.conn_idx && p.as_str() == pattern_str));
-        let removed = before - self.subscriptions.len();
+        let removed = self
+            .pubsub_registry
+            .unsubscribe_pattern(ctx.conn_idx, pattern_str);
         tracing::info!(
             conn_idx = ctx.conn_idx,
             pattern = %pattern_str,
             removed,
+            active = self.pubsub_registry.len(),
             "[pubsub] unsubscribe"
         );
         let ack = format!("{{\"unsubscribed\":\"{pattern_str}\",\"removed\":{removed}}}");
@@ -456,19 +454,18 @@ impl VireonDispatcher {
         topic: &str,
         payload: &[u8],
     ) {
-        let targets: Vec<(usize, u64)> = self
-            .subscriptions
-            .iter()
-            .filter(|(p, _, _)| p.matches(topic))
-            .map(|(_, c, s)| (*c, *s))
-            .filter(|(c, _)| *c != ctx.conn_idx)
+        let targets: Vec<Subscriber> = self
+            .pubsub_registry
+            .lookup(topic)
+            .into_iter()
+            .filter(|s| s.conn_idx != ctx.conn_idx)
             .collect();
 
         tracing::info!(
             conn_idx = ctx.conn_idx,
             topic = %topic,
             targets = targets.len(),
-            subs = self.subscriptions.len(),
+            subs = self.pubsub_registry.len(),
             "[pubsub] publish"
         );
 
@@ -480,15 +477,56 @@ impl VireonDispatcher {
         framed.extend_from_slice(payload);
         let bytes = Bytes::from(framed);
 
-        for (target_conn, target_stream) in targets {
+        for target in targets {
             self.enqueue_frame(
-                target_conn,
-                target_stream,
+                target.conn_idx,
+                target.quic_stream_id,
                 stream,
                 MessageType::Publish,
                 bytes.clone(),
             );
         }
+    }
+
+    /// Records a `TopicCreate`. Retention / partition enforcement lands in
+    /// Phase 4 — for now the catalog simply remembers the declared config.
+    fn handle_topic_create(
+        &mut self,
+        ctx: &FrameContext,
+        stream: StreamId,
+        topic: &str,
+        partitions: u32,
+        retention_ms: u64,
+    ) {
+        let config = TopicConfig {
+            partitions: partitions.max(1),
+            retention_ms,
+        };
+        self.topic_catalog.create(topic, config);
+        tracing::info!(
+            conn_idx = ctx.conn_idx,
+            topic = %topic,
+            partitions = config.partitions,
+            retention_ms,
+            total_topics = self.topic_catalog.len(),
+            "[pubsub] TopicCreate"
+        );
+        let ack = format!("{{\"topic_created\":\"{topic}\"}}");
+        self.enqueue_response(ctx, stream, MessageType::TopicCreate, Bytes::from(ack));
+    }
+
+    /// Removes a topic from the catalog.
+    fn handle_topic_delete(&mut self, ctx: &FrameContext, stream: StreamId, topic: &str) {
+        let existed = self.topic_catalog.delete(topic);
+        tracing::info!(
+            conn_idx = ctx.conn_idx,
+            topic = %topic,
+            existed,
+            total_topics = self.topic_catalog.len(),
+            "[pubsub] TopicDelete"
+        );
+        let ack = format!("{{\"topic_deleted\":\"{topic}\",\"existed\":{existed}}}");
+        self.enqueue_response(ctx, stream, MessageType::TopicDelete, Bytes::from(ack));
     }
 }
 
@@ -622,9 +660,7 @@ impl AppDispatcher for VireonDispatcher {
         session_id: SessionId,
         reason: Option<&str>,
     ) {
-        let before = self.subscriptions.len();
-        self.subscriptions.retain(|(_, c, _)| *c != conn_idx);
-        let removed = before - self.subscriptions.len();
+        let removed = self.pubsub_registry.remove_connection(conn_idx);
         tracing::info!(
             conn_idx,
             session_id = ?session_id,
