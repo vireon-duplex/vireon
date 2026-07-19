@@ -12,6 +12,7 @@ fn p(b: u8) -> FramePayload {
     FramePayload::new(
         MessageType::TextToken,
         FrameFlags::NONE,
+        0,
         Bytes::from(vec![b]),
     )
 }
@@ -128,4 +129,40 @@ fn upgrade_from_default_flushes_buffered_before_swap() {
     assert!(matches!(d_high, Decision::Deliver(_)));
     let d_stale = t.apply(0, StreamId::new(5), Seq::new(4), p(4));
     assert!(matches!(d_stale, Decision::Drop));
+}
+
+#[test]
+fn quic_stream_id_round_trips_through_drain() {
+    // Drained frames (gap-filled ReliableOrdered, LatestOnly pending
+    // slot) must carry the same quic_stream_id they arrived on — the
+    // engine emits them as `QuicEvent::FrameReceived` long after the
+    // originating QUIC stream read returned.
+    let mut t = DeliveryPolicyTable::new();
+    t.bind(0, StreamId::new(7), DeliveryPolicy::ReliableOrdered)
+        .unwrap();
+
+    let mk = |quic_id: u64, b: u8| {
+        FramePayload::new(
+            MessageType::TextToken,
+            FrameFlags::NONE,
+            quic_id,
+            Bytes::from(vec![b]),
+        )
+    };
+
+    // Anchor at seq=0 on quic_stream_id=42.
+    let _ = t.apply(0, StreamId::new(7), Seq::new(0), mk(42, 0xA0));
+    // seq=2 buffers — arrived on a different QUIC stream id=99.
+    let _ = t.apply(0, StreamId::new(7), Seq::new(2), mk(99, 0xA2));
+    // Fill the gap; drain should yield seq=2 with quic_id=99 preserved.
+    let _ = t.apply(0, StreamId::new(7), Seq::new(1), mk(42, 0xA1));
+
+    let mut out = Vec::new();
+    t.drain_ready_for_connection(0, &mut out);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].1, Seq::new(2));
+    assert_eq!(
+        out[0].2.quic_stream_id, 99,
+        "drained frame must carry the original quic_stream_id"
+    );
 }

@@ -349,6 +349,7 @@ mod tests {
         FramePayload::new(
             MessageType::TextToken,
             FrameFlags::NONE,
+            0,
             Bytes::from(vec![n]),
         )
     }

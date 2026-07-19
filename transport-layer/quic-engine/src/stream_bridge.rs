@@ -122,13 +122,12 @@ pub fn process_readable(
             break;
         }
         // The drained `FramePayload` carries the original msg_type/flags
-        // so the upper layer sees the same header it would have seen for
-        // an immediately-delivered frame.
+        // AND the quic_stream_id it arrived on, so the upper layer sees
+        // the same `FrameReceived` event it would have seen for an
+        // immediately-delivered frame.
         events.push(QuicEvent::FrameReceived {
             conn_idx,
-            quic_stream_id: 0, // Not bound to a specific QUIC stream —
-            // drained frames may have arrived on any
-            // QUIC stream carrying this logical id.
+            quic_stream_id: payload.quic_stream_id,
             header: codec::FrameHeader {
                 stream_id,
                 seq,
@@ -451,7 +450,12 @@ fn apply_and_emit(
     // retain the payload across the call (reorder window, pending slot).
     let bytes: Bytes = buf.into_bytes();
 
-    let payload = delivery_policy::FramePayload::new(frame_ref.msg_type, frame_ref.flags, bytes);
+    let payload = delivery_policy::FramePayload::new(
+        frame_ref.msg_type,
+        frame_ref.flags,
+        quic_stream_id,
+        bytes,
+    );
     let decision = delivery_policies.apply(conn_idx, frame_ref.stream_id, frame_ref.seq, payload);
     match decision {
         Decision::Deliver(p) => {
@@ -470,6 +474,8 @@ fn apply_and_emit(
         Decision::Buffer => {
             // Policy owns the payload; it will resurface via
             // drain_ready_for_connection at the end of the batch.
+            // The original `quic_stream_id` travels with the payload
+            // and is restored when the drained frame is emitted.
         }
         Decision::Drop => {
             // Payload is released — no event emitted.

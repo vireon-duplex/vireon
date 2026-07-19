@@ -19,18 +19,30 @@ pub struct FramePayload {
     pub msg_type: MessageType,
     /// Original `FrameFlags` of the data frame.
     pub flags: FrameFlags,
+    /// The QUIC transport stream id the frame arrived on. Preserved so
+    /// drained frames can re-emit `QuicEvent::FrameReceived` with the
+    /// same `quic_stream_id` they would have had if delivered
+    /// synchronously. `0` for frames that arrived via QUIC datagram
+    /// (which carries no stream id) or for synthetic payloads.
+    pub quic_stream_id: u64,
     /// Payload bytes.
     pub bytes: Bytes,
 }
 
 impl FramePayload {
-    /// Construct from the three pieces.
+    /// Construct from the four pieces.
     #[inline]
     #[must_use]
-    pub fn new(msg_type: MessageType, flags: FrameFlags, bytes: Bytes) -> Self {
+    pub fn new(
+        msg_type: MessageType,
+        flags: FrameFlags,
+        quic_stream_id: u64,
+        bytes: Bytes,
+    ) -> Self {
         Self {
             msg_type,
             flags,
+            quic_stream_id,
             bytes,
         }
     }
