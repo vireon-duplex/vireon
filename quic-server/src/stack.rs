@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use buffer_pool::Buffer;
+use bytes::Bytes;
 use frame::codec::{self, FrameHeader, FrameRef};
 use io::handler::{IoHandler, TickContext};
 use quic_engine::{QuicEngine, QuicEvent, QuicSendError};
@@ -354,7 +354,7 @@ impl VireonStack {
         conn_idx: usize,
         quic_stream_id: u64,
         header: FrameHeader,
-        payload: Buffer,
+        payload: Bytes,
     ) {
         // Look up cross-layer connection state (ConnState is Copy).
         let Some(cs) = self.connections.get(conn_idx) else {

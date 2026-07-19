@@ -25,13 +25,16 @@
 //! └──────────────────────────────────────────────────────────────────┘
 //! ```
 
+use bytes::Bytes;
 use rustc_hash::FxHashMap;
 
 use crate::hash::CrcHashMap;
 use std::net::SocketAddr;
 
 use buffer_pool::BufferPool;
+use delivery_policy::{DeliveryPolicyTable, FramePayload};
 use frame::codec;
+use frame::header::{Seq, StreamId};
 use io::handler::{IoHandler, TickContext};
 
 use crate::config::QuicConfig;
@@ -92,8 +95,11 @@ pub enum QuicEvent {
         quic_stream_id: u64,
         /// Codec-layer frame header (stream_id, seq, msg_type, flags).
         header: codec::FrameHeader,
-        /// Payload backed by a pool buffer (recycled on drop).
-        payload: buffer_pool::Buffer,
+        /// Refcounted payload bytes. The engine allocates from the buffer
+        /// pool on the receive path, then converts to `Bytes` once via
+        /// `Buffer::into_bytes` so the bytes can outlive the pool guard
+        /// (e.g. when buffered in a delivery-policy reorder window).
+        payload: Bytes,
     },
     /// A stream signaled FIN (graceful close).
     StreamFinished {
@@ -198,6 +204,17 @@ pub struct QuicEngine {
     /// share the same carryover entry, producing decode garbage.
     stream_carryover: FxHashMap<(usize, u64), StreamCarry>,
 
+    // ── Delivery policy ──────────────────────────────────────────
+    /// Per-stream receive-side delivery semantics (ReliableOrdered /
+    /// ReliableUnordered / RealtimeDropOld / LatestOnly), keyed by
+    /// `(conn_idx, header.stream_id)`. Populated by `StreamOpen` frames
+    /// and applied to every data frame in `stream_bridge`.
+    delivery_policies: DeliveryPolicyTable,
+
+    /// Reusable scratch for `DeliveryPolicyTable::drain_ready_for_connection`
+    /// output. Avoids per-tick Vec allocation.
+    policy_drain_buf: Vec<(StreamId, Seq, FramePayload)>,
+
     // ── Buffer pool ───────────────────────────────────────────────
     /// Pool for frame payload buffers (zero-alloc hot path).
     pool: BufferPool,
@@ -294,6 +311,8 @@ impl QuicEngine {
             flushed_this_tick: Vec::with_capacity(64),
             dirty: DirtyBitset::new(),
             stream_carryover: FxHashMap::default(),
+            delivery_policies: DeliveryPolicyTable::new(),
+            policy_drain_buf: Vec::new(),
             pool,
             gso_batcher: GsoBatcher::new(),
             events: Vec::new(),
@@ -481,6 +500,8 @@ impl QuicEngine {
                     readable_buf,
                     pool,
                     carryover,
+                    &mut self.delivery_policies,
+                    &mut self.policy_drain_buf,
                     self.config.skip_crc,
                 );
             }
@@ -679,6 +700,10 @@ impl QuicEngine {
                 self.dcid_to_idx.remove(&entry.initial_dcid_key);
                 self.active_count = self.active_count.saturating_sub(1);
                 self.free_slots.push(idx);
+                // Drop all per-stream delivery-policy state for this conn
+                // so the slab indices can be reused without leaking policy
+                // entries that would otherwise never be cleaned up.
+                self.delivery_policies.remove_connection(idx);
 
                 // Capture close reason before the connection is dropped.
                 let reason = entry
@@ -738,6 +763,11 @@ impl QuicEngine {
         if let Some(Some(entry)) = self.connections.get_mut(conn_idx) {
             let _ = entry.conn.close(true, app_error, reason);
             self.dirty.set(conn_idx);
+            // Drop delivery-policy state immediately on explicit close —
+            // the connection slab slot will be reclaimed by `cleanup_closed`
+            // later, but cleaning up here bounds memory if the slab is
+            // under pressure.
+            self.delivery_policies.remove_connection(conn_idx);
             tracing::debug!(
                 reactor_id = self.reactor_id,
                 conn_idx,

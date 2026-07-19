@@ -44,6 +44,9 @@ io = { path = "../../io-layer/io" }
 # Message layer — frame codec for stream data parsing.
 frame = { path = "../../message-layer/frame" }
 
+# Stream layer — per-stream receive-side delivery policy.
+delivery-policy = { path = "../../stream-layer/delivery-policy" }
+
 # Profiler — #[profile] instrumentation.
 profiler = { workspace = true }
 
