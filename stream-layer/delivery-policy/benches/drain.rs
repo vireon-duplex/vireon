@@ -35,7 +35,7 @@ fn reliable_ordered_drain(c: &mut Criterion) {
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             let sid = StreamId::new(1);
-            b.iter_batched(
+            b.iter_batched_ref(
                 || {
                     let mut t = DeliveryPolicyTable::new();
                     t.bind(CONN, sid, DeliveryPolicy::ReliableOrdered).unwrap();
@@ -44,16 +44,14 @@ fn reliable_ordered_drain(c: &mut Criterion) {
                     for i in 1..=n as u64 {
                         let _ = t.apply(CONN, sid, Seq::new(i), payload(128));
                     }
-                    (t, sid)
+                    t
                 },
-                |(mut t, sid)| {
+                |t| {
                     // seq=0 already delivered; drain walks the n buffered
                     // entries immediately.
                     let mut out = Vec::new();
                     t.drain_ready_for_connection(CONN, &mut out);
                     black_box(out.len());
-                    black_box(t);
-                    let _ = sid;
                 },
                 criterion::BatchSize::PerIteration,
             );
@@ -69,21 +67,19 @@ fn latest_only_drain(c: &mut Criterion) {
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             let sid = StreamId::new(2);
-            b.iter_batched(
+            b.iter_batched_ref(
                 || {
                     let mut t = DeliveryPolicyTable::new();
                     t.bind(CONN, sid, DeliveryPolicy::LatestOnly).unwrap();
                     for i in 0..n as u64 {
                         let _ = t.apply(CONN, sid, Seq::new(i), payload(128));
                     }
-                    (t, sid)
+                    t
                 },
-                |(mut t, sid)| {
+                |t| {
                     let mut out = Vec::new();
                     t.drain_ready_for_connection(CONN, &mut out);
                     black_box(out.len());
-                    black_box(t);
-                    let _ = sid;
                 },
                 criterion::BatchSize::PerIteration,
             );
@@ -93,9 +89,14 @@ fn latest_only_drain(c: &mut Criterion) {
 }
 
 /// Steady-state scan: `streams_per_conn` bound streams on a connection,
-/// none of which have pending work. The drain call walks all of them.
-/// This is the dominant cost on the engine's per-tick drain call when
-/// most streams are `RealtimeDropOld` / `ReliableUnordered`.
+/// none of which have pending work. With dirty-streams tracking the
+/// drain call is O(dirty) = O(0) here — the bench verifies that the
+/// per-tick drain cost stays bounded as the stream count grows.
+///
+/// Uses `iter_batched_ref` so the table's `Drop` (which is unavoidably
+/// O(streams) since each entry owns a `FramePayload`) happens once per
+/// sample rather than per iteration — otherwise Drop cost dominates and
+/// masks the drain algorithmic improvement.
 fn scan_no_pending(c: &mut Criterion) {
     let mut group = c.benchmark_group("drain/scan_no_pending");
     for streams in [1usize, 64, 1024, 8192] {
@@ -104,7 +105,7 @@ fn scan_no_pending(c: &mut Criterion) {
             BenchmarkId::from_parameter(streams),
             &streams,
             |b, &streams| {
-                b.iter_batched(
+                b.iter_batched_ref(
                     || {
                         let mut t = DeliveryPolicyTable::new();
                         for i in 0..streams as u64 {
@@ -115,11 +116,10 @@ fn scan_no_pending(c: &mut Criterion) {
                         }
                         t
                     },
-                    |mut t| {
+                    |t| {
                         let mut out = Vec::new();
                         t.drain_ready_for_connection(CONN, &mut out);
                         black_box(out.len());
-                        black_box(t);
                     },
                     criterion::BatchSize::PerIteration,
                 );

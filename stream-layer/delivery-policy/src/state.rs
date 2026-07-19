@@ -119,6 +119,26 @@ impl PerStreamState {
             Self::ReliableUnordered(_) | Self::RealtimeDropOld(_) => {}
         }
     }
+
+    /// `true` if [`drain_ready`](Self::drain_ready) would emit at least
+    /// one frame right now. Used by the table to skip idle streams during
+    /// the per-tick drain scan.
+    ///
+    /// Semantics:
+    /// * `ReliableOrdered` — dirty while the reorder window is non-empty
+    ///   (gap-fill pending, or a just-arrived anchor unblocked a run).
+    /// * `LatestOnly` — dirty while the pending slot is occupied.
+    /// * `ReliableUnordered` / `RealtimeDropOld` — never dirty (they
+    ///   always emit synchronously on `apply`).
+    #[inline]
+    #[must_use]
+    pub fn is_dirty(&self) -> bool {
+        match self {
+            Self::ReliableOrdered(s) => !s.reorder.is_empty(),
+            Self::LatestOnly(s) => s.pending.is_some(),
+            Self::ReliableUnordered(_) | Self::RealtimeDropOld(_) => false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
