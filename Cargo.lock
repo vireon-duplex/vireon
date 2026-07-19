@@ -443,6 +443,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "delivery-policy"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "criterion",
+ "frame",
+ "rustc-hash",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "dependency-injection"
 version = "0.1.0"
 dependencies = [
@@ -1098,6 +1110,7 @@ dependencies = [
  "connection-shard",
  "cqe-processor",
  "criterion",
+ "delivery-policy",
  "frame",
  "io",
  "libc",
