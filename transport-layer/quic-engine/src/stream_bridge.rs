@@ -5,11 +5,15 @@
 //! multiple `stream_recv` calls), and pushes decoded frames as
 //! [`QuicEvent::FrameReceived`] into the engine's event queue.
 
+use bytes::Bytes;
 use rustc_hash::FxHashMap;
 
 use buffer_pool::BufferPool;
 use bytes::BytesMut;
+use delivery_policy::{Decision, DeliveryPolicyTable, FramePayload, StreamOpenMeta};
 use frame::codec;
+use frame::header::MessageType;
+use frame::header::{Seq, StreamId};
 
 use crate::engine::QuicEvent;
 
@@ -65,6 +69,8 @@ pub fn process_readable(
     readable_buf: &mut Vec<u64>,
     pool: &BufferPool,
     carryover: &mut FxHashMap<(usize, u64), StreamCarry>,
+    delivery_policies: &mut DeliveryPolicyTable,
+    policy_drain_buf: &mut Vec<(StreamId, Seq, FramePayload)>,
     skip_crc: bool,
 ) {
     // Collect readable stream IDs into the caller-provided buffer to
@@ -89,8 +95,47 @@ pub fn process_readable(
     for i in 0..n {
         let stream_id = readable_buf[i];
         process_single_stream(
-            conn, stream_id, reactor_id, conn_idx, events, pool, carryover, skip_crc,
+            conn,
+            stream_id,
+            reactor_id,
+            conn_idx,
+            events,
+            pool,
+            carryover,
+            delivery_policies,
+            skip_crc,
         );
+    }
+
+    // Release frames that became deliverable due to gap-fill (ReliableOrdered)
+    // or that have been held in a pending slot (LatestOnly). This runs once
+    // per connection-tick, after all readable streams have been drained.
+    policy_drain_buf.clear();
+    delivery_policies.drain_ready_for_connection(conn_idx, policy_drain_buf);
+    for (stream_id, seq, payload) in policy_drain_buf.drain(..) {
+        if events.len() >= crate::engine::MAX_PENDING_EVENTS {
+            tracing::warn!(
+                conn_idx,
+                pending = events.len(),
+                "event queue full — dropping drained frame"
+            );
+            break;
+        }
+        // The drained `FramePayload` carries the original msg_type/flags
+        // AND the quic_stream_id it arrived on, so the upper layer sees
+        // the same `FrameReceived` event it would have seen for an
+        // immediately-delivered frame.
+        events.push(QuicEvent::FrameReceived {
+            conn_idx,
+            quic_stream_id: payload.quic_stream_id,
+            header: codec::FrameHeader {
+                stream_id,
+                seq,
+                msg_type: payload.msg_type,
+                flags: payload.flags,
+            },
+            payload: payload.bytes,
+        });
     }
 
     // Also process any pending DATAGRAM frames.
@@ -107,6 +152,7 @@ fn process_single_stream(
     events: &mut Vec<QuicEvent>,
     pool: &BufferPool,
     carryover: &mut FxHashMap<(usize, u64), StreamCarry>,
+    delivery_policies: &mut DeliveryPolicyTable,
     skip_crc: bool,
 ) {
     let mut read_buf = [0u8; STREAM_READ_BUF_SIZE];
@@ -194,8 +240,14 @@ fn process_single_stream(
                     };
                     match result {
                         Ok((frame_ref, consumed)) => {
-                            emit_frame_event(
-                                &frame_ref, stream_id, reactor_id, conn_idx, events, pool,
+                            dispatch_decoded_frame(
+                                &frame_ref,
+                                stream_id,
+                                reactor_id,
+                                conn_idx,
+                                events,
+                                pool,
+                                delivery_policies,
                             );
                             offset += consumed;
                             total_frames += 1;
@@ -291,23 +343,162 @@ fn process_datagrams(conn: &mut quiche::Connection, reactor_id: u32, conn_idx: u
     }
 }
 
-/// Creates a `FrameReceived` event from a decoded frame reference and
-/// pushes it into the engine's event queue. Payload bytes are copied
-/// into a pool buffer that is recycled when the event is consumed.
-fn emit_frame_event(
+/// Routes a decoded frame to the right handler based on its `MessageType`:
+///
+/// * **Control plane** (`StreamOpen`, `StreamReset`, `StreamClose`) —
+///   mutates the delivery-policy table (register / remove stream state),
+///   then emits a `FrameReceived` event so the upper layer sees the
+///   control message.
+/// * **Data plane** (everything else) — allocates a pool buffer, copies
+///   the payload into it, converts to `Bytes`, and applies the policy.
+///   The policy decides `Deliver` (emit now), `Buffer` (held for later
+///   drain), or `Drop` (discard).
+fn dispatch_decoded_frame(
     frame_ref: &codec::FrameRef<'_>,
-    stream_id: u64,
+    quic_stream_id: u64,
     _reactor_id: u32,
     conn_idx: usize,
     events: &mut Vec<QuicEvent>,
     pool: &BufferPool,
+    delivery_policies: &mut DeliveryPolicyTable,
 ) {
-    // Backpressure: stop pushing when the upper layer hasn't drained.
+    match frame_ref.msg_type {
+        MessageType::StreamOpen => {
+            match StreamOpenMeta::decode(frame_ref.payload) {
+                Ok(meta) => {
+                    if let Err(e) =
+                        delivery_policies.bind(conn_idx, frame_ref.stream_id, meta.policy)
+                    {
+                        tracing::warn!(
+                            conn_idx,
+                            stream_id = frame_ref.stream_id.get(),
+                            policy = ?meta.policy,
+                            error = ?e,
+                            "delivery policy bind failed"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        conn_idx,
+                        stream_id = frame_ref.stream_id.get(),
+                        error = ?e,
+                        "malformed StreamOpen payload — stream will use default ReliableOrdered"
+                    );
+                }
+            }
+            // Still emit the StreamOpen event so the app layer can react.
+            emit_control_frame_event(frame_ref, quic_stream_id, conn_idx, events, pool);
+        }
+        MessageType::StreamReset | MessageType::StreamClose => {
+            delivery_policies.remove_stream(conn_idx, frame_ref.stream_id);
+            emit_control_frame_event(frame_ref, quic_stream_id, conn_idx, events, pool);
+        }
+        _ => {
+            // Data-plane frame — route through the policy.
+            apply_and_emit(
+                frame_ref,
+                quic_stream_id,
+                conn_idx,
+                events,
+                pool,
+                delivery_policies,
+            );
+        }
+    }
+}
+
+/// Allocates a pool buffer for the payload, copies it, converts to
+/// `Bytes`, and applies the delivery policy. On `Deliver`, emits a
+/// `FrameReceived` event; on `Buffer`/`Drop`, the bytes are owned by
+/// the policy or dropped.
+fn apply_and_emit(
+    frame_ref: &codec::FrameRef<'_>,
+    quic_stream_id: u64,
+    conn_idx: usize,
+    events: &mut Vec<QuicEvent>,
+    pool: &BufferPool,
+    delivery_policies: &mut DeliveryPolicyTable,
+) {
     if events.len() >= crate::engine::MAX_PENDING_EVENTS {
         tracing::warn!(
             conn_idx,
             pending = events.len(),
-            "event queue full — dropping frame"
+            "event queue full — dropping frame before policy check"
+        );
+        return;
+    }
+
+    let payload_len = frame_ref.payload.len().max(1);
+    let mut buf = match pool.try_get(payload_len) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                conn_idx,
+                error = ?e,
+                payload_len,
+                "buffer pool exhausted — dropping frame"
+            );
+            return;
+        }
+    };
+    let n = frame_ref.payload.len();
+    if n > 0 {
+        buf[..n].copy_from_slice(frame_ref.payload);
+    }
+    // Convert the pool buffer into refcounted Bytes — the policy may
+    // retain the payload across the call (reorder window, pending slot).
+    let bytes: Bytes = buf.into_bytes();
+
+    let payload = delivery_policy::FramePayload::new(
+        frame_ref.msg_type,
+        frame_ref.flags,
+        quic_stream_id,
+        bytes,
+    );
+    let decision = delivery_policies.apply(conn_idx, frame_ref.stream_id, frame_ref.seq, payload);
+    match decision {
+        Decision::Deliver(p) => {
+            events.push(QuicEvent::FrameReceived {
+                conn_idx,
+                quic_stream_id,
+                header: codec::FrameHeader {
+                    stream_id: frame_ref.stream_id,
+                    seq: frame_ref.seq,
+                    msg_type: p.msg_type,
+                    flags: p.flags,
+                },
+                payload: p.bytes,
+            });
+        }
+        Decision::Buffer => {
+            // Policy owns the payload; it will resurface via
+            // drain_ready_for_connection at the end of the batch.
+            // The original `quic_stream_id` travels with the payload
+            // and is restored when the drained frame is emitted.
+        }
+        Decision::Drop => {
+            // Payload is released — no event emitted.
+        }
+    }
+}
+
+/// Creates a `FrameReceived` event for a **control-plane** frame
+/// (`StreamOpen`, `StreamReset`, `StreamClose`, etc.). These bypass the
+/// delivery policy entirely — control frames must always reach the upper
+/// layer so the app sees stream lifecycle.
+fn emit_control_frame_event(
+    frame_ref: &codec::FrameRef<'_>,
+    quic_stream_id: u64,
+    conn_idx: usize,
+    events: &mut Vec<QuicEvent>,
+    pool: &BufferPool,
+) {
+    if events.len() >= crate::engine::MAX_PENDING_EVENTS {
+        tracing::warn!(
+            conn_idx,
+            pending = events.len(),
+            "event queue full — dropping control frame"
         );
         return;
     }
@@ -318,42 +509,29 @@ fn emit_frame_event(
         msg_type: frame_ref.msg_type,
         flags: frame_ref.flags,
     };
-    let payload_len = frame_ref.payload.len();
-
-    if payload_len == 0 {
-        match pool.try_get(1) {
-            Ok(buf) => events.push(QuicEvent::FrameReceived {
+    let payload_len = frame_ref.payload.len().max(1);
+    let mut buf = match pool.try_get(payload_len) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
                 conn_idx,
-                quic_stream_id: stream_id,
-                header,
-                payload: buf,
-            }),
-            Err(e) => {
-                tracing::warn!(
-                    conn_idx, error = ?e,
-                    "buffer pool exhausted — dropping zero-len frame"
-                );
-            }
+                error = ?e,
+                payload_len,
+                "buffer pool exhausted — dropping control frame"
+            );
+            return;
         }
-    } else {
-        match pool.try_get(payload_len) {
-            Ok(mut buf) => {
-                buf[..payload_len].copy_from_slice(frame_ref.payload);
-                events.push(QuicEvent::FrameReceived {
-                    conn_idx,
-                    quic_stream_id: stream_id,
-                    header,
-                    payload: buf,
-                });
-            }
-            Err(e) => {
-                tracing::warn!(
-                    conn_idx, error = ?e, payload_len,
-                    "buffer pool exhausted — dropping frame"
-                );
-            }
-        }
+    };
+    let n = frame_ref.payload.len();
+    if n > 0 {
+        buf[..n].copy_from_slice(frame_ref.payload);
     }
+    events.push(QuicEvent::FrameReceived {
+        conn_idx,
+        quic_stream_id,
+        header,
+        payload: buf.into_bytes(),
+    });
 }
 
 #[cfg(test)]
