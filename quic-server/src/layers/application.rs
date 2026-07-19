@@ -40,6 +40,10 @@ use event_bus::{EventBus, EventBusConfig, PartitionId, TopicId};
 use feature_flags::manager::FeatureFlagManager;
 use frame::codec::{FrameHeader, FrameRef};
 use frame::header::{FrameFlags, MessageType, Seq, StreamId};
+use frame::payload::{
+    ParsedPayload, SubscribePayload, TopicCreatePayload, TopicDeletePayload, UnsubscribePayload,
+    parse_payload,
+};
 use graceful_startup_shutdown::StartupShutdownCoordinator;
 use media_streaming::{
     MediaError, MediaSession, MediaStreamingConfig, MediaTrackId, TrackDirection, TrackKind,
@@ -288,7 +292,10 @@ impl VireonDispatcher {
 
     /// Routes a `StateUpdate` frame.
     ///
-    /// Parses payload for pub/sub control messages:
+    /// Legacy path: parses payload for JSON pub/sub control messages. New
+    /// clients should send native `MessageType::Subscribe`/`Publish`/etc.
+    /// frames instead — see [`Self::route_native_pubsub`].
+    ///
     /// - `{"action":"subscribe","pattern":"sensor.*"}` → register subscription
     /// - `{"action":"publish","topic":"sensor.temp","payload":"23.5"}` → deliver to subscribers
     ///
@@ -300,83 +307,14 @@ impl VireonDispatcher {
             match action.as_str() {
                 "subscribe" => {
                     if let Some(pattern_str) = extract_json_string(&text, "pattern") {
-                        match TopicPattern::new(&pattern_str) {
-                            Ok(pattern) => {
-                                eprintln!(
-                                    "[pubsub] subscribe: conn_idx={} pattern={pattern_str} \
-                                     stream={}",
-                                    ctx.conn_idx, ctx.quic_stream_id
-                                );
-                                self.subscriptions.push((
-                                    pattern,
-                                    ctx.conn_idx,
-                                    ctx.quic_stream_id,
-                                ));
-                                let ack = format!("{{\"subscribed\":\"{pattern_str}\"}}");
-                                self.enqueue_response(
-                                    ctx,
-                                    frame.stream_id,
-                                    MessageType::StateUpdate,
-                                    Bytes::from(ack),
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    conn_idx = ctx.conn_idx,
-                                    pattern = %pattern_str,
-                                    error = ?e,
-                                    "[pubsub] invalid pattern"
-                                );
-                            }
-                        }
+                        self.handle_subscribe(ctx, frame.stream_id, &pattern_str);
                     }
                     return;
                 }
                 "publish" => {
                     if let Some(topic) = extract_json_string(&text, "topic") {
                         let msg_payload = extract_json_string(&text, "payload").unwrap_or_default();
-
-                        let targets: Vec<(usize, u64)> = self
-                            .subscriptions
-                            .iter()
-                            .filter(|(p, _, _)| p.matches(&topic))
-                            .map(|(_, c, s)| (*c, *s))
-                            .filter(|(c, _)| *c != ctx.conn_idx)
-                            .collect();
-
-                        let deliver =
-                            format!("{{\"topic\":\"{topic}\",\"payload\":\"{msg_payload}\"}}");
-                        let bytes = Bytes::from(deliver);
-
-                        eprintln!(
-                            "[pubsub] publish: conn_idx={} topic={topic} \
-                             targets={} subs={}",
-                            ctx.conn_idx,
-                            targets.len(),
-                            self.subscriptions.len()
-                        );
-
-                        let delivered = targets.len();
-                        for (target_conn, target_stream) in targets {
-                            eprintln!(
-                                "[pubsub] delivering to conn_idx={target_conn} \
-                                 stream={target_stream}"
-                            );
-                            self.enqueue_frame(
-                                target_conn,
-                                target_stream,
-                                frame.stream_id,
-                                MessageType::StateUpdate,
-                                bytes.clone(),
-                            );
-                        }
-
-                        tracing::info!(
-                            conn_idx = ctx.conn_idx,
-                            topic = %topic,
-                            delivered,
-                            "[pubsub] published"
-                        );
+                        self.handle_publish(ctx, frame.stream_id, &topic, msg_payload.as_bytes());
                         return;
                     }
                 }
@@ -391,6 +329,166 @@ impl VireonDispatcher {
             .publish(self.default_topic, PartitionId::new(0), msg_hash);
         let msg = PubSubMessage::new("state.update", frame.payload.to_vec());
         let _ = self.pubsub.publish(msg);
+    }
+
+    /// Routes a native pub/sub control frame (`Subscribe`/`Unsubscribe`/
+    /// `Publish`/`TopicCreate`/`TopicDelete`).
+    ///
+    /// The payload is parsed by the frame layer into a structured type
+    /// (see `frame::payload`); the dispatcher then invokes the same
+    /// subscribe/publish helpers used by the legacy JSON path so both
+    /// paths share routing semantics until the JSON path is removed.
+    fn route_native_pubsub(&mut self, ctx: &FrameContext, frame: &FrameRef<'_>) {
+        match parse_payload(frame.msg_type, frame.payload) {
+            Ok(Some(ParsedPayload::Subscribe(SubscribePayload { pattern, qos: _ }))) => {
+                self.handle_subscribe(ctx, frame.stream_id, pattern);
+            }
+            Ok(Some(ParsedPayload::Unsubscribe(UnsubscribePayload { pattern }))) => {
+                self.handle_unsubscribe(ctx, frame.stream_id, pattern);
+            }
+            Ok(Some(ParsedPayload::Publish(frame::payload::PublishPayload { topic, payload }))) => {
+                self.handle_publish(ctx, frame.stream_id, topic, payload);
+            }
+            Ok(Some(ParsedPayload::TopicCreate(TopicCreatePayload {
+                topic,
+                partitions,
+                retention_ms,
+            }))) => {
+                tracing::info!(
+                    conn_idx = ctx.conn_idx,
+                    topic = %topic,
+                    partitions,
+                    retention_ms,
+                    "[pubsub] TopicCreate (no-op until topic registry lands)"
+                );
+                let ack = format!("{{\"topic_created\":\"{topic}\"}}");
+                self.enqueue_response(
+                    ctx,
+                    frame.stream_id,
+                    MessageType::TopicCreate,
+                    Bytes::from(ack),
+                );
+            }
+            Ok(Some(ParsedPayload::TopicDelete(TopicDeletePayload { topic }))) => {
+                tracing::info!(
+                    conn_idx = ctx.conn_idx,
+                    topic = %topic,
+                    "[pubsub] TopicDelete (no-op until topic registry lands)"
+                );
+                let ack = format!("{{\"topic_deleted\":\"{topic}\"}}");
+                let _ = ack; // no-op until Phase 2 wires a real TopicRegistry
+            }
+            Ok(Some(other)) => {
+                tracing::warn!(
+                    conn_idx = ctx.conn_idx,
+                    msg_type = ?frame.msg_type,
+                    parsed = ?other,
+                    "[pubsub] msg_type / payload mismatch"
+                );
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    conn_idx = ctx.conn_idx,
+                    msg_type = ?frame.msg_type,
+                    "[pubsub] no structured payload for type"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    conn_idx = ctx.conn_idx,
+                    msg_type = ?frame.msg_type,
+                    error = ?e,
+                    "[pubsub] payload decode failed"
+                );
+            }
+        }
+    }
+
+    /// Registers a subscription for the calling connection.
+    fn handle_subscribe(&mut self, ctx: &FrameContext, stream: StreamId, pattern_str: &str) {
+        match TopicPattern::new(pattern_str) {
+            Ok(pattern) => {
+                tracing::info!(
+                    conn_idx = ctx.conn_idx,
+                    pattern = %pattern_str,
+                    quic_stream = ctx.quic_stream_id,
+                    "[pubsub] subscribe"
+                );
+                self.subscriptions
+                    .push((pattern, ctx.conn_idx, ctx.quic_stream_id));
+                let ack = format!("{{\"subscribed\":\"{pattern_str}\"}}");
+                self.enqueue_response(ctx, stream, MessageType::StateUpdate, Bytes::from(ack));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    conn_idx = ctx.conn_idx,
+                    pattern = %pattern_str,
+                    error = ?e,
+                    "[pubsub] invalid pattern"
+                );
+            }
+        }
+    }
+
+    /// Removes any subscription for the calling connection whose pattern
+    /// matches `pattern_str` exactly.
+    fn handle_unsubscribe(&mut self, ctx: &FrameContext, stream: StreamId, pattern_str: &str) {
+        let before = self.subscriptions.len();
+        self.subscriptions
+            .retain(|(p, c, _)| !(*c == ctx.conn_idx && p.as_str() == pattern_str));
+        let removed = before - self.subscriptions.len();
+        tracing::info!(
+            conn_idx = ctx.conn_idx,
+            pattern = %pattern_str,
+            removed,
+            "[pubsub] unsubscribe"
+        );
+        let ack = format!("{{\"unsubscribed\":\"{pattern_str}\",\"removed\":{removed}}}");
+        self.enqueue_response(ctx, stream, MessageType::Unsubscribe, Bytes::from(ack));
+    }
+
+    /// Fans a published payload out to every subscriber whose pattern matches
+    /// `topic`, skipping the origin connection (no echo).
+    fn handle_publish(
+        &mut self,
+        ctx: &FrameContext,
+        stream: StreamId,
+        topic: &str,
+        payload: &[u8],
+    ) {
+        let targets: Vec<(usize, u64)> = self
+            .subscriptions
+            .iter()
+            .filter(|(p, _, _)| p.matches(topic))
+            .map(|(_, c, s)| (*c, *s))
+            .filter(|(c, _)| *c != ctx.conn_idx)
+            .collect();
+
+        tracing::info!(
+            conn_idx = ctx.conn_idx,
+            topic = %topic,
+            targets = targets.len(),
+            subs = self.subscriptions.len(),
+            "[pubsub] publish"
+        );
+
+        // Re-encode as a Publish frame so downstream subscribers receive the
+        // same wire shape the publisher used (topic_len + topic + payload).
+        let mut framed = Vec::with_capacity(2 + topic.len() + payload.len());
+        framed.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+        framed.extend_from_slice(topic.as_bytes());
+        framed.extend_from_slice(payload);
+        let bytes = Bytes::from(framed);
+
+        for (target_conn, target_stream) in targets {
+            self.enqueue_frame(
+                target_conn,
+                target_stream,
+                stream,
+                MessageType::Publish,
+                bytes.clone(),
+            );
+        }
     }
 }
 
@@ -479,6 +577,19 @@ impl AppDispatcher for VireonDispatcher {
                     conn_idx = ctx.conn_idx,
                     payload_len = frame.payload.len(),
                     "[app:event-bus+pubsub] StateUpdate"
+                );
+            }
+            MessageType::Subscribe
+            | MessageType::Unsubscribe
+            | MessageType::Publish
+            | MessageType::TopicCreate
+            | MessageType::TopicDelete => {
+                self.route_native_pubsub(ctx, frame);
+                tracing::trace!(
+                    conn_idx = ctx.conn_idx,
+                    msg_type = ?frame.msg_type,
+                    payload_len = frame.payload.len(),
+                    "[app:pubsub] native control"
                 );
             }
             MessageType::Error => {
