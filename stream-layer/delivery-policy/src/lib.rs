@@ -44,6 +44,7 @@
 
 pub mod decision;
 pub mod error;
+pub mod metrics;
 pub mod policy;
 pub mod state;
 pub mod table;
@@ -52,6 +53,7 @@ pub mod table;
 
 pub use decision::{Decision, FramePayload};
 pub use error::DeliveryPolicyError;
+pub use metrics::{DeliveryPolicyMetrics, MetricsSnapshot};
 pub use policy::{DeliveryPolicy, StreamOpenMeta};
 pub use state::PerStreamState;
 pub use table::DeliveryPolicyTable;

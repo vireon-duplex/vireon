@@ -12,6 +12,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::decision::{Decision, FramePayload};
 use crate::error::DeliveryPolicyError;
+use crate::metrics::DeliveryPolicyMetrics;
 use crate::policy::DeliveryPolicy;
 use crate::state::PerStreamState;
 
@@ -58,6 +59,10 @@ pub struct DeliveryPolicyTable {
     /// Membership mirrors [`PerStreamState::is_dirty`]; updated on every
     /// `apply` and cleared by `drain_ready_for_connection`.
     dirty: FxHashSet<(usize, StreamId)>,
+    /// Atomic observability counters. Updated on every `apply`,
+    /// `drain_ready_for_connection`, and `bind`. Snapshot via
+    /// [`Self::metrics`].
+    metrics: DeliveryPolicyMetrics,
 }
 
 impl DeliveryPolicyTable {
@@ -68,6 +73,7 @@ impl DeliveryPolicyTable {
             entries: FxHashMap::default(),
             warned_default: FxHashSet::default(),
             dirty: FxHashSet::default(),
+            metrics: DeliveryPolicyMetrics::new(),
         }
     }
 
@@ -132,6 +138,9 @@ impl DeliveryPolicyTable {
                 existing.flush_for_upgrade(&mut acc);
                 // Replace with a fresh state for the new policy.
                 let _ = mem::replace(existing, PerStreamState::new(policy));
+                self.metrics
+                    .bind_upgrades
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 acc
             }
             None => {
@@ -181,6 +190,9 @@ impl DeliveryPolicyTable {
                     cap = MAX_TRACKED_STREAMS,
                     "delivery-policy table full — dropping frame for unbound stream"
                 );
+                self.metrics
+                    .table_full_drops
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Decision::Drop;
             }
             if self.warned_default.insert(key) {
@@ -190,6 +202,9 @@ impl DeliveryPolicyTable {
                     seq = seq.get(),
                     "data frame arrived before StreamOpen — defaulting to ReliableOrdered"
                 );
+                self.metrics
+                    .lazy_default_inserts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
 
@@ -208,6 +223,24 @@ impl DeliveryPolicyTable {
         // policies (ReliableUnordered / RealtimeDropOld).
         if state.is_dirty() {
             self.dirty.insert(key);
+        }
+
+        // Counter updates use Relaxed so they don't act as a fence in
+        // the per-frame hot path. Relaxed is enough for the cross-thread
+        // snapshot reads done by a metrics scraper.
+        use std::sync::atomic::Ordering;
+        match &decision {
+            Decision::Deliver(_) => {
+                self.metrics
+                    .frames_delivered
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Decision::Buffer => {
+                self.metrics.frames_buffered.fetch_add(1, Ordering::Relaxed);
+            }
+            Decision::Drop => {
+                self.metrics.frames_dropped.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         decision
@@ -246,6 +279,7 @@ impl DeliveryPolicyTable {
             .collect();
 
         let mut scratch: Vec<(Seq, FramePayload)> = Vec::new();
+        let mut emitted: u64 = 0;
         for key in keys {
             let Some(state) = self.entries.get_mut(&key) else {
                 // Entry was removed (e.g. via remove_stream) — drop the
@@ -257,12 +291,26 @@ impl DeliveryPolicyTable {
             state.drain_ready(&mut scratch);
             for (seq, payload) in scratch.drain(..) {
                 out.push((key.1, seq, payload));
+                emitted += 1;
             }
             // drain_ready empties the pending set; the dirty marker is
             // now stale. (We always clear — is_dirty() would also work
             // but costs an extra match on the enum.)
             self.dirty.remove(&key);
         }
+        if emitted > 0 {
+            self.metrics
+                .drain_emitted
+                .fetch_add(emitted, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Point-in-time snapshot of the table's observability counters.
+    /// Counters are monotonic; the engine typically diffs snapshots
+    /// across a window (e.g. per-second) to derive rates.
+    #[must_use]
+    pub fn metrics(&self) -> crate::metrics::MetricsSnapshot {
+        self.metrics.snapshot()
     }
 
     /// Remove a single stream's policy state. Called on `StreamReset`
@@ -535,5 +583,55 @@ mod tests {
             out.is_empty(),
             "dirty marker must be cleared on bind upgrade"
         );
+    }
+
+    #[test]
+    fn metrics_track_apply_decisions_and_drain() {
+        let mut t = DeliveryPolicyTable::new();
+        // bind → no counter movement (new stream).
+        t.bind(0, StreamId::new(1), DeliveryPolicy::ReliableOrdered)
+            .unwrap();
+        let s = t.metrics();
+        assert_eq!(s.bind_upgrades, 0);
+        assert_eq!(s.frames_delivered, 0);
+
+        // seq=0 delivers immediately.
+        let _ = t.apply(0, StreamId::new(1), Seq::new(0), payload(0x00));
+        // seq=2 buffers (gap at 1).
+        let _ = t.apply(0, StreamId::new(1), Seq::new(2), payload(0x02));
+        // seq=0 again → stale drop.
+        let _ = t.apply(0, StreamId::new(1), Seq::new(0), payload(0xFF));
+
+        let s = t.metrics();
+        assert_eq!(s.frames_delivered, 1, "seq=0 delivered");
+        assert_eq!(s.frames_buffered, 1, "seq=2 buffered");
+        assert_eq!(s.frames_dropped, 1, "stale seq=0 dropped");
+
+        // Drain releases the buffered seq=2 after seq=1 fills the gap.
+        let _ = t.apply(0, StreamId::new(1), Seq::new(1), payload(0x01));
+        let mut out: Vec<(StreamId, Seq, FramePayload)> = Vec::new();
+        t.drain_ready_for_connection(0, &mut out);
+        assert_eq!(out.len(), 1);
+
+        let s = t.metrics();
+        assert_eq!(s.drain_emitted, 1, "drain released one frame");
+        assert_eq!(s.frames_delivered, 2, "seq=1 was also delivered");
+    }
+
+    #[test]
+    fn metrics_track_bind_upgrades_and_lazy_defaults() {
+        let mut t = DeliveryPolicyTable::new();
+        // Lazy-default via apply.
+        let _ = t.apply(0, StreamId::new(2), Seq::new(0), payload(0x11));
+        let s = t.metrics();
+        assert_eq!(s.lazy_default_inserts, 1);
+        assert_eq!(s.frames_delivered, 1);
+
+        // Upgrade via bind.
+        let _ = t
+            .bind(0, StreamId::new(2), DeliveryPolicy::LatestOnly)
+            .unwrap();
+        let s = t.metrics();
+        assert_eq!(s.bind_upgrades, 1);
     }
 }
