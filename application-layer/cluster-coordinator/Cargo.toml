@@ -1,0 +1,19 @@
+[package]
+name = "cluster-coordinator"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+autobenches = false
+description = "Cluster topology, topic routing, and inter-node pub/sub message types."
+
+[dependencies]
+bytes       = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+rustc-hash = { workspace = true }
+session-registry = { path = "../../session-layer/session-registry" }
+
+[lints]
+workspace = true
