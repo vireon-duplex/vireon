@@ -225,6 +225,52 @@ fn realistic_payload(mt: MessageType) -> Vec<u8> {
             v
         }
         MessageType::Ack => br#"{"ack_seq":1042,"highest_seq":1042,"delay_ms":3}"#.to_vec(),
+
+        // Pub/sub Phase 1 wire format — binary payloads (no JSON).
+        MessageType::Subscribe => {
+            let pattern = b"sensor.temperature.zone.*";
+            let mut v = Vec::with_capacity(2 + pattern.len() + 1);
+            v.extend_from_slice(&(pattern.len() as u16).to_be_bytes());
+            v.extend_from_slice(pattern);
+            v.push(1);
+            v
+        }
+        MessageType::Unsubscribe => {
+            let pattern = b"sensor.temperature.zone.*";
+            let mut v = Vec::with_capacity(2 + pattern.len());
+            v.extend_from_slice(&(pattern.len() as u16).to_be_bytes());
+            v.extend_from_slice(pattern);
+            v
+        }
+        MessageType::Publish => {
+            let topic = b"sensor.temperature.zone1";
+            let mut v = Vec::with_capacity(2 + topic.len() + 4096);
+            v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            v.extend_from_slice(topic);
+            let mut payload = vec![0u8; 4096];
+            payload
+                .iter_mut()
+                .enumerate()
+                .for_each(|(i, b)| *b = (i & 0xFF) as u8);
+            v.extend_from_slice(&payload);
+            v
+        }
+        MessageType::TopicCreate => {
+            let topic = b"metrics.cpu.host.*";
+            let mut v = Vec::with_capacity(2 + topic.len() + 12);
+            v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            v.extend_from_slice(topic);
+            v.extend_from_slice(&8u32.to_be_bytes());
+            v.extend_from_slice(&(3_600_000u64).to_be_bytes());
+            v
+        }
+        MessageType::TopicDelete => {
+            let topic = b"metrics.cpu.host.stale";
+            let mut v = Vec::with_capacity(2 + topic.len());
+            v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            v.extend_from_slice(topic);
+            v
+        }
     }
 }
 
@@ -255,6 +301,11 @@ fn type_name(mt: MessageType) -> &'static str {
         MessageType::Handshake => "Handshake",
         MessageType::Fragment => "Fragment",
         MessageType::Ack => "Ack",
+        MessageType::Subscribe => "Subscribe",
+        MessageType::Unsubscribe => "Unsubscribe",
+        MessageType::Publish => "Publish",
+        MessageType::TopicCreate => "TopicCreate",
+        MessageType::TopicDelete => "TopicDelete",
     }
 }
 

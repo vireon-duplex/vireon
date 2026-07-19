@@ -8,6 +8,7 @@
 
 use std::io::{BufRead, Write};
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -77,6 +78,11 @@ struct Cli {
     /// How long to listen for incoming messages (seconds).
     #[arg(long, short = 'l')]
     listen: Option<u64>,
+
+    /// Use native `MessageType::Subscribe`/`Publish`/... frames instead of
+    /// the legacy JSON-over-StateUpdate encoding (Phase 1 wire format).
+    #[arg(long, default_value_t = false)]
+    native: bool,
 
     // ── RPC mode args ──────────────────────────────────────────────
     /// RPC method name.
@@ -375,6 +381,10 @@ enum StdinCmd {
 fn pubsub_mode(conn: &mut ClientConn, cli: &Cli) -> Result<()> {
     let running = std::sync::Arc::new(AtomicBool::new(true));
 
+    if cli.native {
+        return pubsub_mode_native(conn, cli, running);
+    }
+
     match cli.action.as_str() {
         "subscribe" => {
             let pattern = cli.topic.as_deref().unwrap_or("*");
@@ -483,6 +493,147 @@ fn pubsub_mode(conn: &mut ClientConn, cli: &Cli) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Native pub/sub mode — emits Phase 1 wire-format frames
+/// (`MessageType::Subscribe` / `Publish` / `Unsubscribe`) instead of
+/// JSON-in-StateUpdate.
+fn pubsub_mode_native(conn: &mut ClientConn, cli: &Cli, running: Arc<AtomicBool>) -> Result<()> {
+    match cli.action.as_str() {
+        "subscribe" => {
+            let pattern = cli.topic.as_deref().unwrap_or("*");
+            eprintln!("[pubsub:native] subscribing to '{pattern}'");
+            let payload = encode_subscribe_payload(pattern, 0);
+            conn.send_frame(MessageType::Subscribe, &payload)?;
+
+            let (tx, rx) = mpsc::channel::<StdinCmd>();
+            let running_clone = running.clone();
+            std::thread::spawn(move || {
+                let stdin = std::io::stdin();
+                for line in stdin.lock().lines() {
+                    if !running_clone.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    match line {
+                        Ok(ref l) if l == "/q" || l == "/quit" => {
+                            let _ = tx.send(StdinCmd::Quit);
+                            break;
+                        }
+                        Ok(ref l) if !l.trim().is_empty() => {
+                            let _ = tx.send(StdinCmd::Publish(l.trim().to_string()));
+                        }
+                        _ => {}
+                    }
+                }
+            });
+
+            eprintln!("[pubsub:native] listening... (type to publish, /q to quit)");
+
+            let listen_duration = cli.listen.map(Duration::from_secs);
+            let start = Instant::now();
+            let mut decoder = FrameDecoder::new();
+
+            loop {
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
+                if conn.is_closed() {
+                    eprintln!("[pubsub:native] connection closed");
+                    break;
+                }
+                if let Some(dur) = listen_duration {
+                    if start.elapsed() > dur {
+                        break;
+                    }
+                }
+
+                conn.tick()?;
+                let frames = conn.drain_frames(&mut decoder)?;
+                for f in frames {
+                    let text = String::from_utf8_lossy(&f.payload);
+                    println!("[pubsub:native] << (type={:?}) {text}", f.msg_type);
+                }
+
+                match rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(StdinCmd::Publish(text)) => {
+                        let topic = cli.topic.as_deref().unwrap_or("default");
+                        eprintln!("[pubsub:native] >> publishing to '{topic}': {text}");
+                        let payload = encode_publish_payload(topic, text.as_bytes());
+                        conn.send_frame(MessageType::Publish, &payload)?;
+                    }
+                    Ok(StdinCmd::Quit) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
+
+            running.store(false, Ordering::Relaxed);
+        }
+        "publish" => {
+            let topic = cli.topic.as_deref().unwrap_or("default");
+            let text = cli.text.as_deref().unwrap_or("");
+            eprintln!("[pubsub:native] >> publishing to '{topic}': {text}");
+            let payload = encode_publish_payload(topic, text.as_bytes());
+            conn.send_frame(MessageType::Publish, &payload)?;
+
+            let listen_duration = cli
+                .listen
+                .map(Duration::from_secs)
+                .unwrap_or(Duration::from_secs(2));
+            let deadline = Instant::now() + listen_duration;
+            let mut decoder = FrameDecoder::new();
+            while Instant::now() < deadline {
+                conn.tick()?;
+                let frames = conn.drain_frames(&mut decoder)?;
+                for f in frames {
+                    let text = String::from_utf8_lossy(&f.payload);
+                    println!("[pubsub:native] << (type={:?}) {text}", f.msg_type);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        "unsubscribe" => {
+            let pattern = cli.topic.as_deref().unwrap_or("*");
+            eprintln!("[pubsub:native] unsubscribing from '{pattern}'");
+            let payload = encode_unsubscribe_payload(pattern);
+            conn.send_frame(MessageType::Unsubscribe, &payload)?;
+        }
+        other => {
+            eprintln!(
+                "[pubsub:native] unknown action '{other}' (use: publish, subscribe, unsubscribe)"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Wire-encodes a `Subscribe` payload: `pattern_len(u16) + pattern + qos(u8)`.
+fn encode_subscribe_payload(pattern: &str, qos: u8) -> Vec<u8> {
+    let mut v = Vec::with_capacity(2 + pattern.len() + 1);
+    v.extend_from_slice(&(pattern.len() as u16).to_be_bytes());
+    v.extend_from_slice(pattern.as_bytes());
+    v.push(qos);
+    v
+}
+
+/// Wire-encodes an `Unsubscribe` payload: `pattern_len(u16) + pattern`.
+fn encode_unsubscribe_payload(pattern: &str) -> Vec<u8> {
+    let mut v = Vec::with_capacity(2 + pattern.len());
+    v.extend_from_slice(&(pattern.len() as u16).to_be_bytes());
+    v.extend_from_slice(pattern.as_bytes());
+    v
+}
+
+/// Wire-encodes a `Publish` payload: `topic_len(u16) + topic + payload_bytes`.
+fn encode_publish_payload(topic: &str, payload: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(2 + topic.len() + payload.len());
+    v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+    v.extend_from_slice(topic.as_bytes());
+    v.extend_from_slice(payload);
+    v
 }
 
 // ── Main ──────────────────────────────────────────────────────────

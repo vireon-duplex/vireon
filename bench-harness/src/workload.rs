@@ -1,6 +1,6 @@
 //! Realistic per-`MessageType` workload generator.
 //!
-//! Builds one workload containing all 15 frame types — each with a payload
+//! Builds one workload containing all 20 frame types — each with a payload
 //! whose size and shape match what a real Vireon client would send. Unlike
 //! the previous design, payloads are stored **raw** (not pre-encoded); the
 //! layer stack encodes them at send time via `ClientStack::encode_frame_coalesced`.
@@ -23,7 +23,7 @@ pub struct WorkloadEntry {
     pub flags: FrameFlags,
     /// Raw payload bytes (encoded at send time by the layer stack).
     pub payload: Vec<u8>,
-    /// Logical stream index (0..14) — mapped to QUIC stream `i * 4`.
+    /// Logical stream index (0..19) — mapped to QUIC stream `i * 4`.
     pub logical_stream: u64,
 }
 
@@ -41,7 +41,7 @@ pub struct Workload {
     pub entries: Box<[WorkloadEntry]>,
     /// Sum of every payload length (no headers) — for the summary.
     pub total_payload_bytes: usize,
-    /// Total wire bytes for one un-coalesced batch (all 15 frames × 1 copy).
+    /// Total wire bytes for one un-coalesced batch (all 20 frames × 1 copy).
     pub batch_wire_bytes: usize,
     /// How many consecutive copies of each frame to coalesce per stream_send.
     /// The full workload uses [`COALESCE`] (32); latency sweeps use 1 to avoid
@@ -74,10 +74,10 @@ pub fn build_fixed_size(payload_bytes: usize) -> anyhow::Result<Workload> {
     })
 }
 
-/// Builds the full 15-frame workload.
+/// Builds the full 20-frame workload.
 ///
-/// Each `MessageType` gets its own logical `StreamId` (0..14), matching the
-/// "1 user = 15 streams" model: N users produce 15×N logical streams.
+/// Each `MessageType` gets its own logical `StreamId` (0..19), matching the
+/// "1 user = 20 streams" model: N users produce 20×N logical streams.
 pub fn build() -> anyhow::Result<Workload> {
     let mut entries: Vec<WorkloadEntry> = Vec::with_capacity(ALL_MESSAGE_TYPES.len());
     let mut total_payload_bytes = 0usize;
@@ -111,7 +111,7 @@ pub fn build() -> anyhow::Result<Workload> {
 
 /// Returns a realistic payload for `mt`.
 ///
-/// Target: 15 frames total ≈ 1 MiB. Heavy media frames carry the bulk;
+/// Target: 20 frames total ≈ 1 MiB. Heavy media frames carry the bulk;
 /// text/control types are larger-than-typical but still realistic.
 fn realistic_payload(mt: MessageType) -> Vec<u8> {
     match mt {
@@ -255,6 +255,57 @@ fn realistic_payload(mt: MessageType) -> Vec<u8> {
 
         // 64 bytes — ACK is a control frame.
         MessageType::Ack => br#"{"ack_seq":1042,"highest_seq":1042,"delay_ms":3}"#.to_vec(),
+
+        // 32-byte subscribe control: 2-byte len + pattern + 1-byte qos.
+        MessageType::Subscribe => {
+            let pattern = b"sensor.temperature.zone.*";
+            let mut v = Vec::with_capacity(2 + pattern.len() + 1);
+            v.extend_from_slice(&(pattern.len() as u16).to_be_bytes());
+            v.extend_from_slice(pattern);
+            v.push(1); // qos
+            v
+        }
+
+        // 28-byte unsubscribe control: 2-byte len + pattern.
+        MessageType::Unsubscribe => {
+            let pattern = b"sensor.temperature.zone.*";
+            let mut v = Vec::with_capacity(2 + pattern.len());
+            v.extend_from_slice(&(pattern.len() as u16).to_be_bytes());
+            v.extend_from_slice(pattern);
+            v
+        }
+
+        // 4 KiB publish — pseudo media chunk as opaque bytes.
+        MessageType::Publish => {
+            let topic = b"sensor.temperature.zone1";
+            let mut v = Vec::with_capacity(2 + topic.len() + 4096);
+            v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            v.extend_from_slice(topic);
+            let mut payload = vec![0u8; 4096];
+            fill_pseudo_media(&mut payload, 0xE8);
+            v.extend_from_slice(&payload);
+            v
+        }
+
+        // TopicCreate — small control: topic + partitions(4) + retention_ms(8).
+        MessageType::TopicCreate => {
+            let topic = b"metrics.cpu.host.*";
+            let mut v = Vec::with_capacity(2 + topic.len() + 12);
+            v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            v.extend_from_slice(topic);
+            v.extend_from_slice(&8u32.to_be_bytes());
+            v.extend_from_slice(&(3_600_000u64).to_be_bytes());
+            v
+        }
+
+        // TopicDelete — minimal control: 2-byte len + topic.
+        MessageType::TopicDelete => {
+            let topic = b"metrics.cpu.host.stale";
+            let mut v = Vec::with_capacity(2 + topic.len());
+            v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            v.extend_from_slice(topic);
+            v
+        }
     }
 }
 
@@ -287,6 +338,11 @@ fn type_name(mt: MessageType) -> &'static str {
         MessageType::Handshake => "Handshake",
         MessageType::Fragment => "Fragment",
         MessageType::Ack => "Ack",
+        MessageType::Subscribe => "Subscribe",
+        MessageType::Unsubscribe => "Unsubscribe",
+        MessageType::Publish => "Publish",
+        MessageType::TopicCreate => "TopicCreate",
+        MessageType::TopicDelete => "TopicDelete",
     }
 }
 
@@ -318,9 +374,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn workload_has_fifteen_entries() {
+    fn workload_has_twenty_entries() {
         let w = build().unwrap();
-        assert_eq!(w.entries.len(), 15);
+        assert_eq!(w.entries.len(), 20);
     }
 
     #[test]
@@ -334,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn logical_streams_are_zero_to_fourteen() {
+    fn logical_streams_are_zero_to_nineteen() {
         let w = build().unwrap();
         for (i, e) in w.entries.iter().enumerate() {
             assert_eq!(e.logical_stream, i as u64);
