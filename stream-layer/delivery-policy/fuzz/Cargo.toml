@@ -1,0 +1,34 @@
+[package]
+name = "delivery-policy-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "cargo-fuzz targets for delivery-policy — run with `cargo fuzz run <target>`."
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+delivery-policy = { path = ".." }
+frame          = { path = "../../../message-layer/frame" }
+bytes          = "1"
+libfuzzer-sys  = "0.4"
+
+# Each fuzz target is a separate [[bin]] so `cargo fuzz run <name>`
+# knows what to invoke.
+[[bin]]
+name = "table"
+path = "fuzz_targets/table.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "apply_seq_pattern"
+path = "fuzz_targets/apply_seq_pattern.rs"
+test = false
+doc = false
+
+# Standalone workspace — explicitly NOT a member of the parent
+# `vireon` workspace. The parent's Cargo.toml also excludes `fuzz/`
+# to make this intent load-bearing.
+[workspace]
