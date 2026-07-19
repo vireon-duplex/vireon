@@ -49,6 +49,15 @@ pub struct DeliveryPolicyTable {
     /// because a data frame arrived before its `StreamOpen`. Each entry
     /// is warned exactly once; removed when `bind` upgrades the stream.
     warned_default: FxHashSet<(usize, StreamId)>,
+    /// Streams whose state currently holds pending frames that
+    /// [`Self::drain_ready_for_connection`] would emit. Tracked so the
+    /// per-tick drain scan only visits streams with actual work — the
+    /// steady-state hot path on a real engine has thousands of idle
+    /// streams and a handful of dirty ones.
+    ///
+    /// Membership mirrors [`PerStreamState::is_dirty`]; updated on every
+    /// `apply` and cleared by `drain_ready_for_connection`.
+    dirty: FxHashSet<(usize, StreamId)>,
 }
 
 impl DeliveryPolicyTable {
@@ -58,6 +67,7 @@ impl DeliveryPolicyTable {
         Self {
             entries: FxHashMap::default(),
             warned_default: FxHashSet::default(),
+            dirty: FxHashSet::default(),
         }
     }
 
@@ -102,6 +112,9 @@ impl DeliveryPolicyTable {
 
         // Stop tracking as "default" — this stream now has an explicit policy.
         self.warned_default.remove(&key);
+        // The flushed frames are emitted via the return value; the new
+        // state starts clean, so any prior dirty marker is stale.
+        self.dirty.remove(&key);
 
         let drained = match self.entries.get_mut(&key) {
             Some(existing) => {
@@ -184,7 +197,21 @@ impl DeliveryPolicyTable {
             .entries
             .entry(key)
             .or_insert_with(|| PerStreamState::new(DeliveryPolicy::ReliableOrdered));
-        state.apply(seq, payload)
+        let decision = state.apply(seq, payload);
+
+        // Maintain the dirty index. is_dirty() is a single-branch match
+        // against the enum — cheaper than letting drain_ready later walk
+        // every stream in the table just to discover there's nothing to do.
+        if state.is_dirty() {
+            self.dirty.insert(key);
+        } else {
+            // drain_ready may have run inside apply? No — but be safe.
+            // If apply drained everything (e.g. contiguous gap-fill left
+            // the reorder window empty), clear the marker.
+            self.dirty.remove(&key);
+        }
+
+        decision
     }
 
     /// Drain frames that became deliverable for **any** stream on the
@@ -195,17 +222,26 @@ impl DeliveryPolicyTable {
     /// `process_single_stream` (or `process_readable`), so that gap-filled
     /// `ReliableOrdered` frames and pending `LatestOnly` frames are
     /// released to the engine without waiting for the next data arrival.
+    ///
+    /// Visits only the streams marked dirty by recent `apply` calls — the
+    /// steady-state scan on a per-tick drain thus costs O(dirty) rather
+    /// than O(streams). Streams that drain to an empty pending set have
+    /// their dirty marker cleared automatically.
     pub fn drain_ready_for_connection(
         &mut self,
         conn_idx: usize,
         out: &mut Vec<(StreamId, Seq, FramePayload)>,
     ) {
-        // Iterate by raw keys to avoid borrow issues while mutating
-        // values. FxHashMap iteration order is unspecified but does not
-        // affect correctness here — each stream's drain is independent.
+        if self.dirty.is_empty() {
+            return;
+        }
+
+        // Collect dirty keys belonging to this connection. FxHashSet
+        // iteration is unspecified but does not affect correctness — each
+        // stream's drain is independent.
         let keys: Vec<(usize, StreamId)> = self
-            .entries
-            .keys()
+            .dirty
+            .iter()
             .copied()
             .filter(|(c, _)| *c == conn_idx)
             .collect();
@@ -213,6 +249,9 @@ impl DeliveryPolicyTable {
         let mut scratch: Vec<(Seq, FramePayload)> = Vec::new();
         for key in keys {
             let Some(state) = self.entries.get_mut(&key) else {
+                // Entry was removed (e.g. via remove_stream) — drop the
+                // stale dirty marker and move on.
+                self.dirty.remove(&key);
                 continue;
             };
             scratch.clear();
@@ -220,6 +259,10 @@ impl DeliveryPolicyTable {
             for (seq, payload) in scratch.drain(..) {
                 out.push((key.1, seq, payload));
             }
+            // drain_ready empties the pending set; the dirty marker is
+            // now stale. (We always clear — is_dirty() would also work
+            // but costs an extra match on the enum.)
+            self.dirty.remove(&key);
         }
     }
 
@@ -230,6 +273,7 @@ impl DeliveryPolicyTable {
         let key = (conn_idx, stream_id);
         self.entries.remove(&key);
         self.warned_default.remove(&key);
+        self.dirty.remove(&key);
     }
 
     /// Remove all streams for a connection. Called from `cleanup_closed`
@@ -237,6 +281,7 @@ impl DeliveryPolicyTable {
     pub fn remove_connection(&mut self, conn_idx: usize) {
         self.entries.retain(|(c, _), _| *c != conn_idx);
         self.warned_default.retain(|(c, _)| *c != conn_idx);
+        self.dirty.retain(|(c, _)| *c != conn_idx);
     }
 }
 
@@ -399,5 +444,97 @@ mod tests {
         // An already-tracked stream is unaffected.
         let d = t.apply(0, StreamId::new(0), Seq::new(0), payload(0xFF));
         assert!(matches!(d, Decision::Deliver(_)));
+    }
+
+    #[test]
+    fn dirty_tracking_skips_idle_realtime_streams() {
+        // Many RealtimeDropOld streams with delivered frames — none
+        // should be marked dirty. Drain should be a no-op.
+        let mut t = DeliveryPolicyTable::new();
+        for i in 0..1000 {
+            let sid = StreamId::new(i);
+            t.bind(0, sid, DeliveryPolicy::RealtimeDropOld).unwrap();
+            let _ = t.apply(0, sid, Seq::new(0), payload(0xAA));
+        }
+        let mut out: Vec<(StreamId, Seq, FramePayload)> = Vec::new();
+        t.drain_ready_for_connection(0, &mut out);
+        assert!(out.is_empty(), "RealtimeDropOld streams must not drain");
+    }
+
+    #[test]
+    fn dirty_tracking_marks_reliable_ordered_with_reorder() {
+        let mut t = DeliveryPolicyTable::new();
+        t.bind(0, StreamId::new(1), DeliveryPolicy::ReliableOrdered)
+            .unwrap();
+        // Anchor seq=0, then seq=2 buffers (gap at 1).
+        let _ = t.apply(0, StreamId::new(1), Seq::new(0), payload(0x00));
+        let d = t.apply(0, StreamId::new(1), Seq::new(2), payload(0x02));
+        assert!(matches!(d, Decision::Buffer));
+
+        // Before the gap fills, drain walks forward from seq=1 and finds
+        // nothing — but the stream is still marked dirty because the
+        // reorder window is non-empty. This is correct: the buffered
+        // frame will become deliverable once seq=1 arrives.
+        let mut out: Vec<(StreamId, Seq, FramePayload)> = Vec::new();
+        t.drain_ready_for_connection(0, &mut out);
+        assert!(out.is_empty(), "gap not filled — drain yields nothing");
+
+        // Now fill the gap. seq=1 delivers immediately via apply AND
+        // unblocks the previously-buffered seq=2.
+        let d1 = t.apply(0, StreamId::new(1), Seq::new(1), payload(0x01));
+        assert!(matches!(d1, Decision::Deliver(_)));
+
+        let mut out2: Vec<(StreamId, Seq, FramePayload)> = Vec::new();
+        t.drain_ready_for_connection(0, &mut out2);
+        assert_eq!(out2.len(), 1);
+        assert_eq!(out2[0].1, Seq::new(2));
+
+        // After drain, dirty marker is cleared.
+        let mut out3: Vec<(StreamId, Seq, FramePayload)> = Vec::new();
+        t.drain_ready_for_connection(0, &mut out3);
+        assert!(out3.is_empty());
+    }
+
+    #[test]
+    fn dirty_tracking_marks_latest_only_pending() {
+        let mut t = DeliveryPolicyTable::new();
+        t.bind(0, StreamId::new(1), DeliveryPolicy::LatestOnly)
+            .unwrap();
+        let d = t.apply(0, StreamId::new(1), Seq::new(0), payload(0x00));
+        assert!(matches!(d, Decision::Buffer));
+
+        let mut out: Vec<(StreamId, Seq, FramePayload)> = Vec::new();
+        t.drain_ready_for_connection(0, &mut out);
+        assert_eq!(out.len(), 1);
+
+        // After drain, no more pending.
+        let mut out2: Vec<(StreamId, Seq, FramePayload)> = Vec::new();
+        t.drain_ready_for_connection(0, &mut out2);
+        assert!(out2.is_empty());
+    }
+
+    #[test]
+    fn dirty_cleared_on_bind_upgrade() {
+        // Lazy-default a stream by applying, then upgrade via bind.
+        // The dirty marker from the lazy apply must not persist.
+        let mut t = DeliveryPolicyTable::new();
+        // Out-of-order apply creates a buffer entry → dirty.
+        let _ = t.apply(0, StreamId::new(5), Seq::new(0), payload(0x00));
+        let _ = t.apply(0, StreamId::new(5), Seq::new(2), payload(0x02));
+
+        // bind flushes everything and replaces state.
+        let drained = t
+            .bind(0, StreamId::new(5), DeliveryPolicy::LatestOnly)
+            .unwrap();
+        assert_eq!(drained.len(), 1, "seq=2 was buffered, should be flushed");
+
+        // After bind, the new state is LatestOnly with empty pending.
+        // Drain should produce nothing.
+        let mut out: Vec<(StreamId, Seq, FramePayload)> = Vec::new();
+        t.drain_ready_for_connection(0, &mut out);
+        assert!(
+            out.is_empty(),
+            "dirty marker must be cleared on bind upgrade"
+        );
     }
 }
