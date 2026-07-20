@@ -86,5 +86,14 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# Application-layer crates wired into the vireon binary.
+pubsub-engine          = { path = "application-layer/pubsub-engine" }
+topic-acl              = { path = "application-layer/topic-acl" }
+auth-framework         = { path = "application-layer/auth-framework" }
+observability-exporters = { path = "application-layer/observability-exporters" }
+
+# Signal handling for graceful shutdown.
+ctrlc = "3.4"
+
 [lints]
 workspace = true

@@ -97,6 +97,14 @@ impl PubSubEngine {
         self.subscriptions.len()
     }
 
+    /// Take a snapshot of the engine's atomic counters. Useful for
+    /// metric collectors that need access to fields not present on
+    /// [`HealthReport`] (e.g. `messages_delivered`).
+    #[must_use]
+    pub fn snapshot(&self) -> crate::stats::StatsSnapshot {
+        self.stats.snapshot()
+    }
+
     /// Get the current health report.
     #[must_use]
     pub fn health(&self) -> HealthReport {

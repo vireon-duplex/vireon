@@ -1852,6 +1852,11 @@ name = "vireon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "auth-framework",
+ "ctrlc",
+ "observability-exporters",
+ "pubsub-engine",
+ "topic-acl",
  "tracing",
  "tracing-subscriber",
 ]
