@@ -1853,7 +1853,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "auth-framework",
+ "bytes",
  "ctrlc",
+ "delivery-policy",
+ "frame",
  "observability-exporters",
  "pubsub-engine",
  "topic-acl",
