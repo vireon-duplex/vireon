@@ -112,7 +112,14 @@ fn run_pubsub_demo() -> PubSubEngine {
         ("metrics.cpu", &[0x00][..]),
     ];
     for (topic, payload) in topics {
-        match engine.publish(PubSubMessage::new(topic, payload.to_vec())) {
+        let topic = match pubsub_engine::Topic::new(topic) {
+            Ok(t) => t,
+            Err(e) => {
+                println!("  topic {topic:?} rejected: {e:?}");
+                continue;
+            }
+        };
+        match engine.publish(PubSubMessage::new(topic.clone(), payload.to_vec())) {
             Ok(()) => println!("  published → {topic} ({} bytes)", payload.len()),
             Err(e) => println!("  publish {topic} failed: {e:?}"),
         }

@@ -9,7 +9,7 @@
 #![allow(missing_docs, clippy::unwrap_used)]
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use pubsub_engine::{PubSubConfig, PubSubEngine, PubSubMessage, TopicPattern};
+use pubsub_engine::{PubSubConfig, PubSubEngine, PubSubMessage, Topic, TopicPattern};
 
 const FANOUTS: &[usize] = &[1, 10, 100, 1000];
 
@@ -26,7 +26,7 @@ fn build_engine_with_fans(n: usize) -> PubSubEngine {
 }
 
 fn bench_fanout(c: &mut Criterion) {
-    let msg = PubSubMessage::new("sensor.temp", vec![0xAB; 64]);
+    let msg = PubSubMessage::new(Topic::new("sensor.temp").unwrap(), vec![0xAB; 64]);
     let mut group = c.benchmark_group("fanout");
     for &n in FANOUTS {
         let mut engine = build_engine_with_fans(n);

@@ -22,6 +22,7 @@
 use crate::config::PubSubConfig;
 use crate::error::PubSubError;
 use crate::subscription::SubscriptionId;
+use crate::topic::Topic;
 use crate::trie::TopicTrie;
 use rustc_hash::FxHashMap;
 use std::fmt;
@@ -163,7 +164,7 @@ impl TopicRegistry {
     /// receive a delivery. The caller is responsible for any fan-out
     /// filtering (e.g. suppressing echo to the origin connection).
     #[must_use]
-    pub fn lookup(&self, topic: &str) -> Vec<Subscriber> {
+    pub fn lookup(&self, topic: &Topic) -> Vec<Subscriber> {
         match self.trie.lookup(topic) {
             Ok(ids) => ids
                 .iter()
@@ -296,12 +297,16 @@ mod tests {
         }
     }
 
+    fn t(s: &str) -> Topic {
+        Topic::new(s).unwrap()
+    }
+
     #[test]
     fn empty_registry_has_zero_len() {
         let r = TopicRegistry::new(PubSubConfig::new());
         assert!(r.is_empty());
         assert_eq!(r.len(), 0);
-        assert!(r.lookup("any.topic").is_empty());
+        assert!(r.lookup(&t("any.topic")).is_empty());
     }
 
     #[test]
@@ -319,7 +324,7 @@ mod tests {
         r.subscribe(sub(7, 100), "sensor.temp").unwrap();
         r.subscribe(sub(8, 200), "sensor.humidity").unwrap();
 
-        let hits = r.lookup("sensor.temp");
+        let hits = r.lookup(&t("sensor.temp"));
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0], sub(7, 100));
     }
@@ -331,7 +336,7 @@ mod tests {
         r.subscribe(sub(2, 20), "sensor.*").unwrap();
         r.subscribe(sub(3, 30), "alert.*").unwrap();
 
-        let hits = r.lookup("sensor.temp");
+        let hits = r.lookup(&t("sensor.temp"));
         assert_eq!(hits.len(), 2);
         let conns: Vec<_> = hits.iter().map(|h| h.conn_idx).collect();
         assert!(conns.contains(&1));
@@ -342,10 +347,10 @@ mod tests {
     fn unsubscribe_removes_from_lookup() {
         let mut r = TopicRegistry::new(PubSubConfig::new());
         let id = r.subscribe(sub(0, 5), "sensor.*").unwrap();
-        assert_eq!(r.lookup("sensor.x").len(), 1);
+        assert_eq!(r.lookup(&t("sensor.x")).len(), 1);
 
         r.unsubscribe(id).unwrap();
-        assert!(r.lookup("sensor.x").is_empty());
+        assert!(r.lookup(&t("sensor.x")).is_empty());
         assert!(r.is_empty());
     }
 
@@ -367,8 +372,8 @@ mod tests {
         // Remove only "sensor.*" for conn 0.
         let removed = r.unsubscribe_pattern(0, "sensor.*");
         assert_eq!(removed, 1);
-        assert!(r.lookup("sensor.temp").is_empty());
-        assert_eq!(r.lookup("alert.fire").len(), 1);
+        assert!(r.lookup(&t("sensor.temp")).is_empty());
+        assert_eq!(r.lookup(&t("alert.fire")).len(), 1);
     }
 
     #[test]
@@ -380,7 +385,7 @@ mod tests {
         // Conn 0 unsubscribes; conn 1 should still receive matches.
         let removed = r.unsubscribe_pattern(0, "sensor.*");
         assert_eq!(removed, 1);
-        let hits = r.lookup("sensor.temp");
+        let hits = r.lookup(&t("sensor.temp"));
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].conn_idx, 1);
     }
@@ -396,8 +401,8 @@ mod tests {
         assert_eq!(removed, 2);
         assert_eq!(r.len(), 1);
         // Conn 1's subscription survives.
-        assert_eq!(r.lookup("a.x").len(), 1);
-        assert_eq!(r.lookup("a.x")[0].conn_idx, 1);
+        assert_eq!(r.lookup(&t("a.x")).len(), 1);
+        assert_eq!(r.lookup(&t("a.x"))[0].conn_idx, 1);
     }
 
     #[test]
@@ -418,7 +423,7 @@ mod tests {
         let b = r.subscribe(sub(0, 1), "t.*").unwrap();
         assert_ne!(a, b);
 
-        let hits = r.lookup("t.x");
+        let hits = r.lookup(&t("t.x"));
         assert_eq!(hits.len(), 2, "both registrations should match");
     }
 
