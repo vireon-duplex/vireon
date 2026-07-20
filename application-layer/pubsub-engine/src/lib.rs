@@ -30,6 +30,7 @@
 //! | 7  | [`builder`]      | 0 ✅  | `PubSubBuilder` (fluent) |
 //! | 8  | [`engine`]       | 1    | `PubSubEngine` facade |
 //! | 9  | [`trie`]         | 1    | `TopicTrie` (pattern matching) |
+//! | 10 | [`topic`]        | 1    | `Topic` (validated concrete topic name) |
 //!
 //! # Phase 0 status
 //!
@@ -47,6 +48,7 @@ pub mod message;
 pub mod registry;
 pub mod stats;
 pub mod subscription;
+pub mod topic;
 pub mod trie;
 
 // ── Re-exports ────────────────────────────────────────────────────
@@ -60,6 +62,7 @@ pub use message::PubSubMessage;
 pub use registry::{Subscriber, TopicCatalog, TopicConfig, TopicRegistry};
 pub use stats::{PubSubStats, StatsSnapshot};
 pub use subscription::{SubscriptionId, TopicPattern};
+pub use topic::Topic;
 pub use trie::TopicTrie;
 
 // Re-export key adjacent-layer types for convenience.
