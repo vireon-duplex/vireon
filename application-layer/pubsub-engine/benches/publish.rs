@@ -6,7 +6,7 @@ use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use pubsub_engine::{PubSubConfig, PubSubEngine, PubSubMessage};
 
 fn bench_publish(c: &mut Criterion) {
-    let engine = PubSubEngine::new(PubSubConfig::new());
+    let mut engine = PubSubEngine::new(PubSubConfig::new());
     let msg = PubSubMessage::new("sensor.temp", vec![1, 2, 3, 4]);
     c.bench_function("publish", |b| {
         b.iter(|| {

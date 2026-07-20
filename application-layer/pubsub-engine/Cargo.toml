@@ -34,5 +34,9 @@ harness = false
 name = "deliver"
 harness = false
 
+[[bench]]
+name = "fanout"
+harness = false
+
 [lints]
 workspace = true

@@ -1,12 +1,17 @@
-//! Bench: deliver — measure the cost of delivering a message to a subscription.
+//! Bench: deliver — measure the cost of delivering a message to a
+//! single matching subscription.
+//!
+//! This isolates per-delivery overhead (pattern match + stat increment)
+//! from subscription-fan-out scaling, which is covered by `fanout.rs`.
 
 #![allow(missing_docs)]
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use pubsub_engine::{PubSubConfig, PubSubEngine, PubSubMessage};
+use pubsub_engine::{PubSubConfig, PubSubEngine, PubSubMessage, TopicPattern};
 
 fn bench_deliver(c: &mut Criterion) {
-    let engine = PubSubEngine::new(PubSubConfig::new());
+    let mut engine = PubSubEngine::new(PubSubConfig::new());
+    engine.subscribe(TopicPattern::new("sensor.*").unwrap()).unwrap();
     let msg = PubSubMessage::new("sensor.temp", vec![1, 2, 3]);
     c.bench_function("deliver", |b| {
         b.iter(|| {

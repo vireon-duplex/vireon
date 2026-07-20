@@ -6,7 +6,7 @@ use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use pubsub_engine::{PubSubConfig, PubSubEngine, TopicPattern};
 
 fn bench_subscribe(c: &mut Criterion) {
-    let engine = PubSubEngine::new(PubSubConfig::new());
+    let mut engine = PubSubEngine::new(PubSubConfig::new());
     let pattern = TopicPattern::new("sensor.*").unwrap();
     c.bench_function("subscribe", |b| {
         b.iter(|| {
