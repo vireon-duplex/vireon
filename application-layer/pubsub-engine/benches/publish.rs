@@ -1,6 +1,6 @@
 //! Bench: publish — measure the cost of publishing a message to the engine.
 
-#![allow(missing_docs)]
+#![allow(missing_docs, clippy::unwrap_used)]
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use pubsub_engine::{PubSubConfig, PubSubEngine, PubSubMessage};

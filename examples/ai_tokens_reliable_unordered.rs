@@ -7,7 +7,7 @@
 //! races must be suppressed. Order is irrelevant — the renderer
 //! places tokens by seq.
 
-#![allow(clippy::print_stdout)]
+#![allow(clippy::print_stdout, clippy::unwrap_used)]
 
 use bytes::Bytes;
 use delivery_policy::{
