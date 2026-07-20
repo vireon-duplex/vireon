@@ -22,8 +22,8 @@
 
 #![allow(clippy::print_stdout)]
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use auth_framework::PrincipalId;
@@ -298,7 +298,9 @@ mod tests {
         // Unmatched topic → NoMatch.
         assert!(matches!(
             t.check(PrincipalId::new(99), Action::Publish, "unknown.topic"),
-            AclDecision::Deny { reason: topic_acl::DenyReason::NoMatch }
+            AclDecision::Deny {
+                reason: topic_acl::DenyReason::NoMatch
+            }
         ));
     }
 

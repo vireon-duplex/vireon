@@ -93,7 +93,7 @@ impl Worker {
                     .max_memory(pool_budget)
                     .numa_node(numa_node)
                     .build()
-                    .expect("pool config is valid"),
+                    .map_err(|e| ServerError::EngineInit(format!("buffer pool: {e:?}")))?,
             )
             .forward_mesh(mesh)
             .num_workers(num_workers)

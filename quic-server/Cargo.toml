@@ -7,6 +7,14 @@ authors.workspace = true
 license.workspace = true
 autobenches = false
 
+[lib]
+name = "quic_server"
+path = "src/lib.rs"
+
+[[bench]]
+name = "pubsub_dispatch"
+harness = false
+
 [dependencies]
 # Vireon crates — one per architectural layer
 # ── IO Layer ────────────────────────────────────────────────────────
@@ -33,6 +41,7 @@ frame = { path = "../message-layer/frame" }
 # ── Stream Layer ────────────────────────────────────────────────────
 stream-manager = { path = "../stream-layer/stream-manager" }
 stream-scheduler = { path = "../stream-layer/stream-scheduler" }
+send-policy = { path = "../stream-layer/send-policy" }
 
 # ── Session Layer ───────────────────────────────────────────────────
 session-manager = { path = "../session-layer/session-manager" }
@@ -57,6 +66,7 @@ configuration-system = { path = "../application-layer/configuration-system" }
 plugin-manager = { path = "../application-layer/plugin-manager" }
 scheduler-hooks = { path = "../application-layer/scheduler-hooks" }
 auth-framework = { path = "../application-layer/auth-framework" }
+topic-acl = { path = "../application-layer/topic-acl" }
 observability-sdk = { path = "../application-layer/observability-sdk" }
 resource-quotas = { path = "../application-layer/resource-quotas" }
 feature-flags = { path = "../application-layer/feature-flags" }
@@ -90,6 +100,9 @@ bytes = { workspace = true }
 
 # Function profiler (#[profile] instrumentation).
 profiler = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [features]
 default = []

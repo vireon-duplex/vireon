@@ -35,7 +35,7 @@ use quic_engine::{QuicEngine, QuicEvent, QuicSendError};
 
 use crate::connection::{ConnState, ConnectionRegistry};
 use crate::error::ServerError;
-use crate::layers::{ApplicationLayer, FrameContext, RuntimeLayer};
+use crate::layers::{ApplicationLayer, FrameContext, OutgoingFrame, RuntimeLayer};
 
 /// Drain timeout — how long to wait for connections to close cleanly
 /// before forcing reactor exit. 2 seconds covers 3 × PTO (Probe Timeout)
@@ -274,8 +274,37 @@ impl VireonStack {
         // Doing this once per batch (instead of per-frame) reduces the
         // number of outbox drain calls and allows the engine to coalesce
         // multiple frames into fewer flush cycles.
+        //
+        // Two-category routing:
+        //   * direct_send — control frames (Subscribe ACKs, TopicCreate
+        //     ACKs, etc.) and frames on streams not bound to a send
+        //     policy. These bypass policy and go straight to the wire.
+        //   * policy — frames on streams whose subscriber declared a
+        //     delivery policy at StreamOpen. These are consumed by the
+        //     SendPolicyTable and emerge from `drain_ready_egress` in
+        //     policy order (FIFO / drop-stale / latest-only).
+        //
+        // Splitting the drain into two passes avoids the borrow conflict
+        // between `application.enqueue_egress(&mut self, ...)` and
+        // `encode_and_send(&mut self, ...)` — we collect each category
+        // into a local Vec, then send in a separate loop.
         let outbox = self.application.drain_outbox();
+        let mut direct_send: Vec<OutgoingFrame> = Vec::with_capacity(outbox.len());
         for out in outbox {
+            match self.application.enqueue_egress(out) {
+                None => {} // consumed by policy
+                Some(out) => direct_send.push(out),
+            }
+        }
+        // Send the bypass frames first so control-plane ACKs reach the
+        // peer before any policy-delayed data.
+        for out in direct_send {
+            self.encode_and_send(out.conn_idx, out.quic_stream_id, out.header, &out.payload);
+        }
+        // Drain policy-cleared frames and send.
+        let mut policy_ready: Vec<OutgoingFrame> = Vec::new();
+        self.application.drain_ready_egress(&mut policy_ready);
+        for out in policy_ready {
             self.encode_and_send(out.conn_idx, out.quic_stream_id, out.header, &out.payload);
         }
     }

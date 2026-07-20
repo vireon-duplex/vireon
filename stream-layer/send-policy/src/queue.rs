@@ -27,10 +27,10 @@ pub const MAX_STREAM_QUEUE: usize = 1024;
 
 /// Bounded FIFO of pending egress frames for one stream.
 ///
-/// Stored as `VecDeque<FramePayload>` keyed by arrival order; `seq` is
-/// passed in to `push_back` purely so the table can maintain
-/// `newest_seq` for `RealtimeDropOld`'s stale check without forcing that
-/// policy to also store the queue type.
+/// Stored as `VecDeque<FramePayload>` keyed by arrival order. Each
+/// `FramePayload` carries its own `seq`, so the queue maintains
+/// `newest_seq` for `RealtimeDropOld`'s stale check by reading
+/// `payload.seq` on every push — no separate seq argument needed.
 #[derive(Debug, Default)]
 pub struct StreamQueue {
     buf: VecDeque<FramePayload>,
@@ -72,12 +72,12 @@ impl StreamQueue {
 
     /// Append a frame to the tail. Returns `Some(displaced)` when the
     /// queue was at capacity — the caller is expected to log/count and
-    /// then drop the displaced payload. `seq` is recorded as `newest_seq`
-    /// regardless of capacity outcome (it represents the freshest arrival
-    /// the stream has seen).
+    /// then drop the displaced payload. `payload.seq` is recorded as
+    /// `newest_seq` regardless of capacity outcome (it represents the
+    /// freshest arrival the stream has seen).
     #[inline]
-    pub fn push_back(&mut self, seq: Seq, payload: FramePayload) -> Option<FramePayload> {
-        self.newest_seq = Some(seq);
+    pub fn push_back(&mut self, payload: FramePayload) -> Option<FramePayload> {
+        self.newest_seq = Some(payload.seq);
         let displaced = if self.buf.len() >= MAX_STREAM_QUEUE {
             self.buf.pop_front()
         } else {
@@ -117,11 +117,12 @@ mod tests {
     use bytes::Bytes;
     use frame::header::{FrameFlags, MessageType};
 
-    fn p(n: u8) -> FramePayload {
+    fn p(seq: u64, byte: u8) -> FramePayload {
         FramePayload::new(
             MessageType::TextToken,
             FrameFlags::NONE,
-            Bytes::from(vec![n]),
+            Seq::new(seq),
+            Bytes::from(vec![byte]),
         )
     }
 
@@ -137,9 +138,9 @@ mod tests {
     #[test]
     fn push_pop_round_trip_preserves_order() {
         let mut q = StreamQueue::new();
-        q.push_back(Seq::new(0), p(1));
-        q.push_back(Seq::new(1), p(2));
-        q.push_back(Seq::new(2), p(3));
+        q.push_back(p(0, 1));
+        q.push_back(p(1, 2));
+        q.push_back(p(2, 3));
         assert_eq!(q.len(), 3);
 
         assert_eq!(q.pop_front().unwrap().bytes.as_ref(), &[1]);
@@ -151,8 +152,8 @@ mod tests {
     #[test]
     fn newest_seq_remains_after_drain() {
         let mut q = StreamQueue::new();
-        q.push_back(Seq::new(5), p(0));
-        q.push_back(Seq::new(9), p(0));
+        q.push_back(p(5, 0));
+        q.push_back(p(9, 0));
         let _ = q.pop_front();
         let _ = q.pop_front();
         assert!(q.is_empty());
@@ -163,11 +164,11 @@ mod tests {
     fn push_at_capacity_displaces_oldest() {
         let mut q = StreamQueue::new();
         for i in 0..MAX_STREAM_QUEUE as u64 {
-            q.push_back(Seq::new(i), p(i as u8));
+            q.push_back(p(i, i as u8));
         }
         assert_eq!(q.len(), MAX_STREAM_QUEUE);
         // One more push should displace the oldest (seq=0) and stay at cap.
-        let displaced = q.push_back(Seq::new(MAX_STREAM_QUEUE as u64), p(0xAA));
+        let displaced = q.push_back(p(MAX_STREAM_QUEUE as u64, 0xAA));
         assert_eq!(q.len(), MAX_STREAM_QUEUE);
         let d = displaced.unwrap();
         assert_eq!(d.bytes.as_ref(), &[0]);
@@ -176,8 +177,8 @@ mod tests {
     #[test]
     fn drain_all_empties_and_returns_in_order() {
         let mut q = StreamQueue::new();
-        q.push_back(Seq::new(0), p(1));
-        q.push_back(Seq::new(1), p(2));
+        q.push_back(p(0, 1));
+        q.push_back(p(1, 2));
         let drained = q.drain_all();
         assert_eq!(drained.len(), 2);
         assert_eq!(drained[0].bytes.as_ref(), &[1]);

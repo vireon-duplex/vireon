@@ -2,18 +2,21 @@
 //! and [`SendPolicyTable::dequeue`](crate::SendPolicyTable::dequeue).
 
 use bytes::Bytes;
-use frame::header::{FrameFlags, MessageType};
+use frame::header::{FrameFlags, MessageType, Seq};
 
 /// Owned payload bytes plus the parts of the frame header the scheduler
 /// needs in order to emit a wire-format frame when the payload leaves the
-/// send queue.
+/// send queue: `msg_type`, `flags`, `seq`, and the payload bytes. The
+/// logical `StreamId` is known from the dequeue key, so it is not
+/// duplicated here.
 ///
-/// Mirrors `delivery_policy::FramePayload` so callers that already build
-/// a [`FramePayload`] for the receive side can reuse the same construction
-/// site (although the two types are intentionally distinct — receive-side
-/// payloads carry `quic_stream_id` for re-emission through `FrameReceived`,
-/// while send-side payloads carry the data the scheduler will turn into
-/// outgoing bytes).
+/// Mirrors `delivery_policy::FramePayload` in spirit, but the two types
+/// are intentionally distinct — receive-side payloads carry
+/// `quic_stream_id` for re-emission through `FrameReceived`, while
+/// send-side payloads carry `seq` so the scheduler can rebuild a complete
+/// wire-format `FrameHeader` on egress. The receiver's policy consumes
+/// `seq` for ordering / dedup / stale checks, so it must survive any
+/// send-side reordering or drop.
 #[derive(Debug, Clone)]
 pub struct FramePayload {
     /// Original `MessageType` of the data frame. Preserved so the
@@ -22,18 +25,23 @@ pub struct FramePayload {
     pub msg_type: MessageType,
     /// Original `FrameFlags` of the data frame.
     pub flags: FrameFlags,
+    /// Original `Seq` of the data frame. Preserved through any send-side
+    /// reordering or drop so the receiver's policy sees the same sequence
+    /// position the publisher intended.
+    pub seq: Seq,
     /// Payload bytes.
     pub bytes: Bytes,
 }
 
 impl FramePayload {
-    /// Construct from the three pieces.
+    /// Construct from the four pieces.
     #[inline]
     #[must_use]
-    pub fn new(msg_type: MessageType, flags: FrameFlags, bytes: Bytes) -> Self {
+    pub fn new(msg_type: MessageType, flags: FrameFlags, seq: Seq, bytes: Bytes) -> Self {
         Self {
             msg_type,
             flags,
+            seq,
             bytes,
         }
     }

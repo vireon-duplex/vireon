@@ -8,9 +8,7 @@
 #![allow(clippy::print_stdout, clippy::unwrap_used)]
 
 use bytes::Bytes;
-use delivery_policy::{
-    Decision, DeliveryPolicy, DeliveryPolicyTable, FramePayload,
-};
+use delivery_policy::{Decision, DeliveryPolicy, DeliveryPolicyTable, FramePayload};
 use frame::header::{FrameFlags, MessageType, Seq, StreamId};
 
 const CONN: usize = 0;

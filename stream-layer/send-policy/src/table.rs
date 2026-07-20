@@ -8,7 +8,7 @@
 
 use std::mem;
 
-use frame::header::{Seq, StreamId};
+use frame::header::StreamId;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::decision::{DequeueOutcome, EnqueueDecision, FramePayload};
@@ -155,9 +155,9 @@ impl SendPolicyTable {
         &mut self,
         conn_idx: usize,
         stream_id: StreamId,
-        seq: Seq,
         payload: FramePayload,
     ) -> EnqueueDecision {
+        let seq = payload.seq;
         let key = (conn_idx, stream_id);
 
         // Lazy-default path: check & warn OUTSIDE the entry() borrow to
@@ -195,7 +195,7 @@ impl SendPolicyTable {
             .entries
             .entry(key)
             .or_insert_with(|| PerStreamSendState::new(DeliveryPolicy::ReliableOrdered));
-        let decision = state.enqueue(seq, payload);
+        let decision = state.enqueue(payload);
 
         // Maintain the ready index. `enqueue` can only transition a stream
         // false → true (it never empties the queue), so we skip the
@@ -261,12 +261,36 @@ impl SendPolicyTable {
         );
     }
 
+    /// Snapshot every stream that currently has at least one frame ready
+    /// for `dequeue`, across all connections. Returned in unspecified
+    /// order.
+    ///
+    /// Use this when the caller drains per-batch (not per-connection),
+    /// e.g. a stack-level outbox drain that collects ready frames from
+    /// every connection into one outgoing batch. For per-connection
+    /// drain, prefer [`Self::ready_streams_for_connection`] which avoids
+    /// scanning the full ready set.
+    pub fn ready_streams_all(&self, out: &mut Vec<(usize, StreamId)>) {
+        out.extend(self.ready.iter().copied());
+    }
+
     /// Number of streams on the given connection that have at least one
     /// ready frame. Cheap O(1)-ish check the scheduler can use to short-
     /// circuit a tick when there is nothing to send.
     #[must_use]
     pub fn ready_count_for_connection(&self, conn_idx: usize) -> usize {
         self.ready.iter().filter(|(c, _)| *c == conn_idx).count()
+    }
+
+    /// `true` when `(conn_idx, stream_id)` has an explicit policy bound
+    /// (or has been lazy-defaulted by a prior `enqueue`). The stack uses
+    /// this to decide whether to route an `OutgoingFrame` through the
+    /// policy (returns `true`) or send it directly on the QUIC stream
+    /// (returns `false` — control frames, unbound subscriber streams).
+    #[inline]
+    #[must_use]
+    pub fn contains(&self, conn_idx: usize, stream_id: StreamId) -> bool {
+        self.entries.contains_key(&(conn_idx, stream_id))
     }
 
     /// Point-in-time snapshot of the table's observability counters.
@@ -308,13 +332,14 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use bytes::Bytes;
-    use frame::header::{FrameFlags, MessageType};
+    use frame::header::{FrameFlags, MessageType, Seq};
 
-    fn payload(n: u8) -> FramePayload {
+    fn payload(seq: u64, byte: u8) -> FramePayload {
         FramePayload::new(
             MessageType::TextToken,
             FrameFlags::NONE,
-            Bytes::from(vec![n]),
+            Seq::new(seq),
+            Bytes::from(vec![byte]),
         )
     }
 
@@ -332,15 +357,15 @@ mod tests {
             .unwrap();
 
         // First frame queues.
-        let d = t.enqueue(0, StreamId::new(1), Seq::new(5), payload(0xAA));
+        let d = t.enqueue(0, StreamId::new(1), payload(5, 0xAA));
         assert!(matches!(d, EnqueueDecision::Queue));
 
         // Older seq drops.
-        let d = t.enqueue(0, StreamId::new(1), Seq::new(3), payload(0xBB));
+        let d = t.enqueue(0, StreamId::new(1), payload(3, 0xBB));
         assert!(matches!(d, EnqueueDecision::Drop));
 
         // Newer seq queues.
-        let d = t.enqueue(0, StreamId::new(1), Seq::new(9), payload(0xCC));
+        let d = t.enqueue(0, StreamId::new(1), payload(9, 0xCC));
         assert!(matches!(d, EnqueueDecision::Queue));
     }
 
@@ -348,12 +373,12 @@ mod tests {
     fn enqueue_without_bind_uses_default_with_warning() {
         let mut t = SendPolicyTable::new();
         // No bind — should lazy-insert ReliableOrdered (FIFO).
-        let d = t.enqueue(0, StreamId::new(2), Seq::new(0), payload(0x11));
+        let d = t.enqueue(0, StreamId::new(2), payload(0, 0x11));
         assert!(matches!(d, EnqueueDecision::Queue));
         // Stream should now be tracked.
         assert_eq!(t.len(), 1);
         // Warned-default marker prevents re-warning on next enqueue.
-        let d = t.enqueue(0, StreamId::new(2), Seq::new(1), payload(0x22));
+        let d = t.enqueue(0, StreamId::new(2), payload(1, 0x22));
         assert!(matches!(d, EnqueueDecision::Queue));
     }
 
@@ -362,9 +387,9 @@ mod tests {
         let mut t = SendPolicyTable::new();
         t.bind(0, StreamId::new(1), DeliveryPolicy::ReliableOrdered)
             .unwrap();
-        let _ = t.enqueue(0, StreamId::new(1), Seq::new(0), payload(1));
-        let _ = t.enqueue(0, StreamId::new(1), Seq::new(1), payload(2));
-        let _ = t.enqueue(0, StreamId::new(1), Seq::new(2), payload(3));
+        let _ = t.enqueue(0, StreamId::new(1), payload(0, 1));
+        let _ = t.enqueue(0, StreamId::new(1), payload(1, 2));
+        let _ = t.enqueue(0, StreamId::new(1), payload(2, 3));
 
         match t.dequeue(0, StreamId::new(1)) {
             DequeueOutcome::Some(p) => assert_eq!(p.bytes.as_ref(), &[1]),
@@ -397,8 +422,8 @@ mod tests {
     fn bind_upgrades_state_and_drains_queued() {
         let mut t = SendPolicyTable::new();
         // Enqueue first → triggers default ReliableOrdered (FIFO).
-        let _ = t.enqueue(0, StreamId::new(3), Seq::new(0), payload(1));
-        let _ = t.enqueue(0, StreamId::new(3), Seq::new(1), payload(2));
+        let _ = t.enqueue(0, StreamId::new(3), payload(0, 1));
+        let _ = t.enqueue(0, StreamId::new(3), payload(1, 2));
 
         // Now StreamOpen arrives upgrading to LatestOnly.
         let drained = t
@@ -434,7 +459,7 @@ mod tests {
         t.remove_connection(0);
         // Conn 0 streams gone; conn 1 stream remains.
         assert_eq!(t.len(), 1);
-        let _ = t.enqueue(1, StreamId::new(1), Seq::new(0), payload(0x00));
+        let _ = t.enqueue(1, StreamId::new(1), payload(0, 0x00));
     }
 
     #[test]
@@ -445,7 +470,7 @@ mod tests {
         t.bind(0, StreamId::new(2), DeliveryPolicy::ReliableOrdered)
             .unwrap();
         // Only stream 1 gets a frame.
-        let _ = t.enqueue(0, StreamId::new(1), Seq::new(0), payload(1));
+        let _ = t.enqueue(0, StreamId::new(1), payload(0, 1));
 
         let mut ready = Vec::new();
         t.ready_streams_for_connection(0, &mut ready);
@@ -460,7 +485,7 @@ mod tests {
         let mut t = SendPolicyTable::new();
         t.bind(0, StreamId::new(1), DeliveryPolicy::ReliableOrdered)
             .unwrap();
-        let _ = t.enqueue(0, StreamId::new(1), Seq::new(0), payload(1));
+        let _ = t.enqueue(0, StreamId::new(1), payload(0, 1));
 
         assert_eq!(t.ready_count_for_connection(0), 1);
 
@@ -488,14 +513,13 @@ mod tests {
         let d = t.enqueue(
             0,
             StreamId::new(MAX_TRACKED_STREAMS as u64 + 1),
-            Seq::new(0),
-            payload(0xEE),
+            payload(0, 0xEE),
         );
         assert!(matches!(d, EnqueueDecision::Drop));
         assert_eq!(t.len(), before_len, "entries must not grow past cap");
 
         // An already-tracked stream is unaffected.
-        let d = t.enqueue(0, StreamId::new(0), Seq::new(0), payload(0xFF));
+        let d = t.enqueue(0, StreamId::new(0), payload(0, 0xFF));
         assert!(matches!(d, EnqueueDecision::Queue));
     }
 
@@ -504,9 +528,9 @@ mod tests {
         let mut t = SendPolicyTable::new();
         t.bind(0, StreamId::new(1), DeliveryPolicy::LatestOnly)
             .unwrap();
-        let _ = t.enqueue(0, StreamId::new(1), Seq::new(0), payload(1));
+        let _ = t.enqueue(0, StreamId::new(1), payload(0, 1));
         // Newer replaces older.
-        match t.enqueue(0, StreamId::new(1), Seq::new(1), payload(2)) {
+        match t.enqueue(0, StreamId::new(1), payload(1, 2)) {
             EnqueueDecision::Replace(p) => assert_eq!(p.bytes.as_ref(), &[1]),
             _ => panic!("expected Replace"),
         }
@@ -522,8 +546,8 @@ mod tests {
         let mut t = SendPolicyTable::new();
         t.bind(0, StreamId::new(1), DeliveryPolicy::ReliableOrdered)
             .unwrap();
-        let _ = t.enqueue(0, StreamId::new(1), Seq::new(0), payload(0));
-        let _ = t.enqueue(0, StreamId::new(1), Seq::new(1), payload(1));
+        let _ = t.enqueue(0, StreamId::new(1), payload(0, 0));
+        let _ = t.enqueue(0, StreamId::new(1), payload(1, 1));
         let s = t.metrics();
         assert_eq!(s.frames_queued, 2);
         assert_eq!(s.frames_dequeued, 0);
@@ -537,7 +561,7 @@ mod tests {
     fn metrics_track_bind_upgrades_and_lazy_defaults() {
         let mut t = SendPolicyTable::new();
         // Lazy-default via enqueue.
-        let _ = t.enqueue(0, StreamId::new(2), Seq::new(0), payload(0x11));
+        let _ = t.enqueue(0, StreamId::new(2), payload(0, 0x11));
         let s = t.metrics();
         assert_eq!(s.lazy_default_inserts, 1);
         assert_eq!(s.frames_queued, 1);
@@ -555,10 +579,10 @@ mod tests {
         let mut t = SendPolicyTable::new();
         t.bind(0, StreamId::new(1), DeliveryPolicy::RealtimeDropOld)
             .unwrap();
-        let _ = t.enqueue(0, StreamId::new(1), Seq::new(0), payload(0));
-        let _ = t.enqueue(0, StreamId::new(1), Seq::new(5), payload(1));
+        let _ = t.enqueue(0, StreamId::new(1), payload(0, 0));
+        let _ = t.enqueue(0, StreamId::new(1), payload(5, 1));
         // Older than 5 → drop.
-        let _ = t.enqueue(0, StreamId::new(1), Seq::new(2), payload(2));
+        let _ = t.enqueue(0, StreamId::new(1), payload(2, 2));
 
         let s = t.metrics();
         assert_eq!(s.frames_queued, 2);

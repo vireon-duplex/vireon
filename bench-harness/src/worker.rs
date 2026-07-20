@@ -61,6 +61,11 @@ const ECHO_DEADLINE: Duration = Duration::from_secs(5);
 /// Client-initiated bidirectional QUIC stream IDs for the 15 logical streams.
 /// Formula: id = i * 4 (client bidi streams use ids 0, 4, 8, ...).
 const STREAM_IDS: [u64; 15] = [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56];
+
+/// Number of distinct QUIC streams the workload cycles through. Exposed
+/// so `workload::build` can map its 20 message types onto the stream
+/// pool without indexing out of bounds (see `STREAM_IDS`).
+pub(crate) const STREAM_ID_COUNT: usize = STREAM_IDS.len();
 /// UDP datagram scratch buffer size.
 const DGRAM_BUF: usize = 65_535;
 
@@ -881,7 +886,6 @@ fn measure_pipeline(
     let mut rtts = Vec::new();
     let mut bytes_sent_total = 0u64;
     let mut payload_bytes_sent_total = 0u64;
-    let mut bytes_recv_total = 0u64;
     let mut write_syscalls = 0u64;
     let mut read_syscalls = 0u64;
     let mut queue_depth_sum = 0u64;
@@ -942,7 +946,7 @@ fn measure_pipeline(
         // bytes consumed during the send phase (inside send_through_stack's
         // flow-control path) are also counted toward bytes_recv_total.
         let _ = drain_recv_through_stack(stack, conn, &mut stream_buf, entries.len());
-        bytes_recv_total = stack.bytes_rx();
+        let bytes_recv_total = stack.bytes_rx();
 
         queue_depth_sum += in_flight.len() as u64;
         queue_depth_samples += 1;

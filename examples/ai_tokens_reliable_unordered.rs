@@ -10,9 +10,7 @@
 #![allow(clippy::print_stdout, clippy::unwrap_used)]
 
 use bytes::Bytes;
-use delivery_policy::{
-    Decision, DeliveryPolicy, DeliveryPolicyTable, FramePayload,
-};
+use delivery_policy::{Decision, DeliveryPolicy, DeliveryPolicyTable, FramePayload};
 use frame::header::{FrameFlags, MessageType, Seq, StreamId};
 
 const CONN: usize = 0;
@@ -57,7 +55,7 @@ fn main() {
         (2, "\"world\""),
         (1, "\",\""),
         (3, "\"!\""),
-        (1, "\",\" (dup)"), // duplicate from a racing worker
+        (1, "\",\" (dup)"),     // duplicate from a racing worker
         (0, "\"Hello\" (dup)"), // duplicate
         (4, "\"How\""),
     ];
