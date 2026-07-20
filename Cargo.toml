@@ -95,5 +95,11 @@ observability-exporters = { path = "application-layer/observability-exporters" }
 # Signal handling for graceful shutdown.
 ctrlc = "3.4"
 
+[dev-dependencies]
+# Crates used only by examples/ — kept out of the runtime dep graph.
+bytes          = { workspace = true }
+frame          = { path = "message-layer/frame" }
+delivery-policy = { path = "stream-layer/delivery-policy" }
+
 [lints]
 workspace = true
