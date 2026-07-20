@@ -319,6 +319,10 @@ impl VireonDispatcher {
                 "publish" => {
                     if let Some(topic) = extract_json_string(&text, "topic") {
                         let msg_payload = extract_json_string(&text, "payload").unwrap_or_default();
+                        let topic = match self.validate_topic_or_log(ctx, &topic) {
+                            Some(t) => t,
+                            None => return,
+                        };
                         self.handle_publish(ctx, frame.stream_id, &topic, msg_payload.as_bytes());
                         return;
                     }
@@ -332,7 +336,19 @@ impl VireonDispatcher {
         let _ = self
             .event_bus
             .publish(self.default_topic, PartitionId::new(0), msg_hash);
-        let msg = PubSubMessage::new("state.update", frame.payload.to_vec());
+        // "state.update" is a static literal that always passes Topic's
+        // validator; the match arm exists only to satisfy the Result API.
+        let topic = match pubsub_engine::Topic::new("state.update") {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(
+                    error = ?e,
+                    "BUG: built-in 'state.update' topic failed validation"
+                );
+                return;
+            }
+        };
+        let msg = PubSubMessage::new(topic, frame.payload.to_vec());
         let _ = self.pubsub.publish(msg);
     }
 
@@ -352,7 +368,11 @@ impl VireonDispatcher {
                 self.handle_unsubscribe(ctx, frame.stream_id, pattern);
             }
             Ok(Some(ParsedPayload::Publish(frame::payload::PublishPayload { topic, payload }))) => {
-                self.handle_publish(ctx, frame.stream_id, topic, payload);
+                let topic = match self.validate_topic_or_log(ctx, &topic) {
+                    Some(t) => t,
+                    None => return,
+                };
+                self.handle_publish(ctx, frame.stream_id, &topic, &payload);
             }
             Ok(Some(ParsedPayload::TopicCreate(TopicCreatePayload {
                 topic,
@@ -362,7 +382,11 @@ impl VireonDispatcher {
                 self.handle_topic_create(ctx, frame.stream_id, topic, partitions, retention_ms);
             }
             Ok(Some(ParsedPayload::TopicDelete(TopicDeletePayload { topic }))) => {
-                self.handle_topic_delete(ctx, frame.stream_id, topic);
+                let topic = match self.validate_topic_or_log(ctx, &topic) {
+                    Some(t) => t,
+                    None => return,
+                };
+                self.handle_topic_delete(ctx, frame.stream_id, &topic);
             }
             Ok(Some(other)) => {
                 tracing::warn!(
@@ -451,7 +475,7 @@ impl VireonDispatcher {
         &mut self,
         ctx: &FrameContext,
         stream: StreamId,
-        topic: &str,
+        topic: &pubsub_engine::Topic,
         payload: &[u8],
     ) {
         let targets: Vec<Subscriber> = self
@@ -471,9 +495,10 @@ impl VireonDispatcher {
 
         // Re-encode as a Publish frame so downstream subscribers receive the
         // same wire shape the publisher used (topic_len + topic + payload).
-        let mut framed = Vec::with_capacity(2 + topic.len() + payload.len());
-        framed.extend_from_slice(&(topic.len() as u16).to_be_bytes());
-        framed.extend_from_slice(topic.as_bytes());
+        let topic_str = topic.as_str();
+        let mut framed = Vec::with_capacity(2 + topic_str.len() + payload.len());
+        framed.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
+        framed.extend_from_slice(topic_str.as_bytes());
         framed.extend_from_slice(payload);
         let bytes = Bytes::from(framed);
 
@@ -485,6 +510,29 @@ impl VireonDispatcher {
                 MessageType::Publish,
                 bytes.clone(),
             );
+        }
+    }
+
+    /// Validates a wire-decoded topic string. Logs + returns `None` on
+    /// invalid names so dispatch callers can early-return without
+    /// enqueuing an error ack (the rejection is silent at the protocol
+    /// level — only the operator sees the warning).
+    fn validate_topic_or_log(
+        &self,
+        ctx: &FrameContext,
+        raw: &str,
+    ) -> Option<pubsub_engine::Topic> {
+        match pubsub_engine::Topic::new(raw) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                tracing::warn!(
+                    conn_idx = ctx.conn_idx,
+                    topic = raw,
+                    error = ?e,
+                    "[pubsub] invalid topic name"
+                );
+                None
+            }
         }
     }
 
@@ -516,8 +564,13 @@ impl VireonDispatcher {
     }
 
     /// Removes a topic from the catalog.
-    fn handle_topic_delete(&mut self, ctx: &FrameContext, stream: StreamId, topic: &str) {
-        let existed = self.topic_catalog.delete(topic);
+    fn handle_topic_delete(
+        &mut self,
+        ctx: &FrameContext,
+        stream: StreamId,
+        topic: &pubsub_engine::Topic,
+    ) {
+        let existed = self.topic_catalog.delete(topic.as_str());
         tracing::info!(
             conn_idx = ctx.conn_idx,
             topic = %topic,

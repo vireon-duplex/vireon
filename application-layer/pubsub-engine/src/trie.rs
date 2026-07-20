@@ -20,6 +20,7 @@ use crate::config::PubSubConfig;
 use crate::error::PubSubError;
 use crate::stats::PubSubStats;
 use crate::subscription::SubscriptionId;
+use crate::topic::Topic;
 use rustc_hash::FxHashMap;
 use std::fmt;
 
@@ -153,8 +154,8 @@ impl TopicTrie {
     /// # Errors
     /// Currently never errors; returns `Ok` for consistency with the
     /// trait contract.
-    pub fn lookup(&self, topic: &str) -> Result<Vec<SubscriptionId>, PubSubError> {
-        let segments: Vec<&str> = topic.split('.').collect();
+    pub fn lookup(&self, topic: &Topic) -> Result<Vec<SubscriptionId>, PubSubError> {
+        let segments: Vec<&str> = topic.as_str().split('.').collect();
         let mut results = Vec::new();
         Self::lookup_recursive(&self.root, &segments, 0, &mut results);
 
@@ -200,7 +201,12 @@ impl TopicTrie {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
+
+    fn t(s: &str) -> Topic {
+        Topic::new(s).unwrap()
+    }
 
     #[test]
     fn trie_creation() {
@@ -212,7 +218,7 @@ mod tests {
     fn insert_then_lookup_exact() {
         let mut trie = TopicTrie::new(PubSubConfig::new());
         trie.insert("sensor.temp", SubscriptionId::new(1)).unwrap();
-        let result = trie.lookup("sensor.temp").unwrap();
+        let result = trie.lookup(&t("sensor.temp")).unwrap();
         assert_eq!(result, vec![SubscriptionId::new(1)]);
     }
 
@@ -220,7 +226,7 @@ mod tests {
     fn lookup_misses_non_matching() {
         let mut trie = TopicTrie::new(PubSubConfig::new());
         trie.insert("sensor.temp", SubscriptionId::new(1)).unwrap();
-        let result = trie.lookup("sensor.humidity").unwrap();
+        let result = trie.lookup(&t("sensor.humidity")).unwrap();
         assert!(result.is_empty(), "expected no matches, got {result:?}");
     }
 
@@ -230,17 +236,17 @@ mod tests {
         trie.insert("sensor.*", SubscriptionId::new(1)).unwrap();
 
         assert!(
-            trie.lookup("sensor.temp")
+            trie.lookup(&t("sensor.temp"))
                 .unwrap()
                 .contains(&SubscriptionId::new(1))
         );
         assert!(
-            trie.lookup("sensor.humidity")
+            trie.lookup(&t("sensor.humidity"))
                 .unwrap()
                 .contains(&SubscriptionId::new(1))
         );
-        assert!(trie.lookup("sensor").unwrap().is_empty()); // too few segments
-        assert!(trie.lookup("sensor.temp.extra").unwrap().is_empty()); // too many
+        assert!(trie.lookup(&t("sensor")).unwrap().is_empty()); // too few segments
+        assert!(trie.lookup(&t("sensor.temp.extra")).unwrap().is_empty()); // too many
     }
 
     #[test]
@@ -249,15 +255,15 @@ mod tests {
         trie.insert("*.temp", SubscriptionId::new(1)).unwrap();
         trie.insert("sensor.*", SubscriptionId::new(2)).unwrap();
 
-        let r = trie.lookup("sensor.temp").unwrap();
+        let r = trie.lookup(&t("sensor.temp")).unwrap();
         assert!(r.contains(&SubscriptionId::new(1)));
         assert!(r.contains(&SubscriptionId::new(2)));
 
-        let r = trie.lookup("room.temp").unwrap();
+        let r = trie.lookup(&t("room.temp")).unwrap();
         assert!(r.contains(&SubscriptionId::new(1)));
         assert!(!r.contains(&SubscriptionId::new(2)));
 
-        let r = trie.lookup("sensor.light").unwrap();
+        let r = trie.lookup(&t("sensor.light")).unwrap();
         assert!(!r.contains(&SubscriptionId::new(1)));
         assert!(r.contains(&SubscriptionId::new(2)));
     }
@@ -268,7 +274,7 @@ mod tests {
         trie.insert("sensor.*", SubscriptionId::new(1)).unwrap();
         trie.insert("sensor.*", SubscriptionId::new(2)).unwrap();
 
-        let r = trie.lookup("sensor.temp").unwrap();
+        let r = trie.lookup(&t("sensor.temp")).unwrap();
         assert_eq!(r.len(), 2);
     }
 
@@ -278,7 +284,7 @@ mod tests {
         trie.insert("sensor.*", SubscriptionId::new(1)).unwrap();
         trie.insert("sensor.*", SubscriptionId::new(1)).unwrap();
 
-        let r = trie.lookup("sensor.temp").unwrap();
+        let r = trie.lookup(&t("sensor.temp")).unwrap();
         assert_eq!(r.len(), 1); // not 2
     }
 
@@ -290,7 +296,7 @@ mod tests {
 
         trie.remove("sensor.*", SubscriptionId::new(1)).unwrap();
 
-        let r = trie.lookup("sensor.temp").unwrap();
+        let r = trie.lookup(&t("sensor.temp")).unwrap();
         assert_eq!(r, vec![SubscriptionId::new(2)]);
     }
 
@@ -300,7 +306,7 @@ mod tests {
         trie.insert("a.b.c", SubscriptionId::new(1)).unwrap();
         trie.remove("a.b.c", SubscriptionId::new(1)).unwrap();
 
-        let r = trie.lookup("a.b.c").unwrap();
+        let r = trie.lookup(&t("a.b.c")).unwrap();
         assert!(r.is_empty());
     }
 
@@ -311,13 +317,13 @@ mod tests {
         trie.insert("a.b.*.d.e", SubscriptionId::new(2)).unwrap();
         trie.insert("a.*.c.*.e", SubscriptionId::new(3)).unwrap();
 
-        let r = trie.lookup("a.b.c.d.e").unwrap();
+        let r = trie.lookup(&t("a.b.c.d.e")).unwrap();
         assert!(r.contains(&SubscriptionId::new(1)));
         assert!(r.contains(&SubscriptionId::new(2)));
         assert!(r.contains(&SubscriptionId::new(3)));
         assert_eq!(r.len(), 3);
 
-        let r = trie.lookup("a.x.c.y.e").unwrap();
+        let r = trie.lookup(&t("a.x.c.y.e")).unwrap();
         assert_eq!(r, vec![SubscriptionId::new(3)]);
     }
 
@@ -327,10 +333,10 @@ mod tests {
         trie.insert("events", SubscriptionId::new(1)).unwrap();
         trie.insert("*", SubscriptionId::new(2)).unwrap();
 
-        let r = trie.lookup("events").unwrap();
+        let r = trie.lookup(&t("events")).unwrap();
         assert_eq!(r.len(), 2);
 
-        let r = trie.lookup("alerts").unwrap();
+        let r = trie.lookup(&t("alerts")).unwrap();
         assert_eq!(r, vec![SubscriptionId::new(2)]);
     }
 

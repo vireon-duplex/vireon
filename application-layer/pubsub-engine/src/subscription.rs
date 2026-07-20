@@ -4,6 +4,7 @@
 //! See `DESIGN.md` Part 4 (subscriptions) and Part 5 (topic patterns).
 
 use crate::error::PubSubError;
+use crate::topic::Topic;
 use std::fmt;
 
 // ── SubscriptionId ───────────────────────────────────────────────
@@ -110,9 +111,9 @@ impl TopicPattern {
     /// - Non-wildcard segments must match exactly.
     /// - The number of segments must be equal.
     #[must_use]
-    pub fn matches(&self, topic: &str) -> bool {
+    pub fn matches(&self, topic: &Topic) -> bool {
         let pat_segments: Vec<&str> = self.pattern.split('.').collect();
-        let topic_segments: Vec<&str> = topic.split('.').collect();
+        let topic_segments: Vec<&str> = topic.as_str().split('.').collect();
 
         if pat_segments.len() != topic_segments.len() {
             return false;
@@ -135,7 +136,12 @@ impl fmt::Display for TopicPattern {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
+
+    fn t(s: &str) -> Topic {
+        Topic::new(s).unwrap()
+    }
 
     // ── SubscriptionId tests ─────────────────────────────────────
 
@@ -225,68 +231,68 @@ mod tests {
     #[test]
     fn topic_pattern_matches_exact() {
         let pat = TopicPattern::new("sensor.temp").unwrap();
-        assert!(pat.matches("sensor.temp"));
-        assert!(!pat.matches("sensor.humidity"));
-        assert!(!pat.matches("sensor.temp.high"));
+        assert!(pat.matches(&t("sensor.temp")));
+        assert!(!pat.matches(&t("sensor.humidity")));
+        assert!(!pat.matches(&t("sensor.temp.high")));
     }
 
     #[test]
     fn topic_pattern_matches_single_wildcard() {
         let pat = TopicPattern::new("sensor.*").unwrap();
-        assert!(pat.matches("sensor.temp"));
-        assert!(pat.matches("sensor.humidity"));
-        assert!(!pat.matches("sensor.temp.high"));
-        assert!(!pat.matches("sensor"));
+        assert!(pat.matches(&t("sensor.temp")));
+        assert!(pat.matches(&t("sensor.humidity")));
+        assert!(!pat.matches(&t("sensor.temp.high")));
+        assert!(!pat.matches(&t("sensor")));
     }
 
     #[test]
     fn topic_pattern_matches_all_wildcards() {
         let pat = TopicPattern::new("*.*").unwrap();
-        assert!(pat.matches("sensor.temp"));
-        assert!(pat.matches("alert.fire"));
-        assert!(!pat.matches("sensor.temp.high"));
-        assert!(!pat.matches("sensor"));
+        assert!(pat.matches(&t("sensor.temp")));
+        assert!(pat.matches(&t("alert.fire")));
+        assert!(!pat.matches(&t("sensor.temp.high")));
+        assert!(!pat.matches(&t("sensor")));
     }
 
     #[test]
     fn topic_pattern_matches_single_segment() {
         let pat = TopicPattern::new("*").unwrap();
-        assert!(pat.matches("sensor"));
-        assert!(pat.matches("anything"));
-        assert!(!pat.matches("sensor.temp"));
+        assert!(pat.matches(&t("sensor")));
+        assert!(pat.matches(&t("anything")));
+        assert!(!pat.matches(&t("sensor.temp")));
     }
 
     #[test]
     fn topic_pattern_matches_literal_single_segment() {
         let pat = TopicPattern::new("alerts").unwrap();
-        assert!(pat.matches("alerts"));
-        assert!(!pat.matches("sensor"));
-        assert!(!pat.matches("alerts.fire"));
+        assert!(pat.matches(&t("alerts")));
+        assert!(!pat.matches(&t("sensor")));
+        assert!(!pat.matches(&t("alerts.fire")));
     }
 
     #[test]
     fn topic_pattern_matches_mixed_wildcards() {
         let pat = TopicPattern::new("sensor.*.high").unwrap();
-        assert!(pat.matches("sensor.temp.high"));
-        assert!(pat.matches("sensor.humidity.high"));
-        assert!(!pat.matches("sensor.temp.low"));
-        assert!(!pat.matches("sensor.temp.high.extra"));
+        assert!(pat.matches(&t("sensor.temp.high")));
+        assert!(pat.matches(&t("sensor.humidity.high")));
+        assert!(!pat.matches(&t("sensor.temp.low")));
+        assert!(!pat.matches(&t("sensor.temp.high.extra")));
     }
 
     #[test]
     fn topic_pattern_matches_multi_segment_wildcards() {
         let pat = TopicPattern::new("*.*.*").unwrap();
-        assert!(pat.matches("a.b.c"));
-        assert!(pat.matches("x.y.z"));
-        assert!(!pat.matches("a.b"));
-        assert!(!pat.matches("a.b.c.d"));
+        assert!(pat.matches(&t("a.b.c")));
+        assert!(pat.matches(&t("x.y.z")));
+        assert!(!pat.matches(&t("a.b")));
+        assert!(!pat.matches(&t("a.b.c.d")));
     }
 
     #[test]
     fn topic_pattern_no_match_different_segment_count() {
         let pat = TopicPattern::new("a.b.c").unwrap();
-        assert!(!pat.matches("a.b"));
-        assert!(!pat.matches("a.b.c.d"));
+        assert!(!pat.matches(&t("a.b")));
+        assert!(!pat.matches(&t("a.b.c.d")));
     }
 
     #[test]
