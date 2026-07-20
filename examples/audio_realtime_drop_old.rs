@@ -5,7 +5,7 @@
 //! the renderer has emitted frame N, any frame with `seq ≤ N` is
 //! stale audio that would glitch the playback — drop it on the floor.
 
-#![allow(clippy::print_stdout)]
+#![allow(clippy::print_stdout, clippy::unwrap_used)]
 
 use bytes::Bytes;
 use delivery_policy::{
@@ -21,7 +21,7 @@ fn opus_frame(seq: u64) -> FramePayload {
     // of pseudo-compressed audio. The contents don't matter for the
     // delivery decision — only `seq` does.
     let mut bytes = vec![0xC0u8];
-    bytes.extend(std::iter::repeat(0xAA).take(79));
+    bytes.extend(std::iter::repeat_n(0xAA, 79));
     let _ = seq;
     FramePayload::new(
         MessageType::AudioFrame,

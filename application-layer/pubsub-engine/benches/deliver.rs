@@ -4,7 +4,7 @@
 //! This isolates per-delivery overhead (pattern match + stat increment)
 //! from subscription-fan-out scaling, which is covered by `fanout.rs`.
 
-#![allow(missing_docs)]
+#![allow(missing_docs, clippy::unwrap_used)]
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use pubsub_engine::{PubSubConfig, PubSubEngine, PubSubMessage, TopicPattern};

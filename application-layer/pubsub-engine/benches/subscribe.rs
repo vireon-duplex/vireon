@@ -1,6 +1,6 @@
 //! Bench: subscribe — measure the cost of creating a subscription.
 
-#![allow(missing_docs)]
+#![allow(missing_docs, clippy::unwrap_used)]
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use pubsub_engine::{PubSubConfig, PubSubEngine, TopicPattern};

@@ -220,6 +220,7 @@ fn pubsub_metrics(s: StatsSnapshot) -> Vec<Metric> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    use topic_acl::AclDecision;
 
     #[test]
     fn pubsub_metrics_returns_three_families() {

@@ -6,7 +6,7 @@
 //! to scale linearly with N (each matching pattern triggers a stat
 //! increment), so the bench surfaces any accidental superlinear work.
 
-#![allow(missing_docs)]
+#![allow(missing_docs, clippy::unwrap_used)]
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use pubsub_engine::{PubSubConfig, PubSubEngine, PubSubMessage, TopicPattern};

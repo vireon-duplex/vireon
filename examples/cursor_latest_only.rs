@@ -11,7 +11,7 @@
 //! cargo run --example cursor_latest_only
 //! ```
 
-#![allow(clippy::print_stdout)]
+#![allow(clippy::print_stdout, clippy::unwrap_used)]
 
 use bytes::Bytes;
 use delivery_policy::{

@@ -1,6 +1,6 @@
 //! Bench: match_pattern — measure the cost of topic pattern matching.
 
-#![allow(missing_docs)]
+#![allow(missing_docs, clippy::unwrap_used)]
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use pubsub_engine::TopicPattern;
