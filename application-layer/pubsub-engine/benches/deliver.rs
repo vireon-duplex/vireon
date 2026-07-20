@@ -11,7 +11,9 @@ use pubsub_engine::{PubSubConfig, PubSubEngine, PubSubMessage, Topic, TopicPatte
 
 fn bench_deliver(c: &mut Criterion) {
     let mut engine = PubSubEngine::new(PubSubConfig::new());
-    engine.subscribe(TopicPattern::new("sensor.*").unwrap()).unwrap();
+    engine
+        .subscribe(TopicPattern::new("sensor.*").unwrap())
+        .unwrap();
     let msg = PubSubMessage::new(Topic::new("sensor.temp").unwrap(), vec![1, 2, 3]);
     c.bench_function("deliver", |b| {
         b.iter(|| {

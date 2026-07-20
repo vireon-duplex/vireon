@@ -163,7 +163,10 @@ mod tests {
             .subscribe(TopicPattern::new("alert.*").unwrap())
             .unwrap();
         engine
-            .publish(PubSubMessage::new(Topic::new("sensor.temp").unwrap(), vec![1, 2, 3]))
+            .publish(PubSubMessage::new(
+                Topic::new("sensor.temp").unwrap(),
+                vec![1, 2, 3],
+            ))
             .unwrap();
         assert_eq!(engine.stats.snapshot().messages_published, 1);
     }

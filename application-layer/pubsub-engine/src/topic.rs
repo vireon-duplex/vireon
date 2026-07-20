@@ -64,9 +64,7 @@ impl Topic {
             return Err(PubSubError::PublishFailed("topic name cannot be empty"));
         }
         if name.len() > Self::MAX_LEN {
-            return Err(PubSubError::PublishFailed(
-                "topic name exceeds 255 bytes",
-            ));
+            return Err(PubSubError::PublishFailed("topic name exceeds 255 bytes"));
         }
         if name.starts_with(' ') || name.ends_with(' ') {
             return Err(PubSubError::PublishFailed(

@@ -9,6 +9,8 @@
 
 use frame::header::{ALL_MESSAGE_TYPES, FrameFlags, MessageType};
 
+use crate::worker::STREAM_ID_COUNT;
+
 /// Per-type metadata, surfaced in the summary table so the operator can verify
 /// the realistic workload at a glance.
 #[derive(Clone)]
@@ -76,8 +78,12 @@ pub fn build_fixed_size(payload_bytes: usize) -> anyhow::Result<Workload> {
 
 /// Builds the full 20-frame workload.
 ///
-/// Each `MessageType` gets its own logical `StreamId` (0..19), matching the
-/// "1 user = 20 streams" model: N users produce 20×N logical streams.
+/// Each `MessageType` is exercised, but they are mapped onto the 15
+/// QUIC stream ids declared in `worker::STREAM_IDS` (the bench
+/// architecture's "1 user = 15 streams" model). With 20 message types
+/// and 15 streams, types 15..=19 share a stream id with types 0..=4 —
+/// this is realistic: a single connection multiplexes many frame kinds
+/// across a bounded stream pool.
 pub fn build() -> anyhow::Result<Workload> {
     let mut entries: Vec<WorkloadEntry> = Vec::with_capacity(ALL_MESSAGE_TYPES.len());
     let mut total_payload_bytes = 0usize;
@@ -93,7 +99,9 @@ pub fn build() -> anyhow::Result<Workload> {
             payload_len,
             flags: realistic_flags(mt),
             payload,
-            logical_stream: i as u64,
+            // STREAM_IDS has 15 slots; cycle so types ≥15 share a stream
+            // with an earlier type instead of indexing out of bounds.
+            logical_stream: (i % STREAM_ID_COUNT) as u64,
         });
     }
 

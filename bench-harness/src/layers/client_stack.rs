@@ -7,20 +7,19 @@
 //!                     ClientStack
 //!                         │
 //!     ┌───────────────────┼───────────────────┐
-//!     │                   │                   │
-//!     ▼                   ▼                   ▼
-//!  ClientAppLayer    coalesce_buf      FrameDecoders
-//!  (owns Session →   (reused per       (one per QUIC
-//!   Stream →          send)             stream, lazy)
-//!   Message)
+//!     │                                       │
+//!     ▼                                       ▼
+//!  ClientAppLayer                       FrameDecoders
+//!  (owns Session →                     (one per QUIC
+//!   Stream → Message)                   stream, lazy)
 //! ```
 //!
 //! SEND PATH:
-//!   stack.encode_frame_coalesced(stream, msg_type, flags, payload)
+//!   stack.encode_frame_coalesced_into(dst, stream, msg_type, flags, payload)
 //!     → app.prepare_frame()          [builds header + increments seq]
 //!       → session → stream           [layer chain]
-//!     → encode_into_slice() × N      [write into coalesce_buf]
-//!     → returns &[u8]                [caller does stream_send]
+//!     → encode_into_slice() × N      [write into caller-owned `dst`]
+//!     → caller does stream_send(&dst)
 //!
 //! RECV PATH:
 //!   stack.on_stream_data(quic_sid, &buf[..n])
@@ -40,24 +39,24 @@ use super::application::ClientApplicationLayer;
 const DECODER_CAPACITY: usize = 65_535;
 
 /// The client-side layer stack — owns the full application chain
-/// plus reusable encode/decode buffers.
+/// plus reusable decode buffers.
 pub struct ClientStack {
     /// Application layer (owns session → stream → message).
     app: ClientApplicationLayer,
-    /// Reusable buffer for coalesced frame encoding (cleared + refilled per send).
-    coalesce_buf: Vec<u8>,
     /// One incremental decoder per QUIC stream (created lazily).
     decoders: HashMap<u64, FrameDecoder>,
 }
 
 impl ClientStack {
-    /// Creates a new stack with a coalesce buffer pre-allocated for
-    /// `coalesce_capacity` bytes (should be `max_frame_wire_size × COALESCE`).
+    /// Creates a new stack.
+    ///
+    /// The `coalesce_capacity` argument is retained for ABI stability
+    /// with callers in `worker.rs` but no longer used — the encode
+    /// path writes into a caller-owned buffer (`encode_frame_coalesced_into`).
     #[must_use]
-    pub fn new(coalesce_capacity: usize) -> Self {
+    pub fn new(_coalesce_capacity: usize) -> Self {
         Self {
             app: ClientApplicationLayer::new(),
-            coalesce_buf: Vec::with_capacity(coalesce_capacity),
             decoders: HashMap::new(),
         }
     }
@@ -105,45 +104,6 @@ impl ClientStack {
             let off = i * frame_wire_size;
             let _ = encode_into_slice(&mut dst[off..off + frame_wire_size], header, payload);
         }
-    }
-
-    /// Encodes `coalesce` copies of a single frame into the internal
-    /// coalesce buffer and returns a reference to the encoded bytes.
-    ///
-    /// Each copy gets a unique incrementing `seq` from the stream layer.
-    /// The caller feeds the returned slice to `conn.stream_send`.
-    ///
-    /// Prefer [`encode_frame_coalesced_into`](Self::encode_frame_coalesced_into)
-    /// when you need to call other `&mut self` methods between encode
-    /// and send — it avoids the borrow-conflict that forces `.to_vec()`.
-    pub fn encode_frame_coalesced(
-        &mut self,
-        logical_stream: u64,
-        msg_type: MessageType,
-        flags: FrameFlags,
-        payload: &[u8],
-        coalesce: usize,
-    ) -> &[u8] {
-        // Split borrows: `app` and `coalesce_buf` are disjoint fields.
-        let app = &mut self.app;
-        let buf = &mut self.coalesce_buf;
-
-        let frame_wire_size = frame::codec::HEADER_SIZE + payload.len() + frame::codec::CRC_SIZE;
-        let total = frame_wire_size * coalesce;
-        buf.clear();
-        if buf.capacity() < total {
-            buf.reserve(total);
-        }
-        // SAFETY: encode_into_slice writes every byte below.
-        unsafe { buf.set_len(total) }
-
-        for i in 0..coalesce {
-            let header = app.prepare_frame(logical_stream, msg_type, flags);
-            let off = i * frame_wire_size;
-            let _ = encode_into_slice(&mut buf[off..off + frame_wire_size], header, payload);
-        }
-
-        &self.coalesce_buf
     }
 
     // ── Receive path ───────────────────────────────────────────────

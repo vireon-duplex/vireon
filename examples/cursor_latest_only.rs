@@ -14,9 +14,7 @@
 #![allow(clippy::print_stdout, clippy::unwrap_used)]
 
 use bytes::Bytes;
-use delivery_policy::{
-    Decision, DeliveryPolicy, DeliveryPolicyTable, FramePayload,
-};
+use delivery_policy::{Decision, DeliveryPolicy, DeliveryPolicyTable, FramePayload};
 use frame::header::{FrameFlags, MessageType, Seq, StreamId};
 
 const CONN: usize = 0;
@@ -45,21 +43,21 @@ fn label(d: &Decision) -> &'static str {
 
 fn main() {
     let mut table = DeliveryPolicyTable::new();
-    table.bind(CONN, STREAM, DeliveryPolicy::LatestOnly).unwrap();
+    table
+        .bind(CONN, STREAM, DeliveryPolicy::LatestOnly)
+        .unwrap();
 
     println!("LatestOnly — remote cursor (60 Hz producer, ~60 Hz consumer)");
     println!("(x, y) coordinates stream in; only the newest survives between drains\n");
 
-    let positions: &[(u64, i32, i32)] = &[
-        (0, 10, 10),
-        (1, 25, 18),
-        (2, 40, 22),
-        (3, 55, 30),
-    ];
+    let positions: &[(u64, i32, i32)] = &[(0, 10, 10), (1, 25, 18), (2, 40, 22), (3, 55, 30)];
 
     for (seq, x, y) in positions {
         let decision = table.apply(CONN, STREAM, Seq::new(*seq), cursor_payload(*seq, *x, *y));
-        println!("  apply seq={seq:>2} (x={x:>3}, y={y:>3}) → {}", label(&decision));
+        println!(
+            "  apply seq={seq:>2} (x={x:>3}, y={y:>3}) → {}",
+            label(&decision)
+        );
     }
 
     let mut drained: Vec<(StreamId, Seq, FramePayload)> = Vec::new();
