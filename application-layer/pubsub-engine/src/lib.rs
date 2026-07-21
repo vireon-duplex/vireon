@@ -64,6 +64,3 @@ pub use stats::{PubSubStats, StatsSnapshot};
 pub use subscription::{SubscriptionId, TopicPattern};
 pub use topic::Topic;
 pub use trie::TopicTrie;
-
-// Re-export key adjacent-layer types for convenience.
-pub use event_bus::TopicId;

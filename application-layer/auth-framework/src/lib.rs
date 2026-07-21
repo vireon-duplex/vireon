@@ -71,5 +71,4 @@ pub use stats::{AuthStats, StatsSnapshot};
 pub use token_manager::TokenManager;
 
 // Re-export key adjacent-layer types for convenience.
-pub use configuration_system::{ConfigKey, ConfigSource, ConfigValue};
 pub use session_manager::SessionId;

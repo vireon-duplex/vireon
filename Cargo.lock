@@ -3,40 +3,12 @@
 version = 4
 
 [[package]]
-name = "agent-runtime"
-version = "0.1.0"
-dependencies = [
- "ai-streaming",
- "configuration-system",
- "criterion",
- "event-bus",
- "rpc-framework",
- "session-manager",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ddd31a130427c27518df266943a5308ed92d4b226cc639f5a8f1002816174301"
 dependencies = [
  "memchr",
-]
-
-[[package]]
-name = "ai-streaming"
-version = "0.1.0"
-dependencies = [
- "configuration-system",
- "criterion",
- "middleware-pipeline",
- "rpc-framework",
- "rustc-hash",
- "session-manager",
- "thiserror 2.0.18",
- "tracing",
 ]
 
 [[package]]
@@ -102,44 +74,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
-name = "application-runtime"
-version = "0.1.0"
-dependencies = [
- "agent-runtime",
- "ai-streaming",
- "auth-framework",
- "configuration-system",
- "connection-shard",
- "criterion",
- "dependency-injection",
- "event-bus",
- "feature-flags",
- "graceful-startup-shutdown",
- "media-streaming",
- "middleware-pipeline",
- "module-lifecycle",
- "observability-sdk",
- "ops-dashboard",
- "plugin-manager",
- "pubsub-engine",
- "reactor",
- "resource-quotas",
- "rpc-framework",
- "scheduler-hooks",
- "service-registry",
- "session-manager",
- "session-registry",
- "stream-manager",
- "thiserror 2.0.18",
- "tracing",
- "version-negotiation",
-]
-
-[[package]]
 name = "auth-framework"
 version = "0.1.0"
 dependencies = [
- "configuration-system",
  "criterion",
  "rustc-hash",
  "session-manager",
@@ -336,15 +273,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
-name = "configuration-system"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
 name = "connection-shard"
 version = "0.1.0"
 dependencies = [
@@ -478,17 +406,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dependency-injection"
-version = "0.1.0"
-dependencies = [
- "configuration-system",
- "criterion",
- "service-registry",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
 name = "dispatch2"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -517,32 +434,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "event-bus"
-version = "0.1.0"
-dependencies = [
- "configuration-system",
- "criterion",
- "middleware-pipeline",
- "rustc-hash",
- "session-manager",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
 name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
-
-[[package]]
-name = "feature-flags"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "thiserror 2.0.18",
- "tracing",
-]
 
 [[package]]
 name = "find-msvc-tools"
@@ -618,19 +513,6 @@ dependencies = [
  "cfg-if",
  "libc",
  "r-efi",
-]
-
-[[package]]
-name = "graceful-startup-shutdown"
-version = "0.1.0"
-dependencies = [
- "configuration-system",
- "criterion",
- "module-lifecycle",
- "scheduler-hooks",
- "service-registry",
- "thiserror 2.0.18",
- "tracing",
 ]
 
 [[package]]
@@ -803,21 +685,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "media-streaming"
-version = "0.1.0"
-dependencies = [
- "configuration-system",
- "criterion",
- "middleware-pipeline",
- "resource-quotas",
- "rustc-hash",
- "session-manager",
- "stream-manager",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
 name = "memchr"
 version = "2.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -830,16 +697,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "middleware-pipeline"
-version = "0.1.0"
-dependencies = [
- "configuration-system",
- "criterion",
- "thiserror 2.0.18",
- "tracing",
 ]
 
 [[package]]
@@ -861,16 +718,6 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "module-lifecycle"
-version = "0.1.0"
-dependencies = [
- "configuration-system",
- "criterion",
- "thiserror 2.0.18",
- "tracing",
 ]
 
 [[package]]
@@ -976,18 +823,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ops-dashboard"
-version = "0.1.0"
-dependencies = [
- "configuration-system",
- "criterion",
- "observability-sdk",
- "service-registry",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1045,17 +880,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "plugin-manager"
-version = "0.1.0"
-dependencies = [
- "configuration-system",
- "criterion",
- "thiserror 2.0.18",
- "tracing",
- "version-negotiation",
-]
-
-[[package]]
 name = "proc-macro2"
 version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1109,9 +933,7 @@ checksum = "106dd99e98437432fed6519dedecfade6a06a73bb7b2a1e019fdd2bee5778d94"
 name = "pubsub-engine"
 version = "0.1.0"
 dependencies = [
- "configuration-system",
  "criterion",
- "event-bus",
  "rustc-hash",
  "thiserror 2.0.18",
  "tracing",
@@ -1162,45 +984,29 @@ dependencies = [
 name = "quic-server"
 version = "0.1.0"
 dependencies = [
- "agent-runtime",
- "ai-streaming",
  "anyhow",
- "application-runtime",
  "auth-framework",
  "buffer-pool",
  "bytes",
  "clap",
- "configuration-system",
  "connection-shard",
  "cqe-processor",
  "criterion",
  "ctrlc",
- "dependency-injection",
- "event-bus",
- "feature-flags",
  "frame",
- "graceful-startup-shutdown",
  "io",
  "kernel-nic",
  "libc",
- "media-streaming",
- "middleware-pipeline",
- "module-lifecycle",
  "observability-sdk",
- "ops-dashboard",
- "plugin-manager",
  "profiler",
  "pubsub-engine",
  "quic-engine",
  "quiche",
  "reactor",
  "resource-quotas",
- "rpc-framework",
  "rustc-hash",
- "scheduler-hooks",
  "send-policy",
  "send-queue",
- "service-registry",
  "session-manager",
  "session-migration-manager",
  "session-registry",
@@ -1215,7 +1021,6 @@ dependencies = [
  "topic-acl",
  "tracing",
  "tracing-subscriber",
- "version-negotiation",
  "wal-store",
 ]
 
@@ -1355,21 +1160,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rpc-framework"
-version = "0.1.0"
-dependencies = [
- "configuration-system",
- "criterion",
- "middleware-pipeline",
- "rustc-hash",
- "session-manager",
- "stream-manager",
- "thiserror 2.0.18",
- "tracing",
- "version-negotiation",
-]
-
-[[package]]
 name = "rustc-hash"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1401,16 +1191,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
-]
-
-[[package]]
-name = "scheduler-hooks"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "reactor",
- "thiserror 2.0.18",
- "tracing",
 ]
 
 [[package]]
@@ -1481,19 +1261,6 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
-]
-
-[[package]]
-name = "service-registry"
-version = "0.1.0"
-dependencies = [
- "configuration-system",
- "connection-shard",
- "criterion",
- "session-manager",
- "session-registry",
- "thiserror 2.0.18",
- "tracing",
 ]
 
 [[package]]
@@ -1844,15 +1611,6 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
-
-[[package]]
-name = "version-negotiation"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "thiserror 2.0.18",
- "tracing",
-]
 
 [[package]]
 name = "vireon"

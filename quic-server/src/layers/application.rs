@@ -1,27 +1,27 @@
 //! Application layer — the outermost layer.
 //!
 //! Owns the `SessionLayer` and a [`VireonDispatcher`] that routes
-//! data-plane frames to the five application-layer modules:
+//! data-plane frames to the pub/sub runtime:
 //!
-//! * `ai-streaming` — text tokens
-//! * `rpc-framework` — tool calls / results
-//! * `media-streaming` — audio / video / image frames
-//! * `event-bus` — state updates (pub/sub partition bus)
-//! * `pubsub-engine` — state updates (topic-pattern subscriptions)
+//! * `pubsub-engine` — topic-pattern subscriptions + fan-out
+//! * `wal-store` — durable append + offset-based replay
+//! * `auth-framework` — per-connection principal resolution
+//! * `topic-acl` — per-publish / per-subscribe authorization
 //!
-//! Responses (e.g. a `ToolResult` echoing a `ToolCall`) are queued in
-//! an outbox that [`VireonStack`](crate::stack::VireonStack) drains and
+//! Responses (acks, FetchReply frames, fan-out copies) are queued in an
+//! outbox that [`VireonStack`](crate::stack::VireonStack) drains and
 //! sends via the QUIC engine.
 //!
 //! ```text
 //! ApplicationLayer
 //!   ├─ SessionLayer (owns StreamLayer → MessageLayer)
+//!   ├─ PlatformServices (observability + quotas)
 //!   └─ VireonDispatcher
-//!        ├─ AiStreamPipeline
-//!        ├─ RpcServer
-//!        ├─ MediaSession
-//!        ├─ EventBus
-//!        ├─ PubSubEngine
+//!        ├─ TopicRegistry + TopicCatalog
+//!        ├─ SendPolicyTable (per-stream egress policy)
+//!        ├─ AuthenticationPipeline (per-connection principals)
+//!        ├─ AclTable (topic-pattern authorization)
+//!        ├─ Option<FileStore> (durable WAL)
 //!        ├─ outbox: Vec<OutgoingFrame>
 //!        └─ next_seq: per-QUIC-stream response seq
 //! ```
@@ -29,15 +29,7 @@
 use rustc_hash::FxHashMap;
 use std::net::SocketAddr;
 
-use agent_runtime::AgentRuntime;
-use ai_streaming::{AiStreamConfig, AiStreamId, AiStreamPipeline, StreamMode, TokenChunk};
-use application_runtime::AppRuntime;
-use application_runtime::stats::AppRuntimeStats;
 use auth_framework::authenticator::AuthenticationPipeline;
-use configuration_system::manager::ConfigurationManager;
-use dependency_injection::container::Container;
-use event_bus::{EventBus, EventBusConfig, PartitionId, TopicId};
-use feature_flags::manager::FeatureFlagManager;
 use frame::byte_writer::ByteWriter;
 use frame::codec::{FrameHeader, FrameRef};
 use frame::header::{FrameFlags, MessageType, Seq, StreamId};
@@ -45,36 +37,21 @@ use frame::payload::{
     FetchReplyPayload, ParsedPayload, SubscribePayload, TopicCreatePayload, TopicDeletePayload,
     UnsubscribePayload, parse_payload,
 };
-use graceful_startup_shutdown::StartupShutdownCoordinator;
-use media_streaming::{
-    MediaError, MediaSession, MediaStreamingConfig, MediaTrackId, TrackDirection, TrackKind,
-};
-use middleware_pipeline::pipeline::Pipeline;
-use module_lifecycle::coordinator::LifecycleCoordinator;
 use observability_sdk::registry::MetricsRegistry;
-use ops_dashboard::OpsDashboardService;
-use plugin_manager::manager::PluginManager;
 use pubsub_engine::{
-    PubSubConfig, PubSubEngine, PubSubMessage, Subscriber, TopicCatalog, TopicConfig, TopicPattern,
-    TopicRegistry,
+    PubSubConfig, Subscriber, TopicCatalog, TopicConfig, TopicPattern, TopicRegistry,
 };
 use resource_quotas::manager::QuotaManager;
-use rpc_framework::{RpcConfig, RpcServer};
-use scheduler_hooks::coordinator::HookCoordinator;
 use send_policy::{
     DeliveryPolicy, DequeueOutcome, EnqueueDecision, FramePayload as SendFramePayload,
     SendPolicyTable, StreamOpenMeta,
 };
-use service_registry::registry::ServiceRegistry;
 use session_manager::SessionId;
 use topic_acl::{AclDecision, AclTable, AclTableBuilder, Action, ActionSet, PrincipalId};
-use version_negotiation::negotiator::VersionNegotiator;
 use wal_store::WalStore;
 
 use auth_framework::{AuthConfig, Credential, CredentialType, PrincipalId as AuthPrincipalId};
 
-use configuration_system::{ConfigKey, ConfigValue};
-use feature_flags::{FlagKey, FlagState, FlagValue};
 use observability_sdk::{MetricKey, MetricType};
 use resource_quotas::{QuotaLimit, TenantId, TenantTier};
 
@@ -152,25 +129,10 @@ pub trait AppDispatcher {
 /// translates incoming frames into module calls and collects any
 /// outgoing responses in an outbox.
 pub struct VireonDispatcher {
-    /// [application-layer] AI streaming pipeline.
-    ai: AiStreamPipeline,
-    /// [application-layer] RPC server.
-    rpc: RpcServer,
-    /// [application-layer] Media session.
-    media: MediaSession,
-    /// [application-layer] Event bus.
-    event_bus: EventBus,
-    /// [application-layer] Pub/Sub engine (Phase 1 facade — counts only).
-    pubsub: PubSubEngine,
     /// [application-layer] Trie-backed subscription registry (Phase 2 hot path).
     pubsub_registry: TopicRegistry,
     /// [application-layer] Created-topic catalog (Phase 2 metadata only).
     topic_catalog: TopicCatalog,
-
-    /// Maps logical frame stream → AI stream id (lazily opened).
-    ai_streams: FxHashMap<u64, AiStreamId>,
-    /// Default event-bus topic for `StateUpdate` routing.
-    default_topic: TopicId,
 
     /// Queued outgoing frames, drained by the stack after each recv.
     outbox: Vec<OutgoingFrame>,
@@ -229,26 +191,9 @@ impl VireonDispatcher {
     /// Creates a new dispatcher with default-configured modules.
     #[must_use]
     pub fn new() -> Self {
-        let mut event_bus = EventBus::new(EventBusConfig::new());
-        let default_topic = event_bus
-            .create_topic(event_bus::TopicConfig::new(4))
-            .unwrap_or(TopicId::NIL);
-
-        let mut pubsub = PubSubEngine::new(PubSubConfig::new());
-        if let Ok(pattern) = TopicPattern::new("state.*") {
-            let _ = pubsub.subscribe(pattern);
-        }
-
         Self {
-            ai: AiStreamPipeline::new(AiStreamConfig::default()),
-            rpc: RpcServer::new(RpcConfig::new()),
-            media: MediaSession::new(MediaStreamingConfig::new()),
-            event_bus,
-            pubsub,
             pubsub_registry: TopicRegistry::new(PubSubConfig::new()),
             topic_catalog: TopicCatalog::new(),
-            ai_streams: FxHashMap::default(),
-            default_topic,
             outbox: Vec::new(),
             next_seq: FxHashMap::default(),
             send_policy: SendPolicyTable::new(),
@@ -573,116 +518,6 @@ impl VireonDispatcher {
                 });
             }
         }
-    }
-
-    /// Routes a `TextToken` frame through the AI streaming pipeline,
-    /// lazily opening a per-logical-stream AI stream.
-    fn route_ai_token(&mut self, ctx: &FrameContext, frame: &FrameRef<'_>) {
-        let logical = frame.stream_id.get();
-        let chunk = TokenChunk {
-            token_id: frame.seq.get(),
-            text: String::from_utf8_lossy(frame.payload),
-            is_final: frame.flags.contains(FrameFlags::FIN),
-        };
-        if !self.ai_streams.contains_key(&logical) {
-            match self.ai.open_stream(StreamMode::Text) {
-                Ok(id) => {
-                    self.ai_streams.insert(logical, id);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        conn_idx = ctx.conn_idx,
-                        error = ?e,
-                        "[app:ai-streaming] open_stream failed"
-                    );
-                    return;
-                }
-            }
-        }
-        // SAFETY: we just ensured the key exists (or returned early).
-        let &ai_id = self.ai_streams.get(&logical).unwrap_or(&AiStreamId::NIL);
-        if let Err(e) = self.ai.send_token_chunk(ai_id, chunk) {
-            tracing::warn!(
-                conn_idx = ctx.conn_idx,
-                error = ?e,
-                "[app:ai-streaming] send_token_chunk failed"
-            );
-        }
-    }
-
-    /// Routes a media frame to the media session, lazily adding the track.
-    fn route_media_frame(&mut self, _ctx: &FrameContext, frame: &FrameRef<'_>) {
-        let track_id = MediaTrackId::new(frame.stream_id.get());
-        let kind = match frame.msg_type {
-            MessageType::AudioFrame => TrackKind::Audio,
-            MessageType::VideoFrame => TrackKind::Video,
-            _ => TrackKind::Data,
-        };
-        if let Err(MediaError::TrackNotFound(_)) =
-            self.media.on_media_frame(track_id, frame.payload.len())
-        {
-            let _ = self
-                .media
-                .add_track(track_id, kind, TrackDirection::RecvOnly);
-            let _ = self.media.on_media_frame(track_id, frame.payload.len());
-        }
-    }
-
-    /// Routes a `StateUpdate` frame.
-    ///
-    /// Legacy path: parses payload for JSON pub/sub control messages. New
-    /// clients should send native `MessageType::Subscribe`/`Publish`/etc.
-    /// frames instead — see [`Self::route_native_pubsub`].
-    ///
-    /// - `{"action":"subscribe","pattern":"sensor.*"}` → register subscription
-    /// - `{"action":"publish","topic":"sensor.temp","payload":"23.5"}` → deliver to subscribers
-    ///
-    /// Falls through to event bus + pubsub engine for other payloads.
-    fn route_state_update(&mut self, ctx: &FrameContext, frame: &FrameRef<'_>) {
-        let text = String::from_utf8_lossy(frame.payload);
-
-        if let Some(action) = extract_json_string(&text, "action") {
-            match action.as_str() {
-                "subscribe" => {
-                    if let Some(pattern_str) = extract_json_string(&text, "pattern") {
-                        self.handle_subscribe(ctx, frame.stream_id, &pattern_str);
-                    }
-                    return;
-                }
-                "publish" => {
-                    if let Some(topic) = extract_json_string(&text, "topic") {
-                        let msg_payload = extract_json_string(&text, "payload").unwrap_or_default();
-                        let topic = match self.validate_topic_or_log(ctx, &topic) {
-                            Some(t) => t,
-                            None => return,
-                        };
-                        self.handle_publish(ctx, frame.stream_id, &topic, msg_payload.as_bytes());
-                        return;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // Default: event bus + pubsub engine (e.g. eventbus mode).
-        let msg_hash = frame.seq.get();
-        let _ = self
-            .event_bus
-            .publish(self.default_topic, PartitionId::new(0), msg_hash);
-        // "state.update" is a static literal that always passes Topic's
-        // validator; the match arm exists only to satisfy the Result API.
-        let topic = match pubsub_engine::Topic::new("state.update") {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!(
-                    error = ?e,
-                    "BUG: built-in 'state.update' topic failed validation"
-                );
-                return;
-            }
-        };
-        let msg = PubSubMessage::new(topic, frame.payload.to_vec());
-        let _ = self.pubsub.publish(msg);
     }
 
     /// Routes a native pub/sub control frame (`Subscribe`/`Unsubscribe`/
@@ -1313,17 +1148,6 @@ impl Default for VireonDispatcher {
     }
 }
 
-/// Lightweight JSON string-field extractor.
-///
-/// Finds `"key":"value"` and returns the value. Sufficient for the
-/// simple JSON the pub/sub client produces — avoids a serde dependency.
-fn extract_json_string(json: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\":\"");
-    let rest = json.split_once(&needle)?;
-    let end = rest.1.find('"')?;
-    Some(rest.1[..end].to_string())
-}
-
 impl AppDispatcher for VireonDispatcher {
     fn on_connection_established(&mut self, session_id: SessionId, peer: SocketAddr) {
         tracing::info!(session_id = ?session_id, %peer, "[app] connection established");
@@ -1331,69 +1155,6 @@ impl AppDispatcher for VireonDispatcher {
 
     fn on_data_frame(&mut self, ctx: &FrameContext, frame: &FrameRef<'_>) {
         match frame.msg_type {
-            MessageType::TextToken => {
-                self.route_ai_token(ctx, frame);
-                tracing::trace!(
-                    conn_idx = ctx.conn_idx,
-                    logical_stream = frame.stream_id.get(),
-                    seq = frame.seq.get(),
-                    payload_len = frame.payload.len(),
-                    "[app:ai-streaming] TextToken"
-                );
-            }
-            MessageType::ToolCall => {
-                tracing::trace!(
-                    conn_idx = ctx.conn_idx,
-                    payload_len = frame.payload.len(),
-                    "[app:rpc] ToolCall → handle"
-                );
-                match self.rpc.handle(frame.payload) {
-                    Ok(response) => {
-                        let payload = match response {
-                            std::borrow::Cow::Borrowed(slice) => Bytes::copy_from_slice(slice),
-                            std::borrow::Cow::Owned(vec) => Bytes::from(vec),
-                        };
-                        self.enqueue_response(
-                            ctx,
-                            frame.stream_id,
-                            MessageType::ToolResult,
-                            payload,
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            conn_idx = ctx.conn_idx,
-                            error = ?e,
-                            "[app:rpc] handle failed"
-                        );
-                    }
-                }
-            }
-            MessageType::ToolResult => {
-                tracing::trace!(
-                    conn_idx = ctx.conn_idx,
-                    payload_len = frame.payload.len(),
-                    "[app:rpc] ToolResult (client-side, log only)"
-                );
-            }
-            MessageType::AudioFrame | MessageType::VideoFrame | MessageType::ImageFrame => {
-                self.route_media_frame(ctx, frame);
-                tracing::trace!(
-                    conn_idx = ctx.conn_idx,
-                    msg_type = ?frame.msg_type,
-                    logical_stream = frame.stream_id.get(),
-                    payload_len = frame.payload.len(),
-                    "[app:media] frame"
-                );
-            }
-            MessageType::StateUpdate => {
-                self.route_state_update(ctx, frame);
-                tracing::trace!(
-                    conn_idx = ctx.conn_idx,
-                    payload_len = frame.payload.len(),
-                    "[app:event-bus+pubsub] StateUpdate"
-                );
-            }
             MessageType::Subscribe
             | MessageType::Unsubscribe
             | MessageType::Publish
@@ -1470,105 +1231,29 @@ impl AppDispatcher for VireonDispatcher {
 
 // ── PlatformServices ──────────────────────────────────────────────
 
-/// Container for the 16 infrastructure/platform services.
-/// Each field holds the real facade object (not just a config),
-/// constructed from its builder-produced config + default stats.
+/// Container for the infrastructure services actually wired into the
+/// hot path. Vireon's scope is pub/sub transport — we only need:
+///
+/// * `observability` — per-frame counters + connection gauges.
+/// * `quotas` — per-tenant byte/session accounting.
+///
+/// Other application-layer crates (auth-framework, topic-acl, wal-store,
+/// etc.) are depended on directly where needed; the dispatcher holds its
+/// own `AuthenticationPipeline`, so there's no need for a second facade
+/// here.
 pub struct PlatformServices {
-    /// [agent-runtime] AI agent execution runtime.
-    #[allow(dead_code)]
-    agent: AgentRuntime,
-    /// [application-runtime] Top-level app lifecycle composition root.
-    #[allow(dead_code)]
-    app: AppRuntime,
-    /// [auth-framework] Authentication + authorization pipeline.
-    #[allow(dead_code)]
-    pub(crate) auth: AuthenticationPipeline,
-    /// [configuration-system] Config key-value store.
-    pub(crate) config_mgr: ConfigurationManager,
-    /// [dependency-injection] DI container for module construction.
-    #[allow(dead_code)]
-    di: Container,
-    /// [feature-flags] Feature toggle management.
-    pub(crate) feature_flags: FeatureFlagManager,
-    /// [graceful-startup-shutdown] Startup/shutdown phase coordinator.
-    #[allow(dead_code)]
-    graceful: StartupShutdownCoordinator,
-    /// [middleware-pipeline] Frame middleware chain.
-    #[allow(dead_code)]
-    pub(crate) middleware: Pipeline,
-    /// [module-lifecycle] Module init/shutdown ordering.
-    #[allow(dead_code)]
-    lifecycle: LifecycleCoordinator,
     /// [observability-sdk] Metrics registry + tracing.
     pub(crate) observability: MetricsRegistry,
-    /// [ops-dashboard] Operational monitoring dashboard.
-    #[allow(dead_code)]
-    ops: OpsDashboardService,
-    /// [plugin-manager] Dynamic plugin loading.
-    #[allow(dead_code)]
-    plugin: PluginManager,
     /// [resource-quotas] Per-tenant quota enforcement.
     pub(crate) quotas: QuotaManager,
-    /// [scheduler-hooks] Scheduler event callbacks.
-    #[allow(dead_code)]
-    scheduler_hooks: HookCoordinator,
-    /// [service-registry] Service discovery for modules.
-    #[allow(dead_code)]
-    registry: ServiceRegistry,
-    /// [version-negotiation] Protocol version ALPN negotiation.
-    #[allow(dead_code)]
-    version: VersionNegotiator,
 }
 
 impl PlatformServices {
-    /// Constructs all 16 platform service facades from builder-produced
-    /// configs and default stats.
+    /// Constructs the platform service facades wired into the server.
     ///
     /// # Errors
     /// Returns [`ServerError`] if any facade fails to construct.
     pub fn new() -> Result<Self, ServerError> {
-        // Build configs via each crate's builder (validates defaults).
-        let agent_cfg = agent_runtime::builder::AgentRuntimeBuilder::new()
-            .build()
-            .map_err(|e| ServerError::EngineInit(format!("agent-runtime: {e:?}")))?;
-
-        let app_cfg = application_runtime::builder::AppRuntimeBuilder::new()
-            .build()
-            .map_err(|e| ServerError::EngineInit(format!("application-runtime: {e:?}")))?;
-
-        let registry_cfg = service_registry::builder::ServiceRegistryBuilder::new()
-            .build()
-            .map_err(|e| ServerError::EngineInit(format!("service-registry: {e:?}")))?;
-
-        let di_cfg = dependency_injection::builder::ContainerBuilder::new()
-            .build()
-            .map_err(|e| ServerError::EngineInit(format!("dependency-injection: {e:?}")))?;
-
-        let lifecycle_cfg = module_lifecycle::builder::LifecycleBuilder::new()
-            .build()
-            .map_err(|e| ServerError::EngineInit(format!("module-lifecycle: {e:?}")))?;
-
-        let middleware_cfg = middleware_pipeline::builder::MiddlewarePipelineBuilder::new()
-            .build()
-            .map_err(|e| ServerError::EngineInit(format!("middleware-pipeline: {e:?}")))?;
-
-        let config_cfg = configuration_system::builder::ConfigBuilder::new()
-            .map_err(|e| ServerError::EngineInit(format!("configuration-system: {e:?}")))?
-            .build()
-            .map_err(|e| ServerError::EngineInit(format!("configuration-system: {e:?}")))?;
-
-        let plugin_cfg = plugin_manager::builder::PluginManagerBuilder::new()
-            .build()
-            .map_err(|e| ServerError::EngineInit(format!("plugin-manager: {e:?}")))?;
-
-        let scheduler_cfg = scheduler_hooks::builder::SchedulerHooksBuilder::new()
-            .build()
-            .map_err(|e| ServerError::EngineInit(format!("scheduler-hooks: {e:?}")))?;
-
-        let auth_cfg = auth_framework::builder::AuthFrameworkBuilder::new()
-            .build()
-            .map_err(|e| ServerError::EngineInit(format!("auth-framework: {e:?}")))?;
-
         let observability_cfg = observability_sdk::builder::ObservabilityBuilder::new()
             .build()
             .map_err(|e| ServerError::EngineInit(format!("observability-sdk: {e:?}")))?;
@@ -1577,65 +1262,15 @@ impl PlatformServices {
             .build()
             .map_err(|e| ServerError::EngineInit(format!("resource-quotas: {e:?}")))?;
 
-        let feature_cfg = feature_flags::builder::FeatureFlagsBuilder::new()
-            .build()
-            .map_err(|e| ServerError::EngineInit(format!("feature-flags: {e:?}")))?;
-
-        let version_cfg = version_negotiation::builder::VersionNegotiationBuilder::new()
-            .map_err(|e| ServerError::EngineInit(format!("version-negotiation: {e:?}")))?
-            .build()
-            .map_err(|e| ServerError::EngineInit(format!("version-negotiation: {e:?}")))?;
-
-        let graceful_cfg = graceful_startup_shutdown::builder::GracefulBuilder::new()
-            .build()
-            .map_err(|e| ServerError::EngineInit(format!("graceful-startup-shutdown: {e:?}")))?;
-
-        let ops_cfg = ops_dashboard::builder::OpsDashboardBuilder::new()
-            .build()
-            .map_err(|e| ServerError::EngineInit(format!("ops-dashboard: {e:?}")))?;
-
-        // Construct facades from configs (+ default stats where needed).
         Ok(Self {
-            agent: AgentRuntime::new(agent_cfg),
-            app: AppRuntime::new(
-                app_cfg,
-                application_runtime::runtime_id::RuntimeId::new(1),
-                AppRuntimeStats::default(),
-            ),
-            auth: AuthenticationPipeline::new(auth_cfg)
-                .map_err(|e| ServerError::EngineInit(format!("auth-framework facade: {e:?}")))?,
-            config_mgr: ConfigurationManager::new(config_cfg).map_err(|e| {
-                ServerError::EngineInit(format!("configuration-system facade: {e:?}"))
-            })?,
-            di: Container::new(di_cfg),
-            feature_flags: FeatureFlagManager::new(feature_cfg)
-                .map_err(|e| ServerError::EngineInit(format!("feature-flags facade: {e:?}")))?,
-            graceful: StartupShutdownCoordinator::new(graceful_cfg),
-            middleware: Pipeline::new(middleware_cfg).map_err(|e| {
-                ServerError::EngineInit(format!("middleware-pipeline facade: {e:?}"))
-            })?,
-            lifecycle: LifecycleCoordinator::new(lifecycle_cfg)
-                .map_err(|e| ServerError::EngineInit(format!("module-lifecycle facade: {e:?}")))?,
             observability: MetricsRegistry::new(
                 observability_cfg,
                 observability_sdk::stats::ObservabilityStats::default(),
             ),
-            ops: OpsDashboardService::new(
-                ops_cfg,
-                ops_dashboard::stats::OpsDashboardStats::default(),
-            ),
-            plugin: PluginManager::new(plugin_cfg)
-                .map_err(|e| ServerError::EngineInit(format!("plugin-manager facade: {e:?}")))?,
             quotas: QuotaManager::new(
                 quotas_cfg,
                 resource_quotas::stats::ResourceQuotaStats::default(),
             ),
-            scheduler_hooks: HookCoordinator::new(scheduler_cfg),
-            registry: ServiceRegistry::new(registry_cfg)
-                .map_err(|e| ServerError::EngineInit(format!("service-registry facade: {e:?}")))?,
-            version: VersionNegotiator::new(version_cfg).map_err(|e| {
-                ServerError::EngineInit(format!("version-negotiation facade: {e:?}"))
-            })?,
         })
     }
 }
@@ -1653,14 +1288,10 @@ pub struct ApplicationLayer {
     dispatcher: VireonDispatcher,
 
     // ── Pre-registered hot-path keys ────────────────────────────────
-    // Constructed once at startup to avoid per-frame MetricKey/FlagKey
-    // allocation. These mirror the keys registered in PlatformServices.
+    // Constructed once at startup to avoid per-frame MetricKey allocation.
+    // These mirror the keys registered in PlatformServices.
     metric_frames_rx: MetricKey,
     metric_connections: MetricKey,
-    flag_ai: FlagKey,
-    flag_rpc: FlagKey,
-    flag_media: FlagKey,
-    flag_event_bus: FlagKey,
     default_tenant: TenantId,
     default_limit: QuotaLimit,
 }
@@ -1668,9 +1299,9 @@ pub struct ApplicationLayer {
 impl ApplicationLayer {
     /// Creates a new application layer.
     ///
-    /// Pre-registers hot-path metric keys, feature flags, default tenant,
-    /// and config keys into the platform services so that the data path
-    /// can use them without per-frame allocation.
+    /// Pre-registers hot-path metric keys and the default tenant into
+    /// the platform services so that the data path can use them without
+    /// per-frame allocation.
     pub fn new() -> Result<Self, ServerError> {
         let mut platform = PlatformServices::new()?;
 
@@ -1687,22 +1318,6 @@ impl ApplicationLayer {
             .observability
             .register(metric_connections, MetricType::Counter);
 
-        // Pre-register feature flags (all enabled by default).
-        let flag_ai = FlagKey::new("ai_streaming")
-            .map_err(|e| ServerError::EngineInit(format!("flag key: {e:?}")))?;
-        let flag_rpc =
-            FlagKey::new("rpc").map_err(|e| ServerError::EngineInit(format!("flag key: {e:?}")))?;
-        let flag_media = FlagKey::new("media_streaming")
-            .map_err(|e| ServerError::EngineInit(format!("flag key: {e:?}")))?;
-        let flag_event_bus = FlagKey::new("event_bus")
-            .map_err(|e| ServerError::EngineInit(format!("flag key: {e:?}")))?;
-
-        let flag_state = FlagState::new(true, FlagValue::bool(true), false, 0);
-        let _ = platform.feature_flags.register(flag_ai, flag_state);
-        let _ = platform.feature_flags.register(flag_rpc, flag_state);
-        let _ = platform.feature_flags.register(flag_media, flag_state);
-        let _ = platform.feature_flags.register(flag_event_bus, flag_state);
-
         // Pre-register default tenant (Phase 1: single tenant, no resolution).
         let default_tenant = TenantId::new(1);
         let default_limit = QuotaLimit::for_tier(TenantTier::Internal);
@@ -1710,21 +1325,12 @@ impl ApplicationLayer {
             .quotas
             .register_tenant(default_tenant, TenantTier::Internal);
 
-        // Pre-register a default config key.
-        if let Ok(key) = ConfigKey::new("server.max_streams_per_conn") {
-            let _ = platform.config_mgr.set(key, ConfigValue::U64(1000));
-        }
-
         Ok(Self {
             session: SessionLayer::new()?,
             platform,
             dispatcher: VireonDispatcher::new(),
             metric_frames_rx,
             metric_connections,
-            flag_ai,
-            flag_rpc,
-            flag_media,
-            flag_event_bus,
             default_tenant,
             default_limit,
         })
@@ -1804,23 +1410,6 @@ impl ApplicationLayer {
         if action == FrameAction::DispatchToApp {
             // Platform: per-frame counter (observability).
             let _ = self.platform.observability.record(self.metric_frames_rx, 1);
-
-            // Platform: feature-flag gate (fail-open — proceed if flag
-            // missing; drop only if the flag exists and is disabled).
-            let flag = match frame.msg_type {
-                MessageType::TextToken => Some(self.flag_ai),
-                MessageType::ToolCall | MessageType::ToolResult => Some(self.flag_rpc),
-                MessageType::AudioFrame | MessageType::VideoFrame | MessageType::ImageFrame => {
-                    Some(self.flag_media)
-                }
-                MessageType::StateUpdate => Some(self.flag_event_bus),
-                _ => None,
-            };
-            if let Some(key) = flag {
-                if !self.platform.feature_flags.is_enabled(key) {
-                    return; // Feature disabled — drop frame.
-                }
-            }
 
             self.dispatcher.on_data_frame(ctx, frame);
 

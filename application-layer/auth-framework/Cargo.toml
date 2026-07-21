@@ -9,7 +9,6 @@ description = "Authentication and authorization framework: pluggable auth method
 autobenches = false
 
 [dependencies]
-configuration-system = { path = "../configuration-system" }
 session-manager      = { path = "../../session-layer/session-manager" }
 thiserror = { workspace = true }
 tracing  = { workspace = true }
