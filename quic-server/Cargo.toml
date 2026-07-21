@@ -51,28 +51,11 @@ session-migration-manager = { path = "../session-layer/session-migration-manager
 session-replication-service = { path = "../session-layer/session-replication-service" }
 
 # ── Application Layer ───────────────────────────────────────────────
-ai-streaming = { path = "../application-layer/ai-streaming" }
-event-bus = { path = "../application-layer/event-bus" }
-media-streaming = { path = "../application-layer/media-streaming" }
 pubsub-engine = { path = "../application-layer/pubsub-engine" }
-rpc-framework = { path = "../application-layer/rpc-framework" }
-agent-runtime = { path = "../application-layer/agent-runtime" }
-application-runtime = { path = "../application-layer/application-runtime" }
-service-registry = { path = "../application-layer/service-registry" }
-dependency-injection = { path = "../application-layer/dependency-injection" }
-module-lifecycle = { path = "../application-layer/module-lifecycle" }
-middleware-pipeline = { path = "../application-layer/middleware-pipeline" }
-configuration-system = { path = "../application-layer/configuration-system" }
-plugin-manager = { path = "../application-layer/plugin-manager" }
-scheduler-hooks = { path = "../application-layer/scheduler-hooks" }
 auth-framework = { path = "../application-layer/auth-framework" }
 topic-acl = { path = "../application-layer/topic-acl" }
 observability-sdk = { path = "../application-layer/observability-sdk" }
 resource-quotas = { path = "../application-layer/resource-quotas" }
-feature-flags = { path = "../application-layer/feature-flags" }
-version-negotiation = { path = "../application-layer/version-negotiation" }
-graceful-startup-shutdown = { path = "../application-layer/graceful-startup-shutdown" }
-ops-dashboard = { path = "../application-layer/ops-dashboard" }
 wal-store = { path = "../application-layer/wal-store" }
 
 # QUIC protocol
