@@ -230,23 +230,39 @@ impl<'a> StreamReset<'a> {
 // ── Handshake ───────────────────────────────────────────────────────
 
 /// Payload for [`MessageType::Handshake`].
+///
+/// As of per-connection PrincipalId wiring, the handshake carries the
+/// caller's identity claim. The server's `AuthenticationPipeline`
+/// verifies `(principal_id, credential_token)` and binds the resolved
+/// principal to the connection's `conn_idx`. A `principal_id` of 0
+/// means anonymous (server falls back to its configured default).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Handshake {
     /// Protocol version the sender proposes or agrees to.
     pub version: Version,
     /// Capability bitfield (bit positions defined by the application).
     pub capabilities: u32,
+    /// Principal the sender claims to be. 0 = anonymous.
+    pub principal_id: u64,
+    /// Opaque credential verified by `auth_framework::AuthenticationPipeline`.
+    /// For static-key deployments this is a shared secret; for production
+    /// deployments this will be a signed token (JWT, etc.) — but the
+    /// wire shape does not change.
+    pub credential_token: u64,
 }
 
 impl Handshake {
-    /// Fixed wire size: `version(1) + capabilities(4)` = 5 bytes.
-    pub const WIRE_SIZE: usize = 5;
+    /// Fixed wire size: `version(1) + capabilities(4) + principal_id(8)
+    /// + credential_token(8)` = 21 bytes.
+    pub const WIRE_SIZE: usize = 21;
 
     /// Encodes into `w`.
     #[inline]
     pub fn encode(&self, w: &mut ByteWriter) {
         w.write_u8(self.version.get());
         w.write_u32(self.capabilities);
+        w.write_u64(self.principal_id);
+        w.write_u64(self.credential_token);
     }
 
     /// Decodes from `r`.
@@ -260,6 +276,8 @@ impl Handshake {
         Ok(Self {
             version: Version::new(r.read_u8()),
             capabilities: r.read_u32(),
+            principal_id: r.read_u64(),
+            credential_token: r.read_u64(),
         })
     }
 }
@@ -382,6 +400,10 @@ pub enum ParsedPayload<'a> {
     TopicCreate(TopicCreatePayload<'a>),
     /// [`MessageType::TopicDelete`].
     TopicDelete(TopicDeletePayload<'a>),
+    /// [`MessageType::Fetch`].
+    Fetch(FetchPayload<'a>),
+    /// [`MessageType::FetchReply`].
+    FetchReply(FetchReplyPayload<'a>),
 }
 
 // ── Pub/sub payloads ────────────────────────────────────────────────
@@ -596,6 +618,131 @@ impl<'a> TopicDeletePayload<'a> {
     }
 }
 
+/// Payload for [`MessageType::Fetch`] (subscriber → server).
+///
+/// The caller asks the server to replay WAL entries for `topic` starting
+/// at `from_offset`. The server responds with at most `max_count`
+/// [`FetchReplyPayload`] frames (or fewer if the log has fewer entries
+/// available).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FetchPayload<'a> {
+    /// Topic name to replay from.
+    pub topic: &'a str,
+    /// Inclusive starting offset. `0` means "from the oldest retained
+    /// entry". Offsets below the server's oldest retained offset are
+    /// clamped to that oldest offset.
+    pub from_offset: u64,
+    /// Maximum number of `FetchReply` frames the subscriber will accept.
+    /// The server caps this at [`FETCH_MAX_COUNT`] to bound fan-out.
+    pub max_count: u32,
+}
+
+/// Fixed tail of a Fetch payload: `from_offset(8) + max_count(4)`.
+const FETCH_TAIL_SIZE: usize = 12;
+
+/// Hard upper bound on `FetchPayload::max_count`. A single Fetch request
+/// can produce at most this many `FetchReply` frames — keeps a wild
+/// request from saturating a subscriber's stream for seconds.
+pub const FETCH_MAX_COUNT: u32 = 256;
+
+impl<'a> FetchPayload<'a> {
+    /// Encodes into `w`.
+    pub fn encode(&self, w: &mut ByteWriter) {
+        write_string(w, self.topic);
+        w.write_u64(self.from_offset);
+        w.write_u32(self.max_count);
+    }
+
+    /// Exact wire size this value will occupy.
+    #[inline]
+    pub fn wire_size(&self) -> usize {
+        string_wire_size(self.topic) + FETCH_TAIL_SIZE
+    }
+
+    /// Decodes from `r`.
+    pub fn decode(r: &mut ByteReader<'a>) -> Result<Self, PayloadError> {
+        let topic = read_string(r)?;
+        if r.remaining() < FETCH_TAIL_SIZE {
+            return Err(PayloadError::Truncated {
+                needed: FETCH_TAIL_SIZE,
+                have: r.remaining(),
+            });
+        }
+        let from_offset = r.read_u64();
+        let max_count = r.read_u32();
+        Ok(Self {
+            topic,
+            from_offset,
+            max_count,
+        })
+    }
+}
+
+/// Payload for [`MessageType::FetchReply`] (server → subscriber).
+///
+/// One replayed WAL entry: the server emits these in ascending offset
+/// order in response to a [`FetchPayload`] request. `payload` borrows
+/// from the underlying wire buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FetchReplyPayload<'a> {
+    /// Topic name the entry belongs to.
+    pub topic: &'a str,
+    /// WAL-assigned offset of this entry.
+    pub offset: u64,
+    /// Nanoseconds since UNIX epoch when the entry was appended.
+    pub timestamp_ns: u64,
+    /// Opaque message payload.
+    pub payload: &'a [u8],
+}
+
+/// Fixed tail of a FetchReply payload: `offset(8) + timestamp_ns(8) +
+/// payload_len(4)`.
+const FETCH_REPLY_TAIL_SIZE: usize = 20;
+
+impl<'a> FetchReplyPayload<'a> {
+    /// Encodes into `w`.
+    pub fn encode(&self, w: &mut ByteWriter) {
+        write_string(w, self.topic);
+        w.write_u64(self.offset);
+        w.write_u64(self.timestamp_ns);
+        w.write_u32(self.payload.len() as u32);
+        w.write_bytes(self.payload);
+    }
+
+    /// Exact wire size this value will occupy.
+    #[inline]
+    pub fn wire_size(&self) -> usize {
+        string_wire_size(self.topic) + FETCH_REPLY_TAIL_SIZE + self.payload.len()
+    }
+
+    /// Decodes from `r`.
+    pub fn decode(r: &mut ByteReader<'a>) -> Result<Self, PayloadError> {
+        let topic = read_string(r)?;
+        if r.remaining() < FETCH_REPLY_TAIL_SIZE {
+            return Err(PayloadError::Truncated {
+                needed: FETCH_REPLY_TAIL_SIZE,
+                have: r.remaining(),
+            });
+        }
+        let offset = r.read_u64();
+        let timestamp_ns = r.read_u64();
+        let payload_len = r.read_u32() as usize;
+        if r.remaining() < payload_len {
+            return Err(PayloadError::Truncated {
+                needed: FETCH_REPLY_TAIL_SIZE + payload_len,
+                have: FETCH_REPLY_TAIL_SIZE + r.remaining(),
+            });
+        }
+        let payload = r.read_slice(payload_len);
+        Ok(Self {
+            topic,
+            offset,
+            timestamp_ns,
+            payload,
+        })
+    }
+}
+
 // ── Top-level convenience functions ─────────────────────────────────
 
 /// Parses a payload based on the frame's `msg_type`.
@@ -637,6 +784,10 @@ pub fn parse_payload<'a>(
         MessageType::TopicDelete => Some(ParsedPayload::TopicDelete(TopicDeletePayload::decode(
             &mut r,
         )?)),
+        MessageType::Fetch => Some(ParsedPayload::Fetch(FetchPayload::decode(&mut r)?)),
+        MessageType::FetchReply => Some(ParsedPayload::FetchReply(FetchReplyPayload::decode(
+            &mut r,
+        )?)),
         // Data-plane types and Fragment have no structured payload here.
         _ => None,
     };
@@ -659,6 +810,8 @@ pub fn payload_wire_size(payload: &ParsedPayload<'_>) -> usize {
         ParsedPayload::Publish(p) => p.wire_size(),
         ParsedPayload::TopicCreate(p) => p.wire_size(),
         ParsedPayload::TopicDelete(p) => p.wire_size(),
+        ParsedPayload::Fetch(p) => p.wire_size(),
+        ParsedPayload::FetchReply(p) => p.wire_size(),
     }
 }
 
@@ -681,6 +834,8 @@ pub fn encode_payload(payload: &ParsedPayload<'_>) -> Vec<u8> {
         ParsedPayload::Publish(p) => p.encode(&mut w),
         ParsedPayload::TopicCreate(p) => p.encode(&mut w),
         ParsedPayload::TopicDelete(p) => p.encode(&mut w),
+        ParsedPayload::Fetch(p) => p.encode(&mut w),
+        ParsedPayload::FetchReply(p) => p.encode(&mut w),
     }
     buf
 }
@@ -855,6 +1010,8 @@ mod tests {
         let hs = Handshake {
             version: Version::V1,
             capabilities: 0xCAFE_F00D,
+            principal_id: 42,
+            credential_token: 0xDEAD_BEEF,
         };
         let mut buf = [0u8; Handshake::WIRE_SIZE];
         let mut w = ByteWriter::new(&mut buf);
@@ -870,7 +1027,10 @@ mod tests {
         let err = Handshake::decode(&mut ByteReader::new(&[0; 4])).unwrap_err();
         assert!(matches!(
             err,
-            PayloadError::Truncated { needed: 5, have: 4 }
+            PayloadError::Truncated {
+                needed: 21,
+                have: 4
+            }
         ));
     }
 
@@ -981,6 +1141,8 @@ mod tests {
         Handshake {
             version: Version::V1,
             capabilities: 1,
+            principal_id: 0,
+            credential_token: 0,
         }
         .encode(&mut ByteWriter::new(&mut buf));
         assert!(matches!(
@@ -1174,6 +1336,81 @@ mod tests {
     }
 
     #[test]
+    fn fetch_round_trip() {
+        let f = FetchPayload {
+            topic: "sensor.temp",
+            from_offset: 42,
+            max_count: 16,
+        };
+        let mut buf = vec![0u8; f.wire_size()];
+        let mut w = ByteWriter::new(&mut buf);
+        f.encode(&mut w);
+
+        let decoded = FetchPayload::decode(&mut ByteReader::new(&buf)).unwrap();
+        assert_eq!(decoded.topic, "sensor.temp");
+        assert_eq!(decoded.from_offset, 42);
+        assert_eq!(decoded.max_count, 16);
+    }
+
+    #[test]
+    fn fetch_truncated_tail() {
+        // topic_len(2) + topic(3) + only 4 of 12 tail bytes.
+        let mut buf = vec![0u8; 9];
+        let mut w = ByteWriter::new(&mut buf);
+        w.write_u16(3);
+        w.write_bytes(b"abc");
+        w.write_u32(7);
+        let err = FetchPayload::decode(&mut ByteReader::new(&buf)).unwrap_err();
+        assert!(matches!(
+            err,
+            PayloadError::Truncated {
+                needed: 12,
+                have: 4
+            }
+        ));
+    }
+
+    #[test]
+    fn fetch_reply_round_trip() {
+        let fr = FetchReplyPayload {
+            topic: "sensor.temp",
+            offset: 99,
+            timestamp_ns: 1_700_000_000_000_000,
+            payload: &[0xDE, 0xAD, 0xBE, 0xEF],
+        };
+        let mut buf = vec![0u8; fr.wire_size()];
+        let mut w = ByteWriter::new(&mut buf);
+        fr.encode(&mut w);
+
+        let decoded = FetchReplyPayload::decode(&mut ByteReader::new(&buf)).unwrap();
+        assert_eq!(decoded.topic, "sensor.temp");
+        assert_eq!(decoded.offset, 99);
+        assert_eq!(decoded.timestamp_ns, 1_700_000_000_000_000);
+        assert_eq!(decoded.payload, &[0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn fetch_reply_truncated_payload() {
+        // topic_len(2) + topic(1) + tail(20) declares payload_len=10 but
+        // the buffer ends right after the tail.
+        let mut buf = vec![0u8; 2 + 1 + 20];
+        let mut w = ByteWriter::new(&mut buf);
+        w.write_u16(1);
+        w.write_bytes(b"x");
+        w.write_u64(0); // offset
+        w.write_u64(0); // timestamp_ns
+        w.write_u32(10); // payload_len — but no payload bytes follow
+        let err = FetchReplyPayload::decode(&mut ByteReader::new(&buf)).unwrap_err();
+        assert!(matches!(
+            err,
+            PayloadError::Truncated {
+                needed: 30,
+                have: 20
+            }
+        ));
+    }
+
+    #[test]
     fn parse_payload_dispatches_all_pubsub_types() {
         // Subscribe
         let original = ParsedPayload::Subscribe(SubscribePayload {
@@ -1205,6 +1442,29 @@ mod tests {
         });
         let bytes = encode_payload(&original);
         let parsed = parse_payload(MessageType::TopicCreate, &bytes)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed, original);
+
+        // Fetch
+        let original = ParsedPayload::Fetch(FetchPayload {
+            topic: "replay.topic",
+            from_offset: 7,
+            max_count: 32,
+        });
+        let bytes = encode_payload(&original);
+        let parsed = parse_payload(MessageType::Fetch, &bytes).unwrap().unwrap();
+        assert_eq!(parsed, original);
+
+        // FetchReply
+        let original = ParsedPayload::FetchReply(FetchReplyPayload {
+            topic: "replay.topic",
+            offset: 7,
+            timestamp_ns: 1234,
+            payload: &[1, 2, 3, 4],
+        });
+        let bytes = encode_payload(&original);
+        let parsed = parse_payload(MessageType::FetchReply, &bytes)
             .unwrap()
             .unwrap();
         assert_eq!(parsed, original);

@@ -15,5 +15,6 @@
 //!        └─ VireonDispatcher  (Phase 3 send-policy + Phase 7 ACL)
 //! ```
 
+pub mod acl_loader;
 pub mod error;
 pub mod layers;

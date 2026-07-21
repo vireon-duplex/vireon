@@ -158,11 +158,13 @@ name = "bench-harness"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "ctrlc",
  "frame",
  "libc",
  "mimalloc",
  "quiche",
+ "send-policy",
  "session-manager",
  "stream-manager",
  "thiserror 2.0.18",
@@ -1207,12 +1209,14 @@ dependencies = [
  "stream-manager",
  "stream-scheduler",
  "task-queue",
+ "tempfile",
  "thiserror 2.0.18",
  "timer-wheel",
  "topic-acl",
  "tracing",
  "tracing-subscriber",
  "version-negotiation",
+ "wal-store",
 ]
 
 [[package]]

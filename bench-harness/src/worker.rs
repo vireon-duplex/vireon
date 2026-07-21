@@ -41,6 +41,35 @@ pub enum BenchMode {
     Pipeline,
 }
 
+/// Selects the client-side send policy applied before frames hit the wire.
+///
+/// `None` keeps the legacy pass-through behaviour (every coalesced copy is
+/// encoded and sent). Any other variant calls `ClientStack::bind_send_policy`
+/// after `on_connect` so the send-policy table routes every enqueue.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EgressPolicy {
+    None,
+    ReliableOrdered,
+    ReliableUnordered,
+    RealtimeDropOld,
+    LatestOnly,
+}
+
+impl EgressPolicy {
+    /// Returns the matching `DeliveryPolicy`, or `None` for the legacy
+    /// pass-through path (no bind).
+    #[must_use]
+    pub const fn to_delivery_policy(self) -> Option<send_policy::DeliveryPolicy> {
+        match self {
+            EgressPolicy::None => None,
+            EgressPolicy::ReliableOrdered => Some(send_policy::DeliveryPolicy::ReliableOrdered),
+            EgressPolicy::ReliableUnordered => Some(send_policy::DeliveryPolicy::ReliableUnordered),
+            EgressPolicy::RealtimeDropOld => Some(send_policy::DeliveryPolicy::RealtimeDropOld),
+            EgressPolicy::LatestOnly => Some(send_policy::DeliveryPolicy::LatestOnly),
+        }
+    }
+}
+
 /// Read timeout on the blocking socket. Short enough that flow-control
 /// spin loops don't waste wall-clock time, long enough that we don't
 /// burn 100% CPU in a pure busy loop.
@@ -109,6 +138,7 @@ struct EstablishedConn {
 /// on `Barrier::wait()` forever — at 1000 conns this happens often enough
 /// (ephemeral port pressure, server reject, slow TLS) that the bench
 /// appears to "hang at N connections".
+#[allow(clippy::too_many_arguments)]
 pub fn worker(
     idx: usize,
     target: SocketAddr,
@@ -118,6 +148,7 @@ pub fn worker(
     mode: BenchMode,
     pipeline_depth: usize,
     coalesce: usize,
+    egress_policy: EgressPolicy,
     shutdown: &AtomicBool,
     barrier: &Barrier,
 ) -> WorkerResult {
@@ -266,6 +297,16 @@ pub fn worker(
     let mut stack = ClientStack::new(max_coalesce_capacity(entries, coalesce));
     if stack.on_connect().is_none() {
         return WorkerResult::failed("session table full".into(), handshake_time);
+    }
+
+    // --- Bind send-side policy (if any) ---------------------------------
+    // Applies the chosen `DeliveryPolicy` to every logical stream the
+    // workload touches. Default `EgressPolicy::None` skips this and the
+    // table lazy-defaults each stream to `ReliableOrdered`.
+    if let Some(policy) = egress_policy.to_delivery_policy() {
+        for (i, _entry) in entries.iter().enumerate() {
+            stack.bind_send_policy(i as u64, policy);
+        }
     }
 
     // --- Measurement (mode-dispatched) ----------------------------------

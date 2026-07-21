@@ -271,6 +271,27 @@ fn realistic_payload(mt: MessageType) -> Vec<u8> {
             v.extend_from_slice(topic);
             v
         }
+        MessageType::Fetch => {
+            let topic = b"metrics.cpu.host.0";
+            let mut v = Vec::with_capacity(2 + topic.len() + 12);
+            v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            v.extend_from_slice(topic);
+            v.extend_from_slice(&0u64.to_be_bytes());
+            v.extend_from_slice(&32u32.to_be_bytes());
+            v
+        }
+        MessageType::FetchReply => {
+            let topic = b"metrics.cpu.host.0";
+            let payload = b"replayed-entry-payload";
+            let mut v = Vec::with_capacity(2 + topic.len() + 20 + payload.len());
+            v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            v.extend_from_slice(topic);
+            v.extend_from_slice(&0u64.to_be_bytes());
+            v.extend_from_slice(&0u64.to_be_bytes());
+            v.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            v.extend_from_slice(payload);
+            v
+        }
     }
 }
 
@@ -306,6 +327,8 @@ fn type_name(mt: MessageType) -> &'static str {
         MessageType::Publish => "Publish",
         MessageType::TopicCreate => "TopicCreate",
         MessageType::TopicDelete => "TopicDelete",
+        MessageType::Fetch => "Fetch",
+        MessageType::FetchReply => "FetchReply",
     }
 }
 

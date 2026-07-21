@@ -556,9 +556,11 @@ impl std::ops::BitAnd for FrameFlags {
 /// multi-stream lifecycle, fragmentation, handshake, and app-level reliability.
 /// Values `0x10`–`0x14` are **pub/sub** data-plane types — they carry a
 /// structured payload (see `frame::payload`) that the application dispatches
-/// to the pub/sub engine.
+/// to the pub/sub engine. Values `0x15`–`0x16` extend the pub/sub plane with
+/// replay-by-offset semantics: `Fetch` requests missed entries from a topic's
+/// WAL; `FetchReply` returns one entry per frame.
 ///
-/// The `u8` representation leaves `0x00` and `0x15`–`0xFF` reserved for future
+/// The `u8` representation leaves `0x00` and `0x17`–`0xFF` reserved for future
 /// expansion; unknown bytes surface as [`FrameError::UnknownMessageType`] rather
 /// than silent corruption.
 #[repr(u8)]
@@ -609,13 +611,21 @@ pub enum MessageType {
     TopicCreate = 0x13,
     /// Delete a topic.
     TopicDelete = 0x14,
+    /// Subscriber → server: replay WAL entries for a topic starting at
+    /// `from_offset`. Payload is [`crate::payload::FetchPayload`].
+    Fetch = 0x15,
+    /// Server → subscriber: one replayed WAL entry. Payload is
+    /// [`crate::payload::FetchReplyPayload`]. A single `Fetch` request
+    /// yields zero or more `FetchReply` frames (bounded by the
+    /// request's `max_count`).
+    FetchReply = 0x16,
 }
 
 /// Every defined [`MessageType`], ascending by wire byte.
 ///
 /// Useful for exhaustive round-trip tests and for dispatchers that want to
 /// validate they handle every variant.
-pub const ALL_MESSAGE_TYPES: [MessageType; 20] = [
+pub const ALL_MESSAGE_TYPES: [MessageType; 22] = [
     MessageType::TextToken,
     MessageType::AudioFrame,
     MessageType::VideoFrame,
@@ -636,6 +646,8 @@ pub const ALL_MESSAGE_TYPES: [MessageType; 20] = [
     MessageType::Publish,
     MessageType::TopicCreate,
     MessageType::TopicDelete,
+    MessageType::Fetch,
+    MessageType::FetchReply,
 ];
 
 impl MessageType {
@@ -669,6 +681,8 @@ impl MessageType {
             0x12 => Self::Publish,
             0x13 => Self::TopicCreate,
             0x14 => Self::TopicDelete,
+            0x15 => Self::Fetch,
+            0x16 => Self::FetchReply,
             _ => return None,
         })
     }
@@ -697,11 +711,13 @@ impl MessageType {
                 | Self::Publish
                 | Self::TopicCreate
                 | Self::TopicDelete
+                | Self::Fetch
+                | Self::FetchReply
         )
     }
 
     /// `true` when this variant is one of the pub/sub data-plane types
-    /// (`Subscribe`..`TopicDelete`). These carry structured payloads parsed
+    /// (`Subscribe`..`FetchReply`). These carry structured payloads parsed
     /// by the frame layer and are routed to the pub/sub engine by the
     /// application dispatcher.
     #[inline]
@@ -713,6 +729,8 @@ impl MessageType {
                 | Self::Publish
                 | Self::TopicCreate
                 | Self::TopicDelete
+                | Self::Fetch
+                | Self::FetchReply
         )
     }
 
@@ -1103,7 +1121,7 @@ mod tests {
     #[test]
     fn reserved_and_unknown_bytes_map_to_none() {
         assert_eq!(MessageType::from_byte(0x00), None);
-        assert_eq!(MessageType::from_byte(0x15), None);
+        assert_eq!(MessageType::from_byte(0x17), None);
         assert_eq!(MessageType::from_byte(0xFF), None);
         assert!(matches!(
             MessageType::try_from(0x42),
@@ -1123,7 +1141,7 @@ mod tests {
     #[test]
     fn wire_bytes_are_dense_and_unique() {
         let bytes: Vec<u8> = ALL_MESSAGE_TYPES.iter().map(|mt| mt.as_byte()).collect();
-        assert_eq!(bytes, (0x01..=0x14u8).collect::<Vec<_>>());
+        assert_eq!(bytes, (0x01..=0x16u8).collect::<Vec<_>>());
         let unique: std::collections::HashSet<_> = bytes.iter().copied().collect();
         assert_eq!(unique.len(), bytes.len());
     }
