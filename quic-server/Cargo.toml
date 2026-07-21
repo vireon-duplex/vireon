@@ -73,6 +73,7 @@ feature-flags = { path = "../application-layer/feature-flags" }
 version-negotiation = { path = "../application-layer/version-negotiation" }
 graceful-startup-shutdown = { path = "../application-layer/graceful-startup-shutdown" }
 ops-dashboard = { path = "../application-layer/ops-dashboard" }
+wal-store = { path = "../application-layer/wal-store" }
 
 # QUIC protocol
 quiche = { workspace = true }
@@ -103,6 +104,7 @@ profiler = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
 
 [features]
 default = []

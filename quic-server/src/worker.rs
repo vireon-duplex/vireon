@@ -100,7 +100,14 @@ impl Worker {
             .build()
             .map_err(|e| ServerError::EngineInit(format!("{e:?}")))?;
 
-        let handler = VireonStack::new(engine, core_id, config.echo, shutdown_requested)?;
+        let handler = VireonStack::new(
+            engine,
+            core_id,
+            config.echo,
+            config.acl_table.clone(),
+            config.wal_root.as_deref(),
+            shutdown_requested,
+        )?;
 
         Ok(Self {
             core_id,

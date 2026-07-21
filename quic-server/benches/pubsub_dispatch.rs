@@ -187,17 +187,17 @@ fn bench_acl_check(c: &mut Criterion) {
 
     let permissive = build_permissive();
     group.bench_function("permissive_default", |b| {
-        b.iter(|| black_box(permissive.check_acl(Action::Subscribe, "sensor.temp")))
+        b.iter(|| black_box(permissive.check_acl(0, Action::Subscribe, "sensor.temp")))
     });
 
     let allow = build_explicit_allow();
     group.bench_function("explicit_allow_rule", |b| {
-        b.iter(|| black_box(allow.check_acl(Action::Subscribe, "sensor.temp")))
+        b.iter(|| black_box(allow.check_acl(0, Action::Subscribe, "sensor.temp")))
     });
 
     let deny = build_explicit_deny();
     group.bench_function("explicit_deny_rule", |b| {
-        b.iter(|| black_box(deny.check_acl(Action::Subscribe, "system.logs")))
+        b.iter(|| black_box(deny.check_acl(0, Action::Subscribe, "system.logs")))
     });
 
     group.finish();

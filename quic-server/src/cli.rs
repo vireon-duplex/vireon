@@ -69,6 +69,24 @@ pub struct Cli {
     /// .dot (Graphviz), anything else = text report.
     #[arg(long)]
     pub profile_output: Option<String>,
+
+    /// Path to a TOML ACL rules file. When set, the server loads
+    /// tenant-isolation rules from this file and replaces the default
+    /// permissive `allow("*.*", None, ALL)` table. When omitted the
+    /// permissive default is kept (single-tenant mode).
+    ///
+    /// See `acl_loader::AclRulesFile` for the file schema.
+    #[arg(long)]
+    pub acl_rules_path: Option<String>,
+
+    /// Directory root for the write-ahead log (WAL). When set, every
+    /// accepted publish is appended to a per-worker `FileStore` under
+    /// `<root>/worker_<core_id>/` before fan-out, and subscribers can
+    /// use `Fetch(offset)` to replay missed messages. When omitted the
+    /// WAL is disabled (publish is fire-and-forget, Fetch returns an
+    /// error ack).
+    #[arg(long)]
+    pub wal_root: Option<String>,
 }
 
 /// CLI worker-mode selector.

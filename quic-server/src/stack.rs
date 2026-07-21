@@ -200,10 +200,31 @@ impl VireonStack {
         engine: QuicEngine,
         reactor_id: u32,
         echo: bool,
+        acl_table: Option<topic_acl::AclTable>,
+        wal_root: Option<&std::path::Path>,
         shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, ServerError> {
+        let mut application = ApplicationLayer::new()?;
+        if let Some(table) = acl_table {
+            application.set_acl(table);
+        }
+        if let Some(root) = wal_root {
+            // Each worker partitions under `<root>/worker_<reactor_id>/`
+            // so concurrent reactors don't fight over the same files.
+            // Cross-worker WAL sharing is a P5/P6 concern.
+            let worker_dir = root.join(format!("worker_{reactor_id}"));
+            match wal_store::FileStore::open(&worker_dir) {
+                Ok(store) => application.set_wal(store),
+                Err(e) => {
+                    return Err(ServerError::EngineInit(format!(
+                        "wal_store open `{}`: {e:?}",
+                        worker_dir.display()
+                    )));
+                }
+            }
+        }
         Ok(Self {
-            application: ApplicationLayer::new()?,
+            application,
             runtime: RuntimeLayer::new(reactor_id)?,
             engine,
             connections: ConnectionRegistry::new(),
@@ -334,7 +355,10 @@ impl VireonStack {
             "session created"
         );
 
-        // Track cross-layer state.
+        // Track cross-layer state. The dispatcher independently tracks
+        // the per-connection principal (resolved from the Handshake
+        // frame) in its own map; the registry here stores only the
+        // connection / session identifiers and eviction bookkeeping.
         self.connections.insert(
             conn_idx,
             ConnState {

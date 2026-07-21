@@ -55,7 +55,7 @@ pub enum DenyReason {
 /// * `pattern_matches(rule.pattern, topic)`, AND
 /// * `rule.principal.is_none() || rule.principal == Some(principal)`, AND
 /// * `rule.actions.contains(action)` (for steps 1–2).
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct AclTable {
     rules: Vec<AclRule>,
 }

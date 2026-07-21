@@ -241,10 +241,14 @@ fn realistic_payload(mt: MessageType) -> Vec<u8> {
             v
         }
 
-        // 2 KiB handshake with full capabilities list.
+        // 2 KiB handshake with full capabilities list + principal/credential
+        // claim. Wire format is 21 bytes (version + capabilities +
+        // principal_id + credential_token) but the bench pads to 2 KiB
+        // to exercise the realistic post-handshake metadata payload that
+        // production deployments carry alongside the fixed fields.
         MessageType::Handshake => {
             let mut v = Vec::with_capacity(2048);
-            let prefix = br#"{"proto":"vireon","version":"1.0.0","capabilities":["audio","video","tools"],"ext":"#;
+            let prefix = br#"{"proto":"vireon","version":"1.0.0","principal_id":42,"capabilities":["audio","video","tools"],"ext":"#;
             v.extend_from_slice(prefix);
             let need = 2048usize.saturating_sub(prefix.len() + 2);
             let mut tmp = vec![0u8; need];
@@ -314,6 +318,33 @@ fn realistic_payload(mt: MessageType) -> Vec<u8> {
             v.extend_from_slice(topic);
             v
         }
+
+        // Fetch — request replay from offset 0, up to 32 entries. The
+        // workload bench doesn't drive replay end-to-end (no server
+        // state) so the payload is just shape-correct filler.
+        MessageType::Fetch => {
+            let topic = b"metrics.cpu.host.0";
+            let mut v = Vec::with_capacity(2 + topic.len() + 12);
+            v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            v.extend_from_slice(topic);
+            v.extend_from_slice(&0u64.to_be_bytes()); // from_offset
+            v.extend_from_slice(&32u32.to_be_bytes()); // max_count
+            v
+        }
+
+        // FetchReply — one replayed WAL entry: small payload is fine.
+        MessageType::FetchReply => {
+            let topic = b"metrics.cpu.host.0";
+            let payload = b"replayed-entry-payload";
+            let mut v = Vec::with_capacity(2 + topic.len() + 20 + payload.len());
+            v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            v.extend_from_slice(topic);
+            v.extend_from_slice(&0u64.to_be_bytes()); // offset
+            v.extend_from_slice(&0u64.to_be_bytes()); // timestamp_ns
+            v.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            v.extend_from_slice(payload);
+            v
+        }
     }
 }
 
@@ -351,6 +382,8 @@ fn type_name(mt: MessageType) -> &'static str {
         MessageType::Publish => "Publish",
         MessageType::TopicCreate => "TopicCreate",
         MessageType::TopicDelete => "TopicDelete",
+        MessageType::Fetch => "Fetch",
+        MessageType::FetchReply => "FetchReply",
     }
 }
 
@@ -382,9 +415,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn workload_has_twenty_entries() {
+    fn workload_has_twenty_two_entries() {
+        // 22 = 20 base message types + Fetch + FetchReply (added in P4).
         let w = build().unwrap();
-        assert_eq!(w.entries.len(), 20);
+        assert_eq!(w.entries.len(), 22);
     }
 
     #[test]
@@ -398,10 +432,13 @@ mod tests {
     }
 
     #[test]
-    fn logical_streams_are_zero_to_nineteen() {
+    fn logical_streams_cycle_within_stream_id_count() {
+        // The 20 workload entries cycle through the 15 QUIC stream IDs
+        // (types 15..=19 share a stream with 0..=4) — see `build()` for
+        // why this mod-cycle is required.
         let w = build().unwrap();
         for (i, e) in w.entries.iter().enumerate() {
-            assert_eq!(e.logical_stream, i as u64);
+            assert_eq!(e.logical_stream, (i % STREAM_ID_COUNT) as u64);
         }
     }
 

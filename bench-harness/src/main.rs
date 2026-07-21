@@ -37,7 +37,7 @@ use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
 use stats::{Summary, SweepPoint, WorkerResult, aggregate, print_summary};
-use worker::{BenchMode, worker};
+use worker::{BenchMode, EgressPolicy, worker};
 use workload::Workload;
 
 /// Worker thread stack size. 512 KiB is sufficient for BoringSSL TLS 1.3
@@ -53,6 +53,7 @@ struct Args {
     mode: BenchMode,
     pipeline_depth: usize,
     sweep: SweepMode,
+    egress_policy: EgressPolicy,
 }
 
 /// Selects single-run vs. sweep mode.
@@ -84,6 +85,7 @@ fn main() -> Result<()> {
                 args.duration,
                 args.mode,
                 args.pipeline_depth,
+                args.egress_policy,
                 &workload,
                 &shutdown,
             )?;
@@ -106,6 +108,7 @@ fn main() -> Result<()> {
                     args.duration,
                     args.mode,
                     args.pipeline_depth,
+                    args.egress_policy,
                     &workload,
                     &shutdown,
                 )?;
@@ -139,6 +142,7 @@ fn main() -> Result<()> {
                     args.duration,
                     BenchMode::Rr,
                     args.pipeline_depth,
+                    args.egress_policy,
                     &workload,
                     &shutdown,
                 )?;
@@ -166,6 +170,7 @@ fn run_benchmark(
     duration: Duration,
     mode: BenchMode,
     pipeline_depth: usize,
+    egress_policy: EgressPolicy,
     workload: &Workload,
     shutdown: &Arc<AtomicBool>,
 ) -> Result<Summary> {
@@ -227,11 +232,15 @@ fn run_benchmark(
                             mode,
                             pipeline_depth,
                             coalesce,
+                            egress_policy,
                             shutdown_ref,
                             barrier_ref,
                         )
                     })
-                    .unwrap_or_else(|e| panic!("worker {idx} spawn failed: {e}"))
+                    .unwrap_or_else(|e| {
+                        tracing::error!("worker {idx} spawn failed: {e}");
+                        std::process::exit(1);
+                    })
             })
             .collect();
 
@@ -327,10 +336,10 @@ fn install_signal_handlers(shutdown: Arc<AtomicBool>) {
     let _ = ctrlc::set_handler(move || {
         if shutdown.swap(true, Ordering::Relaxed) {
             // Already set — this is the second interrupt, force exit now.
-            eprintln!("\nInterrupted — forcing exit.");
+            tracing::warn!("interrupted — forcing exit");
             std::process::exit(130); // 130 = standard exit code for SIGINT
         }
-        eprintln!("Stopping... (press Ctrl-C again to force exit)");
+        tracing::info!("stopping... (press Ctrl-C again to force exit)");
     });
 }
 
@@ -341,6 +350,7 @@ fn parse_args() -> Result<Args> {
     let mut mode = BenchMode::Stream;
     let mut pipeline_depth: usize = 4;
     let mut sweep = SweepMode::None;
+    let mut egress_policy = EgressPolicy::None;
 
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -397,6 +407,21 @@ fn parse_args() -> Result<Args> {
                     };
                 }
             }
+            "--egress-policy" => {
+                i += 1;
+                if i < argv.len() {
+                    egress_policy = match argv[i].as_str() {
+                        "none" => EgressPolicy::None,
+                        "reliable_ordered" => EgressPolicy::ReliableOrdered,
+                        "reliable_unordered" => EgressPolicy::ReliableUnordered,
+                        "realtime_drop_old" => EgressPolicy::RealtimeDropOld,
+                        "latest_only" => EgressPolicy::LatestOnly,
+                        other => anyhow::bail!(
+                            "unknown --egress-policy '{other}'; valid: none, reliable_ordered, reliable_unordered, realtime_drop_old, latest_only"
+                        ),
+                    };
+                }
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -421,6 +446,7 @@ fn parse_args() -> Result<Args> {
         mode,
         pipeline_depth,
         sweep,
+        egress_policy,
     })
 }
 
@@ -434,6 +460,9 @@ fn print_usage() {
     println!("  -m, --mode MODE              Benchmark mode (default: stream)");
     println!("  -p, --pipeline-depth N       In-flight batches for pipeline mode (default: 4)");
     println!("      --sweep MODE             Sweep mode: conn, payload, none (default: none)");
+    println!("      --egress-policy POLICY   Client send policy: none, reliable_ordered,");
+    println!("                               reliable_unordered, realtime_drop_old, latest_only");
+    println!("                               (default: none — legacy pass-through)");
     println!("  -h, --help                   Show this help");
     println!();
     println!("Modes:");

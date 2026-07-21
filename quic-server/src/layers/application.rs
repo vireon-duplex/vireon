@@ -38,11 +38,12 @@ use configuration_system::manager::ConfigurationManager;
 use dependency_injection::container::Container;
 use event_bus::{EventBus, EventBusConfig, PartitionId, TopicId};
 use feature_flags::manager::FeatureFlagManager;
+use frame::byte_writer::ByteWriter;
 use frame::codec::{FrameHeader, FrameRef};
 use frame::header::{FrameFlags, MessageType, Seq, StreamId};
 use frame::payload::{
-    ParsedPayload, SubscribePayload, TopicCreatePayload, TopicDeletePayload, UnsubscribePayload,
-    parse_payload,
+    FetchReplyPayload, ParsedPayload, SubscribePayload, TopicCreatePayload, TopicDeletePayload,
+    UnsubscribePayload, parse_payload,
 };
 use graceful_startup_shutdown::StartupShutdownCoordinator;
 use media_streaming::{
@@ -68,6 +69,9 @@ use service_registry::registry::ServiceRegistry;
 use session_manager::SessionId;
 use topic_acl::{AclDecision, AclTable, AclTableBuilder, Action, ActionSet, PrincipalId};
 use version_negotiation::negotiator::VersionNegotiator;
+use wal_store::WalStore;
+
+use auth_framework::{AuthConfig, Credential, CredentialType, PrincipalId as AuthPrincipalId};
 
 use configuration_system::{ConfigKey, ConfigValue};
 use feature_flags::{FlagKey, FlagState, FlagValue};
@@ -190,13 +194,35 @@ pub struct VireonDispatcher {
     /// broad allow-all rule (`allow("*.*", None, ALL)`) so existing
     /// pub/sub traffic is unaffected; operators can swap in a stricter
     /// table at construction time. Real per-connection `PrincipalId`
-    /// resolution (from `auth_framework::AuthenticationPipeline`) lands
-    /// in a later phase — until then, `default_principal` is used.
+    /// resolution lands via the `Handshake` arm in `on_data_frame` →
+    /// `auth.authenticate` → stored in `principals`.
     acl: AclTable,
-    /// Principal assumed for every connection in single-tenant Phase 1
-    /// mode. The `acl` table's wildcard rules match any principal, so
-    /// the specific value here only matters for non-wildcard rules.
+    /// Principal assumed for any connection that has not completed the
+    /// auth handshake (no `Handshake` frame processed yet, or auth
+    /// failed). The `acl` table's wildcard rules match any principal,
+    /// so the specific value here only matters for non-wildcard rules.
     default_principal: PrincipalId,
+    /// `[conn_idx]` → authenticated principal. Populated when a
+    /// `Handshake` frame arrives and `AuthenticationPipeline::authenticate`
+    /// succeeds; removed in `on_connection_closed`. Connections that
+    /// never complete auth fall back to `default_principal` during
+    /// ACL checks.
+    principals: FxHashMap<usize, PrincipalId>,
+    /// [application-layer] Authentication pipeline. Verifies the
+    /// `(principal_id, credential_token)` carried by `Handshake`
+    /// payloads. Pre-loaded with the configured default principal so
+    /// single-tenant deployments that don't ship credentials still
+    /// authenticate successfully.
+    auth: AuthenticationPipeline,
+    /// [application-layer] Optional WAL — when `Some`, every accepted
+    /// publish is appended to a per-worker `FileStore` before fan-out,
+    /// and `Fetch` requests can replay entries by offset. `None` means
+    /// the operator did not pass `--wal-root`; publish/fetch work as
+    /// before (no persistence, fetch returns an error ack). Each worker
+    /// owns its own store rooted at `<root>/worker_<core_id>/` — this
+    /// matches Vireon's thread-per-core design. Cross-worker sharing
+    /// is a P5/P6 concern.
+    wal: Option<wal_store::FileStore>,
 }
 
 impl VireonDispatcher {
@@ -239,6 +265,16 @@ impl VireonDispatcher {
                 .build()
                 .unwrap_or_default(),
             default_principal: PrincipalId::new(1),
+            principals: FxHashMap::default(),
+            // AuthConfig::new() is a `const fn` that always validates;
+            // the only failure mode is misconfiguration (TTL out of
+            // range), which can't happen with the default. Falling back
+            // to an empty pipeline still works — every `authenticate`
+            // returns `UnknownPrincipal`, so connections fall back to
+            // `default_principal`.
+            auth: AuthenticationPipeline::new(AuthConfig::new())
+                .unwrap_or_else(|_| AuthenticationPipeline::default()),
+            wal: None,
         }
     }
 
@@ -308,19 +344,69 @@ impl VireonDispatcher {
         self
     }
 
-    /// Evaluates `(default_principal, action, topic_or_pattern)` against
-    /// the ACL table. In single-tenant Phase 1 mode every connection
-    /// uses [`Self::default_principal`]; per-connection `PrincipalId`
-    /// resolution arrives in a later phase.
+    /// Attaches a WAL backend. When set, every accepted `Publish` is
+    /// appended to the store before fan-out so `Fetch` requests can
+    /// replay entries by offset.
+    #[allow(dead_code)]
+    pub fn with_wal(mut self, wal: wal_store::FileStore) -> Self {
+        self.wal = Some(wal);
+        self
+    }
+
+    /// Sets the WAL backend in place (non-builder form).
+    #[allow(dead_code)]
+    pub fn set_wal(&mut self, wal: wal_store::FileStore) {
+        self.wal = Some(wal);
+    }
+
+    /// Evaluates `(conn_idx's principal, action, topic_or_pattern)` against
+    /// the ACL table. If `conn_idx` does not have an authenticated
+    /// principal (no `Handshake` processed yet, or auth failed) the
+    /// dispatcher's `default_principal` is used.
     ///
     /// `topic_or_pattern` is the raw wire string for Subscribe (a
     /// pattern like `sensor.*`) and the concrete topic name for
     /// Publish / TopicCreate / TopicDelete. The ACL `pattern_matches`
     /// function interprets both uniformly.
     #[inline]
-    pub fn check_acl(&self, action: Action, topic_or_pattern: &str) -> AclDecision {
-        self.acl
-            .check(self.default_principal, action, topic_or_pattern)
+    pub fn check_acl(
+        &self,
+        conn_idx: usize,
+        action: Action,
+        topic_or_pattern: &str,
+    ) -> AclDecision {
+        let principal = self
+            .principals
+            .get(&conn_idx)
+            .copied()
+            .unwrap_or(self.default_principal);
+        self.acl.check(principal, action, topic_or_pattern)
+    }
+
+    /// Returns the principal currently bound to `conn_idx`, or
+    /// `default_principal` if the connection hasn't completed the
+    /// auth handshake. Used by the connection registry + tracing.
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn principal_for(&self, conn_idx: usize) -> PrincipalId {
+        self.principals
+            .get(&conn_idx)
+            .copied()
+            .unwrap_or(self.default_principal)
+    }
+
+    /// Registers a credential with the auth pipeline. The dispatcher
+    /// calls this for every principal that should be able to complete
+    /// the handshake; in single-tenant deployments the caller registers
+    /// just the default principal with a known credential.
+    #[allow(dead_code)]
+    pub fn register_principal(&mut self, principal: PrincipalId, credential: Credential) {
+        // `auth_framework::PrincipalId` and `topic_acl::PrincipalId`
+        // are the same type — topic_acl re-exports auth_framework's.
+        // The import alias keeps the call site unambiguous.
+        let _ = AuthPrincipalId::new(principal.raw());
+        self.auth
+            .register_principal(AuthPrincipalId::new(principal.raw()), credential);
     }
 
     // ── Send-policy lifecycle ──────────────────────────────────────
@@ -468,29 +554,23 @@ impl VireonDispatcher {
             return;
         }
         for (conn_idx, stream_id) in ready {
-            loop {
-                match self.send_policy.dequeue(conn_idx, stream_id) {
-                    DequeueOutcome::Some(fp) => {
-                        // Look up the quic_stream_id recorded at bind or
-                        // enqueue time. If missing (e.g. the stream was
-                        // removed between enqueue and drain), drop the
-                        // frame — the receiver is gone.
-                        let Some(&quic_stream_id) =
-                            self.egress_quic_streams.get(&(conn_idx, stream_id))
-                        else {
-                            continue;
-                        };
-                        out.push(OutgoingFrame {
-                            conn_idx,
-                            quic_stream_id,
-                            header: FrameHeader::new(stream_id, fp.msg_type)
-                                .with_seq(fp.seq)
-                                .with_flags(fp.flags),
-                            payload: fp.bytes,
-                        });
-                    }
-                    DequeueOutcome::Empty | DequeueOutcome::Unknown => break,
-                }
+            while let DequeueOutcome::Some(fp) = self.send_policy.dequeue(conn_idx, stream_id) {
+                // Look up the quic_stream_id recorded at bind or
+                // enqueue time. If missing (e.g. the stream was
+                // removed between enqueue and drain), drop the
+                // frame — the receiver is gone.
+                let Some(&quic_stream_id) = self.egress_quic_streams.get(&(conn_idx, stream_id))
+                else {
+                    continue;
+                };
+                out.push(OutgoingFrame {
+                    conn_idx,
+                    quic_stream_id,
+                    header: FrameHeader::new(stream_id, fp.msg_type)
+                        .with_seq(fp.seq)
+                        .with_flags(fp.flags),
+                    payload: fp.bytes,
+                });
             }
         }
     }
@@ -621,11 +701,11 @@ impl VireonDispatcher {
                 self.handle_unsubscribe(ctx, frame.stream_id, pattern);
             }
             Ok(Some(ParsedPayload::Publish(frame::payload::PublishPayload { topic, payload }))) => {
-                let topic = match self.validate_topic_or_log(ctx, &topic) {
+                let topic = match self.validate_topic_or_log(ctx, topic) {
                     Some(t) => t,
                     None => return,
                 };
-                self.handle_publish(ctx, frame.stream_id, &topic, &payload);
+                self.handle_publish(ctx, frame.stream_id, &topic, payload);
             }
             Ok(Some(ParsedPayload::TopicCreate(TopicCreatePayload {
                 topic,
@@ -635,7 +715,7 @@ impl VireonDispatcher {
                 self.handle_topic_create(ctx, frame.stream_id, topic, partitions, retention_ms);
             }
             Ok(Some(ParsedPayload::TopicDelete(TopicDeletePayload { topic }))) => {
-                let topic = match self.validate_topic_or_log(ctx, &topic) {
+                let topic = match self.validate_topic_or_log(ctx, topic) {
                     Some(t) => t,
                     None => return,
                 };
@@ -675,7 +755,10 @@ impl VireonDispatcher {
         // permits subscriptions on `sensor.temp` / `sensor.humidity` /
         // etc. Deny produces an error ack so the client knows its
         // subscription was rejected.
-        if !self.check_acl(Action::Subscribe, pattern_str).is_allow() {
+        if !self
+            .check_acl(ctx.conn_idx, Action::Subscribe, pattern_str)
+            .is_allow()
+        {
             tracing::info!(
                 conn_idx = ctx.conn_idx,
                 pattern = %pattern_str,
@@ -753,7 +836,10 @@ impl VireonDispatcher {
         // the registry lookup entirely on Deny — the publish is
         // invisible to subscribers. The check uses the concrete topic
         // string (not the publisher's pattern, which isn't known).
-        if !self.check_acl(Action::Publish, topic.as_str()).is_allow() {
+        if !self
+            .check_acl(ctx.conn_idx, Action::Publish, topic.as_str())
+            .is_allow()
+        {
             tracing::info!(
                 conn_idx = ctx.conn_idx,
                 topic = %topic,
@@ -787,6 +873,39 @@ impl VireonDispatcher {
         framed.extend_from_slice(topic_str.as_bytes());
         framed.extend_from_slice(payload);
         let bytes = Bytes::from(framed);
+
+        // Phase 4: durable append before fan-out. A failure here is
+        // operator-visible (warn log) but does not abort the publish —
+        // the message still reaches live subscribers. Subscribers that
+        // later `Fetch(offset)` for this entry will see a gap; that is
+        // preferable to dropping the live fan-out, which has no recovery
+        // path. The `topic.as_str()` invariant (validated at publish
+        // entry) guarantees the topic is also a valid WAL key.
+        if let Some(wal) = &mut self.wal {
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            let record = wal_store::WalRecord::new(now_ns, Bytes::copy_from_slice(payload));
+            match wal.append(topic_str, record) {
+                Ok(offset) => {
+                    tracing::trace!(
+                        conn_idx = ctx.conn_idx,
+                        topic = topic_str,
+                        offset = offset.get(),
+                        "[wal] appended"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        conn_idx = ctx.conn_idx,
+                        topic = topic_str,
+                        error = ?e,
+                        "[wal] append failed — live fan-out proceeds, replay will have a gap"
+                    );
+                }
+            }
+        }
 
         for target in targets {
             self.enqueue_frame(
@@ -831,7 +950,10 @@ impl VireonDispatcher {
         // Phase 7: TopicCreate mutates the topic catalog, so it needs
         // an explicit ACL action distinct from Publish/Subscribe. Deny
         // returns an error ack and skips the catalog mutation.
-        if !self.check_acl(Action::TopicCreate, topic).is_allow() {
+        if !self
+            .check_acl(ctx.conn_idx, Action::TopicCreate, topic)
+            .is_allow()
+        {
             tracing::info!(
                 conn_idx = ctx.conn_idx,
                 topic = %topic,
@@ -872,7 +994,7 @@ impl VireonDispatcher {
         // TopicCreate. Deny returns an error ack and skips the catalog
         // mutation.
         if !self
-            .check_acl(Action::TopicDelete, topic.as_str())
+            .check_acl(ctx.conn_idx, Action::TopicDelete, topic.as_str())
             .is_allow()
         {
             tracing::info!(
@@ -896,6 +1018,292 @@ impl VireonDispatcher {
         );
         let ack = format!("{{\"topic_deleted\":\"{topic}\",\"existed\":{existed}}}");
         self.enqueue_response(ctx, stream, MessageType::TopicDelete, Bytes::from(ack));
+    }
+
+    /// Processes a `Handshake` frame: extract the claimed
+    /// `(principal_id, credential_token)`, verify via
+    /// `AuthenticationPipeline::authenticate`, and bind the resulting
+    /// `PrincipalId` to `conn_idx` for use in subsequent ACL checks.
+    ///
+    /// On success the dispatcher records `(conn_idx, principal)` in
+    /// `principals`. On failure (unknown principal, bad credential,
+    /// rate-limited) the connection retains whatever principal it had
+    /// before (typically `default_principal`) and a warn-level trace
+    /// is emitted. Either way an ack is enqueued back to the client
+    /// so it knows whether to re-auth.
+    ///
+    /// The `Handshake` payload is 21 bytes: version, capabilities,
+    /// principal_id and credential_token. Pre-1.0 5-byte payloads fail
+    /// `decode` with `PayloadError::Truncated` — this is the intended
+    /// hard cutover.
+    pub fn handle_handshake(&mut self, ctx: &FrameContext, frame: &FrameRef<'_>) {
+        let parsed = match parse_payload(frame.msg_type, frame.payload) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                tracing::warn!(
+                    conn_idx = ctx.conn_idx,
+                    "[auth] handshake payload not recognised"
+                );
+                let ack = br#"{"ok":false,"reason":"bad_handshake_payload"}"#;
+                self.enqueue_response(
+                    ctx,
+                    frame.stream_id,
+                    MessageType::Handshake,
+                    Bytes::from(&ack[..]),
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    conn_idx = ctx.conn_idx,
+                    error = ?e,
+                    "[auth] handshake payload decode failed — connection retains default principal"
+                );
+                let ack = br#"{"ok":false,"reason":"bad_handshake_payload"}"#;
+                self.enqueue_response(
+                    ctx,
+                    frame.stream_id,
+                    MessageType::Handshake,
+                    Bytes::from(&ack[..]),
+                );
+                return;
+            }
+        };
+        let ParsedPayload::Handshake(hs) = parsed else {
+            tracing::warn!(
+                conn_idx = ctx.conn_idx,
+                "[auth] handshake produced wrong parsed payload type"
+            );
+            return;
+        };
+        let principal = PrincipalId::new(hs.principal_id);
+        let credential = Credential::new(
+            CredentialType::Token,
+            hs.credential_token,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0),
+        );
+        let auth_principal = AuthPrincipalId::new(principal.raw());
+        match self.auth.authenticate(auth_principal, credential) {
+            Ok(raw) => {
+                let resolved = PrincipalId::new(raw);
+                self.principals.insert(ctx.conn_idx, resolved);
+                tracing::info!(
+                    conn_idx = ctx.conn_idx,
+                    principal = %resolved,
+                    version = ?hs.version,
+                    "[auth] handshake ok — principal bound to connection"
+                );
+                let ack = format!("{{\"ok\":true,\"principal\":{}}}", resolved.raw());
+                self.enqueue_response(
+                    ctx,
+                    frame.stream_id,
+                    MessageType::Handshake,
+                    Bytes::from(ack),
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    conn_idx = ctx.conn_idx,
+                    principal = %principal,
+                    error = ?e,
+                    "[auth] handshake failed — connection keeps default principal"
+                );
+                let ack = br#"{"ok":false,"reason":"auth_failed"}"#;
+                self.enqueue_response(
+                    ctx,
+                    frame.stream_id,
+                    MessageType::Handshake,
+                    Bytes::from(&ack[..]),
+                );
+            }
+        }
+    }
+
+    /// Handles a `Fetch` request: replay WAL entries for `topic` starting
+    /// at `from_offset`, bounded by `max_count`.
+    ///
+    /// ACL gate: requires `Action::Subscribe` on the topic. Without it,
+    /// the request is rejected with an error ack and no entries are
+    /// surfaced.
+    ///
+    /// When no WAL is configured (`--wal-root` not supplied) the request
+    /// fails fast with a `wal_disabled` error ack — clients can detect
+    /// this and fall back to live subscription only.
+    ///
+    /// On success the dispatcher enqueues one `FetchReply` frame per
+    /// entry (capped by `FETCH_MAX_COUNT`) into the outbox. Each frame
+    /// carries its WAL-assigned offset so the subscriber can reconcile
+    /// gaps.
+    pub fn handle_fetch(&mut self, ctx: &FrameContext, frame: &FrameRef<'_>) {
+        let parsed = match parse_payload(frame.msg_type, frame.payload) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                tracing::warn!(
+                    conn_idx = ctx.conn_idx,
+                    "[wal] fetch payload not recognised"
+                );
+                let ack = br#"{"error":"bad_fetch_payload"}"#;
+                self.enqueue_response(
+                    ctx,
+                    frame.stream_id,
+                    MessageType::FetchReply,
+                    Bytes::from(&ack[..]),
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    conn_idx = ctx.conn_idx,
+                    error = ?e,
+                    "[wal] fetch payload decode failed"
+                );
+                let ack = br#"{"error":"bad_fetch_payload"}"#;
+                self.enqueue_response(
+                    ctx,
+                    frame.stream_id,
+                    MessageType::FetchReply,
+                    Bytes::from(&ack[..]),
+                );
+                return;
+            }
+        };
+        let fetch = match parsed {
+            ParsedPayload::Fetch(f) => f,
+            other => {
+                tracing::warn!(
+                    conn_idx = ctx.conn_idx,
+                    parsed = ?other,
+                    "[wal] fetch arm got non-Fetch payload"
+                );
+                return;
+            }
+        };
+
+        // Validate the topic name — WAL rejects the same invalid names
+        // Topic::new does, but we want to return a structured error ack
+        // rather than let the WAL's InvalidTopic error surface raw.
+        let topic_str = fetch.topic;
+        if let Err(e) = pubsub_engine::Topic::new(topic_str) {
+            tracing::warn!(
+                conn_idx = ctx.conn_idx,
+                topic = topic_str,
+                error = ?e,
+                "[wal] fetch on invalid topic name"
+            );
+            let ack = format!("{{\"error\":\"invalid_topic\",\"topic\":\"{topic_str}\"}}");
+            self.enqueue_response(
+                ctx,
+                frame.stream_id,
+                MessageType::FetchReply,
+                Bytes::from(ack),
+            );
+            return;
+        }
+
+        // ACL: Fetch is treated as Subscribe on the topic.
+        if !self
+            .check_acl(ctx.conn_idx, Action::Subscribe, topic_str)
+            .is_allow()
+        {
+            tracing::info!(
+                conn_idx = ctx.conn_idx,
+                topic = topic_str,
+                "[acl] fetch denied"
+            );
+            let ack =
+                format!("{{\"error\":\"denied\",\"action\":\"fetch\",\"topic\":\"{topic_str}\"}}");
+            self.enqueue_response(
+                ctx,
+                frame.stream_id,
+                MessageType::FetchReply,
+                Bytes::from(ack),
+            );
+            return;
+        }
+
+        let Some(wal) = &mut self.wal else {
+            tracing::debug!(
+                conn_idx = ctx.conn_idx,
+                topic = topic_str,
+                "[wal] fetch requested but --wal-root not set"
+            );
+            let ack = br#"{"error":"wal_disabled"}"#;
+            self.enqueue_response(
+                ctx,
+                frame.stream_id,
+                MessageType::FetchReply,
+                Bytes::from(&ack[..]),
+            );
+            return;
+        };
+
+        // Clamp the requested count to the hard cap so a wild request
+        // can't saturate the subscriber's stream for seconds.
+        let max_count = fetch.max_count.min(frame::payload::FETCH_MAX_COUNT);
+        let from = wal_store::Offset::new(fetch.from_offset);
+        let head = wal.head(topic_str);
+        let mut entries: Vec<wal_store::WalEntry> = Vec::with_capacity(max_count as usize);
+        let upper = if head == wal_store::Offset::NONE {
+            from
+        } else {
+            // Read up to (from + max_count) or head+1, whichever is smaller.
+            let from_plus_cap = wal_store::Offset::new(from.get().saturating_add(max_count as u64));
+            let head_next = wal_store::Offset::new(head.get() + 1);
+            core::cmp::min(from_plus_cap, head_next)
+        };
+        match wal.read_range(topic_str, from, upper, &mut entries) {
+            Ok(count) => {
+                tracing::info!(
+                    conn_idx = ctx.conn_idx,
+                    topic = topic_str,
+                    requested_max = max_count,
+                    delivered = count,
+                    "[wal] fetch replay"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    conn_idx = ctx.conn_idx,
+                    topic = topic_str,
+                    error = ?e,
+                    "[wal] read_range failed"
+                );
+                let ack = format!("{{\"error\":\"read_failed\",\"topic\":\"{topic_str}\"}}");
+                self.enqueue_response(
+                    ctx,
+                    frame.stream_id,
+                    MessageType::FetchReply,
+                    Bytes::from(ack),
+                );
+                return;
+            }
+        }
+
+        for entry in entries {
+            // Build one FetchReply per WAL entry.
+            let fr = FetchReplyPayload {
+                topic: topic_str,
+                offset: entry.offset.get(),
+                timestamp_ns: entry.timestamp_ns,
+                payload: entry.payload.as_ref(),
+            };
+            let size = fr.wire_size();
+            // `vec![0u8; size]` (not `with_capacity`) — ByteWriter
+            // writes through a `&mut [u8]` view, so the slice must
+            // already be `len == size`, not just `capacity == size`.
+            let mut buf = vec![0u8; size];
+            let mut w = ByteWriter::new(&mut buf);
+            fr.encode(&mut w);
+            self.enqueue_response(
+                ctx,
+                frame.stream_id,
+                MessageType::FetchReply,
+                Bytes::from(buf),
+            );
+        }
     }
 }
 
@@ -999,6 +1407,17 @@ impl AppDispatcher for VireonDispatcher {
                     "[app:pubsub] native control"
                 );
             }
+            MessageType::Fetch => {
+                self.handle_fetch(ctx, frame);
+            }
+            MessageType::FetchReply => {
+                // Server doesn't accept FetchReply from clients — it's
+                // a server→subscriber data-plane frame. Log + drop.
+                tracing::warn!(
+                    conn_idx = ctx.conn_idx,
+                    "[app:pubsub] client-sent FetchReply ignored"
+                );
+            }
             MessageType::Error => {
                 tracing::trace!(
                     conn_idx = ctx.conn_idx,
@@ -1012,6 +1431,9 @@ impl AppDispatcher for VireonDispatcher {
                     session_id = ?ctx.session_id,
                     "[app] Heartbeat"
                 );
+            }
+            MessageType::Handshake => {
+                self.handle_handshake(ctx, frame);
             }
             _ => {
                 tracing::trace!(
@@ -1030,10 +1452,12 @@ impl AppDispatcher for VireonDispatcher {
         reason: Option<&str>,
     ) {
         let removed = self.pubsub_registry.remove_connection(conn_idx);
+        let principal = self.principals.remove(&conn_idx);
         tracing::info!(
             conn_idx,
             session_id = ?session_id,
             subs_removed = removed,
+            principal = ?principal,
             reason = reason.unwrap_or("none"),
             "[app] connection closed"
         );
@@ -1485,6 +1909,16 @@ impl ApplicationLayer {
     pub fn set_acl(&mut self, table: AclTable) {
         self.dispatcher.acl = table;
     }
+
+    /// Installs a WAL backend. Should be called before the first
+    /// `Publish` arrives so every accepted message is durably
+    /// appended before fan-out. Calling after the dispatcher has
+    /// already seen traffic is also safe — only subsequent publishes
+    /// are persisted; in-flight ones are unaffected.
+    #[allow(dead_code)]
+    pub fn set_wal(&mut self, wal: wal_store::FileStore) {
+        self.dispatcher.wal = Some(wal);
+    }
 }
 
 #[cfg(test)]
@@ -1544,8 +1978,8 @@ mod tests {
         // Conn 0 streams gone.
         assert!(!d.send_policy.contains(0, StreamId::new(1)));
         assert!(!d.send_policy.contains(0, StreamId::new(2)));
-        assert!(d.egress_quic_streams.get(&(0, StreamId::new(1))).is_none());
-        assert!(d.egress_quic_streams.get(&(0, StreamId::new(2))).is_none());
+        assert!(!d.egress_quic_streams.contains_key(&(0, StreamId::new(1))));
+        assert!(!d.egress_quic_streams.contains_key(&(0, StreamId::new(2))));
         // Conn 1 unaffected.
         assert!(d.send_policy.contains(1, StreamId::new(1)));
     }
@@ -1752,7 +2186,7 @@ mod tests {
                 100 => reliable.push(f),
                 200 => realtime.push(f),
                 300 => latest.push(f),
-                _ => unreachable!("unexpected quic_stream_id"),
+                other => panic!("unexpected quic_stream_id {other}"),
             }
         }
 
@@ -1818,12 +2252,12 @@ mod tests {
         let d = VireonDispatcher::new();
         for action in Action::ALL {
             assert!(
-                d.check_acl(*action, "any.topic").is_allow(),
+                d.check_acl(0, *action, "any.topic").is_allow(),
                 "default ACL should allow {:?} on any.topic",
                 action
             );
             assert!(
-                d.check_acl(*action, "sensor.temp").is_allow(),
+                d.check_acl(0, *action, "sensor.temp").is_allow(),
                 "default ACL should allow {:?} on sensor.temp",
                 action
             );
@@ -1837,12 +2271,12 @@ mod tests {
         let d = VireonDispatcher::new();
         for action in Action::ALL {
             assert!(
-                !d.check_acl(*action, "single").is_allow(),
+                !d.check_acl(0, *action, "single").is_allow(),
                 "default ACL should NOT allow {:?} on single-segment topic",
                 action
             );
             assert!(
-                !d.check_acl(*action, "a.b.c").is_allow(),
+                !d.check_acl(0, *action, "a.b.c").is_allow(),
                 "default ACL should NOT allow {:?} on three-segment topic",
                 action
             );
@@ -1858,15 +2292,15 @@ mod tests {
             .unwrap_or_default();
         let d = VireonDispatcher::new().with_acl(strict);
         // sensor.* subscribe allowed.
-        assert!(d.check_acl(Action::Subscribe, "sensor.temp").is_allow());
+        assert!(d.check_acl(0, Action::Subscribe, "sensor.temp").is_allow());
         // sensor.* publish denied (not in allow set).
         assert!(matches!(
-            d.check_acl(Action::Publish, "sensor.temp"),
+            d.check_acl(0, Action::Publish, "sensor.temp"),
             AclDecision::Deny { .. }
         ));
         // Other topics denied (no rule matches).
         assert!(matches!(
-            d.check_acl(Action::Subscribe, "alerts.fire"),
+            d.check_acl(0, Action::Subscribe, "alerts.fire"),
             AclDecision::Deny { .. }
         ));
     }
@@ -2026,5 +2460,241 @@ mod tests {
         assert_eq!(out.len(), 1);
         let body = String::from_utf8_lossy(&out[0].1);
         assert!(body.contains("\"topic_created\":\"my.topic\""));
+    }
+
+    // ── Per-connection PrincipalId via Handshake ────────────────────
+
+    use frame::header::Version;
+    use frame::payload::{Handshake, ParsedPayload, encode_payload};
+
+    /// Builds a zero-copy `FrameRef` borrowing from `payload_buf`.
+    /// The buffer must contain exactly the handshake wire bytes.
+    fn handshake_fref<'a>(payload_buf: &'a [u8]) -> FrameRef<'a> {
+        FrameRef {
+            stream_id: StreamId::new(0),
+            seq: Seq::ZERO,
+            msg_type: MessageType::Handshake,
+            flags: FrameFlags::NONE,
+            payload: payload_buf,
+        }
+    }
+
+    /// Encodes a `Handshake` payload into a fresh `Vec<u8>`.
+    fn encode_handshake(hs: Handshake) -> Vec<u8> {
+        encode_payload(&ParsedPayload::Handshake(hs))
+    }
+
+    #[test]
+    fn handshake_with_registered_credential_binds_principal_to_connection() {
+        let mut d = VireonDispatcher::new();
+        d.register_principal(
+            PrincipalId::new(42),
+            Credential::new(CredentialType::Token, 0xABCD, 0),
+        );
+
+        let payload = encode_handshake(Handshake {
+            version: Version::new(1),
+            capabilities: 0,
+            principal_id: 42,
+            credential_token: 0xABCD,
+        });
+        let fref = handshake_fref(&payload);
+        d.handle_handshake(&ctx(7, 100), &fref);
+
+        // principal_for(7) should now return 42 (not the default).
+        assert_eq!(d.principal_for(7), PrincipalId::new(42));
+        assert_ne!(d.principal_for(7), d.principal_for(0));
+    }
+
+    #[test]
+    fn handshake_failure_keeps_default_principal_for_connection() {
+        let mut d = VireonDispatcher::new();
+        // No registered principal — auth will return UnknownPrincipal.
+
+        let payload = encode_handshake(Handshake {
+            version: Version::new(1),
+            capabilities: 0,
+            principal_id: 99,
+            credential_token: 0xDEAD,
+        });
+        let fref = handshake_fref(&payload);
+        d.handle_handshake(&ctx(3, 100), &fref);
+
+        // Connection 3 should fall back to default_principal.
+        assert_eq!(d.principal_for(3), d.principal_for(0));
+        assert_eq!(d.principal_for(3), PrincipalId::new(1));
+    }
+
+    #[test]
+    fn connection_close_removes_principal_binding() {
+        let mut d = VireonDispatcher::new();
+        d.register_principal(
+            PrincipalId::new(7),
+            Credential::new(CredentialType::Token, 0x1234, 0),
+        );
+        let payload = encode_handshake(Handshake {
+            version: Version::new(1),
+            capabilities: 0,
+            principal_id: 7,
+            credential_token: 0x1234,
+        });
+        let fref = handshake_fref(&payload);
+        d.handle_handshake(&ctx(5, 100), &fref);
+        assert_eq!(d.principal_for(5), PrincipalId::new(7));
+
+        // Close the connection — principal binding should be gone.
+        d.on_connection_closed(5, SessionId::new(), Some("test"));
+        assert_eq!(d.principal_for(5), d.principal_for(0));
+    }
+
+    #[test]
+    fn acl_distinguishes_principals_after_handshake() {
+        // Strict ACL: principal 42 owns private.*, everyone else denied.
+        let strict = AclTableBuilder::new()
+            .allow("private.*", Some(PrincipalId::new(42)), ActionSet::ALL)
+            .build()
+            .unwrap_or_default();
+        let mut d = VireonDispatcher::new().with_acl(strict);
+        d.register_principal(
+            PrincipalId::new(42),
+            Credential::new(CredentialType::Token, 0xC0FFEE, 0),
+        );
+
+        // Connection 0 (no handshake) → default principal 1 → denied.
+        assert!(matches!(
+            d.check_acl(0, Action::Publish, "private.secret"),
+            AclDecision::Deny { .. }
+        ));
+
+        // Connection 1 completes handshake as principal 42 → allowed.
+        let payload = encode_handshake(Handshake {
+            version: Version::new(1),
+            capabilities: 0,
+            principal_id: 42,
+            credential_token: 0xC0FFEE,
+        });
+        let fref = handshake_fref(&payload);
+        d.handle_handshake(&ctx(1, 100), &fref);
+        assert!(d.check_acl(1, Action::Publish, "private.secret").is_allow());
+    }
+
+    // ── Phase 4: WAL persistence + Fetch(offset) replay ──────────────
+
+    use frame::payload::{FetchPayload, FetchReplyPayload};
+    use tempfile::TempDir;
+
+    /// Encodes a FetchPayload + wraps it in a FrameRef the way the
+    /// dispatcher's `handle_fetch` expects to read it.
+    fn encode_fetch(fetch: FetchPayload<'_>) -> Vec<u8> {
+        encode_payload(&ParsedPayload::Fetch(fetch))
+    }
+
+    fn fetch_fref(payload_buf: &[u8]) -> FrameRef<'_> {
+        FrameRef {
+            stream_id: StreamId::new(0),
+            seq: Seq::ZERO,
+            msg_type: MessageType::Fetch,
+            flags: FrameFlags::NONE,
+            payload: payload_buf,
+        }
+    }
+
+    /// Opens a fresh in-memory-DFS FileStore rooted at a tempdir, and
+    /// attaches it to a fresh dispatcher.
+    fn dispatcher_with_wal() -> (VireonDispatcher, TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = wal_store::FileStore::open(dir.path()).expect("FileStore::open");
+        let d = VireonDispatcher::new().with_wal(store);
+        (d, dir)
+    }
+
+    #[test]
+    fn publish_persists_to_wal() {
+        let (mut d, _keepalive) = dispatcher_with_wal();
+
+        let topic = pubsub_engine::Topic::new("sensor.temp").unwrap();
+        for i in 0..5u8 {
+            d.handle_publish(&ctx(1, 200), StreamId::new(2), &topic, &[i]);
+        }
+        // Drain the fan-out outbox so later asserts aren't muddled.
+        let _ = d.drain_outbox();
+
+        // WAL head should be 4 (last assigned offset, 0-indexed).
+        let wal = d.wal.as_ref().expect("wal attached");
+        assert_eq!(wal.head("sensor.temp"), wal_store::Offset::new(4));
+        assert_eq!(wal.len("sensor.temp"), 5);
+    }
+
+    #[test]
+    fn fetch_replays_by_offset() {
+        let (mut d, _keepalive) = dispatcher_with_wal();
+
+        // Publish 5 entries on sensor.temp.
+        let topic = pubsub_engine::Topic::new("sensor.temp").unwrap();
+        for i in 0..5u8 {
+            d.handle_publish(&ctx(1, 200), StreamId::new(2), &topic, &[i]);
+        }
+        let _ = d.drain_outbox();
+
+        // Subscriber on conn 2 sends Fetch(from=0, max=10).
+        let payload = encode_fetch(FetchPayload {
+            topic: "sensor.temp",
+            from_offset: 0,
+            max_count: 10,
+        });
+        let fref = fetch_fref(&payload);
+        d.handle_fetch(&ctx(2, 300), &fref);
+
+        // Outbox: 5 FetchReply frames in offset order.
+        let out = drain_outbox_bytes(&mut d);
+        assert_eq!(
+            out.len(),
+            5,
+            "expected 5 FetchReply frames, got {}",
+            out.len()
+        );
+        for (i, (mt, body)) in out.iter().enumerate() {
+            assert_eq!(*mt, MessageType::FetchReply);
+            // Decode the body back to a FetchReplyPayload and check offset+payload.
+            let mut r = frame::byte_reader::ByteReader::new(body);
+            let decoded = FetchReplyPayload::decode(&mut r).expect("FetchReply decode");
+            assert_eq!(decoded.offset, i as u64, "offset {i}");
+            assert_eq!(decoded.payload, &[i as u8], "payload byte {i}");
+            assert_eq!(decoded.topic, "sensor.temp");
+        }
+    }
+
+    #[test]
+    fn wal_disabled_when_not_configured() {
+        // Default dispatcher has no WAL attached — publish should
+        // proceed (live fan-out) and fetch should return a wal_disabled
+        // ack rather than replaying anything.
+        let mut d = VireonDispatcher::new();
+
+        let topic = pubsub_engine::Topic::new("sensor.temp").unwrap();
+        d.handle_publish(&ctx(1, 200), StreamId::new(2), &topic, b"payload");
+        let pub_out = drain_outbox_bytes(&mut d);
+        // No subscribers → no fan-out; zero frames queued by publish.
+        assert!(
+            pub_out.is_empty(),
+            "publish shouldn't queue frames without subscribers"
+        );
+
+        // No WAL → fetch enqueues exactly one wal_disabled ack.
+        let payload = encode_fetch(FetchPayload {
+            topic: "sensor.temp",
+            from_offset: 0,
+            max_count: 10,
+        });
+        let fref = fetch_fref(&payload);
+        d.handle_fetch(&ctx(2, 300), &fref);
+        let fetch_out = drain_outbox_bytes(&mut d);
+        assert_eq!(fetch_out.len(), 1);
+        assert_eq!(fetch_out[0].0, MessageType::FetchReply);
+        let body = String::from_utf8_lossy(&fetch_out[0].1);
+        assert!(
+            body.contains("\"error\":\"wal_disabled\""),
+            "expected wal_disabled ack, got: {body}"
+        );
     }
 }
