@@ -7,9 +7,10 @@
 //!
 //! ## Target batch size: ~1 MiB
 
-use frame::header::{ALL_MESSAGE_TYPES, FrameFlags, MessageType};
+use frame::header::{ALL_MESSAGE_TYPES, FrameFlags, MessageType, Version};
+use frame::payload::{Handshake, ParsedPayload, encode_payload};
 
-use crate::worker::STREAM_ID_COUNT;
+use crate::conn_state::STREAM_ID_COUNT;
 
 /// Per-type metadata, surfaced in the summary table so the operator can verify
 /// the realistic workload at a glance.
@@ -79,7 +80,7 @@ pub fn build_fixed_size(payload_bytes: usize) -> anyhow::Result<Workload> {
 /// Builds the full 20-frame workload.
 ///
 /// Each `MessageType` is exercised, but they are mapped onto the 15
-/// QUIC stream ids declared in `worker::STREAM_IDS` (the bench
+/// QUIC stream ids declared in `conn_state::STREAM_IDS` (the bench
 /// architecture's "1 user = 15 streams" model). With 20 message types
 /// and 15 streams, types 15..=19 share a stream id with types 0..=4 —
 /// this is realistic: a single connection multiplexes many frame kinds
@@ -241,22 +242,19 @@ fn realistic_payload(mt: MessageType) -> Vec<u8> {
             v
         }
 
-        // 2 KiB handshake with full capabilities list + principal/credential
-        // claim. Wire format is 21 bytes (version + capabilities +
-        // principal_id + credential_token) but the bench pads to 2 KiB
-        // to exercise the realistic post-handshake metadata payload that
-        // production deployments carry alongside the fixed fields.
-        MessageType::Handshake => {
-            let mut v = Vec::with_capacity(2048);
-            let prefix = br#"{"proto":"vireon","version":"1.0.0","principal_id":42,"capabilities":["audio","video","tools"],"ext":"#;
-            v.extend_from_slice(prefix);
-            let need = 2048usize.saturating_sub(prefix.len() + 2);
-            let mut tmp = vec![0u8; need];
-            fill_pseudo_text(&mut tmp, 0xD6);
-            v.extend_from_slice(&tmp);
-            v.push(b'}');
-            v
-        }
+        // 21-byte handshake — the real wire format the server decodes:
+        // version(1) + capabilities(4) + principal_id(8) + credential_token(8).
+        // The bench claims principal 42 with a fixed credential token; the
+        // server's `AuthenticationPipeline` will reject it (operator hasn't
+        // registered the principal) but the connection still completes with
+        // the default principal, which is enough to exercise the decode path
+        // and keep the bench compatible with pre-auth deployments.
+        MessageType::Handshake => encode_payload(&ParsedPayload::Handshake(Handshake {
+            version: Version::new(1),
+            capabilities: 0xFFFF_FFFF,
+            principal_id: 42,
+            credential_token: 0xDEAD_BEEF_CAFE_BABE,
+        })),
 
         // 120 KiB video NAL continuation (CABAC residuals).
         MessageType::Fragment => {
@@ -320,10 +318,11 @@ fn realistic_payload(mt: MessageType) -> Vec<u8> {
         }
 
         // Fetch — request replay from offset 0, up to 32 entries. The
-        // workload bench doesn't drive replay end-to-end (no server
-        // state) so the payload is just shape-correct filler.
+        // topic matches the `Publish` entry so a server with `--wal-root`
+        // set actually has WAL state to replay; otherwise the Fetch arm
+        // returns empty (or `wal_disabled`).
         MessageType::Fetch => {
-            let topic = b"metrics.cpu.host.0";
+            let topic = b"sensor.temperature.zone1";
             let mut v = Vec::with_capacity(2 + topic.len() + 12);
             v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
             v.extend_from_slice(topic);
@@ -334,7 +333,7 @@ fn realistic_payload(mt: MessageType) -> Vec<u8> {
 
         // FetchReply — one replayed WAL entry: small payload is fine.
         MessageType::FetchReply => {
-            let topic = b"metrics.cpu.host.0";
+            let topic = b"sensor.temperature.zone1";
             let payload = b"replayed-entry-payload";
             let mut v = Vec::with_capacity(2 + topic.len() + 20 + payload.len());
             v.extend_from_slice(&(topic.len() as u16).to_be_bytes());

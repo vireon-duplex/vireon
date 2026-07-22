@@ -20,11 +20,12 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod config;
+mod conn_state;
 mod gso;
 mod layers;
+mod reactor;
 mod resource;
 mod stats;
-mod worker;
 mod workload;
 
 use std::net::SocketAddr;
@@ -36,15 +37,9 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
+use conn_state::{BenchMode, EgressPolicy};
 use stats::{Summary, SweepPoint, WorkerResult, aggregate, print_summary};
-use worker::{BenchMode, EgressPolicy, worker};
 use workload::Workload;
-
-/// Worker thread stack size. 512 KiB is sufficient for BoringSSL TLS 1.3
-/// handshake (~128 KiB peak) + quiche processing (~32 KiB) + layer stack
-/// (~5 KiB) + tracing (~4 KiB), leaving ~340 KiB headroom. Reduces RSS
-/// by ~1.5 GiB vs default 2 MiB stacks at 1000 connections.
-const WORKER_STACK_SIZE: usize = 512 * 1024;
 
 struct Args {
     target: SocketAddr,
@@ -54,6 +49,10 @@ struct Args {
     pipeline_depth: usize,
     sweep: SweepMode,
     egress_policy: EgressPolicy,
+    /// Max reactor threads. `None` = auto (available_parallelism).
+    /// Used with `taskset` to leave cores for the server when both
+    /// run on the same machine.
+    reactors: Option<usize>,
 }
 
 /// Selects single-run vs. sweep mode.
@@ -88,6 +87,7 @@ fn main() -> Result<()> {
                 args.egress_policy,
                 &workload,
                 &shutdown,
+                args.reactors,
             )?;
             print_summary(&summary);
         }
@@ -111,6 +111,7 @@ fn main() -> Result<()> {
                     args.egress_policy,
                     &workload,
                     &shutdown,
+                    args.reactors,
                 )?;
                 print_summary(&summary);
                 points.push(SweepPoint::from_summary(c.to_string(), &summary));
@@ -145,6 +146,7 @@ fn main() -> Result<()> {
                     args.egress_policy,
                     &workload,
                     &shutdown,
+                    args.reactors,
                 )?;
                 print_summary(&summary);
                 points.push(SweepPoint::from_summary(label, &summary));
@@ -158,7 +160,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Runs one benchmark pass: spawns `conns` worker threads, waits for
+/// Runs one benchmark pass: spawns reactor threads, waits for
 /// handshakes, measures CPU/RSS, then aggregates results.
 ///
 /// Returns a [`Summary`] with resource-efficiency metrics attached.
@@ -173,10 +175,21 @@ fn run_benchmark(
     egress_policy: EgressPolicy,
     workload: &Workload,
     shutdown: &Arc<AtomicBool>,
+    max_reactors: Option<usize>,
 ) -> Result<Summary> {
+    let num_reactors = max_reactors
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        })
+        .min(conns)
+        .max(1);
+
     tracing::info!(
         target = %target,
         conns,
+        reactors = num_reactors,
         logical_streams = conns * workload.entries.len(),
         batch_bytes = workload.batch_wire_bytes,
         frames_per_batch = workload.entries.len(),
@@ -186,14 +199,13 @@ fn run_benchmark(
         "starting benchmark run",
     );
 
-    let barrier = Barrier::new(conns + 1);
+    let barrier = Barrier::new(num_reactors + 1);
+    let conns_per_reactor = conns.div_ceil(num_reactors);
 
     let cpu_start = resource::cpu_time_secs();
 
     // Peak-RSS sampler: a background thread polls VmRSS every 50ms during
-    // the run and tracks the maximum. This captures the true working set
-    // when all connections are active, regardless of cleanup that happens
-    // after threads exit (munmap, MADV_FREE reclamation, arena trimming).
+    // the run and tracks the maximum.
     let rss_baseline = resource::rss_kib();
     let peak_rss = Arc::new(AtomicU64::new(rss_baseline));
     let sampler_stop = Arc::new(AtomicBool::new(false));
@@ -218,27 +230,30 @@ fn run_benchmark(
         let sni_ref = sni;
         let entries_ref: &[workload::WorkloadEntry] = &workload.entries;
 
-        let handles: Vec<_> = (0..conns)
-            .map(|idx| {
+        let handles: Vec<_> = (0..num_reactors)
+            .map(|r| {
+                let conn_start = r * conns_per_reactor;
+                let conn_count = conns_per_reactor.min(conns.saturating_sub(conn_start));
+
                 thread::Builder::new()
-                    .stack_size(WORKER_STACK_SIZE)
                     .spawn_scoped(s, move || {
-                        worker(
-                            idx,
+                        reactor::run(
                             target,
                             sni_ref,
                             entries_ref,
-                            duration,
+                            conn_start,
+                            conn_count,
                             mode,
                             pipeline_depth,
-                            coalesce,
                             egress_policy,
+                            coalesce,
+                            duration,
                             shutdown_ref,
                             barrier_ref,
                         )
                     })
                     .unwrap_or_else(|e| {
-                        tracing::error!("worker {idx} spawn failed: {e}");
+                        tracing::error!("reactor {r} spawn failed: {e}");
                         std::process::exit(1);
                     })
             })
@@ -249,35 +264,30 @@ fn run_benchmark(
             "waiting for handshakes to complete..."
         );
 
-        // Watchdog: if handshakes take longer than 30s, dump diagnostics
-        // so the user can see how many workers reached the barrier vs are
-        // still stuck in handshake. Without this the bench hangs silently.
+        // Watchdog: if handshakes take longer than 30s, dump diagnostics.
         let watchdog_shutdown = Arc::new(AtomicBool::new(false));
         let watchdog_handle = {
             let ws = Arc::clone(&watchdog_shutdown);
             thread::spawn(move || {
                 let deadline = Duration::from_secs(30);
-                let poll = Duration::from_millis(100);
+                let poll_interval = Duration::from_millis(100);
                 let start = Instant::now();
                 while !ws.load(Ordering::Relaxed) {
                     if start.elapsed() >= deadline {
                         tracing::error!(
                             elapsed_secs = start.elapsed().as_secs(),
                             "handshake watchdog fired — barrier did not release in 30s. \
-                             This usually means some worker threads are stuck in \
-                             recv_inbound (server not responding) or socket bind. \
-                             Check: (1) server is running, (2) SO_INCOMING_CPU fix \
-                             applied, (3) ephemeral port range, (4) per-process fd limit."
+                             Check: (1) server is running, (2) ephemeral port range, \
+                             (3) per-process fd limit."
                         );
                         std::process::exit(2);
                     }
-                    thread::sleep(poll);
+                    thread::sleep(poll_interval);
                 }
             })
         };
 
         barrier.wait();
-        // Disarm watchdog.
         watchdog_shutdown.store(true, Ordering::Relaxed);
         let _ = watchdog_handle.join();
 
@@ -285,9 +295,12 @@ fn run_benchmark(
 
         handles
             .into_iter()
-            .map(|h| match h.join() {
-                Ok(result) => result,
-                Err(_) => WorkerResult::failed("thread panicked".into(), Duration::ZERO),
+            .flat_map(|h| match h.join() {
+                Ok(results) => results,
+                Err(_) => vec![WorkerResult::failed(
+                    "reactor panicked".into(),
+                    Duration::ZERO,
+                )],
             })
             .collect::<Vec<_>>()
     });
@@ -351,6 +364,7 @@ fn parse_args() -> Result<Args> {
     let mut pipeline_depth: usize = 4;
     let mut sweep = SweepMode::None;
     let mut egress_policy = EgressPolicy::None;
+    let mut reactors: Option<usize> = None;
 
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -392,6 +406,15 @@ fn parse_args() -> Result<Args> {
                 i += 1;
                 if i < argv.len() {
                     pipeline_depth = argv[i].parse().unwrap_or(pipeline_depth);
+                }
+            }
+            "--reactors" => {
+                i += 1;
+                if i < argv.len() {
+                    match argv[i].parse() {
+                        Ok(v) if v > 0 => reactors = Some(v),
+                        _ => anyhow::bail!("--reactors must be >= 1"),
+                    }
                 }
             }
             "--sweep" => {
@@ -447,6 +470,7 @@ fn parse_args() -> Result<Args> {
         pipeline_depth,
         sweep,
         egress_policy,
+        reactors,
     })
 }
 
@@ -463,6 +487,10 @@ fn print_usage() {
     println!("      --egress-policy POLICY   Client send policy: none, reliable_ordered,");
     println!("                               reliable_unordered, realtime_drop_old, latest_only");
     println!("                               (default: none — legacy pass-through)");
+    println!("      --reactors N             Max reactor threads (default: num_cpus).");
+    println!("                               Lower this when client+server share a machine");
+    println!("                               so the server gets CPU too. Use with taskset:");
+    println!("                               taskset -c 8-13 loadtest --reactors 6 ...");
     println!("  -h, --help                   Show this help");
     println!();
     println!("Modes:");
@@ -472,22 +500,29 @@ fn print_usage() {
     println!("  multi-rr    15 streams fired together, wait all echoes. Requires server echo.");
     println!("  pipeline    N batches in-flight (--pipeline-depth). Requires server echo.");
     println!();
-    println!("Workload covers all 15 MessageType variants:");
-    println!("  TextToken(0x01)   → AI Streaming pipeline");
-    println!("  AudioFrame(0x02)  → Media Streaming (audio track)");
-    println!("  VideoFrame(0x03)  → Media Streaming (video track)");
-    println!("  ImageFrame(0x04)  → Media Streaming (data track)");
-    println!("  ToolCall(0x05)    → RPC Framework (echo response)");
-    println!("  ToolResult(0x06)  → RPC Framework (log only)");
-    println!("  StateUpdate(0x07) → Event Bus + PubSub Engine");
-    println!("  Error(0x08)       → Application log");
-    println!("  Heartbeat(0x09)   → Application heartbeat");
-    println!("  StreamOpen(0x0A)  → Stream layer (lifecycle)");
-    println!("  StreamClose(0x0B) → Stream layer (lifecycle)");
-    println!("  StreamReset(0x0C) → Stream layer (lifecycle)");
-    println!("  Handshake(0x0D)   → Stream layer (control)");
-    println!("  Fragment(0x0E)    → Stream layer (continuation)");
-    println!("  Ack(0x0F)         → Stream layer (control)");
+    println!("Workload covers all 22 MessageType variants:");
+    println!("  TextToken(0x01)   → Text / content payload");
+    println!("  AudioFrame(0x02)  → Audio media chunk");
+    println!("  VideoFrame(0x03)  → Video media chunk");
+    println!("  ImageFrame(0x04)  → Image media chunk");
+    println!("  ToolCall(0x05)    → Tool invocation request");
+    println!("  ToolResult(0x06)  → Tool invocation result");
+    println!("  StateUpdate(0x07) → State synchronization delta");
+    println!("  Error(0x08)       → Error frame");
+    println!("  Heartbeat(0x09)   → Keep-alive heartbeat");
+    println!("  StreamOpen(0x0A)  → Stream lifecycle (open)");
+    println!("  StreamClose(0x0B) → Stream lifecycle (close)");
+    println!("  StreamReset(0x0C) → Stream lifecycle (reset)");
+    println!("  Handshake(0x0D)   → Connection handshake");
+    println!("  Fragment(0x0E)    → Stream continuation fragment");
+    println!("  Ack(0x0F)         → Delivery acknowledgment");
+    println!("  Subscribe(0x10)   → PubSub subscription");
+    println!("  Unsubscribe(0x11) → PubSub unsubscription");
+    println!("  Publish(0x12)     → PubSub message publish");
+    println!("  TopicCreate(0x13) → Topic management (create)");
+    println!("  TopicDelete(0x14) → Topic management (delete)");
+    println!("  Fetch(0x15)       → WAL replay request");
+    println!("  FetchReply(0x16)  → WAL replay response");
     println!();
     println!("Example:");
     println!("  loadtest -c 4 -d 10 -m stream          # throughput test, 4 users");
