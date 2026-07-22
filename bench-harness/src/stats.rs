@@ -97,7 +97,8 @@ impl WorkerResult {
     }
 
     /// Returns the failure reason, or `"ok"` if this result is successful.
-    /// Used for pre-barrier failure logging in `worker::worker`.
+    #[allow(dead_code)]
+    /// Used for pre-barrier failure logging in `reactor::run`.
     pub fn reason(&self) -> &str {
         self.error.as_deref().unwrap_or("ok")
     }
@@ -405,12 +406,12 @@ pub fn print_summary(s: &Summary) {
     println!();
     println!("Server architecture under test:");
     println!("  ┌─ Application Layer ─────────────────────────────────────┐");
-    println!("  │ AI Streaming · RPC · Event Bus · Media · PubSub · Agent│");
-    println!("  │ + 16 platform services (DI, Auth, Config, Observability)│");
+    println!("  │ PubSub Engine · Auth · TopicACL · WAL Store · Observ.  │");
+    println!("  │ Resource Quotas                                       │");
     println!("  ├─ Session Layer ────────────────────────────────────────┤");
-    println!("  │ SessionManager · Registry · Router · Migration · Repl  │");
+    println!("  │ SessionManager                                         │");
     println!("  ├─ Stream Layer ─────────────────────────────────────────┤");
-    println!("  │ StreamManager · StreamScheduler                        │");
+    println!("  │ StreamManager · SendPolicy (4 delivery semantics)      │");
     println!("  ├─ Message Layer ────────────────────────────────────────┤");
     println!("  │ Frame Codec (22B header) · Message Classifier          │");
     println!("  ├─ Transport Layer ──────────────────────────────────────┤");
