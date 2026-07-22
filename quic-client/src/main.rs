@@ -292,8 +292,8 @@ fn build_client_config() -> Result<quiche::Config> {
     config.set_initial_max_stream_data_bidi_local(10 * 1024 * 1024);
     config.set_initial_max_stream_data_bidi_remote(10 * 1024 * 1024);
     config.set_initial_max_stream_data_uni(10 * 1024 * 1024);
-    config.set_initial_max_streams_bidi(1000);
-    config.set_initial_max_streams_uni(1000);
+    config.set_initial_max_streams_bidi(1024);
+    config.set_initial_max_streams_uni(1024);
     config.set_disable_active_migration(true);
     config.discover_pmtu(false);
     config.set_cc_algorithm(quiche::CongestionControlAlgorithm::CUBIC);

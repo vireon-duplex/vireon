@@ -22,8 +22,8 @@ pub fn build_client_config() -> Result<quiche::Config> {
     config.set_initial_max_stream_data_bidi_local(10 * 1024 * 1024);
     config.set_initial_max_stream_data_bidi_remote(10 * 1024 * 1024);
     config.set_initial_max_stream_data_uni(10 * 1024 * 1024);
-    config.set_initial_max_streams_bidi(100);
-    config.set_initial_max_streams_uni(100);
+    config.set_initial_max_streams_bidi(1024);
+    config.set_initial_max_streams_uni(1024);
     config.set_disable_active_migration(true);
     // Skip incremental PMTU probing so the full payload size is used from the
     // first 1-RTT packet, maximising per-datagram throughput.
