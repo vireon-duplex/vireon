@@ -32,6 +32,10 @@ tracing-subscriber = { workspace = true }
 # Concurrency + system
 libc = { workspace = true }
 
+# Event-driven I/O — epoll on Linux, kqueue on macOS/BSD. Replaces the
+# thread-per-connection polling model with a thread-per-core reactor.
+mio = { version = "1.2.1", features = ["os-poll", "net"] }
+
 # Global allocator — eliminates glibc arena explosion under 1000-thread
 # burst allocation. mimalloc uses per-thread heaps with no cross-thread
 # contention, reducing RSS by 4-8 GiB at 1000 connections.
