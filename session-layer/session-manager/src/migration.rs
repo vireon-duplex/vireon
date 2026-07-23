@@ -7,21 +7,18 @@
 //! QUIC connection migration (RFC 9000 §9) lets a peer change its
 //! 4-tuple (src/dst IP + port) without tearing down the connection.
 //! Vireon's session layer sits above this: when the transport layer
-//! reports a path change, the migration manager:
+//! reports a path change, the migration manager tracks the session-
+//! level state machine around quiche's internal migration.
 //!
-//! 1. **Validates** — runs `PATH_CHALLENGE` / `PATH_RESPONSE`
-//!    (RFC 9000 §8.2).
-//! 2. **Rotates CID** — switches to a new connection id to prevent
-//!    linkability (RFC 9000 §7.5 / QUIC-LB RFC 9276).
-//! 3. **Hands off reactor** — if the new path prefers a different
-//!    core (NUMA locality), the session moves between reactor
-//!    threads.
-//! 4. **Resumes** — transitions the session back to `Active`.
+//! # Phase 3
 //!
-//! # Phase 0 status
-//!
-//! Phase 0 ships the metadata shape + type signature. Functional
-//! migration lands in Phase 3+.
+//! Functional coordinator: tracks per-session migration metadata
+//! (start, complete, abort). Actual PATH_CHALLENGE/RESPONSE and CID
+//! rotation are handled by quiche internally; this module records
+//! the session-layer bookkeeping so the server can query whether a
+//! session is mid-migration.
+
+use rustc_hash::FxHashMap;
 
 use crate::error::SessionManagerError;
 use crate::id::SessionId;
@@ -86,62 +83,114 @@ impl MigrationMetadata {
     }
 }
 
-/// Migration manager. Owns in-flight migration state for all
-/// sessions on this reactor.
-///
-/// Phase 0 holds no state; Phase 3 will add the per-session map.
-// TODO(phase-3): per-session migration map + path challenge state.
-#[derive(Clone, Debug, Default)]
-pub struct MigrationManager;
+/// Migration manager — tracks in-flight migrations for all sessions
+/// on this reactor.
+pub struct MigrationManager {
+    in_progress: FxHashMap<SessionId, MigrationMetadata>,
+}
+
+impl Default for MigrationManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl MigrationManager {
     /// Construct a new manager.
     #[must_use]
-    pub const fn new() -> Self {
-        Self
+    pub fn new() -> Self {
+        Self {
+            in_progress: FxHashMap::default(),
+        }
     }
 
-    /// Phase-3 `start_migration` placeholder.
+    /// Starts a migration for `id`, recording the old and new
+    /// connection ids. The metadata's phase is set to
+    /// [`MigrationPhase::ChallengeSent`].
     ///
     /// # Errors
-    /// Always returns [`SessionManagerError::MigrationFailed`] in
-    /// Phase 0.
+    /// Returns [`SessionManagerError::MigrationFailed`] if a migration
+    /// for `id` is already in progress.
     pub fn start_migration(
         &mut self,
-        _id: SessionId,
-        _old_cid: ConnectionId,
-        _new_cid: ConnectionId,
+        id: SessionId,
+        old_cid: ConnectionId,
+        new_cid: ConnectionId,
     ) -> Result<MigrationMetadata, SessionManagerError> {
-        // TODO(phase-3): send PATH_CHALLENGE, install metadata.
-        Err(SessionManagerError::MigrationFailed(
-            "migration manager phase-3 stub",
-        ))
+        if self.in_progress.contains_key(&id) {
+            return Err(SessionManagerError::MigrationFailed(
+                "migration already in progress for this session",
+            ));
+        }
+        let meta = MigrationMetadata {
+            old_cid,
+            new_cid,
+            old_core: 0,
+            new_core: 0,
+            phase: MigrationPhase::ChallengeSent,
+            retries: 0,
+        };
+        self.in_progress.insert(id, meta.clone());
+        Ok(meta)
     }
 
-    /// Phase-3 `complete_migration` placeholder.
+    /// Completes a migration for `id`. Removes the in-progress entry
+    /// and returns [`MigrationPhase::Complete`].
     ///
     /// # Errors
-    /// Always returns [`SessionManagerError::MigrationFailed`] in
-    /// Phase 0.
+    /// Returns [`SessionManagerError::MigrationFailed`] if no migration
+    /// is in progress for `id`.
     pub fn complete_migration(
         &mut self,
-        _id: SessionId,
+        id: SessionId,
     ) -> Result<MigrationPhase, SessionManagerError> {
-        // TODO(phase-3): rotate CID, handoff core, transition session.
-        Err(SessionManagerError::MigrationFailed(
-            "migration manager phase-3 stub",
-        ))
+        if self.in_progress.remove(&id).is_none() {
+            return Err(SessionManagerError::MigrationFailed(
+                "no migration in progress for this session",
+            ));
+        }
+        Ok(MigrationPhase::Complete)
     }
 
-    /// Phase-3 `abort_migration` placeholder.
-    pub fn abort_migration(&mut self, _id: SessionId) {
-        // TODO(phase-3): revert path, clear metadata.
+    /// Aborts a migration for `id`. Removes the in-progress entry.
+    /// No-op if no migration is in progress.
+    pub fn abort_migration(&mut self, id: SessionId) {
+        self.in_progress.remove(&id);
+    }
+
+    /// Whether a migration is in progress for `id`.
+    #[must_use]
+    pub fn is_migrating(&self, id: SessionId) -> bool {
+        self.in_progress.contains_key(&id)
+    }
+
+    /// Returns the metadata for an in-progress migration, if any.
+    #[must_use]
+    pub fn metadata(&self, id: SessionId) -> Option<&MigrationMetadata> {
+        self.in_progress.get(&id)
+    }
+
+    /// Number of in-progress migrations.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.in_progress.len()
+    }
+
+    /// Whether there are no in-progress migrations.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.in_progress.is_empty()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
+
+    fn cid(raw: u64) -> ConnectionId {
+        ConnectionId::from_raw(raw)
+    }
 
     #[test]
     fn phase_idle_default() {
@@ -151,8 +200,8 @@ mod tests {
     #[test]
     fn metadata_in_progress() {
         let m = MigrationMetadata {
-            old_cid: ConnectionId::from_raw(1),
-            new_cid: ConnectionId::from_raw(2),
+            old_cid: cid(1),
+            new_cid: cid(2),
             old_core: 0,
             new_core: 1,
             phase: MigrationPhase::ChallengeSent,
@@ -165,8 +214,8 @@ mod tests {
     #[test]
     fn metadata_terminal() {
         let m = MigrationMetadata {
-            old_cid: ConnectionId::from_raw(1),
-            new_cid: ConnectionId::from_raw(2),
+            old_cid: cid(1),
+            new_cid: cid(2),
             old_core: 0,
             new_core: 1,
             phase: MigrationPhase::Complete,
@@ -177,15 +226,62 @@ mod tests {
     }
 
     #[test]
-    fn start_migration_phase0_stub() {
-        let mut m = MigrationManager::new();
-        assert!(
-            m.start_migration(
-                SessionId::nil(),
-                ConnectionId::from_raw(1),
-                ConnectionId::from_raw(2),
-            )
-            .is_err()
-        );
+    fn start_migration_records_metadata() {
+        let mut mgr = MigrationManager::new();
+        let id = SessionId::from_pair(1, 1);
+        let meta = mgr.start_migration(id, cid(1), cid(2)).unwrap();
+        assert_eq!(meta.phase, MigrationPhase::ChallengeSent);
+        assert!(mgr.is_migrating(id));
+        assert_eq!(mgr.len(), 1);
+    }
+
+    #[test]
+    fn start_migration_rejects_duplicate() {
+        let mut mgr = MigrationManager::new();
+        let id = SessionId::from_pair(1, 1);
+        mgr.start_migration(id, cid(1), cid(2)).unwrap();
+        assert!(mgr.start_migration(id, cid(3), cid(4)).is_err());
+    }
+
+    #[test]
+    fn complete_migration_clears_state() {
+        let mut mgr = MigrationManager::new();
+        let id = SessionId::from_pair(1, 1);
+        mgr.start_migration(id, cid(1), cid(2)).unwrap();
+        let phase = mgr.complete_migration(id).unwrap();
+        assert_eq!(phase, MigrationPhase::Complete);
+        assert!(!mgr.is_migrating(id));
+        assert!(mgr.is_empty());
+    }
+
+    #[test]
+    fn complete_migration_unknown_returns_error() {
+        let mut mgr = MigrationManager::new();
+        assert!(mgr.complete_migration(SessionId::nil()).is_err());
+    }
+
+    #[test]
+    fn abort_migration_clears_state() {
+        let mut mgr = MigrationManager::new();
+        let id = SessionId::from_pair(1, 1);
+        mgr.start_migration(id, cid(1), cid(2)).unwrap();
+        mgr.abort_migration(id);
+        assert!(!mgr.is_migrating(id));
+    }
+
+    #[test]
+    fn abort_migration_unknown_is_noop() {
+        let mut mgr = MigrationManager::new();
+        mgr.abort_migration(SessionId::nil()); // should not panic
+    }
+
+    #[test]
+    fn metadata_lookup() {
+        let mut mgr = MigrationManager::new();
+        let id = SessionId::from_pair(1, 1);
+        mgr.start_migration(id, cid(10), cid(20)).unwrap();
+        let meta = mgr.metadata(id).unwrap();
+        assert_eq!(meta.old_cid, cid(10));
+        assert_eq!(meta.new_cid, cid(20));
     }
 }
