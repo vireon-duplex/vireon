@@ -41,7 +41,7 @@ use observability_sdk::registry::MetricsRegistry;
 use pubsub_engine::{
     PubSubConfig, Subscriber, TopicCatalog, TopicConfig, TopicPattern, TopicRegistry,
 };
-use resource_quotas::manager::QuotaManager;
+use resource_quotas::enforcer::QuotaEnforcer;
 use send_policy::{
     DeliveryPolicy, DequeueOutcome, EnqueueDecision, FramePayload as SendFramePayload,
     SendPolicyTable, StreamOpenMeta,
@@ -1245,7 +1245,7 @@ pub struct PlatformServices {
     /// [observability-sdk] Metrics registry + tracing.
     pub(crate) observability: MetricsRegistry,
     /// [resource-quotas] Per-tenant quota enforcement.
-    pub(crate) quotas: QuotaManager,
+    pub(crate) quotas: QuotaEnforcer,
 }
 
 impl PlatformServices {
@@ -1267,7 +1267,7 @@ impl PlatformServices {
                 observability_cfg,
                 observability_sdk::stats::ObservabilityStats::default(),
             ),
-            quotas: QuotaManager::new(
+            quotas: QuotaEnforcer::new(
                 quotas_cfg,
                 resource_quotas::stats::ResourceQuotaStats::default(),
             ),
@@ -1413,11 +1413,11 @@ impl ApplicationLayer {
 
             self.dispatcher.on_data_frame(ctx, frame);
 
-            // Platform: track per-tenant byte volume (observability).
+            // Platform: enforce per-tenant bandwidth quota (tracks volume).
             let _ = self
                 .platform
                 .quotas
-                .record_bytes(self.default_tenant, frame.payload.len() as u64);
+                .enforce_bandwidth(self.default_tenant, frame.payload.len() as u64);
         }
     }
 
