@@ -30,6 +30,7 @@ use rustc_hash::FxHashMap;
 use std::net::SocketAddr;
 
 use auth_framework::authenticator::AuthenticationPipeline;
+use consumer_groups::{ConsumerId, GroupCoordinator, GroupId};
 use frame::byte_writer::ByteWriter;
 use frame::codec::{FrameHeader, FrameRef};
 use frame::header::{FrameFlags, MessageType, Seq, StreamId};
@@ -120,6 +121,22 @@ pub trait AppDispatcher {
     fn drain_outbox(&mut self) -> Vec<OutgoingFrame>;
 }
 
+// ── Consumer-group local tracking ─────────────────────────────────
+
+/// One local member of a consumer group (tracked per-connection).
+struct GroupMember {
+    conn_idx: usize,
+    quic_stream_id: u64,
+    consumer: ConsumerId,
+}
+
+/// Per-(topic, group) local state for round-robin delivery.
+struct GroupLocal {
+    members: Vec<GroupMember>,
+    /// Round-robin index advanced on each publish.
+    rr_idx: usize,
+}
+
 // ── VireonDispatcher ──────────────────────────────────────────────
 
 /// Production dispatcher that routes frames by [`MessageType`] to the
@@ -185,6 +202,20 @@ pub struct VireonDispatcher {
     /// matches Vireon's thread-per-core design. Cross-worker sharing
     /// is a P5/P6 concern.
     wal: Option<wal_store::FileStore>,
+
+    /// [application-layer] Consumer-group coordinator — tracks group
+    /// membership, generations, and partition assignment for load-
+    /// balanced delivery. Publish fan-out consults `group_locals` to
+    /// deliver each message to exactly one consumer per group (round-
+    /// robin within the group's local members on this worker).
+    groups: GroupCoordinator,
+    /// Per-(topic, group_id) local member tracking. Keyed by the raw
+    /// strings so publish fan-out can iterate groups for a topic without
+    /// constructing typed wrappers on the hot path.
+    group_locals: FxHashMap<(String, String), GroupLocal>,
+    /// Per-connection group memberships — used to leave all groups on
+    /// disconnect. Each entry is `(topic, group_id, consumer_id)`.
+    conn_group_keys: FxHashMap<usize, Vec<(String, String, ConsumerId)>>,
 }
 
 impl VireonDispatcher {
@@ -220,6 +251,9 @@ impl VireonDispatcher {
             auth: AuthenticationPipeline::new(AuthConfig::new())
                 .unwrap_or_else(|_| AuthenticationPipeline::default()),
             wal: None,
+            groups: GroupCoordinator::new(),
+            group_locals: FxHashMap::default(),
+            conn_group_keys: FxHashMap::default(),
         }
     }
 
@@ -751,6 +785,32 @@ impl VireonDispatcher {
                 bytes.clone(),
             );
         }
+
+        // P5: consumer-group fan-out — for each group on this topic,
+        // deliver to exactly one local member (round-robin) so the group
+        // load-balances across its members. The selected consumer may
+        // be on the same connection as the publisher; we still deliver
+        // in that case (the consumer is a different logical subscriber).
+        let topic_str_owned = topic_str.to_string();
+        let mut group_targets: Vec<(usize, u64)> = Vec::new();
+        for ((t, _g), local) in &mut self.group_locals {
+            if t != &topic_str_owned || local.members.is_empty() {
+                continue;
+            }
+            let idx = local.rr_idx % local.members.len();
+            local.rr_idx = local.rr_idx.wrapping_add(1);
+            let m = &local.members[idx];
+            group_targets.push((m.conn_idx, m.quic_stream_id));
+        }
+        for (conn_idx, quic_stream_id) in group_targets {
+            self.enqueue_frame(
+                conn_idx,
+                quic_stream_id,
+                stream,
+                MessageType::Publish,
+                bytes.clone(),
+            );
+        }
     }
 
     /// Validates a wire-decoded topic string. Logs + returns `None` on
@@ -1140,6 +1200,374 @@ impl VireonDispatcher {
             );
         }
     }
+
+    // ── Consumer-group handlers (P5) ───────────────────────────────
+
+    /// Parses the common wire prefix shared by all three consumer-group
+    /// messages: `topic_len(u16) | topic | group_len(u16) | group_id
+    /// | consumer_len(u16) | consumer_id`.
+    ///
+    /// Returns `(topic, group_id, consumer_id, remaining_bytes)` on
+    /// success. The `remaining` slice carries any fields that follow
+    /// the common prefix (e.g. `partitions(u32)` for Join, `generation
+    /// (u32)` for Heartbeat).
+    fn parse_group_prefix(payload: &[u8]) -> Option<(&str, &str, &str, &[u8])> {
+        let mut pos = 0;
+        // topic
+        if payload.len() < pos + 2 {
+            return None;
+        }
+        let tlen = u16::from_be_bytes([payload[pos], payload[pos + 1]]) as usize;
+        pos += 2;
+        if payload.len() < pos + tlen {
+            return None;
+        }
+        let topic = std::str::from_utf8(&payload[pos..pos + tlen]).ok()?;
+        pos += tlen;
+        // group
+        if payload.len() < pos + 2 {
+            return None;
+        }
+        let glen = u16::from_be_bytes([payload[pos], payload[pos + 1]]) as usize;
+        pos += 2;
+        if payload.len() < pos + glen {
+            return None;
+        }
+        let group = std::str::from_utf8(&payload[pos..pos + glen]).ok()?;
+        pos += glen;
+        // consumer
+        if payload.len() < pos + 2 {
+            return None;
+        }
+        let clen = u16::from_be_bytes([payload[pos], payload[pos + 1]]) as usize;
+        pos += 2;
+        if payload.len() < pos + clen {
+            return None;
+        }
+        let consumer = std::str::from_utf8(&payload[pos..pos + clen]).ok()?;
+        pos += clen;
+        Some((topic, group, consumer, &payload[pos..]))
+    }
+
+    /// Handles `ConsumerGroupJoin`. Parses the payload, calls the group
+    /// coordinator, records the local membership, and ACKs with the
+    /// generation.
+    pub fn handle_group_join(&mut self, ctx: &FrameContext, frame: &FrameRef<'_>) {
+        let (topic, group, consumer, rest) = match Self::parse_group_prefix(frame.payload) {
+            Some(v) => v,
+            None => {
+                tracing::warn!(
+                    conn_idx = ctx.conn_idx,
+                    "[groups] join: malformed payload"
+                );
+                self.enqueue_response(
+                    ctx,
+                    frame.stream_id,
+                    MessageType::ConsumerGroupJoin,
+                    Bytes::from_static(br#"{"error":"malformed"}"#),
+                );
+                return;
+            }
+        };
+        if rest.len() < 4 {
+            tracing::warn!(conn_idx = ctx.conn_idx, "[groups] join: missing partitions");
+            self.enqueue_response(
+                ctx,
+                frame.stream_id,
+                MessageType::ConsumerGroupJoin,
+                Bytes::from_static(br#"{"error":"missing_partitions"}"#),
+            );
+            return;
+        }
+        let partitions = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
+        let group_id = match GroupId::new(group) {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(conn_idx = ctx.conn_idx, error = ?e, "[groups] invalid group id");
+                self.enqueue_response(
+                    ctx,
+                    frame.stream_id,
+                    MessageType::ConsumerGroupJoin,
+                    Bytes::from_static(br#"{"error":"invalid_group"}"#),
+                );
+                return;
+            }
+        };
+        let consumer_id = match ConsumerId::new(consumer) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(conn_idx = ctx.conn_idx, error = ?e, "[groups] invalid consumer id");
+                self.enqueue_response(
+                    ctx,
+                    frame.stream_id,
+                    MessageType::ConsumerGroupJoin,
+                    Bytes::from_static(br#"{"error":"invalid_consumer"}"#),
+                );
+                return;
+            }
+        };
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let generation = match self
+            .groups
+            .join(topic, &group_id, &consumer_id, partitions, now_ns)
+        {
+            Ok(generation) => generation,
+            Err(e) => {
+                tracing::warn!(conn_idx = ctx.conn_idx, error = ?e, "[groups] join failed");
+                let ack = format!(r#"{{"error":"join_failed"}}"#);
+                self.enqueue_response(
+                    ctx,
+                    frame.stream_id,
+                    MessageType::ConsumerGroupJoin,
+                    Bytes::from(ack),
+                );
+                return;
+            }
+        };
+        // Record local membership.
+        self.group_locals
+            .entry((topic.to_string(), group.to_string()))
+            .or_insert_with(|| GroupLocal {
+                members: Vec::new(),
+                rr_idx: 0,
+            })
+            .members
+            .push(GroupMember {
+                conn_idx: ctx.conn_idx,
+                quic_stream_id: ctx.quic_stream_id,
+                consumer: consumer_id.clone(),
+            });
+        self.conn_group_keys
+            .entry(ctx.conn_idx)
+            .or_default()
+            .push((
+                topic.to_string(),
+                group.to_string(),
+                consumer_id,
+            ));
+        tracing::info!(
+            conn_idx = ctx.conn_idx,
+            topic = topic,
+            group = group,
+            generation = generation,
+            "[groups] join"
+        );
+        let ack = format!(
+            r#"{{"joined":"{topic}","group":"{group}","generation":{generation}}}"#
+        );
+        self.enqueue_response(
+            ctx,
+            frame.stream_id,
+            MessageType::ConsumerGroupJoin,
+            Bytes::from(ack),
+        );
+    }
+
+    /// Handles `ConsumerGroupLeave`.
+    pub fn handle_group_leave(&mut self, ctx: &FrameContext, frame: &FrameRef<'_>) {
+        let (topic, group, consumer, _rest) = match Self::parse_group_prefix(frame.payload) {
+            Some(v) => v,
+            None => {
+                self.enqueue_response(
+                    ctx,
+                    frame.stream_id,
+                    MessageType::ConsumerGroupLeave,
+                    Bytes::from_static(br#"{"error":"malformed"}"#),
+                );
+                return;
+            }
+        };
+        let group_id = match GroupId::new(group) {
+            Ok(g) => g,
+            Err(_) => {
+                self.enqueue_response(
+                    ctx,
+                    frame.stream_id,
+                    MessageType::ConsumerGroupLeave,
+                    Bytes::from_static(br#"{"error":"invalid_group"}"#),
+                );
+                return;
+            }
+        };
+        let consumer_id = match ConsumerId::new(consumer) {
+            Ok(c) => c,
+            Err(_) => {
+                self.enqueue_response(
+                    ctx,
+                    frame.stream_id,
+                    MessageType::ConsumerGroupLeave,
+                    Bytes::from_static(br#"{"error":"invalid_consumer"}"#),
+                );
+                return;
+            }
+        };
+        let _ = self.groups.leave(topic, &group_id, &consumer_id);
+        self.remove_group_member(topic, group, &consumer_id);
+        // Remove from conn_group_keys.
+        if let Some(keys) = self.conn_group_keys.get_mut(&ctx.conn_idx) {
+            keys.retain(|(t, g, c)| {
+                !(t == topic && g == group && c.as_str() == consumer)
+            });
+        }
+        tracing::info!(
+            conn_idx = ctx.conn_idx,
+            topic = topic,
+            group = group,
+            "[groups] leave"
+        );
+        let ack = format!(r#"{{"left":"{topic}","group":"{group}"}}"#);
+        self.enqueue_response(
+            ctx,
+            frame.stream_id,
+            MessageType::ConsumerGroupLeave,
+            Bytes::from(ack),
+        );
+    }
+
+    /// Handles `ConsumerGroupHeartbeat`.
+    pub fn handle_group_heartbeat(&mut self, ctx: &FrameContext, frame: &FrameRef<'_>) {
+        let (topic, group, consumer, rest) = match Self::parse_group_prefix(frame.payload) {
+            Some(v) => v,
+            None => {
+                self.enqueue_response(
+                    ctx,
+                    frame.stream_id,
+                    MessageType::ConsumerGroupHeartbeat,
+                    Bytes::from_static(br#"{"error":"malformed"}"#),
+                );
+                return;
+            }
+        };
+        if rest.len() < 4 {
+            self.enqueue_response(
+                ctx,
+                frame.stream_id,
+                MessageType::ConsumerGroupHeartbeat,
+                Bytes::from_static(br#"{"error":"missing_generation"}"#),
+            );
+            return;
+        }
+        let generation = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
+        let group_id = match GroupId::new(group) {
+            Ok(g) => g,
+            Err(_) => {
+                self.enqueue_response(
+                    ctx,
+                    frame.stream_id,
+                    MessageType::ConsumerGroupHeartbeat,
+                    Bytes::from_static(br#"{"error":"invalid_group"}"#),
+                );
+                return;
+            }
+        };
+        let consumer_id = match ConsumerId::new(consumer) {
+            Ok(c) => c,
+            Err(_) => {
+                self.enqueue_response(
+                    ctx,
+                    frame.stream_id,
+                    MessageType::ConsumerGroupHeartbeat,
+                    Bytes::from_static(br#"{"error":"invalid_consumer"}"#),
+                );
+                return;
+            }
+        };
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        match self
+            .groups
+            .heartbeat(topic, &group_id, &consumer_id, generation, now_ns)
+        {
+            Ok(cur_gen) => {
+                let ack = format!(
+                    r#"{{"heartbeat":"{topic}","group":"{group}","generation":{cur_gen}}}"#
+                );
+                self.enqueue_response(
+                    ctx,
+                    frame.stream_id,
+                    MessageType::ConsumerGroupHeartbeat,
+                    Bytes::from(ack),
+                );
+            }
+            Err(e) => {
+                tracing::warn!(conn_idx = ctx.conn_idx, error = ?e, "[groups] heartbeat failed");
+                let ack = format!(r#"{{"error":"heartbeat_failed"}}"#);
+                self.enqueue_response(
+                    ctx,
+                    frame.stream_id,
+                    MessageType::ConsumerGroupHeartbeat,
+                    Bytes::from(ack),
+                );
+            }
+        }
+    }
+
+    /// Removes a consumer from `group_locals` for a given (topic, group).
+    /// If the group has no remaining members, the entry is dropped
+    /// entirely so publish fan-out skips it.
+    fn remove_group_member(&mut self, topic: &str, group: &str, consumer: &ConsumerId) {
+        let key = (topic.to_string(), group.to_string());
+        if let Some(local) = self.group_locals.get_mut(&key) {
+            local
+                .members
+                .retain(|m| m.consumer.as_str() != consumer.as_str());
+            if local.members.is_empty() {
+                self.group_locals.remove(&key);
+            } else if local.rr_idx >= local.members.len() {
+                local.rr_idx = 0;
+            }
+        }
+    }
+
+    /// Drives the consumer-group heartbeat timeout. Evicts stale members
+    /// and removes their local tracking entries. Called once per batch
+    /// tick from [`ApplicationLayer::on_batch_tick`].
+    pub fn tick_groups(&mut self) {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let evicted = self.groups.tick(now_ns);
+        if evicted > 0 {
+            tracing::info!(evicted, "[groups] tick evicted stale members");
+            // Clean up group_locals entries that have no live members.
+            // The coordinator already removed stale consumers internally;
+            // we mirror that in our local index by removing members whose
+            // consumer_id is no longer tracked by the coordinator.
+            let mut stale_keys: Vec<(String, String, ConsumerId)> = Vec::new();
+            for ((topic, group), local) in &self.group_locals {
+                let group_id = match GroupId::new(group) {
+                    Ok(g) => g,
+                    Err(_) => continue,
+                };
+                for m in &local.members {
+                    if self
+                        .groups
+                        .owned_partitions(topic, &group_id, &m.consumer)
+                        .is_none()
+                    {
+                        stale_keys.push((topic.clone(), group.clone(), m.consumer.clone()));
+                    }
+                }
+            }
+            for (topic, group, consumer) in stale_keys {
+                self.remove_group_member(&topic, &group, &consumer);
+                // Also clean conn_group_keys.
+                self.conn_group_keys
+                    .values_mut()
+                    .for_each(|keys| {
+                        keys.retain(|(t, g, c)| {
+                            !(t == &topic && g == &group && c == &consumer)
+                        });
+                    });
+            }
+        }
+    }
 }
 
 impl Default for VireonDispatcher {
@@ -1196,6 +1624,15 @@ impl AppDispatcher for VireonDispatcher {
             MessageType::Handshake => {
                 self.handle_handshake(ctx, frame);
             }
+            MessageType::ConsumerGroupJoin => {
+                self.handle_group_join(ctx, frame);
+            }
+            MessageType::ConsumerGroupLeave => {
+                self.handle_group_leave(ctx, frame);
+            }
+            MessageType::ConsumerGroupHeartbeat => {
+                self.handle_group_heartbeat(ctx, frame);
+            }
             _ => {
                 tracing::trace!(
                     conn_idx = ctx.conn_idx,
@@ -1214,6 +1651,17 @@ impl AppDispatcher for VireonDispatcher {
     ) {
         let removed = self.pubsub_registry.remove_connection(conn_idx);
         let principal = self.principals.remove(&conn_idx);
+
+        // P5: leave all consumer groups the disconnected connection
+        // was a member of.
+        if let Some(keys) = self.conn_group_keys.remove(&conn_idx) {
+            for (topic, group, consumer) in keys {
+                if let Ok(gid) = GroupId::new(&group) {
+                    let _ = self.groups.leave(&topic, &gid, &consumer);
+                }
+                self.remove_group_member(&topic, &group, &consumer);
+            }
+        }
         tracing::info!(
             conn_idx,
             session_id = ?session_id,
@@ -1422,9 +1870,11 @@ impl ApplicationLayer {
     }
 
     /// Drives the stream scheduler once per recv batch.
-    /// Propagates through session → stream.
+    /// Propagates through session → stream, and ticks the consumer-group
+    /// heartbeat timeout.
     pub fn on_batch_tick(&mut self) {
         self.session.on_batch_tick();
+        self.dispatcher.tick_groups();
     }
 
     /// Drains queued outgoing frames produced by the dispatcher.

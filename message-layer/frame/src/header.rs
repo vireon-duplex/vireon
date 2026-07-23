@@ -560,7 +560,7 @@ impl std::ops::BitAnd for FrameFlags {
 /// replay-by-offset semantics: `Fetch` requests missed entries from a topic's
 /// WAL; `FetchReply` returns one entry per frame.
 ///
-/// The `u8` representation leaves `0x00` and `0x17`–`0xFF` reserved for future
+/// The `u8` representation leaves `0x00` and `0x1A`–`0xFF` reserved for future
 /// expansion; unknown bytes surface as [`FrameError::UnknownMessageType`] rather
 /// than silent corruption.
 #[repr(u8)]
@@ -619,13 +619,28 @@ pub enum MessageType {
     /// yields zero or more `FetchReply` frames (bounded by the
     /// request's `max_count`).
     FetchReply = 0x16,
+
+    // ---- consumer-group control plane ----
+    /// Consumer → server: join a consumer group for a topic. Payload is
+    /// `topic_len(u16) | topic | group_len(u16) | group_id | consumer_len(u16)
+    /// | consumer_id | partitions(u32)`. The server assigns partitions
+    /// and returns the generation in an ACK.
+    ConsumerGroupJoin = 0x17,
+    /// Consumer → server: leave a consumer group. Payload is
+    /// `topic_len(u16) | topic | group_len(u16) | group_id | consumer_len(u16)
+    /// | consumer_id`.
+    ConsumerGroupLeave = 0x18,
+    /// Consumer → server: heartbeat for a consumer group membership.
+    /// Payload is `topic_len(u16) | topic | group_len(u16) | group_id
+    /// | consumer_len(u16) | consumer_id | generation(u32)`.
+    ConsumerGroupHeartbeat = 0x19,
 }
 
 /// Every defined [`MessageType`], ascending by wire byte.
 ///
 /// Useful for exhaustive round-trip tests and for dispatchers that want to
 /// validate they handle every variant.
-pub const ALL_MESSAGE_TYPES: [MessageType; 22] = [
+pub const ALL_MESSAGE_TYPES: [MessageType; 25] = [
     MessageType::TextToken,
     MessageType::AudioFrame,
     MessageType::VideoFrame,
@@ -648,6 +663,9 @@ pub const ALL_MESSAGE_TYPES: [MessageType; 22] = [
     MessageType::TopicDelete,
     MessageType::Fetch,
     MessageType::FetchReply,
+    MessageType::ConsumerGroupJoin,
+    MessageType::ConsumerGroupLeave,
+    MessageType::ConsumerGroupHeartbeat,
 ];
 
 impl MessageType {
@@ -683,6 +701,9 @@ impl MessageType {
             0x14 => Self::TopicDelete,
             0x15 => Self::Fetch,
             0x16 => Self::FetchReply,
+            0x17 => Self::ConsumerGroupJoin,
+            0x18 => Self::ConsumerGroupLeave,
+            0x19 => Self::ConsumerGroupHeartbeat,
             _ => return None,
         })
     }
@@ -713,6 +734,9 @@ impl MessageType {
                 | Self::TopicDelete
                 | Self::Fetch
                 | Self::FetchReply
+                | Self::ConsumerGroupJoin
+                | Self::ConsumerGroupLeave
+                | Self::ConsumerGroupHeartbeat
         )
     }
 
@@ -731,6 +755,9 @@ impl MessageType {
                 | Self::TopicDelete
                 | Self::Fetch
                 | Self::FetchReply
+                | Self::ConsumerGroupJoin
+                | Self::ConsumerGroupLeave
+                | Self::ConsumerGroupHeartbeat
         )
     }
 
@@ -1121,7 +1148,7 @@ mod tests {
     #[test]
     fn reserved_and_unknown_bytes_map_to_none() {
         assert_eq!(MessageType::from_byte(0x00), None);
-        assert_eq!(MessageType::from_byte(0x17), None);
+        assert_eq!(MessageType::from_byte(0x1A), None);
         assert_eq!(MessageType::from_byte(0xFF), None);
         assert!(matches!(
             MessageType::try_from(0x42),
@@ -1141,7 +1168,7 @@ mod tests {
     #[test]
     fn wire_bytes_are_dense_and_unique() {
         let bytes: Vec<u8> = ALL_MESSAGE_TYPES.iter().map(|mt| mt.as_byte()).collect();
-        assert_eq!(bytes, (0x01..=0x16u8).collect::<Vec<_>>());
+        assert_eq!(bytes, (0x01..=0x19u8).collect::<Vec<_>>());
         let unique: std::collections::HashSet<_> = bytes.iter().copied().collect();
         assert_eq!(unique.len(), bytes.len());
     }
@@ -1156,6 +1183,9 @@ mod tests {
         }
         assert!(MessageType::Subscribe.is_pubsub());
         assert!(MessageType::Publish.is_pubsub());
+        assert!(MessageType::ConsumerGroupJoin.is_pubsub());
+        assert!(MessageType::ConsumerGroupLeave.is_pubsub());
+        assert!(MessageType::ConsumerGroupHeartbeat.is_pubsub());
         assert!(!MessageType::StateUpdate.is_pubsub());
         assert!(!MessageType::StreamOpen.is_pubsub());
     }

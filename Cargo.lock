@@ -991,6 +991,7 @@ dependencies = [
  "bytes",
  "clap",
  "connection-shard",
+ "consumer-groups",
  "cqe-processor",
  "criterion",
  "ctrlc",

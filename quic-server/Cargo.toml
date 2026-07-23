@@ -57,6 +57,7 @@ topic-acl = { path = "../application-layer/topic-acl" }
 observability-sdk = { path = "../application-layer/observability-sdk" }
 resource-quotas = { path = "../application-layer/resource-quotas" }
 wal-store = { path = "../application-layer/wal-store" }
+consumer-groups = { path = "../application-layer/consumer-groups" }
 
 # QUIC protocol
 quiche = { workspace = true }
