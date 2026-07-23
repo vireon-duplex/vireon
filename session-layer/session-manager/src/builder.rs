@@ -12,6 +12,7 @@
 
 use crate::config::{Preset, SessionManagerConfig};
 use crate::error::SessionManagerError;
+use crate::manager::SessionManager;
 use crate::priority::SessionClass;
 
 /// Fluent builder for the session manager.
@@ -126,18 +127,13 @@ impl SessionManagerBuilder {
         self.cfg
     }
 
-    /// Phase-1 `build()` placeholder.
+    /// Build and return a [`SessionManager`].
     ///
     /// # Errors
-    /// - [`SessionManagerError::InvalidConfig`] if validation fails.
-    /// - Phase 0 always returns `Err(ResourceExhausted)` after
-    ///   validation (no manager implementation yet).
-    pub fn build(self) -> Result<(), SessionManagerError> {
+    /// Returns [`SessionManagerError::InvalidConfig`] if validation fails.
+    pub fn build(self) -> Result<SessionManager, SessionManagerError> {
         self.cfg.validate()?;
-        // TODO(phase-1): construct SessionManager.
-        Err(SessionManagerError::ResourceExhausted(
-            "SessionManager phase-1 stub",
-        ))
+        SessionManager::new(self.cfg)
     }
 }
 
@@ -170,9 +166,9 @@ mod tests {
     }
 
     #[test]
-    fn build_validates_before_failing() {
-        let r = SessionManagerBuilder::new().build();
-        assert!(matches!(r, Err(SessionManagerError::ResourceExhausted(_))));
+    fn build_succeeds() {
+        let m = SessionManagerBuilder::new().build();
+        assert!(m.is_ok());
     }
 
     #[test]

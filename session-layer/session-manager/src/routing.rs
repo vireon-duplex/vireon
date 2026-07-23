@@ -8,20 +8,12 @@
 //! Given a [`SessionId`](crate::id::SessionId), resolve the bound
 //! [`ConnectionId`](connection_shard::ConnectionId) and the reactor
 //! core that owns the connection. This is the hot-path resolution
-//! for inbound packets:
-//!
-//! 1. **SessionId → ConnectionId** — table lookup (Phase 1: O(1)
-//!    via the [`SessionTable`](crate::table::SessionTable) index).
-//! 2. **ConnectionId → Reactor core** — affinity map (Phase 1:
-//!    per-shard `ConnectionId → u8`).
+//! for inbound packets.
 //!
 //! Phase 6+ adds a global routing table (consistent hashing or
 //! QUIC-LB for load-balanced deployments).
-//!
-//! # Phase 0 status
-//!
-//! Phase 0 ships the type signature and the lookup result shape.
-//! Functional routing lands in Phase 1+.
+
+use rustc_hash::FxHashMap;
 
 use crate::error::SessionManagerError;
 use crate::id::SessionId;
@@ -37,60 +29,91 @@ pub struct RouteInfo {
     pub reactor_core: u8,
 }
 
-/// Session router.
-///
-/// Phase 0 holds no state; Phase 1 will add the per-shard affinity
-/// map.
-// TODO(phase-1): per-shard affinity map.
-#[derive(Clone, Debug, Default)]
-pub struct SessionRouter;
+/// Session router — per-shard affinity map for
+/// `SessionId → RouteInfo` resolution.
+#[derive(Debug, Default)]
+pub struct SessionRouter {
+    /// SessionId → RouteInfo for sessions bound to this reactor.
+    affinity: FxHashMap<SessionId, RouteInfo>,
+}
 
 impl SessionRouter {
     /// Construct a new router.
     #[must_use]
-    pub const fn new() -> Self {
-        Self
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Phase-1 `resolve` placeholder.
+    /// Number of bound routes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.affinity.len()
+    }
+
+    /// Whether the router has no bound routes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.affinity.is_empty()
+    }
+
+    /// Resolve a [`SessionId`] to its [`RouteInfo`].
     ///
     /// # Errors
-    /// Always returns [`SessionManagerError::SessionNotFound`] in
-    /// Phase 0 (no affinity map yet).
+    /// Returns [`SessionManagerError::SessionNotFound`] if no route
+    /// is bound for the given id.
     pub fn resolve(&self, id: SessionId) -> Result<RouteInfo, SessionManagerError> {
-        // TODO(phase-1): session id → connection id → reactor core.
-        Err(SessionManagerError::SessionNotFound(id))
+        self.affinity
+            .get(&id)
+            .copied()
+            .ok_or(SessionManagerError::SessionNotFound(id))
     }
 
-    /// Phase-1 `bind` placeholder.
+    /// Bind a [`SessionId`] to a [`RouteInfo`].
     ///
     /// # Errors
-    /// Always returns [`SessionManagerError::ResourceExhausted`] in
-    /// Phase 0.
-    pub fn bind(&mut self, _id: SessionId, _info: RouteInfo) -> Result<(), SessionManagerError> {
-        // TODO(phase-1): install affinity entry.
-        Err(SessionManagerError::ResourceExhausted(
-            "router phase-1 stub",
-        ))
+    /// Returns [`SessionManagerError::ResourceExhausted`] if a route
+    /// for this id is already bound.
+    pub fn bind(
+        &mut self,
+        id: SessionId,
+        info: RouteInfo,
+    ) -> Result<(), SessionManagerError> {
+        if self.affinity.contains_key(&id) {
+            return Err(SessionManagerError::ResourceExhausted(
+                "route already bound for this session id",
+            ));
+        }
+        self.affinity.insert(id, info);
+        Ok(())
     }
 
-    /// Phase-1 `unbind` placeholder.
+    /// Unbind a [`SessionId`]'s route.
     ///
     /// # Errors
-    /// Always returns [`SessionManagerError::SessionNotFound`] in
-    /// Phase 0.
+    /// Returns [`SessionManagerError::SessionNotFound`] if no route
+    /// is bound for the given id.
     pub fn unbind(&mut self, id: SessionId) -> Result<(), SessionManagerError> {
-        // TODO(phase-1): remove affinity entry.
-        Err(SessionManagerError::SessionNotFound(id))
+        if self.affinity.remove(&id).is_none() {
+            return Err(SessionManagerError::SessionNotFound(id));
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
 
+    fn route(conn: u64, core: u8) -> RouteInfo {
+        RouteInfo {
+            connection_id: ConnectionId::from_raw(conn),
+            reactor_core: core,
+        }
+    }
+
     #[test]
-    fn resolve_phase0_stub() {
+    fn resolve_unknown_returns_not_found() {
         let r = SessionRouter::new();
         assert!(matches!(
             r.resolve(SessionId::nil()),
@@ -99,17 +122,37 @@ mod tests {
     }
 
     #[test]
-    fn bind_phase0_stub() {
+    fn bind_then_resolve() {
         let mut r = SessionRouter::new();
-        let info = RouteInfo {
-            connection_id: ConnectionId::from_raw(1),
-            reactor_core: 0,
-        };
-        assert!(r.bind(SessionId::nil(), info).is_err());
+        let id = SessionId::from_pair(1, 1);
+        let info = route(42, 3);
+
+        r.bind(id, info).unwrap();
+        assert_eq!(r.resolve(id).unwrap(), info);
+        assert_eq!(r.len(), 1);
     }
 
     #[test]
-    fn unbind_phase0_stub() {
+    fn bind_duplicate_returns_error() {
+        let mut r = SessionRouter::new();
+        let id = SessionId::from_pair(1, 1);
+        r.bind(id, route(1, 0)).unwrap();
+        assert!(r.bind(id, route(2, 1)).is_err());
+    }
+
+    #[test]
+    fn unbind_removes_route() {
+        let mut r = SessionRouter::new();
+        let id = SessionId::from_pair(1, 1);
+        r.bind(id, route(1, 0)).unwrap();
+
+        r.unbind(id).unwrap();
+        assert!(r.resolve(id).is_err());
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn unbind_unknown_returns_error() {
         let mut r = SessionRouter::new();
         assert!(r.unbind(SessionId::nil()).is_err());
     }
