@@ -15,6 +15,10 @@ path = "src/lib.rs"
 name = "pubsub_dispatch"
 harness = false
 
+[[bench]]
+name = "pubsub_wal_group_cluster"
+harness = false
+
 [dependencies]
 # Vireon crates — one per architectural layer
 # ── IO Layer ────────────────────────────────────────────────────────
