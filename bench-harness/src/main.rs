@@ -76,7 +76,11 @@ fn main() -> Result<()> {
 
     match args.sweep {
         SweepMode::None => {
-            let workload = workload::build()?;
+            let workload = if args.mode == BenchMode::Group {
+                workload::build_group()?
+            } else {
+                workload::build()?
+            };
             let summary = run_benchmark(
                 args.target,
                 &sni,
@@ -335,6 +339,7 @@ fn mode_label(mode: BenchMode, depth: usize) -> String {
         BenchMode::MultiRr => "multi-rr (15 streams, concurrent)".into(),
         BenchMode::Stream => "stream (full-duplex, no wait)".into(),
         BenchMode::Pipeline => format!("pipeline (depth={depth}, 15 streams)"),
+        BenchMode::Group => "group (1 publisher + N members, round-robin delivery)".into(),
     }
 }
 
@@ -396,8 +401,9 @@ fn parse_args() -> Result<Args> {
                         "multi-rr" => BenchMode::MultiRr,
                         "stream" => BenchMode::Stream,
                         "pipeline" => BenchMode::Pipeline,
+                        "group" => BenchMode::Group,
                         other => anyhow::bail!(
-                            "unknown --mode '{other}'; valid: rr, multi-rr, stream, pipeline"
+                            "unknown --mode '{other}'; valid: rr, multi-rr, stream, pipeline, group"
                         ),
                     };
                 }
@@ -462,6 +468,14 @@ fn parse_args() -> Result<Args> {
         anyhow::bail!("--conns must be >= 1");
     }
 
+    if mode == BenchMode::Group && conns < 2 {
+        anyhow::bail!("--mode group needs >= 2 connections (1 publisher + >= 1 member)");
+    }
+
+    if mode == BenchMode::Group && sweep != SweepMode::None {
+        anyhow::bail!("--mode group is incompatible with --sweep (use --sweep none)");
+    }
+
     Ok(Args {
         target,
         conns,
@@ -499,6 +513,9 @@ fn print_usage() {
     println!("  rr          Request-response on 1 stream. Requires server echo.");
     println!("  multi-rr    15 streams fired together, wait all echoes. Requires server echo.");
     println!("  pipeline    N batches in-flight (--pipeline-depth). Requires server echo.");
+    println!("  group       P5 consumer-group throughput: conn 0 = publisher streaming Publish");
+    println!("              to topic 'bench.group'; conns 1..N = members that join group 'bench'");
+    println!("              then count round-robin deliveries. Needs >= 2 connections.");
     println!();
     println!("Workload covers all 25 MessageType variants:");
     println!("  TextToken(0x01)   → Text / content payload");

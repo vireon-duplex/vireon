@@ -109,6 +109,7 @@ fn run_inner(
             sni,
             &mut config,
             mode,
+            global_idx,
             pipeline_depth,
             egress_policy,
             entries,
@@ -119,7 +120,6 @@ fn run_inner(
             Ok(mut conn) => {
                 // Send Initial packet
                 conn.flush_outbound();
-                let _ = global_idx; // used for logging only
                 conns.push(Some(conn));
             }
             Err(e) => {

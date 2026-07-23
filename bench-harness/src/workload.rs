@@ -77,6 +77,47 @@ pub fn build_fixed_size(payload_bytes: usize) -> anyhow::Result<Workload> {
     })
 }
 
+/// Topic + group used by the `--mode group` consumer-group scenario.
+/// Kept as a `pub const` so `conn_state` can build matching Publish +
+/// ConsumerGroupJoin payloads without duplicating the strings.
+pub const GROUP_TOPIC: &str = "bench.group";
+/// Consumer-group name all `--mode group` members join.
+pub const GROUP_NAME: &str = "bench";
+/// Partitions declared at join time (the value is advisory for the
+/// current group coordinator — delivery is round-robin regardless).
+pub const GROUP_PARTITIONS: u32 = 4;
+
+/// Builds the 1-entry workload used for display/logging when running
+/// `--mode group`. The actual group-mode frames (Publish for the
+/// publisher, ConsumerGroupJoin for members) are built inside
+/// `ConnState`, not from this `entries` slice — but `run_benchmark`
+/// and the summary table still reference a `Workload`, so this keeps
+/// the displayed breakdown honest (one Publish entry to `bench.group`)
+/// rather than showing the irrelevant 25-type blend.
+pub fn build_group() -> anyhow::Result<Workload> {
+    let topic = GROUP_TOPIC.as_bytes();
+    let data_payload = vec![0xE8u8; 4096];
+    let mut payload = Vec::with_capacity(2 + topic.len() + data_payload.len());
+    payload.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+    payload.extend_from_slice(topic);
+    payload.extend_from_slice(&data_payload);
+    let payload_len = payload.len();
+    Ok(Workload {
+        entries: vec![WorkloadEntry {
+            msg_type: MessageType::Publish,
+            name: "Publish",
+            payload_len,
+            flags: FrameFlags::NONE,
+            payload,
+            logical_stream: 0,
+        }]
+        .into_boxed_slice(),
+        total_payload_bytes: payload_len,
+        batch_wire_bytes: frame::codec::HEADER_SIZE + payload_len + frame::codec::CRC_SIZE,
+        coalesce: COALESCE,
+    })
+}
+
 /// Builds the full 20-frame workload.
 ///
 /// Each `MessageType` is exercised, but they are mapped onto the 15
