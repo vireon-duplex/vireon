@@ -59,6 +59,13 @@ pub struct ServerConfig {
     /// every accepted publish before fan-out. `None` disables WAL.
     #[allow(dead_code)]
     pub wal_root: Option<std::path::PathBuf>,
+
+    /// Optional cluster transport config (P6). When set, the server
+    /// joins a multi-node cluster and routes publishes via UDP-based
+    /// inter-node transport. `None` = single-node mode (all topics
+    /// owned locally).
+    #[allow(dead_code)]
+    pub cluster: Option<crate::cluster::ClusterTransportConfig>,
 }
 
 /// Default queue depth if the CLI passes 0.
@@ -94,6 +101,29 @@ impl ServerConfig {
             None => None,
         };
 
+        // P6: parse cluster configuration if --cluster-node-id is set.
+        let cluster = match (cli.cluster_node_id, cli.cluster_peers.as_deref()) {
+            (Some(id), Some(peers_str)) => {
+                let self_id = session_registry::NodeId::new(id);
+                let peers = crate::cluster::parse_cluster_peers(peers_str)
+                    .map_err(|e| anyhow::anyhow!("--cluster-peers: {e}"))?;
+                let cfg = crate::cluster::build_cluster_transport_config(self_id, &peers)
+                    .map_err(|e| anyhow::anyhow!("--cluster-peers: {e}"))?;
+                Some(cfg)
+            }
+            (Some(_), None) => {
+                return Err(anyhow::anyhow!(
+                    "--cluster-node-id requires --cluster-peers"
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(anyhow::anyhow!(
+                    "--cluster-peers requires --cluster-node-id"
+                ));
+            }
+            (None, None) => None,
+        };
+
         Ok(Self {
             port: cli.port,
             bind_addr,
@@ -114,6 +144,7 @@ impl ServerConfig {
             acl_rules_path: cli.acl_rules_path.clone(),
             acl_table,
             wal_root: cli.wal_root.as_deref().map(std::path::PathBuf::from),
+            cluster,
         })
     }
 

@@ -990,6 +990,7 @@ dependencies = [
  "buffer-pool",
  "bytes",
  "clap",
+ "cluster-coordinator",
  "connection-shard",
  "consumer-groups",
  "cqe-processor",

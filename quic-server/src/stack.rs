@@ -33,6 +33,7 @@ use frame::codec::{self, FrameHeader, FrameRef};
 use io::handler::{IoHandler, TickContext};
 use quic_engine::{QuicEngine, QuicEvent, QuicSendError};
 
+use crate::cluster::ClusterWorkerHandle;
 use crate::connection::{ConnState, ConnectionRegistry};
 use crate::error::ServerError;
 use crate::layers::{ApplicationLayer, FrameContext, OutgoingFrame, RuntimeLayer};
@@ -202,6 +203,7 @@ impl VireonStack {
         echo: bool,
         acl_table: Option<topic_acl::AclTable>,
         wal_root: Option<&std::path::Path>,
+        cluster: Option<(&cluster_coordinator::ClusterConfig, ClusterWorkerHandle)>,
         shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, ServerError> {
         let mut application = ApplicationLayer::new()?;
@@ -222,6 +224,9 @@ impl VireonStack {
                     )));
                 }
             }
+        }
+        if let Some((cfg, handle)) = cluster {
+            application.set_cluster(cfg, handle.outgoing_tx, handle.incoming_rx);
         }
         Ok(Self {
             application,

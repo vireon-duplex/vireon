@@ -16,5 +16,6 @@
 //! ```
 
 pub mod acl_loader;
+pub mod cluster;
 pub mod error;
 pub mod layers;

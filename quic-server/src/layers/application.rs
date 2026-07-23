@@ -28,8 +28,12 @@
 
 use rustc_hash::FxHashMap;
 use std::net::SocketAddr;
+use std::sync::mpsc;
 
 use auth_framework::authenticator::AuthenticationPipeline;
+use cluster_coordinator::{
+    ClusterConfig, ClusterCoordinator, InterNodeMessage, PublishDecision, RemoteSubscriber,
+};
 use consumer_groups::{ConsumerId, GroupCoordinator, GroupId};
 use frame::byte_writer::ByteWriter;
 use frame::codec::{FrameHeader, FrameRef};
@@ -58,6 +62,7 @@ use resource_quotas::{QuotaLimit, TenantId, TenantTier};
 
 use super::message::FrameAction;
 use super::session::SessionLayer;
+use crate::cluster::OutgoingMsg;
 use crate::error::ServerError;
 use bytes::Bytes;
 
@@ -216,6 +221,26 @@ pub struct VireonDispatcher {
     /// Per-connection group memberships — used to leave all groups on
     /// disconnect. Each entry is `(topic, group_id, consumer_id)`.
     conn_group_keys: FxHashMap<usize, Vec<(String, String, ConsumerId)>>,
+
+    // ── P6: multi-node cluster wiring ────────────────────────────
+    /// The cluster coordinator — owns the topic router, remote
+    /// subscriber registry, and cluster stats. `None` in single-node
+    /// mode (all topics owned locally). When `Some`, this dispatcher
+    /// is one of N (one per worker); all share the same `ClusterConfig`
+    /// so routing decisions are deterministic across workers.
+    coordinator: Option<ClusterCoordinator>,
+    /// This node's id (cached for the fan-out path to stamp on every
+    /// outgoing `InterNodeMessage`). `NodeId::NIL` when `coordinator`
+    /// is `None`.
+    node_id: session_registry::NodeId,
+    /// Sender into the cluster transport's outgoing queue. Workers push
+    /// [`OutgoingMsg`]s here to send inter-node UDP datagrams. `None`
+    /// in single-node mode.
+    cluster_outgoing_tx: Option<mpsc::Sender<OutgoingMsg>>,
+    /// Per-worker incoming queue from the cluster transport. Each
+    /// worker drains its own queue in `on_batch_tick` →
+    /// [`Self::drain_cluster_inbox`]. `None` in single-node mode.
+    cluster_incoming_rx: Option<mpsc::Receiver<InterNodeMessage>>,
 }
 
 impl VireonDispatcher {
@@ -254,6 +279,10 @@ impl VireonDispatcher {
             groups: GroupCoordinator::new(),
             group_locals: FxHashMap::default(),
             conn_group_keys: FxHashMap::default(),
+            coordinator: None,
+            node_id: session_registry::NodeId::NIL,
+            cluster_outgoing_tx: None,
+            cluster_incoming_rx: None,
         }
     }
 
@@ -336,6 +365,39 @@ impl VireonDispatcher {
     #[allow(dead_code)]
     pub fn set_wal(&mut self, wal: wal_store::FileStore) {
         self.wal = Some(wal);
+    }
+
+    /// Attaches a cluster coordinator + transport channels (P6).
+    ///
+    /// When set, the dispatcher consults the coordinator's
+    /// `route_publish` for every publish and forwards non-owned topics
+    /// to their owner via [`InterNodeMessage::Publish`]. It also drains
+    /// its incoming cluster queue on each `on_batch_tick` to process
+    /// publishes/fanouts/subscribes from other nodes.
+    ///
+    /// Each worker calls this with its own coordinator copy (same
+    /// config → same routing decisions).
+    #[allow(dead_code)]
+    pub fn set_cluster(
+        &mut self,
+        cfg: &ClusterConfig,
+        outgoing_tx: mpsc::Sender<OutgoingMsg>,
+        incoming_rx: mpsc::Receiver<InterNodeMessage>,
+    ) {
+        match ClusterCoordinator::new(cfg.clone()) {
+            Ok(coord) => {
+                self.node_id = coord.self_id();
+                self.coordinator = Some(coord);
+                self.cluster_outgoing_tx = Some(outgoing_tx);
+                self.cluster_incoming_rx = Some(incoming_rx);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    "[cluster] coordinator construction failed — running in single-node mode"
+                );
+            }
+        }
     }
 
     /// Evaluates `(conn_idx's principal, action, topic_or_pattern)` against
@@ -661,6 +723,33 @@ impl VireonDispatcher {
                     active = self.pubsub_registry.len(),
                     "[pubsub] subscribe"
                 );
+
+                // P6: if we are not the owner of this pattern, notify
+                // the owner of our local interest so future publishes
+                // fan out to us. The owner will record us in its
+                // RemoteSubscriberRegistry.
+                if let Some(coord) = &self.coordinator {
+                    if let Some(owner) = coord.router().owner_of(pattern_str) {
+                        if owner != self.node_id {
+                            if let Some(tx) = &self.cluster_outgoing_tx {
+                                let msg = InterNodeMessage::subscribe(
+                                    self.node_id,
+                                    ctx.conn_idx as u32,
+                                    ctx.quic_stream_id,
+                                    pattern_str.to_string(),
+                                );
+                                let _ = tx.send(OutgoingMsg { msg, target: owner });
+                            }
+                            tracing::debug!(
+                                conn_idx = ctx.conn_idx,
+                                pattern = %pattern_str,
+                                owner = %owner.raw(),
+                                "[cluster] subscribe forwarded to owner"
+                            );
+                        }
+                    }
+                }
+
                 let ack = format!("{{\"subscribed\":\"{pattern_str}\"}}");
                 self.enqueue_response(ctx, stream, MessageType::Subscribe, Bytes::from(ack));
             }
@@ -719,6 +808,65 @@ impl VireonDispatcher {
             self.enqueue_response(ctx, stream, MessageType::Publish, Bytes::from(ack));
             return;
         }
+
+        // P6: cluster routing. If a coordinator is wired, consult it
+        // to decide whether this publish belongs to us (deliver
+        // locally + fan out to remote subscribers) or another node
+        // (forward the publish via UDP).
+        if let Some(coord) = &self.coordinator {
+            let decision = coord.route_publish(topic.as_str());
+            match decision {
+                PublishDecision::Forward { owner } => {
+                    // Send the publish to the owning node via UDP.
+                    // The owner will fan out to its local subscribers
+                    // + any other nodes with remote interest.
+                    if let Some(tx) = &self.cluster_outgoing_tx {
+                        let msg = InterNodeMessage::publish(
+                            self.node_id,
+                            ctx.conn_idx as u32,
+                            ctx.quic_stream_id,
+                            topic.as_str().to_string(),
+                            Bytes::copy_from_slice(payload),
+                        );
+                        let _ = tx.send(OutgoingMsg { msg, target: owner });
+                    }
+                    tracing::debug!(
+                        conn_idx = ctx.conn_idx,
+                        topic = %topic,
+                        owner = %owner.raw(),
+                        "[cluster] publish forwarded to owner"
+                    );
+                    // Do not deliver locally — the owner handles it.
+                    return;
+                }
+                PublishDecision::Own { remote_targets } => {
+                    // Fan out to remote subscribers via UDP. Each
+                    // remote target is a node whose local subscribers
+                    // want this topic.
+                    if let Some(tx) = &self.cluster_outgoing_tx {
+                        // Origin = this node (we own the topic and are
+                        // delivering to local subscribers). The remote
+                        // nodes will use the origin back-route for
+                        // any acks.
+                        let msg = InterNodeMessage::fanout(
+                            self.node_id,
+                            ctx.conn_idx as u32,
+                            ctx.quic_stream_id,
+                            topic.as_str().to_string(),
+                            Bytes::copy_from_slice(payload),
+                        );
+                        for target in remote_targets {
+                            let _ = tx.send(OutgoingMsg {
+                                msg: msg.clone(),
+                                target,
+                            });
+                        }
+                    }
+                    // Fall through to local delivery.
+                }
+            }
+        }
+
         let targets: Vec<Subscriber> = self
             .pubsub_registry
             .lookup(topic)
@@ -1317,7 +1465,7 @@ impl VireonDispatcher {
             Ok(generation) => generation,
             Err(e) => {
                 tracing::warn!(conn_idx = ctx.conn_idx, error = ?e, "[groups] join failed");
-                let ack = format!(r#"{{"error":"join_failed"}}"#);
+                let ack = r#"{"error":"join_failed"}"#.to_string();
                 self.enqueue_response(
                     ctx,
                     frame.stream_id,
@@ -1496,7 +1644,7 @@ impl VireonDispatcher {
             }
             Err(e) => {
                 tracing::warn!(conn_idx = ctx.conn_idx, error = ?e, "[groups] heartbeat failed");
-                let ack = format!(r#"{{"error":"heartbeat_failed"}}"#);
+                let ack = r#"{"error":"heartbeat_failed"}"#.to_string();
                 self.enqueue_response(
                     ctx,
                     frame.stream_id,
@@ -1566,6 +1714,165 @@ impl VireonDispatcher {
                         });
                     });
             }
+        }
+    }
+
+    // ── Cluster inbox draining (P6) ─────────────────────────────────
+
+    /// Drains the per-worker cluster inbox, processing incoming
+    /// [`InterNodeMessage`]s from other nodes.
+    ///
+    /// Called once per batch tick from [`ApplicationLayer::on_batch_tick`].
+    /// Handles four message kinds:
+    /// * `Publish` — another node forwarded a publish to us (the
+    ///   topic owner). Fan out to local subscribers as if a local
+    ///   client had published it.
+    /// * `Fanout` — the topic owner is delivering a publish to us
+    ///   because we previously registered remote interest. Deliver
+    ///   to local subscribers via the inner payload's topic.
+    /// * `Subscribe` — a non-owner node is registering remote
+    ///   interest in a pattern. Record the remote subscriber in our
+    ///   coordinator's `RemoteSubscriberRegistry`.
+    /// * `Unsubscribe` — a non-owner is dropping remote interest.
+    pub fn drain_cluster_inbox(&mut self) {
+        // Drain into a local Vec first to release the borrow on
+        // `self.cluster_incoming_rx` before we call back into
+        // `self.cluster_deliver_local` / `self.coordinator`.
+        const CLUSTER_DRAIN_CAP: usize = 256;
+        let mut batch: Vec<InterNodeMessage> = Vec::with_capacity(CLUSTER_DRAIN_CAP);
+        if let Some(rx) = &mut self.cluster_incoming_rx {
+            while batch.len() < CLUSTER_DRAIN_CAP {
+                match rx.try_recv() {
+                    Ok(msg) => batch.push(msg),
+                    Err(_) => break,
+                }
+            }
+        }
+        if batch.is_empty() {
+            return;
+        }
+        let processed = batch.len();
+        for msg in batch {
+            match msg.kind {
+                cluster_coordinator::InterNodeKind::Publish
+                | cluster_coordinator::InterNodeKind::Fanout => {
+                    self.cluster_deliver_local(
+                        &msg.topic_or_pattern,
+                        &msg.payload,
+                        msg.origin_conn_idx,
+                        msg.origin_stream_id,
+                    );
+                }
+                cluster_coordinator::InterNodeKind::Subscribe => {
+                    if let Some(coord) = &mut self.coordinator {
+                        coord.add_remote_sub(
+                            &msg.topic_or_pattern,
+                            RemoteSubscriber {
+                                node_id: msg.origin_node,
+                                remote_conn_idx: msg.origin_conn_idx,
+                                remote_quic_stream_id: msg.origin_stream_id,
+                            },
+                        );
+                        tracing::debug!(
+                            node = %msg.origin_node.raw(),
+                            pattern = %msg.topic_or_pattern,
+                            "[cluster] remote subscribe registered"
+                        );
+                    }
+                }
+                cluster_coordinator::InterNodeKind::Unsubscribe => {
+                    if let Some(coord) = &mut self.coordinator {
+                        coord.remove_remote_sub(
+                            &msg.topic_or_pattern,
+                            &RemoteSubscriber {
+                                node_id: msg.origin_node,
+                                remote_conn_idx: msg.origin_conn_idx,
+                                remote_quic_stream_id: msg.origin_stream_id,
+                            },
+                        );
+                        tracing::debug!(
+                            node = %msg.origin_node.raw(),
+                            pattern = %msg.topic_or_pattern,
+                            "[cluster] remote unsubscribe"
+                        );
+                    }
+                }
+            }
+        }
+        tracing::trace!(processed, "[cluster] inbox drained");
+    }
+
+    /// Delivers an inter-node Publish/Fanout payload to local
+    /// subscribers. Mirrors the wire encoding used by `handle_publish`:
+    /// `topic_len(u16) | topic | payload`.
+    ///
+    /// Inter-node delivered messages do NOT re-trigger cluster
+    /// routing (that would loop): this method consults only the local
+    /// `pubsub_registry` + `group_locals`.
+    fn cluster_deliver_local(
+        &mut self,
+        topic: &str,
+        payload: &[u8],
+        _origin_conn_idx: u32,
+        _origin_stream_id: u64,
+    ) {
+        let topic_ref = match pubsub_engine::Topic::new(topic) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    topic = topic,
+                    error = ?e,
+                    "[cluster] incoming publish has invalid topic — dropping"
+                );
+                return;
+            }
+        };
+        let targets: Vec<Subscriber> = self.pubsub_registry.lookup(&topic_ref).into_iter().collect();
+
+        // Re-encode as a Publish frame so downstream subscribers receive the
+        // same wire shape the publisher used (topic_len + topic + payload).
+        let topic_str = topic_ref.as_str();
+        let mut framed = Vec::with_capacity(2 + topic_str.len() + payload.len());
+        framed.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
+        framed.extend_from_slice(topic_str.as_bytes());
+        framed.extend_from_slice(payload);
+        let bytes = Bytes::from(framed);
+
+        // Use a synthetic logical stream for inter-node-delivered
+        // publishes — they aren't bound to a particular subscriber's
+        // declared stream. The wire shape still needs a StreamId for
+        // the frame header.
+        let stream = StreamId::new(0xFFFF_FFFF);
+        for target in targets {
+            self.enqueue_frame(
+                target.conn_idx,
+                target.quic_stream_id,
+                stream,
+                MessageType::Publish,
+                bytes.clone(),
+            );
+        }
+
+        // Consumer-group fan-out (P5) — mirror handle_publish.
+        let topic_str_owned = topic_str.to_string();
+        let mut group_targets: Vec<(usize, u64)> = Vec::new();
+        for ((t, _g), local) in &mut self.group_locals {
+            if t != &topic_str_owned || local.members.is_empty() {
+                continue;
+            }
+            let idx = local.rr_idx % local.members.len();
+            local.rr_idx = local.rr_idx.wrapping_add(1);
+            let m = &local.members[idx];
+            group_targets.push((m.conn_idx, m.quic_stream_id));
+        }
+        for (conn_idx, quic_stream_id) in group_targets {
+            self.enqueue_frame(
+                conn_idx,
+                quic_stream_id,
+                stream,
+                MessageType::Publish,
+                bytes.clone(),
+            );
         }
     }
 }
@@ -1870,11 +2177,12 @@ impl ApplicationLayer {
     }
 
     /// Drives the stream scheduler once per recv batch.
-    /// Propagates through session → stream, and ticks the consumer-group
-    /// heartbeat timeout.
+    /// Propagates through session → stream, ticks the consumer-group
+    /// heartbeat timeout, and drains the per-worker cluster inbox (P6).
     pub fn on_batch_tick(&mut self) {
         self.session.on_batch_tick();
         self.dispatcher.tick_groups();
+        self.dispatcher.drain_cluster_inbox();
     }
 
     /// Drains queued outgoing frames produced by the dispatcher.
@@ -1957,6 +2265,19 @@ impl ApplicationLayer {
     #[allow(dead_code)]
     pub fn set_wal(&mut self, wal: wal_store::FileStore) {
         self.dispatcher.wal = Some(wal);
+    }
+
+    /// Installs a cluster coordinator + transport channels (P6).
+    /// Should be called before the first frame is processed so every
+    /// publish is routed via the coordinator from the start.
+    #[allow(dead_code)]
+    pub fn set_cluster(
+        &mut self,
+        cfg: &ClusterConfig,
+        outgoing_tx: mpsc::Sender<OutgoingMsg>,
+        incoming_rx: mpsc::Receiver<InterNodeMessage>,
+    ) {
+        self.dispatcher.set_cluster(cfg, outgoing_tx, incoming_rx);
     }
 }
 
