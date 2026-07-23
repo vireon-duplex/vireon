@@ -31,6 +31,7 @@ use std::time::Instant;
 
 use crate::auth::AuthenticationPipeline;
 use crate::authz::PolicyCache;
+use crate::backpressure::BackpressureTracker;
 use crate::config::SessionManagerConfig;
 use crate::error::SessionManagerError;
 use crate::health::HealthReport;
@@ -59,11 +60,11 @@ pub struct SessionManager {
     auth: AuthenticationPipeline,
     #[allow(dead_code)]
     authz: PolicyCache,
-    #[allow(dead_code)]
     migration: MigrationManager,
     scheduler: SessionScheduler,
     resource: ResourceManager,
     lifecycle: SessionLifecycle,
+    backpressure: BackpressureTracker,
     stats: SessionStats,
     /// Monotonic clock base for `SessionInstantNs` calculations.
     start: Instant,
@@ -86,6 +87,7 @@ impl SessionManager {
             scheduler: SessionScheduler::with_max_sessions(cfg.max_sessions),
             resource: ResourceManager::new(cfg),
             lifecycle: SessionLifecycle::new(),
+            backpressure: BackpressureTracker::new(),
             stats: SessionStats::new(),
             start: Instant::now(),
             cfg,
@@ -129,6 +131,28 @@ impl SessionManager {
     /// Mutably borrow the scheduler (for configuring per-class limits).
     pub fn scheduler_mut(&mut self) -> &mut SessionScheduler {
         &mut self.scheduler
+    }
+
+    /// Borrow the migration manager.
+    #[must_use]
+    pub const fn migration(&self) -> &MigrationManager {
+        &self.migration
+    }
+
+    /// Mutably borrow the migration manager.
+    pub fn migration_mut(&mut self) -> &mut MigrationManager {
+        &mut self.migration
+    }
+
+    /// Borrow the backpressure tracker.
+    #[must_use]
+    pub const fn backpressure(&self) -> &BackpressureTracker {
+        &self.backpressure
+    }
+
+    /// Mutably borrow the backpressure tracker.
+    pub fn backpressure_mut(&mut self) -> &mut BackpressureTracker {
+        &mut self.backpressure
     }
 
     /// Borrow the session table (via the registry).
