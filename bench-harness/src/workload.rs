@@ -344,6 +344,53 @@ fn realistic_payload(mt: MessageType) -> Vec<u8> {
             v.extend_from_slice(payload);
             v
         }
+
+        // ConsumerGroupJoin — topic + group + consumer + partitions.
+        MessageType::ConsumerGroupJoin => {
+            let topic = b"sensor.temperature.zone1";
+            let group = b"zone1-alerts";
+            let consumer = b"consumer-1";
+            let mut v = Vec::with_capacity(2 + topic.len() + 2 + group.len() + 2 + consumer.len() + 4);
+            v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            v.extend_from_slice(topic);
+            v.extend_from_slice(&(group.len() as u16).to_be_bytes());
+            v.extend_from_slice(group);
+            v.extend_from_slice(&(consumer.len() as u16).to_be_bytes());
+            v.extend_from_slice(consumer);
+            v.extend_from_slice(&4u32.to_be_bytes()); // partitions
+            v
+        }
+
+        // ConsumerGroupLeave — topic + group + consumer.
+        MessageType::ConsumerGroupLeave => {
+            let topic = b"sensor.temperature.zone1";
+            let group = b"zone1-alerts";
+            let consumer = b"consumer-1";
+            let mut v = Vec::with_capacity(2 + topic.len() + 2 + group.len() + 2 + consumer.len());
+            v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            v.extend_from_slice(topic);
+            v.extend_from_slice(&(group.len() as u16).to_be_bytes());
+            v.extend_from_slice(group);
+            v.extend_from_slice(&(consumer.len() as u16).to_be_bytes());
+            v.extend_from_slice(consumer);
+            v
+        }
+
+        // ConsumerGroupHeartbeat — topic + group + consumer + generation.
+        MessageType::ConsumerGroupHeartbeat => {
+            let topic = b"sensor.temperature.zone1";
+            let group = b"zone1-alerts";
+            let consumer = b"consumer-1";
+            let mut v = Vec::with_capacity(2 + topic.len() + 2 + group.len() + 2 + consumer.len() + 4);
+            v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            v.extend_from_slice(topic);
+            v.extend_from_slice(&(group.len() as u16).to_be_bytes());
+            v.extend_from_slice(group);
+            v.extend_from_slice(&(consumer.len() as u16).to_be_bytes());
+            v.extend_from_slice(consumer);
+            v.extend_from_slice(&1u32.to_be_bytes()); // generation
+            v
+        }
     }
 }
 
@@ -383,6 +430,9 @@ fn type_name(mt: MessageType) -> &'static str {
         MessageType::TopicDelete => "TopicDelete",
         MessageType::Fetch => "Fetch",
         MessageType::FetchReply => "FetchReply",
+        MessageType::ConsumerGroupJoin => "ConsumerGroupJoin",
+        MessageType::ConsumerGroupLeave => "ConsumerGroupLeave",
+        MessageType::ConsumerGroupHeartbeat => "ConsumerGroupHeartbeat",
     }
 }
 
@@ -414,10 +464,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn workload_has_twenty_two_entries() {
-        // 22 = 20 base message types + Fetch + FetchReply (added in P4).
+    fn workload_has_twenty_five_entries() {
+        // 25 = 22 base message types + ConsumerGroupJoin/Leave/Heartbeat (P5).
         let w = build().unwrap();
-        assert_eq!(w.entries.len(), 22);
+        assert_eq!(w.entries.len(), 25);
     }
 
     #[test]

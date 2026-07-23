@@ -1,7 +1,7 @@
 //! `loadtest` — network load-test harness for Vireon `quic-server`.
 //!
 //! Opens N concurrent QUIC connections to a running server. Each connection
-//! sends the full 15-frame realistic workload (one frame per `MessageType`,
+//! sends the full 25-frame realistic workload (one frame per `MessageType`,
 //! covering text / audio / video / image / tool / state / control planes).
 //!
 //! ```text
@@ -500,7 +500,7 @@ fn print_usage() {
     println!("  multi-rr    15 streams fired together, wait all echoes. Requires server echo.");
     println!("  pipeline    N batches in-flight (--pipeline-depth). Requires server echo.");
     println!();
-    println!("Workload covers all 22 MessageType variants:");
+    println!("Workload covers all 25 MessageType variants:");
     println!("  TextToken(0x01)   → Text / content payload");
     println!("  AudioFrame(0x02)  → Audio media chunk");
     println!("  VideoFrame(0x03)  → Video media chunk");
