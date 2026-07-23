@@ -1271,6 +1271,7 @@ dependencies = [
  "connection-shard",
  "criterion",
  "profiler",
+ "rustc-hash",
  "stream-manager",
  "thiserror 2.0.18",
  "tracing",
