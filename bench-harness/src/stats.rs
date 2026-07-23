@@ -7,6 +7,7 @@
 
 use std::time::Duration;
 
+use crate::conn_state::Role;
 use crate::workload::WorkloadEntry;
 
 /// What one worker thread reports back.
@@ -39,6 +40,10 @@ pub struct WorkerResult {
     pub handshake_time: Duration,
     /// Set when the worker failed.
     pub error: Option<String>,
+    /// Role in `BenchMode::Group` (`None` for the legacy four modes).
+    /// Set by `ConnState::into_result`; consumed by `aggregate` to split
+    /// group throughput into publisher tx vs member rx.
+    pub role: Option<Role>,
 }
 
 impl WorkerResult {
@@ -74,6 +79,7 @@ impl WorkerResult {
             read_syscalls,
             handshake_time,
             error: None,
+            role: None,
         }
     }
 
@@ -93,6 +99,7 @@ impl WorkerResult {
             read_syscalls: 0,
             handshake_time,
             error: Some(msg),
+            role: None,
         }
     }
 
@@ -154,6 +161,23 @@ pub struct Summary {
     pub rss_kib: u64,
     /// Peak RSS (KiB) per successful connection.
     pub rss_per_conn_kib: f64,
+
+    // ── Group (P5) breakdown ────────────────────────────────────────
+    /// True when the run used `BenchMode::Group` (role-tagged results).
+    /// When false, the `group_*` fields below are zero/empty.
+    pub is_group: bool,
+    /// Number of publisher connections that reported ok.
+    pub group_publishers: usize,
+    /// Number of member connections that reported ok.
+    pub group_members: usize,
+    /// Publisher Publish frames/sec (Σ publisher `frames_sent` / duration).
+    pub group_publishes_per_sec: f64,
+    /// Member delivery frames/sec (Σ member `frames_recv` / duration).
+    /// In steady-state round-robin this equals `group_publishes_per_sec`.
+    pub group_deliveries_per_sec: f64,
+    /// Per-member `frames_recv` counts (sorted ascending) for fairness
+    /// reporting (min / avg / max). Tight spread ⇒ round-robin is fair.
+    pub group_member_rx: Vec<u64>,
 }
 
 /// Merges per-worker results into a [`Summary`].
@@ -216,6 +240,36 @@ pub fn aggregate(
     let mut hs: Vec<Duration> = results.iter().map(|r| r.handshake_time).collect();
     hs.sort_unstable();
 
+    // P5 group breakdown: split results by role. Only present when at
+    // least one result carries a role (i.e. BenchMode::Group).
+    let is_group = results.iter().any(|r| r.role.is_some());
+    let group_publishers = results
+        .iter()
+        .filter(|r| r.role == Some(Role::Publisher))
+        .count();
+    let group_members = results
+        .iter()
+        .filter(|r| r.role == Some(Role::Member))
+        .count();
+    let group_pub_frames: u64 = results
+        .iter()
+        .filter(|r| r.error.is_none() && r.role == Some(Role::Publisher))
+        .map(|r| r.frames_sent)
+        .sum();
+    let group_deliveries: u64 = results
+        .iter()
+        .filter(|r| r.error.is_none() && r.role == Some(Role::Member))
+        .map(|r| r.frames_recv)
+        .sum();
+    let mut group_member_rx: Vec<u64> = results
+        .iter()
+        .filter(|r| r.error.is_none() && r.role == Some(Role::Member))
+        .map(|r| r.frames_recv)
+        .collect();
+    group_member_rx.sort_unstable();
+    let group_publishes_per_sec = group_pub_frames as f64 / secs;
+    let group_deliveries_per_sec = group_deliveries as f64 / secs;
+
     Summary {
         target: target.to_string(),
         mode_label,
@@ -255,6 +309,12 @@ pub fn aggregate(
         cpu_per_gibps: 0.0,
         rss_kib: 0,
         rss_per_conn_kib: 0.0,
+        is_group,
+        group_publishers,
+        group_members,
+        group_publishes_per_sec,
+        group_deliveries_per_sec,
+        group_member_rx,
     }
 }
 
@@ -505,6 +565,37 @@ pub fn print_summary(s: &Summary) {
     println!("resource efficiency:");
     print_resource_stats(s);
     println!();
+
+    if s.is_group {
+        println!("group (P5) throughput:");
+        println!(
+            "  publishers          {:>10}  (connections)",
+            s.group_publishers
+        );
+        println!(
+            "  members             {:>10}  (connections, round-robin)",
+            s.group_members
+        );
+        println!(
+            "  publishes/sec       {:>10.1}  (publisher -> server)",
+            s.group_publishes_per_sec
+        );
+        println!(
+            "  deliveries/sec      {:>10.1}  (server -> members)",
+            s.group_deliveries_per_sec
+        );
+        if !s.group_member_rx.is_empty() {
+            let mn = *s.group_member_rx.first().unwrap_or(&0);
+            let mx = *s.group_member_rx.last().unwrap_or(&0);
+            let sum: u64 = s.group_member_rx.iter().sum();
+            let avg = sum as f64 / s.group_member_rx.len() as f64;
+            println!(
+                "  member fairness     {:>10} / {:>.0} / {}  (min / avg / max rx)",
+                mn, avg, mx
+            );
+        }
+        println!();
+    }
 
     println!("workload breakdown (per request):");
     println!(
