@@ -54,12 +54,19 @@ impl QuicServer {
         // Single-worker mode: create a dummy mesh (never used — no other
         // workers to forward to or receive from).
         let (dummy_tx, dummy_rx) = std::sync::mpsc::sync_channel::<quic_engine::ForwardedPacket>(1);
+
+        // P6: launch cluster transport if configured.
+        let cluster_handle = self
+            .launch_cluster_transport(1)?
+            .and_then(|mut h| h.pop());
+
         let worker = Worker::create(
             &self.config,
             0,
             1,
             dummy_rx,
             vec![dummy_tx],
+            cluster_handle,
             shutdown_requested.clone(),
         )?;
         install_signal_handler(shutdown_requested)?;
@@ -77,6 +84,12 @@ impl QuicServer {
         // One shared shutdown flag for all workers + signal handler.
         let shutdown_requested = Arc::new(AtomicBool::new(false));
 
+        // P6: launch cluster transport if configured. Returns one
+        // ClusterWorkerHandle per worker (in core_id order).
+        let mut cluster_handles = self
+            .launch_cluster_transport(num_workers)?
+            .map(std::collections::VecDeque::from);
+
         // Build the inter-worker forwarding mesh. Each worker gets one
         // inbox receiver + the shared sender vector. The mesh provides a
         // migration safety net: when eBPF REUSEPORT steering is
@@ -90,12 +103,15 @@ impl QuicServer {
 
         for (core_id, (inbox_rx, outboxes)) in mesh_channels.into_iter().enumerate() {
             let core_id = core_id as u32;
+            // Pop the next cluster handle in order (core_id matches).
+            let cluster_handle = cluster_handles.as_mut().and_then(|q| q.pop_front());
             let (handle, stop_rx) = Worker::spawn(
                 self.config.clone(),
                 core_id,
                 num_workers as u32,
                 inbox_rx,
                 outboxes,
+                cluster_handle,
                 shutdown_requested.clone(),
             )?;
             handles.push(handle);
@@ -186,6 +202,36 @@ impl QuicServer {
         tracing::info!("session cluster services initialized");
 
         self.run_multi()
+    }
+
+    // ── P6: cluster transport launch helper ────────────────────────
+
+    /// Launches the cluster transport thread if `config.cluster` is
+    /// set, returning one [`ClusterWorkerHandle`] per worker. Returns
+    /// `None` in single-node mode.
+    ///
+    /// # Errors
+    /// Returns [`ServerError::Config`] if the transport thread cannot
+    /// bind its UDP socket or spawn.
+    fn launch_cluster_transport(
+        &self,
+        num_workers: usize,
+    ) -> Result<Option<Vec<crate::cluster::ClusterWorkerHandle>>, ServerError> {
+        let Some(cfg) = self.config.cluster.as_ref() else {
+            return Ok(None);
+        };
+        tracing::info!(
+            self_id = cfg.cluster_cfg.self_id.raw(),
+            peers = cfg.peer_addrs.len(),
+            workers = num_workers,
+            "starting cluster transport"
+        );
+        let (handles, _join) = crate::cluster::launch_cluster(cfg, num_workers)
+            .map_err(|e| ServerError::Config(format!("cluster transport: {e}")))?;
+        // NOTE: `_join` is intentionally dropped here — the transport
+        // thread exits naturally when all worker senders drop. A future
+        // enhancement could join it at shutdown for a clean exit.
+        Ok(Some(handles))
     }
 }
 

@@ -87,6 +87,21 @@ pub struct Cli {
     /// error ack).
     #[arg(long)]
     pub wal_root: Option<String>,
+
+    /// Cluster self node id (P6). When set, the server joins a
+    /// multi-node cluster and routes publishes to the owning node via
+    /// UDP-based inter-node transport. Must be >0; must also appear in
+    /// `--cluster-peers`.
+    #[arg(long)]
+    pub cluster_node_id: Option<u32>,
+
+    /// Cluster peer list, formatted as
+    /// `"id=host:port,id=host:port,..."`. Every node in the cluster
+    /// (including self) must be listed. Example:
+    /// `--cluster-peers "1=10.0.0.1:4433,2=10.0.0.2:4433,3=10.0.0.3:4433"`.
+    /// Requires `--cluster-node-id`.
+    #[arg(long)]
+    pub cluster_peers: Option<String>,
 }
 
 /// CLI worker-mode selector.

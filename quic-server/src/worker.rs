@@ -12,6 +12,7 @@ use std::thread;
 use io::Reactor;
 use quic_engine::{ForwardMesh, ForwardedPacket, QuicEngineBuilder, QuicPreset};
 
+use crate::cluster::ClusterWorkerHandle;
 use crate::config::ServerConfig;
 use crate::error::ServerError;
 use crate::stack::VireonStack;
@@ -38,6 +39,7 @@ impl Worker {
         num_workers: u32,
         inbox_rx: mpsc::Receiver<ForwardedPacket>,
         outboxes: Vec<mpsc::SyncSender<ForwardedPacket>>,
+        cluster_handle: Option<ClusterWorkerHandle>,
         shutdown_requested: Arc<AtomicBool>,
     ) -> Result<Self, ServerError> {
         tracing::info!(core_id, port = config.port, "initializing reactor");
@@ -100,12 +102,20 @@ impl Worker {
             .build()
             .map_err(|e| ServerError::EngineInit(format!("{e:?}")))?;
 
+        let cluster = cluster_handle.and_then(|h| {
+            config
+                .cluster
+                .as_ref()
+                .map(|cfg| (&cfg.cluster_cfg, h))
+        });
+
         let handler = VireonStack::new(
             engine,
             core_id,
             config.echo,
             config.acl_table.clone(),
             config.wal_root.as_deref(),
+            cluster,
             shutdown_requested,
         )?;
 
@@ -162,6 +172,7 @@ impl Worker {
         num_workers: u32,
         inbox_rx: mpsc::Receiver<ForwardedPacket>,
         outboxes: Vec<mpsc::SyncSender<ForwardedPacket>>,
+        cluster_handle: Option<ClusterWorkerHandle>,
         shutdown_requested: Arc<AtomicBool>,
     ) -> Result<
         (
@@ -180,6 +191,7 @@ impl Worker {
                     num_workers,
                     inbox_rx,
                     outboxes,
+                    cluster_handle,
                     shutdown_requested,
                 ) {
                     Ok(w) => w,

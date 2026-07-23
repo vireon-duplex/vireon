@@ -58,6 +58,7 @@ observability-sdk = { path = "../application-layer/observability-sdk" }
 resource-quotas = { path = "../application-layer/resource-quotas" }
 wal-store = { path = "../application-layer/wal-store" }
 consumer-groups = { path = "../application-layer/consumer-groups" }
+cluster-coordinator = { path = "../application-layer/cluster-coordinator" }
 
 # QUIC protocol
 quiche = { workspace = true }
