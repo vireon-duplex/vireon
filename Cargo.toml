@@ -51,7 +51,7 @@ debug = "line-tables-only"
 strip = false
 
 [workspace]
-members = ["io-layer/io","runtime-layer/buffer-pool", "runtime-layer/timer-wheel","message-layer/frame", "runtime-layer/send-queue", "runtime-layer/task-queue", "runtime-layer/cqe-processor", "kernel-layer/kernel-nic", "runtime-layer/connection-shard", "transport-layer/quic-engine", "runtime-layer/reactor", "stream-layer/stream-manager", "stream-layer/stream-scheduler", "stream-layer/delivery-policy", "stream-layer/send-policy", "session-layer/session-manager", "session-layer/session-registry", "session-layer/session-router", "session-layer/session-migration-manager", "session-layer/session-replication-service", "application-layer/auth-framework", "application-layer/observability-sdk", "application-layer/resource-quotas", "application-layer/pubsub-engine", "application-layer/wal-store", "application-layer/consumer-groups", "application-layer/cluster-coordinator", "application-layer/topic-acl", "application-layer/observability-exporters", "quic-server", "quic-client", "bench-harness", "profiler/macro", "profiler/runtime"]
+members = ["io-layer/io","runtime-layer/buffer-pool", "runtime-layer/timer-wheel","message-layer/frame", "runtime-layer/send-queue", "runtime-layer/task-queue", "runtime-layer/cqe-processor", "kernel-layer/kernel-nic", "runtime-layer/connection-shard", "transport-layer/quic-engine", "runtime-layer/reactor", "stream-layer/stream-manager", "stream-layer/stream-scheduler", "stream-layer/delivery-policy", "stream-layer/send-policy", "session-layer/session-manager", "session-layer/session-registry", "session-layer/session-router", "session-layer/session-migration-manager", "session-layer/session-replication-service", "application-layer/auth-framework", "application-layer/observability-sdk", "application-layer/resource-quotas", "application-layer/pubsub-engine", "application-layer/wal-store", "application-layer/consumer-groups", "application-layer/cluster-coordinator", "application-layer/topic-acl", "application-layer/observability-exporters", "quic-server", "quic-client", "bench-harness", "client-sdk", "profiler/macro", "profiler/runtime"]
 resolver = "2"
 exclude = ["stream-layer/delivery-policy/fuzz"]
 
@@ -73,6 +73,9 @@ dotenv = "0.15.0"
 quiche  = "0.22"
 libc    = "0.2"
 socket2 = { version = "0.5", features = ["all"] }
+
+# Async runtime for the client SDK (the server keeps its io_uring reactor).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 
 # Fast hashing for hot-path HashMaps (FxHash — no DoS resistance needed,
 # thread-per-core with no untrusted keys).
