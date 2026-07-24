@@ -124,11 +124,7 @@ impl SessionTable {
         // Pre-allocate the slab with Free slots linked into a free-list.
         let mut slab: Vec<Slot> = Vec::with_capacity(capacity as usize);
         for i in 0..capacity {
-            let next_free = if i + 1 < capacity {
-                Some(i + 1)
-            } else {
-                None
-            };
+            let next_free = if i + 1 < capacity { Some(i + 1) } else { None };
             slab.push(Slot::Free {
                 generation: 1,
                 next_free,
@@ -223,7 +219,10 @@ impl SessionTable {
             _ => return Err(SessionManagerError::ResourceExhausted("slot not free")),
         };
 
-        self.slab[slot_idx as usize] = Slot::Occupied { session, generation };
+        self.slab[slot_idx as usize] = Slot::Occupied {
+            session,
+            generation,
+        };
         let handle = SlotHandle {
             slot: slot_idx,
             generation,
@@ -295,7 +294,10 @@ impl SessionTable {
     /// Returns [`SessionManagerError::SessionNotFound`] if no session
     /// with the given id exists.
     pub fn remove(&mut self, id: SessionId) -> Result<Session, SessionManagerError> {
-        let handle = self.index.remove(&id).ok_or(SessionManagerError::SessionNotFound(id))?;
+        let handle = self
+            .index
+            .remove(&id)
+            .ok_or(SessionManagerError::SessionNotFound(id))?;
         let slot_idx = handle.slot;
 
         // Bump generation BEFORE stamping so the next occupant of this
@@ -470,11 +472,7 @@ mod tests {
     use crate::priority::SessionClass;
 
     fn make_session(hi: u64) -> Session {
-        Session::new(
-            SessionId::from_pair(hi, hi * 2),
-            SessionClass::default(),
-            0,
-        )
+        Session::new(SessionId::from_pair(hi, hi * 2), SessionClass::default(), 0)
     }
 
     // ── Basic predicates ─────────────────────────────────────────

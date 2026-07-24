@@ -128,16 +128,12 @@ fn bench_wal_replay(c: &mut Criterion) {
         let from = n.saturating_sub(10);
         let payload = encode_fetch("sensor.temp", from, 10);
         let fref = fetch_fref(&payload);
-        group.bench_with_input(
-            BenchmarkId::new("replay_tail_catchup", n),
-            &n,
-            |b, &_| {
-                b.iter(|| {
-                    d.handle_fetch(&ctx(2, 300), &fref);
-                    let _ = d.drain_outbox();
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("replay_tail_catchup", n), &n, |b, &_| {
+            b.iter(|| {
+                d.handle_fetch(&ctx(2, 300), &fref);
+                let _ = d.drain_outbox();
+            });
+        });
     }
 
     // ── publish_append_cost ───────────────────────────────────────
@@ -266,42 +262,38 @@ fn bench_group_fanout(c: &mut Criterion) {
     // Per-join cost vs current membership size M. Setup pre-joins M
     // consumers (not measured); the measured closure joins one more.
     for &m in &[0usize, 8, 32, 128] {
-        group.bench_with_input(
-            BenchmarkId::new("join_cost", m),
-            &m,
-            |b, &m| {
-                b.iter_batched(
-                    || {
-                        let mut d = VireonDispatcher::new();
-                        for i in 0..m {
-                            join_consumer(
-                                &mut d,
-                                i + 1,
-                                100 + i as u64,
-                                topic_str,
-                                group_name,
-                                &format!("c{i}"),
-                                4,
-                            );
-                        }
-                        d
-                    },
-                    |mut d| {
+        group.bench_with_input(BenchmarkId::new("join_cost", m), &m, |b, &m| {
+            b.iter_batched(
+                || {
+                    let mut d = VireonDispatcher::new();
+                    for i in 0..m {
                         join_consumer(
                             &mut d,
-                            m + 1,
-                            100 + m as u64,
+                            i + 1,
+                            100 + i as u64,
                             topic_str,
                             group_name,
-                            "probe",
+                            &format!("c{i}"),
                             4,
                         );
-                        black_box(d.drain_outbox());
-                    },
-                    BatchSize::SmallInput,
-                );
-            },
-        );
+                    }
+                    d
+                },
+                |mut d| {
+                    join_consumer(
+                        &mut d,
+                        m + 1,
+                        100 + m as u64,
+                        topic_str,
+                        group_name,
+                        "probe",
+                        4,
+                    );
+                    black_box(d.drain_outbox());
+                },
+                BatchSize::SmallInput,
+            );
+        });
     }
 
     group.finish();
@@ -331,10 +323,7 @@ fn dummy_cluster_cfg(k: u32) -> cluster_coordinator::ClusterConfig {
 /// the requested decision (Own vs Forward). Used to pick a stable
 /// representative topic for each bench path; the ring is deterministic
 /// so the first hit is stable across runs.
-fn find_topic(
-    coord: &cluster_coordinator::ClusterCoordinator,
-    want_forward: bool,
-) -> String {
+fn find_topic(coord: &cluster_coordinator::ClusterCoordinator, want_forward: bool) -> String {
     for i in 0..2000u32 {
         let t = format!("topic.{i}");
         let forward = match coord.route_publish(&t) {
@@ -366,20 +355,12 @@ fn bench_cluster_routing(c: &mut Criterion) {
         let own_topic = find_topic(&coord, false);
         let fwd_topic = find_topic(&coord, true);
 
-        group.bench_with_input(
-            BenchmarkId::new("route_publish_own", k),
-            &k,
-            |b, &_| {
-                b.iter(|| black_box(coord.route_publish(&own_topic)));
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("route_publish_forward", k),
-            &k,
-            |b, &_| {
-                b.iter(|| black_box(coord.route_publish(&fwd_topic)));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("route_publish_own", k), &k, |b, &_| {
+            b.iter(|| black_box(coord.route_publish(&own_topic)));
+        });
+        group.bench_with_input(BenchmarkId::new("route_publish_forward", k), &k, |b, &_| {
+            b.iter(|| black_box(coord.route_publish(&fwd_topic)));
+        });
     }
 
     // ── forward_path_integration ─────────────────────────────────

@@ -102,12 +102,8 @@ impl Worker {
             .build()
             .map_err(|e| ServerError::EngineInit(format!("{e:?}")))?;
 
-        let cluster = cluster_handle.and_then(|h| {
-            config
-                .cluster
-                .as_ref()
-                .map(|cfg| (&cfg.cluster_cfg, h))
-        });
+        let cluster =
+            cluster_handle.and_then(|h| config.cluster.as_ref().map(|cfg| (&cfg.cluster_cfg, h)));
 
         let handler = VireonStack::new(
             engine,

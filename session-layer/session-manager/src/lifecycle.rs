@@ -149,8 +149,14 @@ mod tests {
     #[test]
     fn activate_idempotent_on_active() {
         let l = SessionLifecycle::new();
-        assert_eq!(l.activate(SessionState::Active).unwrap(), SessionState::Active);
-        assert_eq!(l.activate(SessionState::Idle).unwrap(), SessionState::Active);
+        assert_eq!(
+            l.activate(SessionState::Active).unwrap(),
+            SessionState::Active
+        );
+        assert_eq!(
+            l.activate(SessionState::Idle).unwrap(),
+            SessionState::Active
+        );
     }
 
     #[test]
@@ -162,15 +168,24 @@ mod tests {
     #[test]
     fn drain_from_active() {
         let l = SessionLifecycle::new();
-        assert_eq!(l.drain(SessionState::Active).unwrap(), SessionState::Draining);
+        assert_eq!(
+            l.drain(SessionState::Active).unwrap(),
+            SessionState::Draining
+        );
         assert_eq!(l.drain(SessionState::Idle).unwrap(), SessionState::Draining);
-        assert_eq!(l.drain(SessionState::Migrating).unwrap(), SessionState::Draining);
+        assert_eq!(
+            l.drain(SessionState::Migrating).unwrap(),
+            SessionState::Draining
+        );
     }
 
     #[test]
     fn drain_idempotent() {
         let l = SessionLifecycle::new();
-        assert_eq!(l.drain(SessionState::Draining).unwrap(), SessionState::Draining);
+        assert_eq!(
+            l.drain(SessionState::Draining).unwrap(),
+            SessionState::Draining
+        );
     }
 
     #[test]
@@ -183,9 +198,18 @@ mod tests {
     #[test]
     fn destroy_from_any_non_terminal() {
         let l = SessionLifecycle::new();
-        assert_eq!(l.destroy(SessionState::Active).unwrap(), SessionState::Destroyed);
-        assert_eq!(l.destroy(SessionState::Draining).unwrap(), SessionState::Destroyed);
-        assert_eq!(l.destroy(SessionState::Closed).unwrap(), SessionState::Destroyed);
+        assert_eq!(
+            l.destroy(SessionState::Active).unwrap(),
+            SessionState::Destroyed
+        );
+        assert_eq!(
+            l.destroy(SessionState::Draining).unwrap(),
+            SessionState::Destroyed
+        );
+        assert_eq!(
+            l.destroy(SessionState::Closed).unwrap(),
+            SessionState::Destroyed
+        );
     }
 
     #[test]
@@ -197,8 +221,14 @@ mod tests {
     #[test]
     fn migrate_from_active() {
         let l = SessionLifecycle::new();
-        assert_eq!(l.migrate(SessionState::Active).unwrap(), SessionState::Migrating);
-        assert_eq!(l.migrate(SessionState::Idle).unwrap(), SessionState::Migrating);
+        assert_eq!(
+            l.migrate(SessionState::Active).unwrap(),
+            SessionState::Migrating
+        );
+        assert_eq!(
+            l.migrate(SessionState::Idle).unwrap(),
+            SessionState::Migrating
+        );
     }
 
     #[test]

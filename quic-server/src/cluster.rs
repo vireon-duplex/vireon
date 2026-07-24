@@ -38,9 +38,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::mpsc;
 use std::thread;
 
-use cluster_coordinator::{
-    ClusterConfig, ClusterCoordinator, ClusterError, InterNodeMessage,
-};
+use cluster_coordinator::{ClusterConfig, ClusterCoordinator, ClusterError, InterNodeMessage};
 use rustc_hash::FxHashMap;
 use session_registry::NodeId;
 use session_registry::node::{NodeAddress, NodeInfo, NodeState, Region, Zone};
@@ -531,12 +529,7 @@ mod tests {
         let h2rx = h2.remove(0);
 
         // Node 1 sends a Subscribe to node 2.
-        let msg = InterNodeMessage::subscribe(
-            NodeId::new(1),
-            42,
-            100,
-            "sensor.*".into(),
-        );
+        let msg = InterNodeMessage::subscribe(NodeId::new(1), 42, 100, "sensor.*".into());
         h1rx.outgoing_tx
             .send(OutgoingMsg {
                 msg: msg.clone(),
@@ -545,14 +538,18 @@ mod tests {
             .unwrap();
 
         // Node 2's worker should receive it.
-        let got = h2rx.incoming_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let got = h2rx
+            .incoming_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
         assert_eq!(got, msg);
 
         // Node 1 should NOT receive its own message (transport doesn't
         // broadcast back to self).
-        assert!(h1rx
-            .incoming_rx
-            .recv_timeout(std::time::Duration::from_millis(100))
-            .is_err());
+        assert!(
+            h1rx.incoming_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
     }
 }

@@ -7,9 +7,7 @@
 
 use bytes::Bytes;
 use frame::header::{FrameFlags, MessageType, Seq, StreamId};
-use send_policy::{
-    DequeueOutcome, DeliveryPolicy, EnqueueDecision, FramePayload, SendPolicyTable,
-};
+use send_policy::{DeliveryPolicy, DequeueOutcome, EnqueueDecision, FramePayload, SendPolicyTable};
 
 // ── helpers ─────────────────────────────────────────────────────
 
@@ -107,8 +105,7 @@ fn full_lifecycle_bind_enqueue_drain_remove() {
     let mut t = SendPolicyTable::new();
 
     let stream = StreamId::new(7);
-    t.bind(0, stream, DeliveryPolicy::ReliableOrdered)
-        .unwrap();
+    t.bind(0, stream, DeliveryPolicy::ReliableOrdered).unwrap();
 
     // Enqueue 10 frames.
     for i in 0..10u64 {
@@ -124,18 +121,12 @@ fn full_lifecycle_bind_enqueue_drain_remove() {
     }
 
     // Queue should now be empty.
-    assert!(matches!(
-        t.dequeue(0, stream),
-        DequeueOutcome::Empty
-    ));
+    assert!(matches!(t.dequeue(0, stream), DequeueOutcome::Empty));
 
     // Remove the stream.
     t.remove_stream(0, stream);
     assert!(!t.contains(0, stream));
-    assert!(matches!(
-        t.dequeue(0, stream),
-        DequeueOutcome::Unknown
-    ));
+    assert!(matches!(t.dequeue(0, stream), DequeueOutcome::Unknown));
     assert_eq!(t.len(), 0);
 }
 
@@ -151,9 +142,7 @@ fn lazy_default_then_upgrade_to_latest_only() {
     let _ = t.enqueue(0, stream, payload(1, 2));
 
     // Upgrade to LatestOnly — old FIFO frames must be drained out.
-    let drained = t
-        .bind(0, stream, DeliveryPolicy::LatestOnly)
-        .unwrap();
+    let drained = t.bind(0, stream, DeliveryPolicy::LatestOnly).unwrap();
     assert_eq!(drained.len(), 2);
     assert_eq!(drained[0].bytes.as_ref(), &[1]);
     assert_eq!(drained[1].bytes.as_ref(), &[2]);

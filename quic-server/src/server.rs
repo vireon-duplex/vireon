@@ -56,9 +56,7 @@ impl QuicServer {
         let (dummy_tx, dummy_rx) = std::sync::mpsc::sync_channel::<quic_engine::ForwardedPacket>(1);
 
         // P6: launch cluster transport if configured.
-        let cluster_handle = self
-            .launch_cluster_transport(1)?
-            .and_then(|mut h| h.pop());
+        let cluster_handle = self.launch_cluster_transport(1)?.and_then(|mut h| h.pop());
 
         let worker = Worker::create(
             &self.config,
