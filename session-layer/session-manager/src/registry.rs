@@ -114,11 +114,7 @@ mod tests {
     use crate::priority::SessionClass;
 
     fn make_session(hi: u64) -> Session {
-        Session::new(
-            SessionId::from_pair(hi, hi * 2),
-            SessionClass::default(),
-            0,
-        )
+        Session::new(SessionId::from_pair(hi, hi * 2), SessionClass::default(), 0)
     }
 
     #[test]

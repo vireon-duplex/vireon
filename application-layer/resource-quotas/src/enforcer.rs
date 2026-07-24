@@ -76,11 +76,7 @@ impl QuotaEnforcer {
     // ── Pass-through methods (delegate to QuotaManager) ────────────
 
     /// Register a new tenant. See [`QuotaManager::register_tenant`].
-    pub fn register_tenant(
-        &mut self,
-        id: TenantId,
-        tier: TenantTier,
-    ) -> Result<(), QuotaError> {
+    pub fn register_tenant(&mut self, id: TenantId, tier: TenantTier) -> Result<(), QuotaError> {
         self.manager.register_tenant(id, tier)
     }
 
@@ -163,10 +159,7 @@ mod tests {
     fn enforce_bandwidth_records_bytes_for_registered_tenant() {
         let mut e = enforcer_with_tenant(1, TenantTier::Pro);
         assert!(e.enforce_bandwidth(TenantId::new(1), 1_000_000).is_ok());
-        assert_eq!(
-            e.manager().bytes_used(TenantId::new(1)),
-            1_000_000
-        );
+        assert_eq!(e.manager().bytes_used(TenantId::new(1)), 1_000_000);
     }
 
     #[test]

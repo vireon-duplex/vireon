@@ -249,7 +249,7 @@ impl SessionManager {
             Err(_) => self.lifecycle.destroy(state)?,
         };
         let _ = target; // state is applied conceptually; the session
-                        // is about to be unregistered anyway.
+        // is about to be unregistered anyway.
 
         self.registry.unregister(id)?;
 
@@ -392,7 +392,10 @@ mod tests {
         // Creating → Authenticating
         m.activate_session(id).unwrap();
         let handle = m.lookup(id).unwrap();
-        assert_eq!(m.get_session(handle).unwrap().state, crate::state::SessionState::Authenticating);
+        assert_eq!(
+            m.get_session(handle).unwrap().state,
+            crate::state::SessionState::Authenticating
+        );
         // Authenticating → Ready
         m.activate_session(id).unwrap();
         // Ready → Active
@@ -411,7 +414,10 @@ mod tests {
         }
         m.migrate_session(id).unwrap();
         let handle = m.lookup(id).unwrap();
-        assert_eq!(m.get_session(handle).unwrap().state, crate::state::SessionState::Migrating);
+        assert_eq!(
+            m.get_session(handle).unwrap().state,
+            crate::state::SessionState::Migrating
+        );
     }
 
     #[test]

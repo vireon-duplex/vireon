@@ -73,11 +73,7 @@ impl SessionRouter {
     /// # Errors
     /// Returns [`SessionManagerError::ResourceExhausted`] if a route
     /// for this id is already bound.
-    pub fn bind(
-        &mut self,
-        id: SessionId,
-        info: RouteInfo,
-    ) -> Result<(), SessionManagerError> {
+    pub fn bind(&mut self, id: SessionId, info: RouteInfo) -> Result<(), SessionManagerError> {
         if self.affinity.contains_key(&id) {
             return Err(SessionManagerError::ResourceExhausted(
                 "route already bound for this session id",

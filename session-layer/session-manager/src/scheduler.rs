@@ -125,10 +125,7 @@ impl SessionScheduler {
     /// caller translates `Rejected` into an error. The method itself
     /// returns `Ok(AdmissionDecision)` so the caller can choose to
     /// queue rather than reject.
-    pub fn admit(
-        &mut self,
-        class: SessionClass,
-    ) -> Result<AdmissionDecision, SessionManagerError> {
+    pub fn admit(&mut self, class: SessionClass) -> Result<AdmissionDecision, SessionManagerError> {
         let idx = class as usize;
         let count = self.class_counts[idx];
         if count >= self.class_limits[idx] {
@@ -185,7 +182,11 @@ mod tests {
         let d = s.admit(SessionClass::Interactive).unwrap();
         assert!(matches!(d, AdmissionDecision::Admitted { .. }));
         assert_eq!(s.active_for_class(SessionClass::Interactive), 1);
-        assert_eq!(s.class_stats(SessionClass::Interactive as usize).admitted_total, 1);
+        assert_eq!(
+            s.class_stats(SessionClass::Interactive as usize)
+                .admitted_total,
+            1
+        );
     }
 
     #[test]
@@ -204,7 +205,10 @@ mod tests {
         s.set_class_limit(SessionClass::Bulk, 2);
         assert!(s.admit(SessionClass::Bulk).unwrap().is_admitted());
         assert!(s.admit(SessionClass::Bulk).unwrap().is_admitted());
-        assert_eq!(s.admit(SessionClass::Bulk).unwrap(), AdmissionDecision::Rejected);
+        assert_eq!(
+            s.admit(SessionClass::Bulk).unwrap(),
+            AdmissionDecision::Rejected
+        );
         assert_eq!(s.class_stats(SessionClass::Bulk as usize).rejected_total, 1);
     }
 
@@ -221,7 +225,10 @@ mod tests {
         for _ in 0..3 {
             assert!(s.admit(SessionClass::Interactive).unwrap().is_admitted());
         }
-        assert_eq!(s.admit(SessionClass::Interactive).unwrap(), AdmissionDecision::Rejected);
+        assert_eq!(
+            s.admit(SessionClass::Interactive).unwrap(),
+            AdmissionDecision::Rejected
+        );
     }
 
     #[test]
