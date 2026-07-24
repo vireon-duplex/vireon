@@ -292,20 +292,8 @@ impl QuicEngine {
             connections: Vec::new(),
             free_slots: Vec::new(),
             dcid_to_idx: CrcHashMap::default(),
-            pkt_buf: {
-                // SAFETY: u8 has no destructor. The buffer is always written
-                // via copy_from_slice before any read (see process_datagram).
-                let mut v = Vec::<u8>::with_capacity(65535);
-                unsafe { v.set_len(65535) };
-                v
-            },
-            out_buf: {
-                // SAFETY: u8 has no destructor. quiche::Connection::send
-                // writes into this buffer before the caller reads [..len].
-                let mut v = Vec::<u8>::with_capacity(MAX_PKT_SIZE);
-                unsafe { v.set_len(MAX_PKT_SIZE) };
-                v
-            },
+            pkt_buf: vec![0u8; 65535],
+            out_buf: vec![0u8; MAX_PKT_SIZE],
             readable_buf: Vec::with_capacity(16),
             closed_buf: Vec::with_capacity(16),
             flushed_this_tick: Vec::with_capacity(64),

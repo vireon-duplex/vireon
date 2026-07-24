@@ -1,13 +1,16 @@
 //! Realistic per-`MessageType` workload generator.
 //!
-//! Builds one workload containing all 15 frame types — each with a payload
+//! Builds one workload containing all 20 frame types — each with a payload
 //! whose size and shape match what a real Vireon client would send. Unlike
 //! the previous design, payloads are stored **raw** (not pre-encoded); the
 //! layer stack encodes them at send time via `ClientStack::encode_frame_coalesced`.
 //!
 //! ## Target batch size: ~1 MiB
 
-use frame::header::{ALL_MESSAGE_TYPES, FrameFlags, MessageType};
+use frame::header::{ALL_MESSAGE_TYPES, FrameFlags, MessageType, Version};
+use frame::payload::{Handshake, ParsedPayload, encode_payload};
+
+use crate::conn_state::STREAM_ID_COUNT;
 
 /// Per-type metadata, surfaced in the summary table so the operator can verify
 /// the realistic workload at a glance.
@@ -23,7 +26,7 @@ pub struct WorkloadEntry {
     pub flags: FrameFlags,
     /// Raw payload bytes (encoded at send time by the layer stack).
     pub payload: Vec<u8>,
-    /// Logical stream index (0..14) — mapped to QUIC stream `i * 4`.
+    /// Logical stream index (0..19) — mapped to QUIC stream `i * 4`.
     pub logical_stream: u64,
 }
 
@@ -41,7 +44,7 @@ pub struct Workload {
     pub entries: Box<[WorkloadEntry]>,
     /// Sum of every payload length (no headers) — for the summary.
     pub total_payload_bytes: usize,
-    /// Total wire bytes for one un-coalesced batch (all 15 frames × 1 copy).
+    /// Total wire bytes for one un-coalesced batch (all 20 frames × 1 copy).
     pub batch_wire_bytes: usize,
     /// How many consecutive copies of each frame to coalesce per stream_send.
     /// The full workload uses [`COALESCE`] (32); latency sweeps use 1 to avoid
@@ -74,10 +77,97 @@ pub fn build_fixed_size(payload_bytes: usize) -> anyhow::Result<Workload> {
     })
 }
 
-/// Builds the full 15-frame workload.
+/// Topic + group used by the `--mode group` consumer-group scenario.
+/// Kept as a `pub const` so `conn_state` can build matching Publish +
+/// ConsumerGroupJoin payloads without duplicating the strings.
+pub const GROUP_TOPIC: &str = "bench.group";
+/// Consumer-group name all `--mode group` members join.
+pub const GROUP_NAME: &str = "bench";
+/// Partitions declared at join time (the value is advisory for the
+/// current group coordinator — delivery is round-robin regardless).
+pub const GROUP_PARTITIONS: u32 = 4;
+
+/// Topic used by the `--mode broadcast` scenario. Subscribers send a
+/// Subscribe frame matching this exact topic; the publisher streams
+/// Publish frames to it. The server fans each publish out to every
+/// active subscriber (unlike consumer-group round-robin).
+pub const BROADCAST_TOPIC: &str = "bench.broadcast";
+
+/// Number of bytes reserved at the start of a Publish data payload
+/// (after `topic_len + topic`) to carry an embedded `bench_seq: u64 BE`.
+/// This lets the member/subscriber verify per-message delivery order
+/// without relying on the frame-header seq (which the server overwrites).
+pub const BENCH_SEQ_BYTES: usize = 8;
+
+/// Builds the 1-entry workload used for display/logging when running
+/// `--mode group`. The actual group-mode frames (Publish for the
+/// publisher, ConsumerGroupJoin for members) are built inside
+/// `ConnState`, not from this `entries` slice — but `run_benchmark`
+/// and the summary table still reference a `Workload`, so this keeps
+/// the displayed breakdown honest (one Publish entry to `bench.group`)
+/// rather than showing the irrelevant 25-type blend.
 ///
-/// Each `MessageType` gets its own logical `StreamId` (0..14), matching the
-/// "1 user = 15 streams" model: N users produce 15×N logical streams.
+/// Coalesce is 1 so each Publish frame carries a unique embedded
+/// `bench_seq`. Use `--coalesce N` for raw-throughput runs without
+/// verification.
+pub fn build_group() -> anyhow::Result<Workload> {
+    Ok(build_publish_workload(GROUP_TOPIC, 1))
+}
+
+/// Builds the 1-entry workload used for `--mode broadcast`. Same
+/// structure as `build_group` but targets `BROADCAST_TOPIC`. Coalesce
+/// is 1 for per-message seq verification.
+pub fn build_broadcast() -> anyhow::Result<Workload> {
+    Ok(build_publish_workload(BROADCAST_TOPIC, 1))
+}
+
+/// Shared builder for group/broadcast: one Publish entry to `topic`
+/// with `coalesce` copies per stream_send.
+fn build_publish_workload(topic: &str, coalesce: usize) -> Workload {
+    let topic_b = topic.as_bytes();
+    // data = bench_seq(8) + padding to fill ~4 KiB
+    let data_payload = vec![0xE8u8; 4096];
+    let mut payload = Vec::with_capacity(2 + topic_b.len() + data_payload.len());
+    payload.extend_from_slice(&(topic_b.len() as u16).to_be_bytes());
+    payload.extend_from_slice(topic_b);
+    payload.extend_from_slice(&data_payload);
+    let payload_len = payload.len();
+    Workload {
+        entries: vec![WorkloadEntry {
+            msg_type: MessageType::Publish,
+            name: "Publish",
+            payload_len,
+            flags: FrameFlags::NONE,
+            payload,
+            logical_stream: 0,
+        }]
+        .into_boxed_slice(),
+        total_payload_bytes: payload_len,
+        batch_wire_bytes: frame::codec::HEADER_SIZE + payload_len + frame::codec::CRC_SIZE,
+        coalesce,
+    }
+}
+
+/// Builds a Subscribe frame payload for `topic`: `pattern_len:u16 BE |
+/// pattern | qos:u8`. Used by broadcast subscribers to register interest
+/// with the server's `pubsub_registry`.
+pub fn build_subscribe_payload(topic: &str) -> Vec<u8> {
+    let pattern = topic.as_bytes();
+    let mut v = Vec::with_capacity(2 + pattern.len() + 1);
+    v.extend_from_slice(&(pattern.len() as u16).to_be_bytes());
+    v.extend_from_slice(pattern);
+    v.push(0); // qos = 0 (at-most-once)
+    v
+}
+
+/// Builds the full 20-frame workload.
+///
+/// Each `MessageType` is exercised, but they are mapped onto the 15
+/// QUIC stream ids declared in `conn_state::STREAM_IDS` (the bench
+/// architecture's "1 user = 15 streams" model). With 20 message types
+/// and 15 streams, types 15..=19 share a stream id with types 0..=4 —
+/// this is realistic: a single connection multiplexes many frame kinds
+/// across a bounded stream pool.
 pub fn build() -> anyhow::Result<Workload> {
     let mut entries: Vec<WorkloadEntry> = Vec::with_capacity(ALL_MESSAGE_TYPES.len());
     let mut total_payload_bytes = 0usize;
@@ -93,7 +183,9 @@ pub fn build() -> anyhow::Result<Workload> {
             payload_len,
             flags: realistic_flags(mt),
             payload,
-            logical_stream: i as u64,
+            // STREAM_IDS has 15 slots; cycle so types ≥15 share a stream
+            // with an earlier type instead of indexing out of bounds.
+            logical_stream: (i % STREAM_ID_COUNT) as u64,
         });
     }
 
@@ -111,7 +203,7 @@ pub fn build() -> anyhow::Result<Workload> {
 
 /// Returns a realistic payload for `mt`.
 ///
-/// Target: 15 frames total ≈ 1 MiB. Heavy media frames carry the bulk;
+/// Target: 20 frames total ≈ 1 MiB. Heavy media frames carry the bulk;
 /// text/control types are larger-than-typical but still realistic.
 fn realistic_payload(mt: MessageType) -> Vec<u8> {
     match mt {
@@ -233,18 +325,19 @@ fn realistic_payload(mt: MessageType) -> Vec<u8> {
             v
         }
 
-        // 2 KiB handshake with full capabilities list.
-        MessageType::Handshake => {
-            let mut v = Vec::with_capacity(2048);
-            let prefix = br#"{"proto":"vireon","version":"1.0.0","capabilities":["audio","video","tools"],"ext":"#;
-            v.extend_from_slice(prefix);
-            let need = 2048usize.saturating_sub(prefix.len() + 2);
-            let mut tmp = vec![0u8; need];
-            fill_pseudo_text(&mut tmp, 0xD6);
-            v.extend_from_slice(&tmp);
-            v.push(b'}');
-            v
-        }
+        // 21-byte handshake — the real wire format the server decodes:
+        // version(1) + capabilities(4) + principal_id(8) + credential_token(8).
+        // The bench claims principal 42 with a fixed credential token; the
+        // server's `AuthenticationPipeline` will reject it (operator hasn't
+        // registered the principal) but the connection still completes with
+        // the default principal, which is enough to exercise the decode path
+        // and keep the bench compatible with pre-auth deployments.
+        MessageType::Handshake => encode_payload(&ParsedPayload::Handshake(Handshake {
+            version: Version::new(1),
+            capabilities: 0xFFFF_FFFF,
+            principal_id: 42,
+            credential_token: 0xDEAD_BEEF_CAFE_BABE,
+        })),
 
         // 120 KiB video NAL continuation (CABAC residuals).
         MessageType::Fragment => {
@@ -255,6 +348,134 @@ fn realistic_payload(mt: MessageType) -> Vec<u8> {
 
         // 64 bytes — ACK is a control frame.
         MessageType::Ack => br#"{"ack_seq":1042,"highest_seq":1042,"delay_ms":3}"#.to_vec(),
+
+        // 32-byte subscribe control: 2-byte len + pattern + 1-byte qos.
+        MessageType::Subscribe => {
+            let pattern = b"sensor.temperature.zone.*";
+            let mut v = Vec::with_capacity(2 + pattern.len() + 1);
+            v.extend_from_slice(&(pattern.len() as u16).to_be_bytes());
+            v.extend_from_slice(pattern);
+            v.push(1); // qos
+            v
+        }
+
+        // 28-byte unsubscribe control: 2-byte len + pattern.
+        MessageType::Unsubscribe => {
+            let pattern = b"sensor.temperature.zone.*";
+            let mut v = Vec::with_capacity(2 + pattern.len());
+            v.extend_from_slice(&(pattern.len() as u16).to_be_bytes());
+            v.extend_from_slice(pattern);
+            v
+        }
+
+        // 4 KiB publish — pseudo media chunk as opaque bytes.
+        MessageType::Publish => {
+            let topic = b"sensor.temperature.zone1";
+            let mut v = Vec::with_capacity(2 + topic.len() + 4096);
+            v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            v.extend_from_slice(topic);
+            let mut payload = vec![0u8; 4096];
+            fill_pseudo_media(&mut payload, 0xE8);
+            v.extend_from_slice(&payload);
+            v
+        }
+
+        // TopicCreate — small control: topic + partitions(4) + retention_ms(8).
+        MessageType::TopicCreate => {
+            let topic = b"metrics.cpu.host.*";
+            let mut v = Vec::with_capacity(2 + topic.len() + 12);
+            v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            v.extend_from_slice(topic);
+            v.extend_from_slice(&8u32.to_be_bytes());
+            v.extend_from_slice(&(3_600_000u64).to_be_bytes());
+            v
+        }
+
+        // TopicDelete — minimal control: 2-byte len + topic.
+        MessageType::TopicDelete => {
+            let topic = b"metrics.cpu.host.stale";
+            let mut v = Vec::with_capacity(2 + topic.len());
+            v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            v.extend_from_slice(topic);
+            v
+        }
+
+        // Fetch — request replay from offset 0, up to 32 entries. The
+        // topic matches the `Publish` entry so a server with `--wal-root`
+        // set actually has WAL state to replay; otherwise the Fetch arm
+        // returns empty (or `wal_disabled`).
+        MessageType::Fetch => {
+            let topic = b"sensor.temperature.zone1";
+            let mut v = Vec::with_capacity(2 + topic.len() + 12);
+            v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            v.extend_from_slice(topic);
+            v.extend_from_slice(&0u64.to_be_bytes()); // from_offset
+            v.extend_from_slice(&32u32.to_be_bytes()); // max_count
+            v
+        }
+
+        // FetchReply — one replayed WAL entry: small payload is fine.
+        MessageType::FetchReply => {
+            let topic = b"sensor.temperature.zone1";
+            let payload = b"replayed-entry-payload";
+            let mut v = Vec::with_capacity(2 + topic.len() + 20 + payload.len());
+            v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            v.extend_from_slice(topic);
+            v.extend_from_slice(&0u64.to_be_bytes()); // offset
+            v.extend_from_slice(&0u64.to_be_bytes()); // timestamp_ns
+            v.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            v.extend_from_slice(payload);
+            v
+        }
+
+        // ConsumerGroupJoin — topic + group + consumer + partitions.
+        MessageType::ConsumerGroupJoin => {
+            let topic = b"sensor.temperature.zone1";
+            let group = b"zone1-alerts";
+            let consumer = b"consumer-1";
+            let mut v =
+                Vec::with_capacity(2 + topic.len() + 2 + group.len() + 2 + consumer.len() + 4);
+            v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            v.extend_from_slice(topic);
+            v.extend_from_slice(&(group.len() as u16).to_be_bytes());
+            v.extend_from_slice(group);
+            v.extend_from_slice(&(consumer.len() as u16).to_be_bytes());
+            v.extend_from_slice(consumer);
+            v.extend_from_slice(&4u32.to_be_bytes()); // partitions
+            v
+        }
+
+        // ConsumerGroupLeave — topic + group + consumer.
+        MessageType::ConsumerGroupLeave => {
+            let topic = b"sensor.temperature.zone1";
+            let group = b"zone1-alerts";
+            let consumer = b"consumer-1";
+            let mut v = Vec::with_capacity(2 + topic.len() + 2 + group.len() + 2 + consumer.len());
+            v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            v.extend_from_slice(topic);
+            v.extend_from_slice(&(group.len() as u16).to_be_bytes());
+            v.extend_from_slice(group);
+            v.extend_from_slice(&(consumer.len() as u16).to_be_bytes());
+            v.extend_from_slice(consumer);
+            v
+        }
+
+        // ConsumerGroupHeartbeat — topic + group + consumer + generation.
+        MessageType::ConsumerGroupHeartbeat => {
+            let topic = b"sensor.temperature.zone1";
+            let group = b"zone1-alerts";
+            let consumer = b"consumer-1";
+            let mut v =
+                Vec::with_capacity(2 + topic.len() + 2 + group.len() + 2 + consumer.len() + 4);
+            v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            v.extend_from_slice(topic);
+            v.extend_from_slice(&(group.len() as u16).to_be_bytes());
+            v.extend_from_slice(group);
+            v.extend_from_slice(&(consumer.len() as u16).to_be_bytes());
+            v.extend_from_slice(consumer);
+            v.extend_from_slice(&1u32.to_be_bytes()); // generation
+            v
+        }
     }
 }
 
@@ -287,6 +508,16 @@ fn type_name(mt: MessageType) -> &'static str {
         MessageType::Handshake => "Handshake",
         MessageType::Fragment => "Fragment",
         MessageType::Ack => "Ack",
+        MessageType::Subscribe => "Subscribe",
+        MessageType::Unsubscribe => "Unsubscribe",
+        MessageType::Publish => "Publish",
+        MessageType::TopicCreate => "TopicCreate",
+        MessageType::TopicDelete => "TopicDelete",
+        MessageType::Fetch => "Fetch",
+        MessageType::FetchReply => "FetchReply",
+        MessageType::ConsumerGroupJoin => "ConsumerGroupJoin",
+        MessageType::ConsumerGroupLeave => "ConsumerGroupLeave",
+        MessageType::ConsumerGroupHeartbeat => "ConsumerGroupHeartbeat",
     }
 }
 
@@ -318,9 +549,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn workload_has_fifteen_entries() {
+    fn workload_has_twenty_five_entries() {
+        // 25 = 22 base message types + ConsumerGroupJoin/Leave/Heartbeat (P5).
         let w = build().unwrap();
-        assert_eq!(w.entries.len(), 15);
+        assert_eq!(w.entries.len(), 25);
     }
 
     #[test]
@@ -334,10 +566,13 @@ mod tests {
     }
 
     #[test]
-    fn logical_streams_are_zero_to_fourteen() {
+    fn logical_streams_cycle_within_stream_id_count() {
+        // The 20 workload entries cycle through the 15 QUIC stream IDs
+        // (types 15..=19 share a stream with 0..=4) — see `build()` for
+        // why this mod-cycle is required.
         let w = build().unwrap();
         for (i, e) in w.entries.iter().enumerate() {
-            assert_eq!(e.logical_stream, i as u64);
+            assert_eq!(e.logical_stream, (i % STREAM_ID_COUNT) as u64);
         }
     }
 

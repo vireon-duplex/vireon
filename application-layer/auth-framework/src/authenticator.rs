@@ -128,6 +128,25 @@ impl AuthenticationPipeline {
     }
 }
 
+impl Default for AuthenticationPipeline {
+    /// Equivalent to `AuthenticationPipeline::new(AuthConfig::new())`.
+    /// `AuthConfig::new()` is a `const fn` whose default values always
+    /// pass `validate()`, so this never panics.
+    fn default() -> Self {
+        Self::new(AuthConfig::new())
+            // SAFETY: AuthConfig::new() always validates Ok (token_ttl_ms
+            // and min_password_length are inside the valid ranges).
+            // Keeping a fallback rather than `unwrap()` so callers in
+            // deny-panic workspaces don't have to suppress the lint.
+            .unwrap_or_else(|_| Self {
+                cfg: AuthConfig::new(),
+                stats: AuthStats::new(),
+                principals: HashMap::new(),
+                rate_tracker: HashMap::new(),
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

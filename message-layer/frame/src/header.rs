@@ -554,8 +554,13 @@ impl std::ops::BitAnd for FrameFlags {
 /// whose semantics the application defines. Values `0x0A`–`0x0F` are
 /// **control-plane** types that the frame layer itself understands: they drive
 /// multi-stream lifecycle, fragmentation, handshake, and app-level reliability.
+/// Values `0x10`–`0x14` are **pub/sub** data-plane types — they carry a
+/// structured payload (see `frame::payload`) that the application dispatches
+/// to the pub/sub engine. Values `0x15`–`0x16` extend the pub/sub plane with
+/// replay-by-offset semantics: `Fetch` requests missed entries from a topic's
+/// WAL; `FetchReply` returns one entry per frame.
 ///
-/// The `u8` representation leaves `0x00` and `0x10`–`0xFF` reserved for future
+/// The `u8` representation leaves `0x00` and `0x1A`–`0xFF` reserved for future
 /// expansion; unknown bytes surface as [`FrameError::UnknownMessageType`] rather
 /// than silent corruption.
 #[repr(u8)]
@@ -594,13 +599,48 @@ pub enum MessageType {
     Fragment = 0x0E,
     /// Acknowledges receipt of a previous frame (app-level reliability).
     Ack = 0x0F,
+
+    // ---- pub/sub data plane (application-dispatched, structured payload) ----
+    /// Subscribe to a topic pattern; payload is `Subscribe`.
+    Subscribe = 0x10,
+    /// Remove a previously-registered subscription.
+    Unsubscribe = 0x11,
+    /// Publish an opaque payload to a topic.
+    Publish = 0x12,
+    /// Create a topic with retention / partition config.
+    TopicCreate = 0x13,
+    /// Delete a topic.
+    TopicDelete = 0x14,
+    /// Subscriber → server: replay WAL entries for a topic starting at
+    /// `from_offset`. Payload is [`crate::payload::FetchPayload`].
+    Fetch = 0x15,
+    /// Server → subscriber: one replayed WAL entry. Payload is
+    /// [`crate::payload::FetchReplyPayload`]. A single `Fetch` request
+    /// yields zero or more `FetchReply` frames (bounded by the
+    /// request's `max_count`).
+    FetchReply = 0x16,
+
+    // ---- consumer-group control plane ----
+    /// Consumer → server: join a consumer group for a topic. Payload is
+    /// `topic_len(u16) | topic | group_len(u16) | group_id | consumer_len(u16)
+    /// | consumer_id | partitions(u32)`. The server assigns partitions
+    /// and returns the generation in an ACK.
+    ConsumerGroupJoin = 0x17,
+    /// Consumer → server: leave a consumer group. Payload is
+    /// `topic_len(u16) | topic | group_len(u16) | group_id | consumer_len(u16)
+    /// | consumer_id`.
+    ConsumerGroupLeave = 0x18,
+    /// Consumer → server: heartbeat for a consumer group membership.
+    /// Payload is `topic_len(u16) | topic | group_len(u16) | group_id
+    /// | consumer_len(u16) | consumer_id | generation(u32)`.
+    ConsumerGroupHeartbeat = 0x19,
 }
 
 /// Every defined [`MessageType`], ascending by wire byte.
 ///
 /// Useful for exhaustive round-trip tests and for dispatchers that want to
 /// validate they handle every variant.
-pub const ALL_MESSAGE_TYPES: [MessageType; 15] = [
+pub const ALL_MESSAGE_TYPES: [MessageType; 25] = [
     MessageType::TextToken,
     MessageType::AudioFrame,
     MessageType::VideoFrame,
@@ -616,6 +656,16 @@ pub const ALL_MESSAGE_TYPES: [MessageType; 15] = [
     MessageType::Handshake,
     MessageType::Fragment,
     MessageType::Ack,
+    MessageType::Subscribe,
+    MessageType::Unsubscribe,
+    MessageType::Publish,
+    MessageType::TopicCreate,
+    MessageType::TopicDelete,
+    MessageType::Fetch,
+    MessageType::FetchReply,
+    MessageType::ConsumerGroupJoin,
+    MessageType::ConsumerGroupLeave,
+    MessageType::ConsumerGroupHeartbeat,
 ];
 
 impl MessageType {
@@ -644,11 +694,26 @@ impl MessageType {
             0x0D => Self::Handshake,
             0x0E => Self::Fragment,
             0x0F => Self::Ack,
+            0x10 => Self::Subscribe,
+            0x11 => Self::Unsubscribe,
+            0x12 => Self::Publish,
+            0x13 => Self::TopicCreate,
+            0x14 => Self::TopicDelete,
+            0x15 => Self::Fetch,
+            0x16 => Self::FetchReply,
+            0x17 => Self::ConsumerGroupJoin,
+            0x18 => Self::ConsumerGroupLeave,
+            0x19 => Self::ConsumerGroupHeartbeat,
             _ => return None,
         })
     }
 
     /// `true` when this variant carries application data (the data plane).
+    ///
+    /// Includes the pub/sub data-plane types (`Subscribe`..`TopicDelete`) —
+    /// they are dispatched to the application layer just like other data
+    /// frames, even though their payload is structured (parsed by the frame
+    /// layer rather than the application).
     #[inline]
     pub const fn is_data(self) -> bool {
         matches!(
@@ -662,6 +727,37 @@ impl MessageType {
                 | Self::StateUpdate
                 | Self::Error
                 | Self::Heartbeat
+                | Self::Subscribe
+                | Self::Unsubscribe
+                | Self::Publish
+                | Self::TopicCreate
+                | Self::TopicDelete
+                | Self::Fetch
+                | Self::FetchReply
+                | Self::ConsumerGroupJoin
+                | Self::ConsumerGroupLeave
+                | Self::ConsumerGroupHeartbeat
+        )
+    }
+
+    /// `true` when this variant is one of the pub/sub data-plane types
+    /// (`Subscribe`..`FetchReply`). These carry structured payloads parsed
+    /// by the frame layer and are routed to the pub/sub engine by the
+    /// application dispatcher.
+    #[inline]
+    pub const fn is_pubsub(self) -> bool {
+        matches!(
+            self,
+            Self::Subscribe
+                | Self::Unsubscribe
+                | Self::Publish
+                | Self::TopicCreate
+                | Self::TopicDelete
+                | Self::Fetch
+                | Self::FetchReply
+                | Self::ConsumerGroupJoin
+                | Self::ConsumerGroupLeave
+                | Self::ConsumerGroupHeartbeat
         )
     }
 
@@ -1052,7 +1148,7 @@ mod tests {
     #[test]
     fn reserved_and_unknown_bytes_map_to_none() {
         assert_eq!(MessageType::from_byte(0x00), None);
-        assert_eq!(MessageType::from_byte(0x10), None);
+        assert_eq!(MessageType::from_byte(0x1A), None);
         assert_eq!(MessageType::from_byte(0xFF), None);
         assert!(matches!(
             MessageType::try_from(0x42),
@@ -1072,9 +1168,26 @@ mod tests {
     #[test]
     fn wire_bytes_are_dense_and_unique() {
         let bytes: Vec<u8> = ALL_MESSAGE_TYPES.iter().map(|mt| mt.as_byte()).collect();
-        assert_eq!(bytes, (0x01..=0x0Fu8).collect::<Vec<_>>());
+        assert_eq!(bytes, (0x01..=0x19u8).collect::<Vec<_>>());
         let unique: std::collections::HashSet<_> = bytes.iter().copied().collect();
         assert_eq!(unique.len(), bytes.len());
+    }
+
+    #[test]
+    fn pubsub_variants_classified_correctly() {
+        for mt in ALL_MESSAGE_TYPES {
+            if mt.is_pubsub() {
+                assert!(mt.is_data(), "{mt:?}: pub/sub must be data-plane");
+                assert!(!mt.is_control(), "{mt:?}: pub/sub must not be control");
+            }
+        }
+        assert!(MessageType::Subscribe.is_pubsub());
+        assert!(MessageType::Publish.is_pubsub());
+        assert!(MessageType::ConsumerGroupJoin.is_pubsub());
+        assert!(MessageType::ConsumerGroupLeave.is_pubsub());
+        assert!(MessageType::ConsumerGroupHeartbeat.is_pubsub());
+        assert!(!MessageType::StateUpdate.is_pubsub());
+        assert!(!MessageType::StreamOpen.is_pubsub());
     }
 
     // ---- FrameHeader builder ----

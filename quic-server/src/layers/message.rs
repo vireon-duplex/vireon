@@ -6,6 +6,7 @@
 //! to the application layer or consume it internally.
 
 use frame::codec::FrameRef;
+use frame::header::MessageType;
 
 /// Routing action returned by the message layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,13 +34,18 @@ impl MessageLayer {
 
     /// Classifies a decoded frame into a routing action.
     ///
-    /// Data frames (`MessageType::is_data()`) are dispatched to the
-    /// application layer. All other frames (StreamOpen, StreamClose,
-    /// StreamReset, Handshake, Fragment, Ack) are consumed by lower
-    /// layers.
+    /// Data frames (`MessageType::is_data()`) and `MessageType::Handshake`
+    /// are dispatched to the application layer. Handshake needs to reach
+    /// the dispatcher so it can run `AuthenticationPipeline::authenticate`
+    /// and bind the resolved `PrincipalId` to the connection — without
+    /// this, the ACL check path falls back to the configured default
+    /// principal for every connection.
+    ///
+    /// All other non-data frames (StreamOpen, StreamClose, StreamReset,
+    /// Fragment, Ack) are consumed by lower layers.
     #[must_use]
     pub fn classify(&self, frame: &FrameRef<'_>) -> FrameAction {
-        if frame.msg_type.is_data() {
+        if frame.msg_type.is_data() || frame.msg_type == MessageType::Handshake {
             FrameAction::DispatchToApp
         } else {
             FrameAction::Consumed
@@ -78,13 +84,23 @@ mod tests {
     }
 
     #[test]
+    fn handshake_dispatches_to_app_for_principal_resolution() {
+        // Handshake must reach the dispatcher so the AuthenticationPipeline
+        // can resolve PrincipalId. See `MessageLayer::classify` doc.
+        let ml = MessageLayer::new();
+        assert_eq!(
+            classify_msg_type(&ml, MessageType::Handshake),
+            FrameAction::DispatchToApp
+        );
+    }
+
+    #[test]
     fn control_frames_are_consumed() {
         let ml = MessageLayer::new();
         for mt in [
             MessageType::StreamOpen,
             MessageType::StreamClose,
             MessageType::StreamReset,
-            MessageType::Handshake,
             MessageType::Ack,
             MessageType::Fragment,
         ] {

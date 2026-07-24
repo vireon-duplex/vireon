@@ -1,10 +1,14 @@
 //! GSO (`UDP_SEGMENT`) send helper.
+//!
+//! Accepts a raw fd so it works with both `std::net::UdpSocket` and
+//! `mio::net::UdpSocket`.
 
-use std::net::{SocketAddr, UdpSocket};
+use std::net::SocketAddr;
+use std::os::fd::RawFd;
 
 /// Sends `buf` to `dest`, using GSO when `segment_size` is `Some` on Linux.
 pub fn send_with_gso(
-    socket: &UdpSocket,
+    fd: RawFd,
     buf: &[u8],
     dest: SocketAddr,
     segment_size: Option<usize>,
@@ -12,23 +16,39 @@ pub fn send_with_gso(
     #[cfg(target_os = "linux")]
     if let Some(seg) = segment_size {
         if seg > 0 && seg < buf.len() {
-            return send_gso_linux(socket, buf, dest, seg as u16);
+            return send_gso_linux(fd, buf, dest, seg as u16);
         }
     }
     let _ = segment_size;
-    socket.send_to(buf, dest)?;
+    send_simple(fd, buf, dest)
+}
+
+/// Non-GSO fallback: plain `sendto` on the raw fd.
+fn send_simple(fd: RawFd, buf: &[u8], dest: SocketAddr) -> std::io::Result<()> {
+    let (name, name_len) = sockaddr_from_std(dest);
+    let ret = unsafe {
+        libc::sendto(
+            fd,
+            buf.as_ptr() as *const _,
+            buf.len(),
+            0,
+            name.as_ptr() as *const _,
+            name_len,
+        )
+    };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
 fn send_gso_linux(
-    socket: &UdpSocket,
+    fd: RawFd,
     buf: &[u8],
     dest: SocketAddr,
     segment_size: u16,
 ) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-
     const SOL_UDP: libc::c_int = 17;
     const UDP_SEGMENT: libc::c_int = 103;
 
@@ -56,7 +76,7 @@ fn send_gso_linux(
             (libc::CMSG_DATA(cmsg) as *mut u16).write_unaligned(segment_size);
         }
         hdr.msg_controllen = libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) as _;
-        let ret = libc::sendmsg(socket.as_raw_fd(), &hdr, 0);
+        let ret = libc::sendmsg(fd, &hdr, 0);
         if ret < 0 {
             return Err(std::io::Error::last_os_error());
         }

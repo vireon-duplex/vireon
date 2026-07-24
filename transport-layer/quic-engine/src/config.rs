@@ -58,10 +58,16 @@ pub const DEFAULT_INITIAL_MAX_DATA: u64 = 100 * 1024 * 1024;
 pub const DEFAULT_INITIAL_MAX_STREAM_DATA: u64 = 10 * 1024 * 1024;
 
 /// Initial bidirectional stream count (MAX_STREAMS_BIDIR).
-pub const DEFAULT_INITIAL_MAX_STREAMS_BIDI: u64 = 100;
+///
+/// 1024 + 1024 (uni) = 2048 concurrent streams per connection — aligns
+/// with the design vision's "thousands of independent logical streams"
+/// claim. Operators with tight per-connection memory budgets can lower
+/// this via config; quiche's per-stream state is ~1 KiB so the default
+/// costs ~2 MiB per connection.
+pub const DEFAULT_INITIAL_MAX_STREAMS_BIDI: u64 = 1024;
 
 /// Initial unidirectional stream count (MAX_STREAMS_UNI).
-pub const DEFAULT_INITIAL_MAX_STREAMS_UNI: u64 = 100;
+pub const DEFAULT_INITIAL_MAX_STREAMS_UNI: u64 = 1024;
 
 // ── Congestion control ───────────────────────────────────────────
 

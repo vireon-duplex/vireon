@@ -1,0 +1,114 @@
+name: Benchmarks
+
+# Two jobs:
+#   compile-benches  — runs on every PR; verifies benches still build.
+#                      Cheap; catches `cargo bench --no-run` breakage.
+#   record-baseline  — runs only on push to main; saves a Criterion
+#                      baseline under target/criterion/ and uploads it
+#                      as an artifact so developers can download and
+#                      locally `scripts/bench.sh compare main`.
+#
+# Why no PR-level bench comparison?
+#   GitHub runners are virtualized with noisy neighbors; regression
+#   thresholds below ~25% are unreliable. The published main baseline
+#   is for offline local comparison on dedicated hardware, not for
+#   blocking PRs. See scripts/bench.sh for the local workflow.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 0
+
+jobs:
+  compile-benches:
+    name: Benches compile (--no-run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-bench-
+            ${{ runner.os }}-cargo-
+
+      - name: Cache target
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-target-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-target-bench-
+
+      - name: Verify benches compile
+        run: cargo bench --workspace --benches --no-run
+
+  record-baseline:
+    name: Record main baseline
+    runs-on: ubuntu-latest
+    # Only on real main pushes — skip forks and PRs.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-bench-
+            ${{ runner.os }}-cargo-
+
+      - name: Cache target
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-target-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-target-bench-
+
+      - name: Install critcmp
+        run: cargo install critcmp || true
+
+      - name: Save baseline
+        run: |
+          ./scripts/bench.sh save main
+        continue-on-error: true  # see comment below
+
+      - name: Tar baseline artifacts
+        run: |
+          mkdir -p artifacts
+          tar -czf artifacts/criterion-main.tgz \
+            -C "$PWD" target/criterion target/criterion-baselines 2>/dev/null || true
+
+      - name: Upload baseline artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-baseline-${{ github.sha }}
+          path: artifacts/
+          retention-days: 30
+
+# Note on `continue-on-error` for the save step:
+#   A single bench panicking (e.g., a flaky timing assertion) should not
+#   scrap the whole baseline. Partial Criterion data is still useful for
+#   download + local compare. The compile-benches job above is the gate
+#   that catches structural breakage.

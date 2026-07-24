@@ -255,46 +255,73 @@ openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
 ### Run
 
 ```bash
-# Single-worker mode (main thread)
-cargo run -p quic-server -- \
-    --port 4433 \
-    --cert cert.pem \
-    --key key.pem \
-    --mode single \
-    -v
+# Single-worker mode (default) — benchmarks, development
+cargo run -p quic-server --release -- \
+    --cert cert.pem --key key.pem --port 4433 --mode single
 
-# Multi-worker mode (thread-per-core)
-cargo run -p quic-server -- \
-    --port 4433 \
-    --cert cert.pem \
-    --key key.pem \
-    --mode multi \
-    --preset bare-metal
+# Benchmark echo mode (for bench-harness rr/multi-rr/pipeline)
+cargo run -p quic-server --release -- \
+    --cert cert.pem --key key.pem --port 4433 --mode single --echo
+
+# Multi-worker mode (thread-per-core, production)
+cargo run -p quic-server --release -- \
+    --cert cert.pem --key key.pem --port 4433 \
+    --mode multi --preset bare-metal
+
+# With WAL durability (enables Fetch/replay)
+cargo run -p quic-server --release -- \
+    --cert cert.pem --key key.pem --port 4433 \
+    --mode multi --wal-root /var/lib/vireon/wal
 
 # Custom worker count + queue depth
-cargo run -p quic-server -- \
-    --port 4433 \
-    --cert cert.pem \
-    --key key.pem \
-    --mode multi \
-    --workers 4 \
-    --queue-depth 512 \
-    -v
+cargo run -p quic-server --release -- \
+    --cert cert.pem --key key.pem --port 4433 \
+    --mode multi --workers 4 --queue-depth 512 -v
 ```
 
 ### CLI Arguments
 
+#### Connection / networking
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--port` | `4433` | UDP port to bind |
-| `--bind` | `0.0.0.0` | Bind address |
+| `--bind` | `0.0.0.0` | Bind address (IP only; port from `--port`) |
 | `--cert` | *(required)* | PEM certificate chain path |
 | `--key` | *(required)* | PEM private key path |
-| `--mode` | `single` | `single`, `multi`, `distributed` |
-| `--workers` | `0` (auto) | Worker thread count (0 = CPU count) |
-| `--preset` | `cloud` | `cloud`, `bare-metal`, `hundred-gbe`, `low-latency`, `max-throughput` |
-| `--queue-depth` | `256` | io_uring submission queue depth |
-| `-v` | — | Enable verbose (debug) logging |
+
+#### Worker / threading
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--mode` | `single` | `single` (1 reactor on main thread), `multi` (thread-per-core), `distributed` (multi + inter-node, stub) |
+| `--workers N` | `0` (auto) | Worker thread count. `0` = one per CPU core. Ignored in `single` mode (always 1). |
+| `--queue-depth N` | `256` | io_uring submission queue depth (0 = default). Higher = more in-flight I/O but more memory. |
+
+#### Tuning presets
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--preset` | `bare-metal` | Tune QUIC defaults for a deployment class. See [Presets](#presets) below. |
+
+#### Benchmark / debug
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--echo` | off | Bounce every received frame back on the same QUIC stream. Required for `bench-harness` `rr` / `multi-rr` / `pipeline` modes. Bypasses the application layer. |
+| `--skip-crc` | off | Skip CRC32C verification on received frames. Trusted environments only — QUIC's AEAD already guarantees integrity. Saves ~50% of small-frame decode time. |
+| `--sqpoll` | on | Enable the io_uring SQPOLL kernel thread (kernel ≥ 5.11, needs CAP_SYS_NICE). The kernel polls the SQ ring, eliminating submit syscalls. Auto-falls-back if denied. |
+| `-v` | off | Enable verbose (debug-level) tracing. |
+| `--profile-output FILE` | off | Dump profiler report on shutdown. Requires `--features profiling`. Extension selects format: `.json`, `.csv`, `.ctrace`, `.folded`, `.dot`, else text. |
+
+#### Pub/Sub features
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--acl-rules FILE` | off | Load tenant-isolation ACL rules from a TOML file, replacing the default permissive `allow("*.*")` table. |
+| `--wal-root DIR` | off | Enable the write-ahead log. Every accepted publish is appended under `<DIR>/worker_<id>/`. Subscribers can `Fetch(offset)` to replay missed messages. Off = fire-and-forget. |
+| `--cluster-node-id N` | off | (P6) Join a multi-node cluster as node `N`. Must be >0 and appear in `--cluster-peers`. |
+| `--cluster-peers LIST` | off | (P6) Cluster peer list: `"1=host:port,2=host:port,..."`. All nodes including self must be listed. Requires `--cluster-node-id`. |
 
 ### Presets
 
@@ -322,6 +349,14 @@ worker:
 - Binds to the same UDP port (SO_REUSEPORT)
 
 The kernel steers incoming datagrams to workers via RSS/RPS.
+
+> **Consumer-group caveat:** `group_locals` (the per-connection
+> membership map used for round-robin fan-out) lives inside each
+> worker's `ApplicationLayer`. It is **not shared across workers**.
+> In `--mode multi`, a publisher and its group members may land on
+> different workers → deliveries are silently lost. For consumer-group
+> benchmarks (`bench-harness -m group`), use `--mode single` until
+> cross-worker group sharing lands (tracked as a P5/P6 follow-up).
 
 ### Distributed (`--mode distributed`)
 
