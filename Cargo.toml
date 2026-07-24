@@ -74,6 +74,9 @@ quiche  = "0.22"
 libc    = "0.2"
 socket2 = { version = "0.5", features = ["all"] }
 
+# Async runtime for the client SDK (the server keeps its io_uring reactor).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+
 # Fast hashing for hot-path HashMaps (FxHash — no DoS resistance needed,
 # thread-per-core with no untrusted keys).
 rustc-hash = "2.1"
