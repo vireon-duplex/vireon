@@ -204,6 +204,8 @@ impl VireonStack {
         acl_table: Option<topic_acl::AclTable>,
         wal_root: Option<&std::path::Path>,
         cluster: Option<(&cluster_coordinator::ClusterConfig, ClusterWorkerHandle)>,
+        worker_inbox: Option<std::sync::mpsc::Receiver<crate::layers::InterWorkerPublish>>,
+        worker_outboxes: Vec<std::sync::mpsc::SyncSender<crate::layers::InterWorkerPublish>>,
         shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, ServerError> {
         let mut application = ApplicationLayer::new()?;
@@ -227,6 +229,9 @@ impl VireonStack {
         }
         if let Some((cfg, handle)) = cluster {
             application.set_cluster(cfg, handle.outgoing_tx, handle.incoming_rx);
+        }
+        if let Some(inbox) = worker_inbox {
+            application.set_worker_channels(reactor_id as usize, inbox, worker_outboxes);
         }
         Ok(Self {
             application,
@@ -297,23 +302,19 @@ impl VireonStack {
         }
 
         // Drain + send all outgoing frames accumulated during the batch.
-        // Doing this once per batch (instead of per-frame) reduces the
-        // number of outbox drain calls and allows the engine to coalesce
-        // multiple frames into fewer flush cycles.
-        //
-        // Two-category routing:
-        //   * direct_send — control frames (Subscribe ACKs, TopicCreate
-        //     ACKs, etc.) and frames on streams not bound to a send
-        //     policy. These bypass policy and go straight to the wire.
-        //   * policy — frames on streams whose subscriber declared a
-        //     delivery policy at StreamOpen. These are consumed by the
-        //     SendPolicyTable and emerge from `drain_ready_egress` in
-        //     policy order (FIFO / drop-stale / latest-only).
-        //
-        // Splitting the drain into two passes avoids the borrow conflict
-        // between `application.enqueue_egress(&mut self, ...)` and
-        // `encode_and_send(&mut self, ...)` — we collect each category
-        // into a local Vec, then send in a separate loop.
+        // Shared with the no-events tick path via `flush_outbox`.
+        self.flush_outbox();
+    }
+
+    /// Drains the application outbox and sends every frame via the
+    /// encode-and-send path. Frames on streams bound to a send policy
+    /// are consumed by the policy table and emerge from
+    /// `drain_ready_egress`; unbound frames go direct.
+    ///
+    /// Called from both `process_events` (after inbound events) and
+    /// the no-events tick path (to flush cross-worker / cluster
+    /// deliveries that arrived while this worker had no QUIC traffic).
+    fn flush_outbox(&mut self) {
         let outbox = self.application.drain_outbox();
         let mut direct_send: Vec<OutgoingFrame> = Vec::with_capacity(outbox.len());
         for out in outbox {
@@ -322,12 +323,9 @@ impl VireonStack {
                 Some(out) => direct_send.push(out),
             }
         }
-        // Send the bypass frames first so control-plane ACKs reach the
-        // peer before any policy-delayed data.
         for out in direct_send {
             self.encode_and_send(out.conn_idx, out.quic_stream_id, out.header, &out.payload);
         }
-        // Drain policy-cleared frames and send.
         let mut policy_ready: Vec<OutgoingFrame> = Vec::new();
         self.application.drain_ready_egress(&mut policy_ready);
         for out in policy_ready {
@@ -896,6 +894,14 @@ impl IoHandler for VireonStack {
         // Process events through the full layer stack.
         if !events.is_empty() {
             self.process_events(events);
+        } else {
+            // Even with no inbound events, we must drain cross-worker
+            // and cluster inboxes each tick — otherwise publishes
+            // forwarded from other workers pile up undelivered when
+            // this worker has no incoming QUIC traffic to trigger
+            // `process_events`.
+            self.application.on_batch_tick();
+            self.flush_outbox();
         }
 
         // [transport-layer] Flush outgoing packets queued by process_events
