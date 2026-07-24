@@ -40,10 +40,23 @@ pub struct WorkerResult {
     pub handshake_time: Duration,
     /// Set when the worker failed.
     pub error: Option<String>,
-    /// Role in `BenchMode::Group` (`None` for the legacy four modes).
-    /// Set by `ConnState::into_result`; consumed by `aggregate` to split
-    /// group throughput into publisher tx vs member rx.
+    /// Role in `BenchMode::Group` or `BenchMode::Broadcast` (`None` for
+    /// the legacy four modes). Set by `ConnState::into_result`; consumed
+    /// by `aggregate` to split throughput into publisher tx vs consumer rx.
     pub role: Option<Role>,
+    // ── Delivery verification (from embedded bench_seq) ────────────
+    /// Total Publish frames verified by this consumer's SeqVerifier.
+    pub seq_received: u64,
+    /// Gaps detected in the seq stream (meaningful per-consumer only for
+    /// broadcast; for group it's inherently high due to round-robin subset).
+    pub seq_missing: u64,
+    /// Times a seq ≤ next_expected was observed (re-delivery).
+    pub seq_duplicates: u64,
+    /// Highest bench_seq observed.
+    pub seq_max: u64,
+    /// Publisher: total unique frames published (== pub_seq counter).
+    /// Zero for consumers.
+    pub pub_seq: u64,
 }
 
 impl WorkerResult {
@@ -80,6 +93,11 @@ impl WorkerResult {
             handshake_time,
             error: None,
             role: None,
+            seq_received: 0,
+            seq_missing: 0,
+            seq_duplicates: 0,
+            seq_max: 0,
+            pub_seq: 0,
         }
     }
 
@@ -100,6 +118,11 @@ impl WorkerResult {
             handshake_time,
             error: Some(msg),
             role: None,
+            seq_received: 0,
+            seq_missing: 0,
+            seq_duplicates: 0,
+            seq_max: 0,
+            pub_seq: 0,
         }
     }
 
@@ -109,6 +132,20 @@ impl WorkerResult {
     pub fn reason(&self) -> &str {
         self.error.as_deref().unwrap_or("ok")
     }
+}
+
+/// Per-consumer (member or subscriber) detail row for the summary table.
+pub struct ConsumerDetail {
+    /// Display label, e.g. `"member 3"` or `"subscriber 5"`.
+    pub label: String,
+    /// Frames/sec (frames_recv / duration).
+    pub msg_per_sec: f64,
+    /// MiB/s of payload received (bytes_recv / duration).
+    pub mib_per_sec: f64,
+    /// SeqVerifier gap count (meaningful for broadcast; high for group).
+    pub missing: u64,
+    /// SeqVerifier duplicate count.
+    pub duplicates: u64,
 }
 
 /// Aggregated summary across all workers.
@@ -162,22 +199,39 @@ pub struct Summary {
     /// Peak RSS (KiB) per successful connection.
     pub rss_per_conn_kib: f64,
 
-    // ── Group (P5) breakdown ────────────────────────────────────────
-    /// True when the run used `BenchMode::Group` (role-tagged results).
-    /// When false, the `group_*` fields below are zero/empty.
+    // ── Group / Broadcast (pub/sub) breakdown ───────────────────────
+    /// True when the run used `BenchMode::Group` or `BenchMode::Broadcast`
+    /// (role-tagged results). When false, the `group_*` fields below are
+    /// zero/empty.
     pub is_group: bool,
+    /// True for `BenchMode::Broadcast` specifically (fan-out = all
+    /// subscribers). False for `BenchMode::Group` (round-robin).
+    pub is_broadcast: bool,
     /// Number of publisher connections that reported ok.
     pub group_publishers: usize,
-    /// Number of member connections that reported ok.
+    /// Number of consumer connections (members or subscribers) that ok'd.
     pub group_members: usize,
     /// Publisher Publish frames/sec (Σ publisher `frames_sent` / duration).
     pub group_publishes_per_sec: f64,
-    /// Member delivery frames/sec (Σ member `frames_recv` / duration).
-    /// In steady-state round-robin this equals `group_publishes_per_sec`.
+    /// Consumer delivery frames/sec (Σ consumer `frames_recv` / duration).
+    /// For broadcast this should ≈ `publishes × subscribers`.
     pub group_deliveries_per_sec: f64,
-    /// Per-member `frames_recv` counts (sorted ascending) for fairness
-    /// reporting (min / avg / max). Tight spread ⇒ round-robin is fair.
-    pub group_member_rx: Vec<u64>,
+    /// Per-consumer detail rows for the summary table.
+    pub consumer_details: Vec<ConsumerDetail>,
+
+    // ── Delivery verification ───────────────────────────────────────
+    /// Total verified Publish frames received across all consumers.
+    pub total_seq_received: u64,
+    /// Total gaps detected across all consumers.
+    pub total_missing: u64,
+    /// Total duplicates detected across all consumers.
+    pub total_duplicates: u64,
+    /// Publisher's total unique frames sent (max `pub_seq` across publishers).
+    pub publisher_pub_seq: u64,
+    /// Delivery ratio = actual / expected (1.0 = perfect). For group:
+    /// `total_received / publisher_pub_seq`. For broadcast:
+    /// `total_received / (publisher_pub_seq × subscribers)`.
+    pub delivery_ratio: f64,
 }
 
 /// Merges per-worker results into a [`Summary`].
@@ -240,16 +294,16 @@ pub fn aggregate(
     let mut hs: Vec<Duration> = results.iter().map(|r| r.handshake_time).collect();
     hs.sort_unstable();
 
-    // P5 group breakdown: split results by role. Only present when at
-    // least one result carries a role (i.e. BenchMode::Group).
+    // Pub/sub breakdown (group or broadcast): split results by role.
     let is_group = results.iter().any(|r| r.role.is_some());
+    let is_broadcast = results.iter().any(|r| r.role == Some(Role::Subscriber));
     let group_publishers = results
         .iter()
         .filter(|r| r.role == Some(Role::Publisher))
         .count();
     let group_members = results
         .iter()
-        .filter(|r| r.role == Some(Role::Member))
+        .filter(|r| matches!(r.role, Some(Role::Member) | Some(Role::Subscriber)))
         .count();
     let group_pub_frames: u64 = results
         .iter()
@@ -258,15 +312,81 @@ pub fn aggregate(
         .sum();
     let group_deliveries: u64 = results
         .iter()
-        .filter(|r| r.error.is_none() && r.role == Some(Role::Member))
+        .filter(|r| {
+            r.error.is_none() && matches!(r.role, Some(Role::Member) | Some(Role::Subscriber))
+        })
         .map(|r| r.frames_recv)
         .sum();
-    let mut group_member_rx: Vec<u64> = results
+
+    // Per-consumer detail rows for the summary table.
+    let consumer_label = |role: Role| match role {
+        Role::Subscriber => "subscriber",
+        _ => "member",
+    };
+    let mut consumer_details: Vec<ConsumerDetail> = Vec::new();
+    let mut consumer_idx = 0usize;
+    for r in results
         .iter()
-        .filter(|r| r.error.is_none() && r.role == Some(Role::Member))
-        .map(|r| r.frames_recv)
-        .collect();
-    group_member_rx.sort_unstable();
+        .filter(|r| {
+            r.error.is_none() && matches!(r.role, Some(Role::Member) | Some(Role::Subscriber))
+        })
+        .collect::<Vec<_>>()
+    {
+        consumer_idx += 1;
+        let Some(role) = r.role else {
+            continue;
+        };
+        consumer_details.push(ConsumerDetail {
+            label: format!("{} {consumer_idx}", consumer_label(role)),
+            msg_per_sec: r.frames_recv as f64 / secs,
+            mib_per_sec: r.bytes_recv as f64 / secs / (1024.0 * 1024.0),
+            missing: r.seq_missing,
+            duplicates: r.seq_duplicates,
+        });
+    }
+
+    // Delivery verification aggregates.
+    let total_seq_received: u64 = results
+        .iter()
+        .filter(|r| {
+            r.error.is_none() && matches!(r.role, Some(Role::Member) | Some(Role::Subscriber))
+        })
+        .map(|r| r.seq_received)
+        .sum();
+    let total_missing: u64 = results
+        .iter()
+        .filter(|r| {
+            r.error.is_none() && matches!(r.role, Some(Role::Member) | Some(Role::Subscriber))
+        })
+        .map(|r| r.seq_missing)
+        .sum();
+    let total_duplicates: u64 = results
+        .iter()
+        .filter(|r| {
+            r.error.is_none() && matches!(r.role, Some(Role::Member) | Some(Role::Subscriber))
+        })
+        .map(|r| r.seq_duplicates)
+        .sum();
+    let publisher_pub_seq: u64 = results
+        .iter()
+        .filter(|r| r.error.is_none() && r.role == Some(Role::Publisher))
+        .map(|r| r.pub_seq)
+        .max()
+        .unwrap_or(0);
+    // Delivery ratio:
+    //   group:     total_received / publisher_pub_seq
+    //   broadcast: total_received / (publisher_pub_seq × subscribers)
+    let expected = if is_broadcast {
+        publisher_pub_seq.saturating_mul(group_members as u64)
+    } else {
+        publisher_pub_seq
+    };
+    let delivery_ratio = if expected > 0 {
+        total_seq_received as f64 / expected as f64
+    } else {
+        0.0
+    };
+
     let group_publishes_per_sec = group_pub_frames as f64 / secs;
     let group_deliveries_per_sec = group_deliveries as f64 / secs;
 
@@ -310,11 +430,17 @@ pub fn aggregate(
         rss_kib: 0,
         rss_per_conn_kib: 0.0,
         is_group,
+        is_broadcast,
         group_publishers,
         group_members,
         group_publishes_per_sec,
         group_deliveries_per_sec,
-        group_member_rx,
+        consumer_details,
+        total_seq_received,
+        total_missing,
+        total_duplicates,
+        publisher_pub_seq,
+        delivery_ratio,
     }
 }
 
@@ -506,14 +632,18 @@ pub fn print_summary(s: &Summary) {
     println!("duration:     {:.1}s", s.duration.as_secs_f64());
     println!("encryption:  TLS 1.3 (BoringSSL via quiche) — ACTIVE");
     println!();
-    println!("requests:     {}", s.total_requests);
+    if s.total_requests > 0 {
+        println!("requests:     {}", s.total_requests);
+    }
     println!("frames:       {}", s.total_frames);
     println!(
         "bytes:        {:.2} MiB",
         s.total_bytes as f64 / (1024.0 * 1024.0)
     );
     println!("errors:       {}", s.connections_failed);
-    println!("req/sec:      {:.1}", s.req_per_sec);
+    if s.total_requests > 0 {
+        println!("req/sec:      {:.1}", s.req_per_sec);
+    }
     println!("frames/sec:   {:.1}", s.frames_per_sec);
     println!();
 
@@ -567,13 +697,23 @@ pub fn print_summary(s: &Summary) {
     println!();
 
     if s.is_group {
-        println!("group (P5) throughput:");
+        let consumer_word = if s.is_broadcast {
+            "subscribers"
+        } else {
+            "members (round-robin)"
+        };
+        let mode_word = if s.is_broadcast {
+            "broadcast"
+        } else {
+            "group (P5)"
+        };
+        println!("{mode_word} throughput:");
         println!(
             "  publishers          {:>10}  (connections)",
             s.group_publishers
         );
         println!(
-            "  members             {:>10}  (connections, round-robin)",
+            "  consumers           {:>10}  ({consumer_word})",
             s.group_members
         );
         println!(
@@ -581,20 +721,56 @@ pub fn print_summary(s: &Summary) {
             s.group_publishes_per_sec
         );
         println!(
-            "  deliveries/sec      {:>10.1}  (server -> members)",
+            "  deliveries/sec      {:>10.1}  (server -> consumers)",
             s.group_deliveries_per_sec
         );
-        if !s.group_member_rx.is_empty() {
-            let mn = *s.group_member_rx.first().unwrap_or(&0);
-            let mx = *s.group_member_rx.last().unwrap_or(&0);
-            let sum: u64 = s.group_member_rx.iter().sum();
-            let avg = sum as f64 / s.group_member_rx.len() as f64;
+        if s.is_broadcast && s.group_members > 0 {
+            let fanout = s.group_deliveries_per_sec / s.group_publishes_per_sec.max(0.01);
             println!(
-                "  member fairness     {:>10} / {:>.0} / {}  (min / avg / max rx)",
-                mn, avg, mx
+                "  fanout multiplier   {:>10.1}x  (deliveries / publishes)",
+                fanout
             );
         }
         println!();
+
+        // ── Delivery correctness ────────────────────────────────────
+        println!("delivery correctness:");
+        let pct = (s.delivery_ratio * 100.0).min(999.9);
+        println!("  delivery ratio      {:>9.1}%  (actual / expected)", pct);
+        println!(
+            "  total verified      {:>10}  (seqs received)",
+            s.total_seq_received
+        );
+        println!(
+            "  missing             {:>10}  (gap count{})",
+            s.total_missing,
+            if s.is_broadcast {
+                ""
+            } else {
+                " — per-member subset, see aggregate"
+            }
+        );
+        println!(
+            "  duplicates          {:>10}  (re-deliveries)",
+            s.total_duplicates
+        );
+        println!(
+            "  publisher max seq   {:>10}  (total unique published)",
+            s.publisher_pub_seq
+        );
+        println!();
+
+        // ── Per-consumer table ──────────────────────────────────────
+        if !s.consumer_details.is_empty() {
+            println!("per consumer:");
+            for c in &s.consumer_details {
+                println!(
+                    "  {:<14} {:>8.0} msg/s   {:>6.1} MiB/s   missing={:<6} dup={}",
+                    c.label, c.msg_per_sec, c.mib_per_sec, c.missing, c.duplicates
+                );
+            }
+            println!();
+        }
     }
 
     println!("workload breakdown (per request):");

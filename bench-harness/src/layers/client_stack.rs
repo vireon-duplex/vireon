@@ -46,6 +46,8 @@ use frame::header::{FrameFlags, MessageType, StreamId};
 use send_policy::{DeliveryPolicy, DequeueOutcome, FramePayload, SendPolicyTable};
 use session_manager::SessionId;
 
+use crate::workload::BENCH_SEQ_BYTES;
+
 use super::application::ClientApplicationLayer;
 
 /// Pre-allocation size for each per-stream `FrameDecoder`.
@@ -68,6 +70,10 @@ pub struct ClientStack {
     /// [`Self::bind_send_policy`] is called, so the default bench
     /// workload (which never binds) is fully pass-through.
     send_policy: SendPolicyTable,
+    /// Collected `bench_seq` values extracted from received Publish
+    /// frames. Drained by `ConnState::drain_and_process` for delivery
+    /// verification (missing / duplicate / out-of-order detection).
+    verified_seqs: Vec<u64>,
 }
 
 impl ClientStack {
@@ -82,6 +88,7 @@ impl ClientStack {
             app: ClientApplicationLayer::new(),
             decoders: HashMap::new(),
             send_policy: SendPolicyTable::new(),
+            verified_seqs: Vec::new(),
         }
     }
 
@@ -207,6 +214,21 @@ impl ClientStack {
                         payload: &frame.payload[..],
                     };
                     self.app.on_frame(&frame_ref);
+                    // Extract embedded bench_seq from Publish frames for
+                    // delivery verification. Payload layout:
+                    //   topic_len:u16 BE | topic | bench_seq:u64 BE | data
+                    if frame.msg_type == MessageType::Publish
+                        && frame.payload.len() >= 2 + BENCH_SEQ_BYTES
+                    {
+                        let topic_len =
+                            u16::from_be_bytes([frame.payload[0], frame.payload[1]]) as usize;
+                        let seq_off = 2 + topic_len;
+                        if frame.payload.len() >= seq_off + BENCH_SEQ_BYTES {
+                            let mut buf = [0u8; 8];
+                            buf.copy_from_slice(&frame.payload[seq_off..seq_off + BENCH_SEQ_BYTES]);
+                            self.verified_seqs.push(u64::from_be_bytes(buf));
+                        }
+                    }
                     count += 1;
                 }
                 Ok(None) => break,
@@ -246,6 +268,14 @@ impl ClientStack {
     #[must_use]
     pub fn bytes_rx(&self) -> u64 {
         self.app.bytes_rx()
+    }
+
+    /// Drains and returns the collected `bench_seq` values from received
+    /// Publish frames. Called once per `drain_and_process` cycle so the
+    /// caller can feed seqs into a `SeqVerifier` for delivery correctness
+    /// tracking (missing / duplicate / out-of-order).
+    pub fn take_verified_seqs(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.verified_seqs)
     }
 }
 

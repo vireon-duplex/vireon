@@ -87,6 +87,18 @@ pub const GROUP_NAME: &str = "bench";
 /// current group coordinator — delivery is round-robin regardless).
 pub const GROUP_PARTITIONS: u32 = 4;
 
+/// Topic used by the `--mode broadcast` scenario. Subscribers send a
+/// Subscribe frame matching this exact topic; the publisher streams
+/// Publish frames to it. The server fans each publish out to every
+/// active subscriber (unlike consumer-group round-robin).
+pub const BROADCAST_TOPIC: &str = "bench.broadcast";
+
+/// Number of bytes reserved at the start of a Publish data payload
+/// (after `topic_len + topic`) to carry an embedded `bench_seq: u64 BE`.
+/// This lets the member/subscriber verify per-message delivery order
+/// without relying on the frame-header seq (which the server overwrites).
+pub const BENCH_SEQ_BYTES: usize = 8;
+
 /// Builds the 1-entry workload used for display/logging when running
 /// `--mode group`. The actual group-mode frames (Publish for the
 /// publisher, ConsumerGroupJoin for members) are built inside
@@ -94,15 +106,33 @@ pub const GROUP_PARTITIONS: u32 = 4;
 /// and the summary table still reference a `Workload`, so this keeps
 /// the displayed breakdown honest (one Publish entry to `bench.group`)
 /// rather than showing the irrelevant 25-type blend.
+///
+/// Coalesce is 1 so each Publish frame carries a unique embedded
+/// `bench_seq`. Use `--coalesce N` for raw-throughput runs without
+/// verification.
 pub fn build_group() -> anyhow::Result<Workload> {
-    let topic = GROUP_TOPIC.as_bytes();
+    Ok(build_publish_workload(GROUP_TOPIC, 1))
+}
+
+/// Builds the 1-entry workload used for `--mode broadcast`. Same
+/// structure as `build_group` but targets `BROADCAST_TOPIC`. Coalesce
+/// is 1 for per-message seq verification.
+pub fn build_broadcast() -> anyhow::Result<Workload> {
+    Ok(build_publish_workload(BROADCAST_TOPIC, 1))
+}
+
+/// Shared builder for group/broadcast: one Publish entry to `topic`
+/// with `coalesce` copies per stream_send.
+fn build_publish_workload(topic: &str, coalesce: usize) -> Workload {
+    let topic_b = topic.as_bytes();
+    // data = bench_seq(8) + padding to fill ~4 KiB
     let data_payload = vec![0xE8u8; 4096];
-    let mut payload = Vec::with_capacity(2 + topic.len() + data_payload.len());
-    payload.extend_from_slice(&(topic.len() as u16).to_be_bytes());
-    payload.extend_from_slice(topic);
+    let mut payload = Vec::with_capacity(2 + topic_b.len() + data_payload.len());
+    payload.extend_from_slice(&(topic_b.len() as u16).to_be_bytes());
+    payload.extend_from_slice(topic_b);
     payload.extend_from_slice(&data_payload);
     let payload_len = payload.len();
-    Ok(Workload {
+    Workload {
         entries: vec![WorkloadEntry {
             msg_type: MessageType::Publish,
             name: "Publish",
@@ -114,8 +144,20 @@ pub fn build_group() -> anyhow::Result<Workload> {
         .into_boxed_slice(),
         total_payload_bytes: payload_len,
         batch_wire_bytes: frame::codec::HEADER_SIZE + payload_len + frame::codec::CRC_SIZE,
-        coalesce: COALESCE,
-    })
+        coalesce,
+    }
+}
+
+/// Builds a Subscribe frame payload for `topic`: `pattern_len:u16 BE |
+/// pattern | qos:u8`. Used by broadcast subscribers to register interest
+/// with the server's `pubsub_registry`.
+pub fn build_subscribe_payload(topic: &str) -> Vec<u8> {
+    let pattern = topic.as_bytes();
+    let mut v = Vec::with_capacity(2 + pattern.len() + 1);
+    v.extend_from_slice(&(pattern.len() as u16).to_be_bytes());
+    v.extend_from_slice(pattern);
+    v.push(0); // qos = 0 (at-most-once)
+    v
 }
 
 /// Builds the full 20-frame workload.
@@ -391,7 +433,8 @@ fn realistic_payload(mt: MessageType) -> Vec<u8> {
             let topic = b"sensor.temperature.zone1";
             let group = b"zone1-alerts";
             let consumer = b"consumer-1";
-            let mut v = Vec::with_capacity(2 + topic.len() + 2 + group.len() + 2 + consumer.len() + 4);
+            let mut v =
+                Vec::with_capacity(2 + topic.len() + 2 + group.len() + 2 + consumer.len() + 4);
             v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
             v.extend_from_slice(topic);
             v.extend_from_slice(&(group.len() as u16).to_be_bytes());
@@ -422,7 +465,8 @@ fn realistic_payload(mt: MessageType) -> Vec<u8> {
             let topic = b"sensor.temperature.zone1";
             let group = b"zone1-alerts";
             let consumer = b"consumer-1";
-            let mut v = Vec::with_capacity(2 + topic.len() + 2 + group.len() + 2 + consumer.len() + 4);
+            let mut v =
+                Vec::with_capacity(2 + topic.len() + 2 + group.len() + 2 + consumer.len() + 4);
             v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
             v.extend_from_slice(topic);
             v.extend_from_slice(&(group.len() as u16).to_be_bytes());
