@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use crate::config::{ServerConfig, WorkerMode};
 use crate::error::ServerError;
+use crate::layers::InterWorkerPublish;
 use crate::worker::{Worker, install_signal_handler};
 
 /// Top-level QUIC server.
@@ -64,6 +65,8 @@ impl QuicServer {
             1,
             dummy_rx,
             vec![dummy_tx],
+            None,
+            Vec::new(),
             cluster_handle,
             shutdown_requested.clone(),
         )?;
@@ -96,10 +99,17 @@ impl QuicServer {
         // reactor_id from DCID[0..4] and forwards the packet.
         let mesh_channels = quic_engine::ForwardMesh::build_channels(num_workers as u32);
 
+        // Build inter-worker pub/sub channels. Each worker broadcasts
+        // publishes to all others so subscribers on any worker receive
+        // the message regardless of which worker the publisher landed on.
+        let pubsub_channels = build_inter_worker_pubsub_channels(num_workers);
+
         let mut handles = Vec::with_capacity(num_workers);
         let mut stop_rx_list = Vec::with_capacity(num_workers);
 
-        for (core_id, (inbox_rx, outboxes)) in mesh_channels.into_iter().enumerate() {
+        for (core_id, ((inbox_rx, outboxes), (ps_inbox, ps_outboxes))) in
+            mesh_channels.into_iter().zip(pubsub_channels.into_iter()).enumerate()
+        {
             let core_id = core_id as u32;
             // Pop the next cluster handle in order (core_id matches).
             let cluster_handle = cluster_handles.as_mut().and_then(|q| q.pop_front());
@@ -109,6 +119,8 @@ impl QuicServer {
                 num_workers as u32,
                 inbox_rx,
                 outboxes,
+                Some(ps_inbox),
+                ps_outboxes,
                 cluster_handle,
                 shutdown_requested.clone(),
             )?;
@@ -254,4 +266,30 @@ fn join_all(handles: Vec<thread::JoinHandle<Result<(), ServerError>>>) -> Result
     }
 
     last_err.map_or(Ok(()), Err)
+}
+
+/// Builds the inter-worker pub/sub channel mesh.
+///
+/// Returns one `(inbox, outboxes)` pair per worker — same topology as
+/// `ForwardMesh::build_channels`. Each worker's `outboxes` is a Vec of
+/// cloned senders (one per worker, including itself). The worker skips
+/// its own index during broadcast.
+///
+/// Bounded at 1024 messages per inbox. `try_send` drops on full rather
+/// than blocking the reactor thread.
+fn build_inter_worker_pubsub_channels(
+    n: usize,
+) -> Vec<(
+    std::sync::mpsc::Receiver<InterWorkerPublish>,
+    Vec<std::sync::mpsc::SyncSender<InterWorkerPublish>>,
+)> {
+    let cap = 1024;
+    let channels: Vec<_> = (0..n)
+        .map(|_| std::sync::mpsc::sync_channel::<InterWorkerPublish>(cap))
+        .collect();
+    let senders: Vec<_> = channels.iter().map(|(s, _)| s.clone()).collect();
+    channels
+        .into_iter()
+        .map(|(_, rx)| (rx, senders.clone()))
+        .collect()
 }

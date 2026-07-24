@@ -66,6 +66,22 @@ use crate::cluster::OutgoingMsg;
 use crate::error::ServerError;
 use bytes::Bytes;
 
+// ── Inter-worker pub/sub forwarding ────────────────────────────────
+
+/// A published message forwarded from one worker to another for
+/// cross-worker fan-out. Each worker broadcasts publishes to all other
+/// workers so their local subscribers receive the message.
+///
+/// Receiving workers drain their inbox in `drain_worker_inbox` and call
+/// `cluster_deliver_local` (the same code path as inter-node delivery).
+/// Forwarded publishes are NOT re-broadcast, preventing loops.
+pub struct InterWorkerPublish {
+    /// Topic string (same as the wire-level topic in the Publish frame).
+    pub topic: String,
+    /// Application payload bytes.
+    pub payload: Bytes,
+}
+
 // ── FrameContext & OutgoingFrame ──────────────────────────────────
 
 /// Connection + stream context passed into dispatcher callbacks.
@@ -241,6 +257,15 @@ pub struct VireonDispatcher {
     /// worker drains its own queue in `on_batch_tick` →
     /// [`Self::drain_cluster_inbox`]. `None` in single-node mode.
     cluster_incoming_rx: Option<mpsc::Receiver<InterNodeMessage>>,
+    /// Outboxes to all workers for pub/sub fan-out. Index = worker
+    /// reactor_id. The sender at `worker_self_idx` is skipped during
+    /// broadcast. Empty in single-worker mode.
+    worker_outboxes: Vec<mpsc::SyncSender<InterWorkerPublish>>,
+    /// Inbox of forwarded publishes from other workers. Drained in
+    /// [`Self::drain_worker_inbox`]. `None` in single-worker mode.
+    worker_inbox: Option<mpsc::Receiver<InterWorkerPublish>>,
+    /// This worker's reactor_id — used to skip self when broadcasting.
+    worker_self_idx: usize,
 }
 
 impl VireonDispatcher {
@@ -283,6 +308,9 @@ impl VireonDispatcher {
             node_id: session_registry::NodeId::NIL,
             cluster_outgoing_tx: None,
             cluster_incoming_rx: None,
+            worker_outboxes: Vec::new(),
+            worker_inbox: None,
+            worker_self_idx: 0,
         }
     }
 
@@ -398,6 +426,23 @@ impl VireonDispatcher {
                 );
             }
         }
+    }
+
+    /// Installs inter-worker pub/sub channels for cross-worker fan-out.
+    ///
+    /// When set, every local publish is broadcast to all other workers
+    /// via `try_send`. Receiving workers drain their inbox in
+    /// `on_batch_tick` → [`Self::drain_worker_inbox`] and deliver to
+    /// their local subscribers.
+    pub fn set_worker_channels(
+        &mut self,
+        self_idx: usize,
+        inbox: mpsc::Receiver<InterWorkerPublish>,
+        outboxes: Vec<mpsc::SyncSender<InterWorkerPublish>>,
+    ) {
+        self.worker_self_idx = self_idx;
+        self.worker_inbox = Some(inbox);
+        self.worker_outboxes = outboxes;
     }
 
     /// Evaluates `(conn_idx's principal, action, topic_or_pattern)` against
@@ -958,6 +1003,29 @@ impl VireonDispatcher {
                 MessageType::Publish,
                 bytes.clone(),
             );
+        }
+
+        // Cross-worker fan-out: broadcast to all other workers so their
+        // local subscribers receive this publish. `try_send` is
+        // non-blocking — a full inbox drops the publish rather than
+        // stalling the reactor thread.
+        if !self.worker_outboxes.is_empty() {
+            let fwd_topic = topic_str.to_string();
+            let fwd_payload = Bytes::copy_from_slice(payload);
+            for (i, outbox) in self.worker_outboxes.iter().enumerate() {
+                if i == self.worker_self_idx {
+                    continue;
+                }
+                if let Err(std::sync::mpsc::TrySendError::Full(_)) = outbox.try_send(InterWorkerPublish {
+                    topic: fwd_topic.clone(),
+                    payload: fwd_payload.clone(),
+                }) {
+                    tracing::trace!(
+                        worker = i,
+                        "[pubsub] worker inbox full — publish dropped"
+                    );
+                }
+            }
         }
     }
 
@@ -1876,6 +1944,38 @@ impl VireonDispatcher {
             );
         }
     }
+
+    /// Drains forwarded publishes from other workers and delivers them
+    /// to local subscribers. Called from `on_batch_tick` each reactor
+    /// cycle. Bounded at 256 messages per drain to avoid monopolising
+    /// the reactor thread.
+    ///
+    /// Delivered publishes are NOT re-broadcast to other workers,
+    /// preventing forwarding loops.
+    pub fn drain_worker_inbox(&mut self) {
+        let Some(rx) = &mut self.worker_inbox else {
+            return;
+        };
+        const CAP: usize = 256;
+        let mut batch: Vec<InterWorkerPublish> = Vec::with_capacity(CAP);
+        while batch.len() < CAP {
+            match rx.try_recv() {
+                Ok(msg) => batch.push(msg),
+                Err(_) => break,
+            }
+        }
+        if batch.is_empty() {
+            return;
+        }
+        tracing::debug!(
+            worker = self.worker_self_idx,
+            count = batch.len(),
+            "[pubsub] worker inbox drained"
+        );
+        for msg in batch {
+            self.cluster_deliver_local(&msg.topic, &msg.payload, 0, 0);
+        }
+    }
 }
 
 impl Default for VireonDispatcher {
@@ -2184,6 +2284,7 @@ impl ApplicationLayer {
         self.session.on_batch_tick();
         self.dispatcher.tick_groups();
         self.dispatcher.drain_cluster_inbox();
+        self.dispatcher.drain_worker_inbox();
     }
 
     /// Drains queued outgoing frames produced by the dispatcher.
@@ -2279,6 +2380,19 @@ impl ApplicationLayer {
         incoming_rx: mpsc::Receiver<InterNodeMessage>,
     ) {
         self.dispatcher.set_cluster(cfg, outgoing_tx, incoming_rx);
+    }
+
+    /// Installs inter-worker pub/sub channels for cross-worker fan-out.
+    /// Should be called before the first frame is processed so every
+    /// publish is broadcast to other workers from the start.
+    #[allow(dead_code)]
+    pub fn set_worker_channels(
+        &mut self,
+        self_idx: usize,
+        inbox: mpsc::Receiver<InterWorkerPublish>,
+        outboxes: Vec<mpsc::SyncSender<InterWorkerPublish>>,
+    ) {
+        self.dispatcher.set_worker_channels(self_idx, inbox, outboxes);
     }
 }
 

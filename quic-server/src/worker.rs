@@ -39,6 +39,8 @@ impl Worker {
         num_workers: u32,
         inbox_rx: mpsc::Receiver<ForwardedPacket>,
         outboxes: Vec<mpsc::SyncSender<ForwardedPacket>>,
+        worker_inbox: Option<mpsc::Receiver<crate::layers::InterWorkerPublish>>,
+        worker_outboxes: Vec<mpsc::SyncSender<crate::layers::InterWorkerPublish>>,
         cluster_handle: Option<ClusterWorkerHandle>,
         shutdown_requested: Arc<AtomicBool>,
     ) -> Result<Self, ServerError> {
@@ -112,6 +114,8 @@ impl Worker {
             config.acl_table.clone(),
             config.wal_root.as_deref(),
             cluster,
+            worker_inbox,
+            worker_outboxes,
             shutdown_requested,
         )?;
 
@@ -168,6 +172,8 @@ impl Worker {
         num_workers: u32,
         inbox_rx: mpsc::Receiver<ForwardedPacket>,
         outboxes: Vec<mpsc::SyncSender<ForwardedPacket>>,
+        worker_inbox: Option<mpsc::Receiver<crate::layers::InterWorkerPublish>>,
+        worker_outboxes: Vec<mpsc::SyncSender<crate::layers::InterWorkerPublish>>,
         cluster_handle: Option<ClusterWorkerHandle>,
         shutdown_requested: Arc<AtomicBool>,
     ) -> Result<
@@ -187,6 +193,8 @@ impl Worker {
                     num_workers,
                     inbox_rx,
                     outboxes,
+                    worker_inbox,
+                    worker_outboxes,
                     cluster_handle,
                     shutdown_requested,
                 ) {
