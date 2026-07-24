@@ -1,6 +1,8 @@
 //! Vireon QUIC Server — production-grade QUIC server on io_uring + quiche.
 
+mod acl_loader;
 mod cli;
+mod cluster;
 mod config;
 mod connection;
 mod distributed;
@@ -11,6 +13,7 @@ mod server;
 mod stack;
 mod worker;
 
+#[cfg(feature = "profiling")]
 use std::sync::OnceLock;
 
 use clap::Parser;

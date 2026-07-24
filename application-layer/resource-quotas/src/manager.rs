@@ -178,6 +178,21 @@ impl QuotaManager {
     pub fn bytes_used(&self, id: TenantId) -> u64 {
         self.tenants.get(&id).map_or(0, |e| e.bytes_used)
     }
+
+    /// Get the stored limit for a tenant (derived from tier at registration).
+    ///
+    /// Used by [`QuotaEnforcer`](crate::enforcer::QuotaEnforcer) to enforce
+    /// quotas without requiring the caller to pass an explicit `QuotaLimit`.
+    ///
+    /// # Errors
+    /// Returns [`QuotaError::TenantNotFound`] if unregistered.
+    pub fn limit_for(&self, id: TenantId) -> Result<QuotaLimit, QuotaError> {
+        let entry = self
+            .tenants
+            .get(&id)
+            .ok_or(QuotaError::TenantNotFound(id))?;
+        Ok(entry.limit)
+    }
 }
 
 #[cfg(test)]

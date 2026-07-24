@@ -4,17 +4,19 @@
 
 use std::collections::BTreeMap;
 
+use crate::topic::Topic;
+
 // ── PubSubMessage ───────────────────────────────────────────────
 
 /// A message published to a topic in the pub/sub engine.
 ///
-/// Messages carry a topic string, a binary payload, a timestamp,
+/// Messages carry a validated [`Topic`], a binary payload, a timestamp,
 /// and optional headers. The topic is used by the engine to route
 /// the message to matching subscriptions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PubSubMessage {
     /// The topic this message is published to.
-    pub topic: String,
+    pub topic: Topic,
     /// The binary payload.
     pub payload: Vec<u8>,
     /// Timestamp in milliseconds since epoch.
@@ -29,9 +31,9 @@ impl PubSubMessage {
     /// The timestamp is set to 0; callers should set it externally.
     /// Headers are initialized as empty.
     #[must_use]
-    pub fn new(topic: impl Into<String>, payload: Vec<u8>) -> Self {
+    pub fn new(topic: Topic, payload: Vec<u8>) -> Self {
         Self {
-            topic: topic.into(),
+            topic,
             payload,
             timestamp_ms: 0,
             headers: BTreeMap::new(),
@@ -40,9 +42,9 @@ impl PubSubMessage {
 
     /// Create a new pub/sub message with a timestamp.
     #[must_use]
-    pub fn with_timestamp(topic: impl Into<String>, payload: Vec<u8>, timestamp_ms: u64) -> Self {
+    pub fn with_timestamp(topic: Topic, payload: Vec<u8>, timestamp_ms: u64) -> Self {
         Self {
-            topic: topic.into(),
+            topic,
             payload,
             timestamp_ms,
             headers: BTreeMap::new(),
@@ -68,21 +70,26 @@ impl PubSubMessage {
         self.headers.get(key).map(|s| s.as_str())
     }
 
-    /// Get the topic as a string slice.
+    /// Get the topic as a typed reference.
     #[must_use]
-    pub fn topic(&self) -> &str {
+    pub fn topic(&self) -> &Topic {
         &self.topic
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
+
+    fn t(s: &str) -> Topic {
+        Topic::new(s).unwrap()
+    }
 
     #[test]
     fn new_message() {
-        let msg = PubSubMessage::new("sensor.temp", vec![1, 2, 3]);
-        assert_eq!(msg.topic, "sensor.temp");
+        let msg = PubSubMessage::new(t("sensor.temp"), vec![1, 2, 3]);
+        assert_eq!(msg.topic.as_str(), "sensor.temp");
         assert_eq!(msg.payload, vec![1, 2, 3]);
         assert_eq!(msg.timestamp_ms, 0);
         assert!(msg.headers.is_empty());
@@ -90,15 +97,15 @@ mod tests {
 
     #[test]
     fn new_with_timestamp() {
-        let msg = PubSubMessage::with_timestamp("alerts", vec![42], 1_700_000_000_000);
-        assert_eq!(msg.topic, "alerts");
+        let msg = PubSubMessage::with_timestamp(t("alerts"), vec![42], 1_700_000_000_000);
+        assert_eq!(msg.topic.as_str(), "alerts");
         assert_eq!(msg.payload, vec![42]);
         assert_eq!(msg.timestamp_ms, 1_700_000_000_000);
     }
 
     #[test]
     fn with_header_chains() {
-        let msg = PubSubMessage::new("topic", vec![])
+        let msg = PubSubMessage::new(t("topic"), vec![])
             .with_header("source", "sensor-1")
             .with_header("priority", "high");
         assert_eq!(msg.header("source"), Some("sensor-1"));
@@ -108,41 +115,41 @@ mod tests {
 
     #[test]
     fn payload_size() {
-        let msg = PubSubMessage::new("topic", vec![0; 1024]);
+        let msg = PubSubMessage::new(t("topic"), vec![0; 1024]);
         assert_eq!(msg.payload_size(), 1024);
     }
 
     #[test]
     fn empty_payload() {
-        let msg = PubSubMessage::new("topic", vec![]);
+        let msg = PubSubMessage::new(t("topic"), vec![]);
         assert_eq!(msg.payload_size(), 0);
     }
 
     #[test]
     fn topic_accessor() {
-        let msg = PubSubMessage::new("sensor.temp", vec![]);
-        assert_eq!(msg.topic(), "sensor.temp");
+        let msg = PubSubMessage::new(t("sensor.temp"), vec![]);
+        assert_eq!(msg.topic().as_str(), "sensor.temp");
     }
 
     #[test]
     fn message_equality() {
-        let m1 = PubSubMessage::with_timestamp("a", vec![1], 100);
-        let m2 = PubSubMessage::with_timestamp("a", vec![1], 100);
-        let m3 = PubSubMessage::with_timestamp("a", vec![1], 200);
+        let m1 = PubSubMessage::with_timestamp(t("a"), vec![1], 100);
+        let m2 = PubSubMessage::with_timestamp(t("a"), vec![1], 100);
+        let m3 = PubSubMessage::with_timestamp(t("a"), vec![1], 200);
         assert_eq!(m1, m2);
         assert_ne!(m1, m3);
     }
 
     #[test]
     fn message_clone() {
-        let m1 = PubSubMessage::new("topic", vec![1, 2, 3]);
+        let m1 = PubSubMessage::new(t("topic"), vec![1, 2, 3]);
         let m2 = m1.clone();
         assert_eq!(m1, m2);
     }
 
     #[test]
     fn headers_ordered() {
-        let msg = PubSubMessage::new("topic", vec![])
+        let msg = PubSubMessage::new(t("topic"), vec![])
             .with_header("zebra", "z")
             .with_header("apple", "a")
             .with_header("mango", "m");

@@ -43,6 +43,29 @@ pub struct ServerConfig {
     pub echo: bool,
     pub sqpoll: bool,
     pub skip_crc: bool,
+    /// Optional operator-provided ACL rules file path. When set, the
+    /// server loads tenant-isolation rules from this path at startup
+    /// (one `AclTable` parsed in `from_cli`, shared across workers
+    /// via `Clone`). When `None`, the permissive default
+    /// `allow("*.*", None, ALL)` is kept.
+    #[allow(dead_code)]
+    pub acl_rules_path: Option<String>,
+    /// Parsed ACL table, ready to apply. `None` keeps the dispatcher's
+    /// built-in permissive default. Parsed once in `from_cli`; cloned
+    /// per-worker at stack construction (cheap: `Vec<AclRule>` clone).
+    pub acl_table: Option<topic_acl::AclTable>,
+    /// Optional WAL root directory. When set, each worker opens its own
+    /// `FileStore` rooted at `<root>/worker_<core_id>/` and appends
+    /// every accepted publish before fan-out. `None` disables WAL.
+    #[allow(dead_code)]
+    pub wal_root: Option<std::path::PathBuf>,
+
+    /// Optional cluster transport config (P6). When set, the server
+    /// joins a multi-node cluster and routes publishes via UDP-based
+    /// inter-node transport. `None` = single-node mode (all topics
+    /// owned locally).
+    #[allow(dead_code)]
+    pub cluster: Option<crate::cluster::ClusterTransportConfig>,
 }
 
 /// Default queue depth if the CLI passes 0.
@@ -66,6 +89,41 @@ impl ServerConfig {
 
         let workers = resolve_workers(cli.workers, &cli.mode);
 
+        // Parse the ACL rules file once at startup so worker threads
+        // just `Clone` the resulting table. A parse failure surfaces as
+        // a `Config` error — the server refuses to start rather than
+        // silently falling back to permissive defaults.
+        let acl_table = match cli.acl_rules_path.as_deref() {
+            Some(path) => Some(
+                crate::acl_loader::load(std::path::Path::new(path))
+                    .map_err(|e| anyhow::anyhow!("ACL rules file `{path}`: {e:#}"))?,
+            ),
+            None => None,
+        };
+
+        // P6: parse cluster configuration if --cluster-node-id is set.
+        let cluster = match (cli.cluster_node_id, cli.cluster_peers.as_deref()) {
+            (Some(id), Some(peers_str)) => {
+                let self_id = session_registry::NodeId::new(id);
+                let peers = crate::cluster::parse_cluster_peers(peers_str)
+                    .map_err(|e| anyhow::anyhow!("--cluster-peers: {e}"))?;
+                let cfg = crate::cluster::build_cluster_transport_config(self_id, &peers)
+                    .map_err(|e| anyhow::anyhow!("--cluster-peers: {e}"))?;
+                Some(cfg)
+            }
+            (Some(_), None) => {
+                return Err(anyhow::anyhow!(
+                    "--cluster-node-id requires --cluster-peers"
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(anyhow::anyhow!(
+                    "--cluster-peers requires --cluster-node-id"
+                ));
+            }
+            (None, None) => None,
+        };
+
         Ok(Self {
             port: cli.port,
             bind_addr,
@@ -83,6 +141,10 @@ impl ServerConfig {
             echo: cli.echo,
             sqpoll: cli.sqpoll,
             skip_crc: cli.skip_crc,
+            acl_rules_path: cli.acl_rules_path.clone(),
+            acl_table,
+            wal_root: cli.wal_root.as_deref().map(std::path::PathBuf::from),
+            cluster,
         })
     }
 

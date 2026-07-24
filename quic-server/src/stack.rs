@@ -33,9 +33,10 @@ use frame::codec::{self, FrameHeader, FrameRef};
 use io::handler::{IoHandler, TickContext};
 use quic_engine::{QuicEngine, QuicEvent, QuicSendError};
 
+use crate::cluster::ClusterWorkerHandle;
 use crate::connection::{ConnState, ConnectionRegistry};
 use crate::error::ServerError;
-use crate::layers::{ApplicationLayer, FrameContext, RuntimeLayer};
+use crate::layers::{ApplicationLayer, FrameContext, OutgoingFrame, RuntimeLayer};
 
 /// Drain timeout — how long to wait for connections to close cleanly
 /// before forcing reactor exit. 2 seconds covers 3 × PTO (Probe Timeout)
@@ -200,10 +201,35 @@ impl VireonStack {
         engine: QuicEngine,
         reactor_id: u32,
         echo: bool,
+        acl_table: Option<topic_acl::AclTable>,
+        wal_root: Option<&std::path::Path>,
+        cluster: Option<(&cluster_coordinator::ClusterConfig, ClusterWorkerHandle)>,
         shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, ServerError> {
+        let mut application = ApplicationLayer::new()?;
+        if let Some(table) = acl_table {
+            application.set_acl(table);
+        }
+        if let Some(root) = wal_root {
+            // Each worker partitions under `<root>/worker_<reactor_id>/`
+            // so concurrent reactors don't fight over the same files.
+            // Cross-worker WAL sharing is a P5/P6 concern.
+            let worker_dir = root.join(format!("worker_{reactor_id}"));
+            match wal_store::FileStore::open(&worker_dir) {
+                Ok(store) => application.set_wal(store),
+                Err(e) => {
+                    return Err(ServerError::EngineInit(format!(
+                        "wal_store open `{}`: {e:?}",
+                        worker_dir.display()
+                    )));
+                }
+            }
+        }
+        if let Some((cfg, handle)) = cluster {
+            application.set_cluster(cfg, handle.outgoing_tx, handle.incoming_rx);
+        }
         Ok(Self {
-            application: ApplicationLayer::new()?,
+            application,
             runtime: RuntimeLayer::new(reactor_id)?,
             engine,
             connections: ConnectionRegistry::new(),
@@ -274,8 +300,37 @@ impl VireonStack {
         // Doing this once per batch (instead of per-frame) reduces the
         // number of outbox drain calls and allows the engine to coalesce
         // multiple frames into fewer flush cycles.
+        //
+        // Two-category routing:
+        //   * direct_send — control frames (Subscribe ACKs, TopicCreate
+        //     ACKs, etc.) and frames on streams not bound to a send
+        //     policy. These bypass policy and go straight to the wire.
+        //   * policy — frames on streams whose subscriber declared a
+        //     delivery policy at StreamOpen. These are consumed by the
+        //     SendPolicyTable and emerge from `drain_ready_egress` in
+        //     policy order (FIFO / drop-stale / latest-only).
+        //
+        // Splitting the drain into two passes avoids the borrow conflict
+        // between `application.enqueue_egress(&mut self, ...)` and
+        // `encode_and_send(&mut self, ...)` — we collect each category
+        // into a local Vec, then send in a separate loop.
         let outbox = self.application.drain_outbox();
+        let mut direct_send: Vec<OutgoingFrame> = Vec::with_capacity(outbox.len());
         for out in outbox {
+            match self.application.enqueue_egress(out) {
+                None => {} // consumed by policy
+                Some(out) => direct_send.push(out),
+            }
+        }
+        // Send the bypass frames first so control-plane ACKs reach the
+        // peer before any policy-delayed data.
+        for out in direct_send {
+            self.encode_and_send(out.conn_idx, out.quic_stream_id, out.header, &out.payload);
+        }
+        // Drain policy-cleared frames and send.
+        let mut policy_ready: Vec<OutgoingFrame> = Vec::new();
+        self.application.drain_ready_egress(&mut policy_ready);
+        for out in policy_ready {
             self.encode_and_send(out.conn_idx, out.quic_stream_id, out.header, &out.payload);
         }
     }
@@ -305,7 +360,10 @@ impl VireonStack {
             "session created"
         );
 
-        // Track cross-layer state.
+        // Track cross-layer state. The dispatcher independently tracks
+        // the per-connection principal (resolved from the Handshake
+        // frame) in its own map; the registry here stores only the
+        // connection / session identifiers and eviction bookkeeping.
         self.connections.insert(
             conn_idx,
             ConnState {

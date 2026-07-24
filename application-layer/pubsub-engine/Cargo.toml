@@ -9,8 +9,6 @@ description = "Pub/Sub engine: topic pattern matching, subscription management, 
 autobenches = false
 
 [dependencies]
-configuration-system = { path = "../configuration-system" }
-event-bus            = { path = "../event-bus" }
 thiserror = { workspace = true }
 tracing  = { workspace = true }
 rustc-hash = { workspace = true }
@@ -32,6 +30,10 @@ harness = false
 
 [[bench]]
 name = "deliver"
+harness = false
+
+[[bench]]
+name = "fanout"
 harness = false
 
 [lints]

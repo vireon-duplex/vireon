@@ -13,11 +13,15 @@ path = "src/main.rs"
 [dependencies]
 # Vireon crates
 frame = { path = "../message-layer/frame" }
+send-policy = { path = "../stream-layer/send-policy" }
 session-manager = { path = "../session-layer/session-manager" }
 stream-manager = { path = "../stream-layer/stream-manager" }
 
 # QUIC protocol
 quiche = { workspace = true }
+
+# Bytes (shared with send-policy's FramePayload)
+bytes = { workspace = true }
 
 # Error handling + logging
 anyhow = { workspace = true }
@@ -27,6 +31,10 @@ tracing-subscriber = { workspace = true }
 
 # Concurrency + system
 libc = { workspace = true }
+
+# Event-driven I/O — epoll on Linux, kqueue on macOS/BSD. Replaces the
+# thread-per-connection polling model with a thread-per-core reactor.
+mio = { version = "1.2.1", features = ["os-poll", "net"] }
 
 # Global allocator — eliminates glibc arena explosion under 1000-thread
 # burst allocation. mimalloc uses per-thread heaps with no cross-thread

@@ -22,6 +22,14 @@ pub mod runtime;
 pub mod session;
 pub mod stream;
 
-// Re-export the types used by stack.rs.
-pub use application::{ApplicationLayer, FrameContext};
+// Re-export the types used by stack.rs and by integration benches.
+// The binary crate (which still owns a duplicate copy of this module
+// via `mod layers;` in main.rs) does not use `AppDispatcher` or
+// `VireonDispatcher` directly — they're consumed by the lib's
+// `benches/pubsub_dispatch.rs`. The allow silences the binary's
+// duplicate-compile view without affecting the lib's public API.
+#[allow(unused_imports)]
+pub use application::{
+    AppDispatcher, ApplicationLayer, FrameContext, OutgoingFrame, VireonDispatcher,
+};
 pub use runtime::RuntimeLayer;

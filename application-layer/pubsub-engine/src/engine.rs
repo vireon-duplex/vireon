@@ -97,6 +97,14 @@ impl PubSubEngine {
         self.subscriptions.len()
     }
 
+    /// Take a snapshot of the engine's atomic counters. Useful for
+    /// metric collectors that need access to fields not present on
+    /// [`HealthReport`] (e.g. `messages_delivered`).
+    #[must_use]
+    pub fn snapshot(&self) -> crate::stats::StatsSnapshot {
+        self.stats.snapshot()
+    }
+
     /// Get the current health report.
     #[must_use]
     pub fn health(&self) -> HealthReport {
@@ -106,7 +114,9 @@ impl PubSubEngine {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
+    use crate::Topic;
 
     #[test]
     fn engine_creation() {
@@ -153,7 +163,10 @@ mod tests {
             .subscribe(TopicPattern::new("alert.*").unwrap())
             .unwrap();
         engine
-            .publish(PubSubMessage::new("sensor.temp", vec![1, 2, 3]))
+            .publish(PubSubMessage::new(
+                Topic::new("sensor.temp").unwrap(),
+                vec![1, 2, 3],
+            ))
             .unwrap();
         assert_eq!(engine.stats.snapshot().messages_published, 1);
     }
@@ -161,7 +174,9 @@ mod tests {
     #[test]
     fn health_report_reflects_publishes() {
         let mut engine = PubSubEngine::new(PubSubConfig::new());
-        engine.publish(PubSubMessage::new("t", vec![])).unwrap();
+        engine
+            .publish(PubSubMessage::new(Topic::new("t").unwrap(), vec![]))
+            .unwrap();
         let health = engine.health();
         assert_eq!(health.messages_published, 1);
     }
