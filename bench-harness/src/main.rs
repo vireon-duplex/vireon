@@ -49,6 +49,9 @@ struct Args {
     pipeline_depth: usize,
     sweep: SweepMode,
     egress_policy: EgressPolicy,
+    /// Override the workload's coalesce factor. `None` = use workload
+    /// default (1 for group/broadcast, 32 for stream/pipeline/rr/multi-rr).
+    coalesce: Option<usize>,
     /// Max reactor threads. `None` = auto (available_parallelism).
     /// Used with `taskset` to leave cores for the server when both
     /// run on the same machine.
@@ -76,11 +79,14 @@ fn main() -> Result<()> {
 
     match args.sweep {
         SweepMode::None => {
-            let workload = if args.mode == BenchMode::Group {
-                workload::build_group()?
-            } else {
-                workload::build()?
+            let mut workload = match args.mode {
+                BenchMode::Group => workload::build_group()?,
+                BenchMode::Broadcast => workload::build_broadcast()?,
+                _ => workload::build()?,
             };
+            if let Some(co) = args.coalesce {
+                workload.coalesce = co;
+            }
             let summary = run_benchmark(
                 args.target,
                 &sni,
@@ -340,6 +346,7 @@ fn mode_label(mode: BenchMode, depth: usize) -> String {
         BenchMode::Stream => "stream (full-duplex, no wait)".into(),
         BenchMode::Pipeline => format!("pipeline (depth={depth}, 15 streams)"),
         BenchMode::Group => "group (1 publisher + N members, round-robin delivery)".into(),
+        BenchMode::Broadcast => "broadcast (1 publisher + N subscribers, fan-out to all)".into(),
     }
 }
 
@@ -370,6 +377,7 @@ fn parse_args() -> Result<Args> {
     let mut sweep = SweepMode::None;
     let mut egress_policy = EgressPolicy::None;
     let mut reactors: Option<usize> = None;
+    let mut coalesce: Option<usize> = None;
 
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -402,8 +410,9 @@ fn parse_args() -> Result<Args> {
                         "stream" => BenchMode::Stream,
                         "pipeline" => BenchMode::Pipeline,
                         "group" => BenchMode::Group,
+                        "broadcast" => BenchMode::Broadcast,
                         other => anyhow::bail!(
-                            "unknown --mode '{other}'; valid: rr, multi-rr, stream, pipeline, group"
+                            "unknown --mode '{other}'; valid: rr, multi-rr, stream, pipeline, group, broadcast"
                         ),
                     };
                 }
@@ -420,6 +429,15 @@ fn parse_args() -> Result<Args> {
                     match argv[i].parse() {
                         Ok(v) if v > 0 => reactors = Some(v),
                         _ => anyhow::bail!("--reactors must be >= 1"),
+                    }
+                }
+            }
+            "--coalesce" => {
+                i += 1;
+                if i < argv.len() {
+                    match argv[i].parse() {
+                        Ok(v) if v >= 1 => coalesce = Some(v),
+                        _ => anyhow::bail!("--coalesce must be >= 1"),
                     }
                 }
             }
@@ -472,8 +490,12 @@ fn parse_args() -> Result<Args> {
         anyhow::bail!("--mode group needs >= 2 connections (1 publisher + >= 1 member)");
     }
 
-    if mode == BenchMode::Group && sweep != SweepMode::None {
-        anyhow::bail!("--mode group is incompatible with --sweep (use --sweep none)");
+    if mode == BenchMode::Broadcast && conns < 2 {
+        anyhow::bail!("--mode broadcast needs >= 2 connections (1 publisher + >= 1 subscriber)");
+    }
+
+    if matches!(mode, BenchMode::Group | BenchMode::Broadcast) && sweep != SweepMode::None {
+        anyhow::bail!("--mode group/broadcast is incompatible with --sweep (use --sweep none)");
     }
 
     Ok(Args {
@@ -484,6 +506,7 @@ fn parse_args() -> Result<Args> {
         pipeline_depth,
         sweep,
         egress_policy,
+        coalesce,
         reactors,
     })
 }
@@ -497,6 +520,10 @@ fn print_usage() {
     println!("  -d, --duration SECS          Measurement window in seconds (default: 10)");
     println!("  -m, --mode MODE              Benchmark mode (default: stream)");
     println!("  -p, --pipeline-depth N       In-flight batches for pipeline mode (default: 4)");
+    println!("      --coalesce N             Frame coalesce count per stream_send (default:");
+    println!("                               1 for group/broadcast, 32 for stream/pipeline/rr).");
+    println!("                               Set higher for raw-throughput runs without seq");
+    println!("                               verification (each coalesced copy shares one seq).");
     println!("      --sweep MODE             Sweep mode: conn, payload, none (default: none)");
     println!("      --egress-policy POLICY   Client send policy: none, reliable_ordered,");
     println!("                               reliable_unordered, realtime_drop_old, latest_only");
@@ -516,6 +543,9 @@ fn print_usage() {
     println!("  group       P5 consumer-group throughput: conn 0 = publisher streaming Publish");
     println!("              to topic 'bench.group'; conns 1..N = members that join group 'bench'");
     println!("              then count round-robin deliveries. Needs >= 2 connections.");
+    println!("  broadcast   Fan-out throughput: conn 0 = publisher streaming Publish to topic");
+    println!("              'bench.broadcast'; conns 1..N = subscribers that receive EVERY");
+    println!("              published message (unlike group's round-robin). Needs >= 2 conns.");
     println!();
     println!("Workload covers all 25 MessageType variants:");
     println!("  TextToken(0x01)   → Text / content payload");
@@ -545,6 +575,7 @@ fn print_usage() {
     println!("  loadtest -c 4 -d 10 -m stream          # throughput test, 4 users");
     println!("  loadtest -c 4 -d 30 -m pipeline -p 8   # pipelined, depth 8");
     println!("  loadtest -c 1 -d 10 -m rr              # latency baseline");
+    println!("  loadtest -c 8 -d 10 -m broadcast       # fan-out to 7 subscribers");
     println!("  loadtest --sweep conn -d 5             # throughput vs connections sweep");
     println!("  loadtest --sweep payload -d 5          # latency vs payload size sweep");
     println!();

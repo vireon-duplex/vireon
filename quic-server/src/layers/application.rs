@@ -1404,10 +1404,7 @@ impl VireonDispatcher {
         let (topic, group, consumer, rest) = match Self::parse_group_prefix(frame.payload) {
             Some(v) => v,
             None => {
-                tracing::warn!(
-                    conn_idx = ctx.conn_idx,
-                    "[groups] join: malformed payload"
-                );
+                tracing::warn!(conn_idx = ctx.conn_idx, "[groups] join: malformed payload");
                 self.enqueue_response(
                     ctx,
                     frame.stream_id,
@@ -1476,26 +1473,34 @@ impl VireonDispatcher {
             }
         };
         // Record local membership.
-        self.group_locals
+        // Dedup by consumer_id: heartbeat re-joins (the bench harness
+        // re-sends ConsumerGroupJoin every 1 s) must NOT create duplicate
+        // entries — otherwise the round-robin counter cycles through the
+        // same physical member multiple times, causing duplicate deliveries.
+        let local = self
+            .group_locals
             .entry((topic.to_string(), group.to_string()))
             .or_insert_with(|| GroupLocal {
                 members: Vec::new(),
                 rr_idx: 0,
-            })
-            .members
-            .push(GroupMember {
+            });
+        if let Some(existing) = local.members.iter_mut().find(|m| m.consumer == consumer_id) {
+            // Re-join from an existing consumer: update conn_idx/stream
+            // (handles reconnection to a new QUIC connection).
+            existing.conn_idx = ctx.conn_idx;
+            existing.quic_stream_id = ctx.quic_stream_id;
+        } else {
+            local.members.push(GroupMember {
                 conn_idx: ctx.conn_idx,
                 quic_stream_id: ctx.quic_stream_id,
                 consumer: consumer_id.clone(),
             });
-        self.conn_group_keys
-            .entry(ctx.conn_idx)
-            .or_default()
-            .push((
-                topic.to_string(),
-                group.to_string(),
-                consumer_id,
-            ));
+        }
+        let group_key = (topic.to_string(), group.to_string(), consumer_id);
+        let keys = self.conn_group_keys.entry(ctx.conn_idx).or_default();
+        if !keys.contains(&group_key) {
+            keys.push(group_key);
+        }
         tracing::info!(
             conn_idx = ctx.conn_idx,
             topic = topic,
@@ -1503,9 +1508,7 @@ impl VireonDispatcher {
             generation = generation,
             "[groups] join"
         );
-        let ack = format!(
-            r#"{{"joined":"{topic}","group":"{group}","generation":{generation}}}"#
-        );
+        let ack = format!(r#"{{"joined":"{topic}","group":"{group}","generation":{generation}}}"#);
         self.enqueue_response(
             ctx,
             frame.stream_id,
@@ -1556,9 +1559,7 @@ impl VireonDispatcher {
         self.remove_group_member(topic, group, &consumer_id);
         // Remove from conn_group_keys.
         if let Some(keys) = self.conn_group_keys.get_mut(&ctx.conn_idx) {
-            keys.retain(|(t, g, c)| {
-                !(t == topic && g == group && c.as_str() == consumer)
-            });
+            keys.retain(|(t, g, c)| !(t == topic && g == group && c.as_str() == consumer));
         }
         tracing::info!(
             conn_idx = ctx.conn_idx,
@@ -1706,13 +1707,9 @@ impl VireonDispatcher {
             for (topic, group, consumer) in stale_keys {
                 self.remove_group_member(&topic, &group, &consumer);
                 // Also clean conn_group_keys.
-                self.conn_group_keys
-                    .values_mut()
-                    .for_each(|keys| {
-                        keys.retain(|(t, g, c)| {
-                            !(t == &topic && g == &group && c == &consumer)
-                        });
-                    });
+                self.conn_group_keys.values_mut().for_each(|keys| {
+                    keys.retain(|(t, g, c)| !(t == &topic && g == &group && c == &consumer));
+                });
             }
         }
     }
@@ -1827,7 +1824,11 @@ impl VireonDispatcher {
                 return;
             }
         };
-        let targets: Vec<Subscriber> = self.pubsub_registry.lookup(&topic_ref).into_iter().collect();
+        let targets: Vec<Subscriber> = self
+            .pubsub_registry
+            .lookup(&topic_ref)
+            .into_iter()
+            .collect();
 
         // Re-encode as a Publish frame so downstream subscribers receive the
         // same wire shape the publisher used (topic_len + topic + payload).

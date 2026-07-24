@@ -21,7 +21,10 @@ use mio::net::UdpSocket;
 use crate::gso::send_with_gso;
 use crate::layers::ClientStack;
 use crate::stats::WorkerResult;
-use crate::workload::{GROUP_NAME, GROUP_PARTITIONS, GROUP_TOPIC, WorkloadEntry};
+use crate::workload::{
+    BENCH_SEQ_BYTES, BROADCAST_TOPIC, GROUP_NAME, GROUP_PARTITIONS, GROUP_TOPIC, WorkloadEntry,
+    build_subscribe_payload,
+};
 use frame::header::{FrameFlags, MessageType};
 
 /// Client-initiated bidirectional QUIC stream IDs.
@@ -60,15 +63,21 @@ pub enum BenchMode {
     /// all others are [`Role::Member`]s that join one group and count
     /// round-robin deliveries. See `tick_group`.
     Group,
+    /// Broadcast scenario: connection 0 is the [`Role::Publisher`],
+    /// all others are [`Role::Subscriber`]s that send Subscribe and
+    /// receive every published message. See `tick_broadcast`.
+    Broadcast,
 }
 
-/// Role a connection plays in `BenchMode::Group`. Legacy modes default to
-/// `Publisher` (the field is unused there). Reported back via
-/// [`WorkerResult`] so `stats` can split publisher tx from member rx.
+/// Role a connection plays in `BenchMode::Group` or `BenchMode::Broadcast`.
+/// Legacy modes default to `Publisher` (the field is unused there).
+/// Reported back via [`WorkerResult`] so `stats` can split publisher tx
+/// from member/subscriber rx.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
     Publisher,
     Member,
+    Subscriber,
 }
 
 /// Client-side send policy.
@@ -103,7 +112,58 @@ pub(crate) enum Phase {
     Done,
 }
 
-/// Send cursor — tracks which entry is being sent and how far into its
+/// Tracks per-message delivery correctness using embedded `bench_seq`
+/// values extracted from Publish payloads.
+///
+/// For **broadcast** mode each subscriber should see a perfect contiguous
+/// sequence (0, 1, 2, ...) — `missing` and `duplicates` should both be 0.
+///
+/// For **group** mode each member only receives a round-robin *subset*,
+/// so `missing` is inherently high per-member and is only meaningful at
+/// the aggregate level (union of all members). `duplicates` should still
+/// be 0 (no delivery should ever be duplicated).
+pub(crate) struct SeqVerifier {
+    /// Next contiguous seq we expect (0 initially). Advances as we see
+    /// seqs in order.
+    next_expected: u64,
+    /// Total verified Publish frames received.
+    received: u64,
+    /// Sum of gap sizes detected (seq jumped forward by N → missing += N).
+    missing: u64,
+    /// Times we saw a seq < next_expected (already-passed point).
+    duplicates: u64,
+    /// Highest seq observed.
+    max_seq: u64,
+}
+
+impl SeqVerifier {
+    fn new() -> Self {
+        Self {
+            next_expected: 0,
+            received: 0,
+            missing: 0,
+            duplicates: 0,
+            max_seq: 0,
+        }
+    }
+
+    /// Records one observed `bench_seq`.
+    fn observe(&mut self, seq: u64) {
+        self.received += 1;
+        if seq > self.max_seq {
+            self.max_seq = seq;
+        }
+        if seq == self.next_expected {
+            self.next_expected += 1;
+        } else if seq > self.next_expected {
+            self.missing += seq - self.next_expected;
+            self.next_expected = seq + 1;
+        } else {
+            // seq < next_expected — re-delivery or out-of-order fill
+            self.duplicates += 1;
+        }
+    }
+}
 /// encoded buffer we've pushed via `stream_send`.
 #[derive(Default)]
 pub(crate) struct SendCursor {
@@ -129,15 +189,17 @@ fn flush_conn(conn: &mut quiche::Connection, send_buf: &mut [u8], fd: RawFd) -> 
     syscalls
 }
 
-/// Builds the group-mode publisher's Publish payload:
-/// `topic_len:u16 BE | topic | 4 KiB data`. Mirrors the wire format the
-/// server's `handle_publish` parses (`application.rs` Publish arm).
-fn build_group_publish_payload() -> Vec<u8> {
-    let topic = GROUP_TOPIC.as_bytes();
+/// Builds a Publish payload for `topic`:
+/// `topic_len:u16 BE | topic | bench_seq:u64 placeholder | 4 KiB data`.
+/// The publisher patches the 8 `bench_seq` bytes (at offset `2 +
+/// topic.len()`) with a unique per-frame counter before each encode call.
+/// Mirrors the wire format the server's `handle_publish` parses.
+fn build_publish_payload(topic: &str) -> Vec<u8> {
+    let topic_b = topic.as_bytes();
     let data = vec![0xE8u8; 4096];
-    let mut v = Vec::with_capacity(2 + topic.len() + data.len());
-    v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
-    v.extend_from_slice(topic);
+    let mut v = Vec::with_capacity(2 + topic_b.len() + data.len());
+    v.extend_from_slice(&(topic_b.len() as u16).to_be_bytes());
+    v.extend_from_slice(topic_b);
     v.extend_from_slice(&data);
     v
 }
@@ -199,6 +261,16 @@ pub(crate) enum ModeState {
         /// never sent). Publisher ignores this field.
         last_join: Option<Instant>,
     },
+    /// Broadcast mode. The publisher streams Publish frames (same as
+    /// group but to `BROADCAST_TOPIC`); each subscriber sends one
+    /// Subscribe frame then idles — subscriptions don't expire so no
+    /// heartbeat is needed.
+    Broadcast {
+        cursor: SendCursor,
+        /// Subscriber: whether the Subscribe frame has been sent.
+        /// Publisher ignores this field.
+        subscribe_sent: bool,
+    },
 }
 
 // ── ConnState ──────────────────────────────────────────────────────
@@ -243,18 +315,27 @@ pub(crate) struct ConnState {
     pipeline_depth: usize,
     ms: ModeState,
 
-    /// Role in `BenchMode::Group`. Unused (always `Publisher`) for the
-    /// legacy four modes; reported through `into_result` so `stats` can
-    /// break out group throughput by role.
+    /// Role in `BenchMode::Group` or `BenchMode::Broadcast`. Unused
+    /// (always `Publisher`) for the legacy four modes; reported through
+    /// `into_result` so `stats` can break out throughput by role.
     role: Role,
-    /// Group-mode publisher: the pre-built Publish payload
+    /// Group/broadcast publisher: the pre-built Publish payload
     /// (`topic_len:u16 | topic | data`). Built once in `new`.
-    group_publish_payload: Vec<u8>,
-    /// Group-mode member: the pre-built ConsumerGroupJoin payload
-    /// (`topic_len | topic | group_len | group | consumer_len |
-    ///  consumer | partitions:u32`). Built once in `new` with a
-    /// per-member consumer id derived from the global conn idx.
+    publish_payload: Vec<u8>,
+    /// Offset within `publish_payload` where the 8-byte `bench_seq`
+    /// resides (right after `topic_len:u16 + topic`).
+    bench_seq_offset: usize,
+    /// Group/broadcast publisher: next seq to embed in the payload.
+    /// Incremented before each encode call so each frame carries a
+    /// unique identity for delivery verification.
+    pub_seq: u64,
+    /// Group-mode member: the pre-built ConsumerGroupJoin payload.
     group_join_payload: Vec<u8>,
+    /// Broadcast subscriber: the pre-built Subscribe payload.
+    broadcast_subscribe_payload: Vec<u8>,
+    /// Member/subscriber: tracks delivery correctness from embedded
+    /// bench_seq values. Publisher ignores this field.
+    seq_verifier: SeqVerifier,
 }
 
 impl ConnState {
@@ -322,19 +403,29 @@ impl ConnState {
             .map(|e| (frame::codec::HEADER_SIZE + e.payload_len) as u64 * coalesce as u64)
             .sum();
 
-        // P5 group mode: derive role from global connection index and
-        // pre-build the role-specific payload. Connection 0 publishes;
-        // every other connection joins the group as a member.
-        let role = if mode == BenchMode::Group && global_idx > 0 {
-            Role::Member
-        } else {
-            Role::Publisher
+        // P5 group / broadcast mode: derive role from global connection
+        // index and pre-build the role-specific payload. Connection 0
+        // publishes; every other connection is a consumer (member or
+        // subscriber).
+        let role = match mode {
+            BenchMode::Group if global_idx > 0 => Role::Member,
+            BenchMode::Broadcast if global_idx > 0 => Role::Subscriber,
+            _ => Role::Publisher,
         };
-        let (group_publish_payload, group_join_payload) = if mode == BenchMode::Group {
-            (build_group_publish_payload(), build_group_join_payload(global_idx))
-        } else {
-            (Vec::new(), Vec::new())
-        };
+        let (publish_payload, bench_seq_offset, group_join_payload, broadcast_subscribe_payload) =
+            match mode {
+                BenchMode::Group => {
+                    let p = build_publish_payload(GROUP_TOPIC);
+                    let off = 2 + GROUP_TOPIC.len();
+                    (p, off, build_group_join_payload(global_idx), Vec::new())
+                }
+                BenchMode::Broadcast => {
+                    let p = build_publish_payload(BROADCAST_TOPIC);
+                    let off = 2 + BROADCAST_TOPIC.len();
+                    (p, off, Vec::new(), build_subscribe_payload(BROADCAST_TOPIC))
+                }
+                _ => (Vec::new(), 0, Vec::new(), Vec::new()),
+            };
 
         let ms = match mode {
             BenchMode::Rr => ModeState::Rr {
@@ -369,6 +460,10 @@ impl ConnState {
                 cursor: SendCursor::default(),
                 last_join: None,
             },
+            BenchMode::Broadcast => ModeState::Broadcast {
+                cursor: SendCursor::default(),
+                subscribe_sent: false,
+            },
         };
 
         Ok(Self {
@@ -401,8 +496,12 @@ impl ConnState {
             pipeline_depth,
             ms,
             role,
-            group_publish_payload,
+            publish_payload,
+            bench_seq_offset,
+            pub_seq: 0,
             group_join_payload,
+            broadcast_subscribe_payload,
+            seq_verifier: SeqVerifier::new(),
         })
     }
 
@@ -445,11 +544,7 @@ impl ConnState {
 
     /// Drains quiche's outbound queue onto the socket.
     pub fn flush_outbound(&mut self) -> u64 {
-        let syscalls = flush_conn(
-            &mut self.conn,
-            &mut self.send_buf,
-            self.socket.as_raw_fd(),
-        );
+        let syscalls = flush_conn(&mut self.conn, &mut self.send_buf, self.socket.as_raw_fd());
         self.write_syscalls += syscalls;
         syscalls
     }
@@ -458,7 +553,7 @@ impl ConnState {
     /// then updates mode-specific recv state.
     pub fn drain_and_process(&mut self, entries_len: usize) {
         let num_streams = match self.mode {
-            BenchMode::Rr | BenchMode::Group => 1,
+            BenchMode::Rr | BenchMode::Group | BenchMode::Broadcast => 1,
             _ => entries_len.min(STREAM_IDS.len()),
         };
         let mut raw_recv = 0u64;
@@ -474,6 +569,12 @@ impl ConnState {
                     Err(_) => break,
                 }
             }
+        }
+
+        // Feed any extracted bench_seq values into the verifier for
+        // delivery correctness tracking (members + subscribers).
+        for seq in self.stack.take_verified_seqs() {
+            self.seq_verifier.observe(seq);
         }
 
         // Mode-specific recv processing
@@ -516,7 +617,9 @@ impl ConnState {
                     }
                 }
             }
-            ModeState::Stream { frames_in_flight, .. } => {
+            ModeState::Stream {
+                frames_in_flight, ..
+            } => {
                 if raw_recv > 0 && self.avg_frame_size > 0 {
                     let est = raw_recv / self.avg_frame_size;
                     *frames_in_flight = frames_in_flight.saturating_sub(est);
@@ -547,6 +650,7 @@ impl ConnState {
             BenchMode::Stream => self.tick_stream(entries, coalesce, deadline),
             BenchMode::Pipeline => self.tick_pipeline(entries, coalesce, deadline),
             BenchMode::Group => self.tick_group(coalesce, deadline),
+            BenchMode::Broadcast => self.tick_broadcast(coalesce, deadline),
         }
     }
 
@@ -613,11 +717,8 @@ impl ConnState {
             cursor.encoded = false;
             cursor.entry_idx += 1;
         }
-        self.write_syscalls += flush_conn(
-            &mut self.conn,
-            &mut self.send_buf,
-            self.socket.as_raw_fd(),
-        );
+        self.write_syscalls +=
+            flush_conn(&mut self.conn, &mut self.send_buf, self.socket.as_raw_fd());
         *waiting = true;
         *recv_bytes = 0;
         *batch_start = Some(Instant::now());
@@ -673,8 +774,7 @@ impl ConnState {
                         break;
                     }
                     Err(e) => {
-                        self.error =
-                            Some(format!("multi-rr stream_send(sid={sid}): {e}"));
+                        self.error = Some(format!("multi-rr stream_send(sid={sid}): {e}"));
                         self.phase = Phase::Done;
                         return;
                     }
@@ -687,11 +787,8 @@ impl ConnState {
             cursor.encoded = false;
             cursor.entry_idx += 1;
         }
-        self.write_syscalls += flush_conn(
-            &mut self.conn,
-            &mut self.send_buf,
-            self.socket.as_raw_fd(),
-        );
+        self.write_syscalls +=
+            flush_conn(&mut self.conn, &mut self.send_buf, self.socket.as_raw_fd());
         *waiting = true;
         *recv_bytes = 0;
         *batch_start = Some(Instant::now());
@@ -746,11 +843,8 @@ impl ConnState {
                     Err(quiche::Error::Done) => {
                         self.blocked_writes += 1;
                         self.flow_control_waits += 1;
-                        self.write_syscalls += flush_conn(
-                            &mut self.conn,
-                            &mut self.send_buf,
-                            self.socket.as_raw_fd(),
-                        );
+                        self.write_syscalls +=
+                            flush_conn(&mut self.conn, &mut self.send_buf, self.socket.as_raw_fd());
                         // Drain recv to free flow-control credit
                         let num_streams = entries.len().min(STREAM_IDS.len());
                         let mut raw = 0u64;
@@ -769,23 +863,20 @@ impl ConnState {
                         }
                         if raw > 0 && self.avg_frame_size > 0 {
                             let est = raw / self.avg_frame_size;
-                            *frames_in_flight =
-                                frames_in_flight.saturating_sub(est);
+                            *frames_in_flight = frames_in_flight.saturating_sub(est);
                         }
                         blocked = true;
                         break;
                     }
                     Err(e) => {
-                        self.error =
-                            Some(format!("stream stream_send(sid={sid}): {e}"));
+                        self.error = Some(format!("stream stream_send(sid={sid}): {e}"));
                         self.phase = Phase::Done;
                         return;
                     }
                 }
             }
             if blocked {
-                *frames_in_flight =
-                    frames_in_flight.saturating_add(self.frames_per_batch);
+                *frames_in_flight = frames_in_flight.saturating_add(self.frames_per_batch);
                 self.frames_in_flight_peak = self.frames_in_flight_peak.max(*frames_in_flight);
                 self.queue_depth_sum += *frames_in_flight;
                 self.queue_depth_samples += 1;
@@ -853,8 +944,7 @@ impl ConnState {
                             break;
                         }
                         Err(e) => {
-                            self.error =
-                                Some(format!("pipeline stream_send(sid={sid}): {e}"));
+                            self.error = Some(format!("pipeline stream_send(sid={sid}): {e}"));
                             self.phase = Phase::Done;
                             return;
                         }
@@ -867,11 +957,8 @@ impl ConnState {
                 cursor.encoded = false;
                 cursor.entry_idx += 1;
             }
-            self.write_syscalls += flush_conn(
-                &mut self.conn,
-                &mut self.send_buf,
-                self.socket.as_raw_fd(),
-            );
+            self.write_syscalls +=
+                flush_conn(&mut self.conn, &mut self.send_buf, self.socket.as_raw_fd());
             *payload_sent += self.batch_data_payload_bytes;
             in_flight.push_back((Instant::now(), *payload_sent));
             let cur = in_flight.len() as u64 * self.frames_per_batch;
@@ -894,6 +981,8 @@ impl ConnState {
         match self.role {
             Role::Publisher => self.tick_group_publisher(coalesce, deadline),
             Role::Member => self.tick_group_member(),
+            // Subscribers only exist in Broadcast mode, not Group.
+            Role::Subscriber => {}
         }
     }
 
@@ -901,6 +990,9 @@ impl ConnState {
     /// `bench.group` on QUIC stream 0. Mirrors `tick_stream`'s send loop
     /// and flow-control recovery, but operates on a single self-built
     /// Publish payload instead of the shared `entries` blend.
+    ///
+    /// Before each encode call, patches `bench_seq` into the payload so
+    /// each frame carries a unique identity for delivery verification.
     fn tick_group_publisher(&mut self, coalesce: usize, deadline: Instant) {
         let ModeState::Group { cursor, .. } = &mut self.ms else {
             return;
@@ -910,12 +1002,20 @@ impl ConnState {
                 return;
             }
             if !cursor.encoded {
+                // Patch bench_seq into the payload template (inline to
+                // avoid borrowing all of self while cursor holds &mut self.ms).
+                let off = self.bench_seq_offset;
+                if off + BENCH_SEQ_BYTES <= self.publish_payload.len() {
+                    self.publish_payload[off..off + BENCH_SEQ_BYTES]
+                        .copy_from_slice(&self.pub_seq.to_be_bytes());
+                }
+                self.pub_seq += 1;
                 self.stack.encode_frame_coalesced_into(
                     &mut self.encode_buf,
                     0,
                     MessageType::Publish,
                     FrameFlags::NONE,
-                    &self.group_publish_payload,
+                    &self.publish_payload,
                     coalesce,
                 );
                 cursor.send_off = 0;
@@ -936,11 +1036,8 @@ impl ConnState {
                     Err(quiche::Error::Done) => {
                         self.blocked_writes += 1;
                         self.flow_control_waits += 1;
-                        self.write_syscalls += flush_conn(
-                            &mut self.conn,
-                            &mut self.send_buf,
-                            self.socket.as_raw_fd(),
-                        );
+                        self.write_syscalls +=
+                            flush_conn(&mut self.conn, &mut self.send_buf, self.socket.as_raw_fd());
                         // Drain stream 0 to free flow-control credit so
                         // quiche accepts the next stream_send. The
                         // publisher rarely receives, but members' acks
@@ -1008,11 +1105,8 @@ impl ConnState {
                 Err(quiche::Error::Done) => {
                     self.blocked_writes += 1;
                     self.flow_control_waits += 1;
-                    self.write_syscalls += flush_conn(
-                        &mut self.conn,
-                        &mut self.send_buf,
-                        self.socket.as_raw_fd(),
-                    );
+                    self.write_syscalls +=
+                        flush_conn(&mut self.conn, &mut self.send_buf, self.socket.as_raw_fd());
                     return; // retry next tick
                 }
                 Err(e) => {
@@ -1023,12 +1117,142 @@ impl ConnState {
             }
         }
         self.bytes_sent += self.encode_buf.len() as u64;
-        self.write_syscalls += flush_conn(
-            &mut self.conn,
-            &mut self.send_buf,
-            self.socket.as_raw_fd(),
-        );
+        self.write_syscalls +=
+            flush_conn(&mut self.conn, &mut self.send_buf, self.socket.as_raw_fd());
         *last_join = Some(now);
+    }
+
+    // ── Broadcast (subscription fan-out scenario) ────────────────────
+
+    /// Dispatches by [`Role`]: the publisher streams Publish frames; a
+    /// subscriber sends one Subscribe then idles.
+    fn tick_broadcast(&mut self, coalesce: usize, deadline: Instant) {
+        match self.role {
+            Role::Publisher => self.tick_broadcast_publisher(coalesce, deadline),
+            Role::Subscriber => self.tick_broadcast_subscriber(),
+            _ => {}
+        }
+    }
+
+    /// Publisher: continuously stream Publish frames to `BROADCAST_TOPIC`
+    /// on QUIC stream 0. Same send loop + flow-control recovery as
+    /// `tick_group_publisher`, but targets broadcast subscribers.
+    fn tick_broadcast_publisher(&mut self, coalesce: usize, deadline: Instant) {
+        let ModeState::Broadcast { cursor, .. } = &mut self.ms else {
+            return;
+        };
+        loop {
+            if Instant::now() >= deadline {
+                return;
+            }
+            if !cursor.encoded {
+                // Patch bench_seq into the payload template (inline to
+                // avoid borrowing all of self while cursor holds &mut self.ms).
+                let off = self.bench_seq_offset;
+                if off + BENCH_SEQ_BYTES <= self.publish_payload.len() {
+                    self.publish_payload[off..off + BENCH_SEQ_BYTES]
+                        .copy_from_slice(&self.pub_seq.to_be_bytes());
+                }
+                self.pub_seq += 1;
+                self.stack.encode_frame_coalesced_into(
+                    &mut self.encode_buf,
+                    0,
+                    MessageType::Publish,
+                    FrameFlags::NONE,
+                    &self.publish_payload,
+                    coalesce,
+                );
+                cursor.send_off = 0;
+                cursor.encoded = true;
+            }
+            let sid = STREAM_IDS[0];
+            let mut blocked = false;
+            while cursor.send_off < self.encode_buf.len() {
+                match self
+                    .conn
+                    .stream_send(sid, &self.encode_buf[cursor.send_off..], false)
+                {
+                    Ok(0) => {
+                        blocked = true;
+                        break;
+                    }
+                    Ok(n) => cursor.send_off += n,
+                    Err(quiche::Error::Done) => {
+                        self.blocked_writes += 1;
+                        self.flow_control_waits += 1;
+                        self.write_syscalls +=
+                            flush_conn(&mut self.conn, &mut self.send_buf, self.socket.as_raw_fd());
+                        loop {
+                            match self.conn.stream_recv(STREAM_IDS[0], &mut self.stream_buf) {
+                                Ok((0, _)) => break,
+                                Ok((m, _)) => {
+                                    self.stack
+                                        .on_stream_data(STREAM_IDS[0], &self.stream_buf[..m]);
+                                }
+                                Err(quiche::Error::Done) => break,
+                                Err(_) => break,
+                            }
+                        }
+                        blocked = true;
+                        break;
+                    }
+                    Err(e) => {
+                        self.error = Some(format!("broadcast pub stream_send(sid={sid}): {e}"));
+                        self.phase = Phase::Done;
+                        return;
+                    }
+                }
+            }
+            if blocked {
+                return;
+            }
+            self.bytes_sent += self.encode_buf.len() as u64;
+            cursor.encoded = false;
+        }
+    }
+
+    /// Subscriber: send one Subscribe frame on QUIC stream 0, then idle.
+    /// Server subscriptions don't expire (unlike consumer-group members
+    /// which have a 3s idle timeout), so no heartbeat is needed.
+    fn tick_broadcast_subscriber(&mut self) {
+        let ModeState::Broadcast { subscribe_sent, .. } = &mut self.ms else {
+            return;
+        };
+        if *subscribe_sent {
+            return;
+        }
+        self.stack.encode_frame_coalesced_into(
+            &mut self.encode_buf,
+            0,
+            MessageType::Subscribe,
+            FrameFlags::NONE,
+            &self.broadcast_subscribe_payload,
+            1,
+        );
+        let sid = STREAM_IDS[0];
+        let mut off = 0;
+        while off < self.encode_buf.len() {
+            match self.conn.stream_send(sid, &self.encode_buf[off..], false) {
+                Ok(0) => return, // blocked; retry next tick
+                Ok(n) => off += n,
+                Err(quiche::Error::Done) => {
+                    self.blocked_writes += 1;
+                    self.flow_control_waits += 1;
+                    self.write_syscalls +=
+                        flush_conn(&mut self.conn, &mut self.send_buf, self.socket.as_raw_fd());
+                    return;
+                }
+                Err(e) => {
+                    self.error = Some(format!("broadcast sub stream_send(sid={sid}): {e}"));
+                    self.phase = Phase::Done;
+                    return;
+                }
+            }
+        }
+        self.bytes_sent += self.encode_buf.len() as u64;
+        self.write_syscalls +=
+            flush_conn(&mut self.conn, &mut self.send_buf, self.socket.as_raw_fd());
+        *subscribe_sent = true;
     }
 
     // ── Shutdown ────────────────────────────────────────────────────
@@ -1046,10 +1270,9 @@ impl ConnState {
     /// Consumes the state and produces a [`WorkerResult`].
     pub fn into_result(mut self) -> WorkerResult {
         let handshake_time = self.handshake_time;
-        let role = if self.mode == BenchMode::Group {
-            Some(self.role)
-        } else {
-            None
+        let role = match self.mode {
+            BenchMode::Group | BenchMode::Broadcast => Some(self.role),
+            _ => None,
         };
         if let Some(msg) = self.error.take() {
             let mut r = WorkerResult::failed(msg, handshake_time);
@@ -1072,6 +1295,11 @@ impl ConnState {
             handshake_time,
         );
         r.role = role;
+        r.seq_received = self.seq_verifier.received;
+        r.seq_missing = self.seq_verifier.missing;
+        r.seq_duplicates = self.seq_verifier.duplicates;
+        r.seq_max = self.seq_verifier.max_seq;
+        r.pub_seq = self.pub_seq;
         r
     }
 }
