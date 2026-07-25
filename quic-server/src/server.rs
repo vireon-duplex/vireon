@@ -275,15 +275,16 @@ fn join_all(handles: Vec<thread::JoinHandle<Result<(), ServerError>>>) -> Result
 /// cloned senders (one per worker, including itself). The worker skips
 /// its own index during broadcast.
 ///
-/// Bounded at 1024 messages per inbox. `try_send` drops on full rather
-/// than blocking the reactor thread.
+/// Bounded at 8192 messages per inbox. `try_send` drops on full rather
+/// than blocking the reactor thread. 8192 absorbs typical bursts from a
+/// single worker's batch tick without dropping ReliableOrdered frames.
 fn build_inter_worker_pubsub_channels(
     n: usize,
 ) -> Vec<(
     std::sync::mpsc::Receiver<InterWorkerPublish>,
     Vec<std::sync::mpsc::SyncSender<InterWorkerPublish>>,
 )> {
-    let cap = 1024;
+    let cap = 8192;
     let channels: Vec<_> = (0..n)
         .map(|_| std::sync::mpsc::sync_channel::<InterWorkerPublish>(cap))
         .collect();
