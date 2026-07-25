@@ -71,11 +71,13 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 // header followed by the wrong bytes → CrcMismatch cascade. Caps must
 // therefore be sized so drops essentially never happen under realistic
 // load; if they do, the right answer is backpressure (slow the publisher)
-// rather than truncation. The defaults below are tuned for sustained
-// 1 MiB-frame fan-out across many subscribers.
-const RETRY_QUEUE_CAP: usize = 8192;
-const RETRY_MAX_ATTEMPTS: u8 = 16;
-const RETRY_BYTE_CAP: usize = 256 * 1024 * 1024; // 256 MiB
+// rather than truncation. The defaults below are sized to give
+// subscribers seconds of headroom — under sustained overload, the
+// expectation is that the publisher's QUIC flow-control window fills
+// and backpressure kicks in before these caps are reached.
+const RETRY_QUEUE_CAP: usize = 65_536;
+const RETRY_MAX_ATTEMPTS: u8 = 255;
+const RETRY_BYTE_CAP: usize = 1024 * 1024 * 1024; // 1 GiB
 
 /// A frame pending retry after `QuicSendError::FlowBlocked`.
 ///
