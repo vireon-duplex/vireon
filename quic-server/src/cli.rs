@@ -22,6 +22,14 @@ pub struct Cli {
     #[arg(long)]
     pub key: String,
 
+    /// Optional PEM-encoded CA bundle for mutual TLS (mTLS). When set,
+    /// the server requires every client to present a certificate signed
+    /// by this CA during the TLS handshake. Clients without a valid
+    /// certificate are rejected at the TLS layer before any application
+    /// frame is processed.
+    #[arg(long)]
+    pub client_ca: Option<String>,
+
     /// Number of worker threads. 0 = auto-detect (one per CPU core).
     #[arg(short, long, default_value = "0")]
     pub workers: usize,

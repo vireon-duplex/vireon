@@ -466,17 +466,38 @@ impl QuicEngine {
 
                 // Emit ConnectionEstablished on handshake completion (once).
                 if !entry.established && entry.conn.is_established() {
-                    entry.established = true;
-                    events.push(QuicEvent::ConnectionEstablished {
-                        conn_idx: idx,
-                        peer_addr: peer,
-                    });
-                    tracing::info!(
-                        reactor_id,
-                        idx,
-                        peer = %peer,
-                        "connection established"
-                    );
+                    // mTLS enforcement: when --client-ca is configured,
+                    // quiche's verify_peer(true) validates a presented
+                    // cert but does NOT require one (quiche 0.22 docs:
+                    // "will still allow anonymous clients"). Enforce the
+                    // requirement here by closing connections that did
+                    // not present a client certificate.
+                    if self.config.client_ca.is_some() && entry.conn.peer_cert().is_none() {
+                        tracing::warn!(
+                            reactor_id,
+                            idx,
+                            peer = %peer,
+                            "[mTLS] rejecting anonymous client (no peer certificate)"
+                        );
+                        let _ = entry
+                            .conn
+                            .close(true, 0x100, b"client certificate required");
+                        dirty.set(idx);
+                        // Do NOT mark established — the connection is
+                        // being torn down.
+                    } else {
+                        entry.established = true;
+                        events.push(QuicEvent::ConnectionEstablished {
+                            conn_idx: idx,
+                            peer_addr: peer,
+                        });
+                        tracing::info!(
+                            reactor_id,
+                            idx,
+                            peer = %peer,
+                            "connection established"
+                        );
+                    }
                 }
 
                 // Process readable streams + datagrams, collecting frame events.

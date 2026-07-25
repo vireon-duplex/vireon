@@ -171,6 +171,11 @@ pub struct QuicConfig {
     /// Skip CRC32C verification on received frames. Use only in trusted
     /// environments where the transport layer guarantees integrity.
     pub skip_crc: bool,
+    /// Optional PEM-encoded CA bundle used to verify client certificates
+    /// (mutual TLS). When set, the server enables `verify_peer(true)`
+    /// and rejects any client that does not present a certificate
+    /// signed by this CA. When `None`, client certs are not required.
+    pub client_ca: Option<String>,
 }
 
 impl QuicConfig {
@@ -236,6 +241,7 @@ impl Default for QuicConfig {
             extensions: ExtensionFlags::production(),
             shutting_down: false,
             skip_crc: false,
+            client_ca: None,
         }
     }
 }
