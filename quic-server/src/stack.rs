@@ -857,7 +857,7 @@ impl IoHandler for VireonStack {
         // kernel-hash misrouting (expected without eBPF steering).
         // Also surfaces stream_send FlowBlocked counts to quantify the
         // flow-control deadlock pattern (see encode_and_send drops).
-        if self.tick_count % 5000 == 0 {
+        if self.tick_count % 30_000 == 0 {
             let reactor_id = self.engine.reactor_id;
             let active = self.engine.active_connections();
             let blocked = self.engine.stream_send_blocked;

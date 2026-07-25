@@ -919,7 +919,7 @@ impl VireonDispatcher {
             .filter(|s| s.conn_idx != ctx.conn_idx)
             .collect();
 
-        tracing::info!(
+        tracing::debug!(
             conn_idx = ctx.conn_idx,
             topic = %topic,
             targets = targets.len(),
