@@ -1020,9 +1020,9 @@ impl VireonDispatcher {
                     topic: fwd_topic.clone(),
                     payload: fwd_payload.clone(),
                 }) {
-                    tracing::trace!(
+                    tracing::warn!(
                         worker = i,
-                        "[pubsub] worker inbox full — publish dropped"
+                        "[pubsub] worker inbox full — publish dropped (raise cap in build_inter_worker_pubsub_channels)"
                     );
                 }
             }
