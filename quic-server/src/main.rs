@@ -9,6 +9,7 @@ mod distributed;
 mod error;
 mod eviction;
 mod layers;
+mod metrics;
 mod server;
 mod socket_registry;
 mod stack;
@@ -98,6 +99,9 @@ fn print_banner(config: &ServerConfig) {
     }
     if let Some(ca) = &config.quic_config.client_ca {
         tracing::info!("  mTLS:     ENABLED (client CA: {ca})");
+    }
+    if let Some(port) = config.metrics_port {
+        tracing::info!("  Metrics:  http://0.0.0.0:{port}/metrics");
     }
     tracing::info!("============================================================");
 }
