@@ -65,9 +65,17 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 // `[distribution]` log so operators can spot chronic flow-control
 // starvation (a sign that `initial_max_stream_data` is too small for
 // the workload).
-const RETRY_QUEUE_CAP: usize = 1024;
-const RETRY_MAX_ATTEMPTS: u8 = 4;
-const RETRY_BYTE_CAP: usize = 64 * 1024 * 1024; // 64 MiB
+//
+// NOTE: dropping a queue entry whose bytes have already been PARTIALLY
+// written to quiche corrupts the stream — the subscriber sees a frame
+// header followed by the wrong bytes → CrcMismatch cascade. Caps must
+// therefore be sized so drops essentially never happen under realistic
+// load; if they do, the right answer is backpressure (slow the publisher)
+// rather than truncation. The defaults below are tuned for sustained
+// 1 MiB-frame fan-out across many subscribers.
+const RETRY_QUEUE_CAP: usize = 8192;
+const RETRY_MAX_ATTEMPTS: u8 = 16;
+const RETRY_BYTE_CAP: usize = 256 * 1024 * 1024; // 256 MiB
 
 /// A frame pending retry after `QuicSendError::FlowBlocked`.
 ///
@@ -531,9 +539,20 @@ impl VireonStack {
                     false,
                 );
                 match outcome {
-                    Ok(_) => {
+                    Ok(written) => {
                         if let Some(m) = &self.metrics {
-                            m.add(&m.bytes_sent_total, n as u64);
+                            m.add(&m.bytes_sent_total, written as u64);
+                        }
+                        // Partial-write tail: quiche accepted `written`
+                        // bytes but flow-control stopped it before the
+                        // full frame. Without buffering the tail, the
+                        // next frame's bytes would land at the wrong
+                        // offset on the stream → subscriber decoder
+                        // desyncs → CrcMismatch cascade. Same fix as the
+                        // client transport's partial-write buffer.
+                        if written < n {
+                            let tail = self.send_scratch[written..n].to_vec();
+                            self.enqueue_retry_owned(conn_idx, quic_stream_id, tail);
                         }
                     }
                     Err(QuicSendError::FlowBlocked) => {
@@ -582,14 +601,37 @@ impl VireonStack {
     /// progress.
     fn enqueue_retry_owned(&mut self, conn_idx: usize, quic_stream_id: u64, data: Vec<u8>) {
         // Evict from the front until both caps are satisfied.
+        let mut evicted_bytes = 0u64;
+        let mut evicted_entries = 0u32;
         while self.retry_queue.len() >= RETRY_QUEUE_CAP
             || self.retry_bytes + data.len() > RETRY_BYTE_CAP
         {
             match self.retry_queue.pop_front() {
-                Some(p) => self.retry_bytes -= p.data.len(),
+                Some(p) => {
+                    self.retry_bytes -= p.data.len();
+                    evicted_bytes += p.data.len() as u64;
+                    evicted_entries += 1;
+                }
                 None => break, // len cap satisfied, byte cap cannot be exceeded
             }
             self.retry_drops += 1;
+        }
+        if evicted_entries > 0 {
+            // Evicting an entry whose bytes were already partially written
+            // to quiche CORRUPTS the subscriber's stream — the next bytes
+            // the subscriber reads will be mid-frame, causing a CrcMismatch
+            // cascade. This is a load-shed path of last resort; if you see
+            // this warning at runtime, either raise the caps above or add
+            // publisher-side backpressure.
+            tracing::warn!(
+                conn_idx,
+                quic_stream_id,
+                evicted_entries,
+                evicted_bytes,
+                queue_len = self.retry_queue.len(),
+                queue_bytes = self.retry_bytes,
+                "[retry] evicted entries to satisfy caps — subscriber stream may corrupt"
+            );
         }
         self.retry_bytes += data.len();
         self.retry_queue.push_back(PendingSend {
@@ -625,8 +667,18 @@ impl VireonStack {
                 .engine
                 .send_stream(p.conn_idx, p.quic_stream_id, &p.data, false)
             {
-                Ok(_) => {
-                    succeeded += 1;
+                Ok(written) => {
+                    if written < p.data.len() {
+                        // Partial write on retry — keep the tail in the
+                        // queue without bumping `attempts` (this isn't a
+                        // flow-control block, just a continued partial).
+                        p.data = p.data[written..].to_vec();
+                        self.retry_bytes += p.data.len();
+                        self.retry_queue.push_back(p);
+                        still_blocked += 1;
+                    } else {
+                        succeeded += 1;
+                    }
                 }
                 Err(QuicSendError::FlowBlocked) => {
                     p.attempts += 1;
