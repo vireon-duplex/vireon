@@ -61,9 +61,12 @@ const ENOBUFS: i32 = -libc::ENOBUFS;
 const TICK_TIMER_ID: u64 = 0;
 
 /// Periodic tick interval — wakes `submit_and_wait(1)` at this rate.
-/// 10 ms balances responsiveness (sub-ms not needed for QUIC idle
-/// checks) with CPU overhead (100 wakeups/s).
-const TICK_INTERVAL: Duration = Duration::from_millis(10);
+///
+/// 1 ms balances responsiveness (needed for cross-worker pub/sub
+/// delivery on workers with no inbound QUIC traffic) with CPU
+/// overhead (1000 wakeups/s when idle — negligible vs the busy-poll
+/// budget already spent in the kernel for BareMetal/HundredGbe).
+const TICK_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Thread-per-core reactor.
 pub struct Reactor {
