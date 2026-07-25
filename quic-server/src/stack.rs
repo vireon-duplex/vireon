@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use frame::codec::{self, FrameHeader, FrameRef};
+use frame::header::MessageType;
 use io::handler::{IoHandler, TickContext};
 use quic_engine::{QuicEngine, QuicEvent, QuicSendError};
 
@@ -97,6 +98,9 @@ pub struct VireonStack {
     runtime: RuntimeLayer,
     /// Transport layer — QUIC engine (decodes datagrams, emits events).
     engine: QuicEngine,
+    /// Thread-safe metrics store (`None` when `--metrics-port` is not set).
+    /// Incremented on the hot path to expose counters at `/metrics`.
+    pub metrics: Option<Arc<crate::metrics::ServerMetrics>>,
     /// Cross-layer connection registry (conn_idx → conn_id + session_id).
     connections: ConnectionRegistry,
 
@@ -237,6 +241,7 @@ impl VireonStack {
             application,
             runtime: RuntimeLayer::new(reactor_id)?,
             engine,
+            metrics: None,
             connections: ConnectionRegistry::new(),
             reap_buf: Vec::with_capacity(16),
             send_scratch: Vec::with_capacity(4096),
@@ -325,11 +330,17 @@ impl VireonStack {
         }
         for out in direct_send {
             self.encode_and_send(out.conn_idx, out.quic_stream_id, out.header, &out.payload);
+            if let Some(m) = &self.metrics {
+                m.inc(&m.deliveries_total);
+            }
         }
         let mut policy_ready: Vec<OutgoingFrame> = Vec::new();
         self.application.drain_ready_egress(&mut policy_ready);
         for out in policy_ready {
             self.encode_and_send(out.conn_idx, out.quic_stream_id, out.header, &out.payload);
+            if let Some(m) = &self.metrics {
+                m.inc(&m.deliveries_total);
+            }
         }
     }
 
@@ -340,6 +351,12 @@ impl VireonStack {
         let Some(conn_id) = self.runtime.on_connect(conn_idx, peer) else {
             return;
         };
+
+        // Metrics: count the connection + bump the active gauge.
+        if let Some(m) = &self.metrics {
+            m.inc(&m.connections_total);
+            m.active_connections.fetch_add(1, Ordering::Relaxed);
+        }
 
         // [application → session → stream] Top-down lifecycle.
         let Some(session_id) = self.application.on_connect(conn_idx, peer) else {
@@ -387,6 +404,11 @@ impl VireonStack {
             return;
         };
 
+        // Metrics: decrement the active-connections gauge.
+        if let Some(m) = &self.metrics {
+            m.active_connections.fetch_sub(1, Ordering::Relaxed);
+        }
+
         // [application → session → stream] Top-down teardown.
         self.application.on_close(conn_idx, cs.session_id, reason);
 
@@ -423,6 +445,14 @@ impl VireonStack {
 
         // [runtime-layer] Update stats + reset timer.
         self.runtime.on_frame(conn_idx, cs.conn_id, payload.len());
+
+        // Metrics: count frames + bytes; tag publishes separately.
+        if let Some(m) = &self.metrics {
+            m.add(&m.bytes_recv_total, payload.len() as u64);
+            if header.msg_type == MessageType::Publish {
+                m.inc(&m.publishes_total);
+            }
+        }
 
         // Track per-connection activity for memory-pressure eviction.
         self.connections.record_activity(
@@ -501,7 +531,11 @@ impl VireonStack {
                     false,
                 );
                 match outcome {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        if let Some(m) = &self.metrics {
+                            m.add(&m.bytes_sent_total, n as u64);
+                        }
+                    }
                     Err(QuicSendError::FlowBlocked) => {
                         // Per-stream outbound buffer full: peer hasn't
                         // acked enough to free credit. Enqueue for retry

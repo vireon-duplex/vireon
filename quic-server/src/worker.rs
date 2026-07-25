@@ -107,7 +107,7 @@ impl Worker {
         let cluster =
             cluster_handle.and_then(|h| config.cluster.as_ref().map(|cfg| (&cfg.cluster_cfg, h)));
 
-        let handler = VireonStack::new(
+        let mut handler = VireonStack::new(
             engine,
             core_id,
             config.echo,
@@ -118,6 +118,7 @@ impl Worker {
             worker_outboxes,
             shutdown_requested,
         )?;
+        handler.metrics = config.metrics.clone();
 
         Ok(Self {
             core_id,

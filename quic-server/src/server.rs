@@ -33,6 +33,12 @@ impl QuicServer {
             .build()
             .map_err(|e| ServerError::EngineInit(format!("kernel-nic: {e:?}")))?;
 
+        // Start the Prometheus /metrics endpoint if configured.
+        if let (Some(port), Some(metrics)) = (self.config.metrics_port, &self.config.metrics) {
+            crate::metrics::start_metrics_endpoint(metrics.clone(), port)
+                .map_err(|e| ServerError::Config(format!("metrics endpoint: {e}")))?;
+        }
+
         tracing::info!(
             cpus = nic_manager.topology().thread_count(),
             cores = nic_manager.topology().core_count(),
