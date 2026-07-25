@@ -207,6 +207,11 @@ impl Worker {
                 // Send stop handle + socket fd back before entering run loop.
                 let fd = worker.reactor.socket().raw_fd();
                 let _ = tx.send((worker.stop_handle(), fd));
+                // Register the fd so the signal handler / panic hook can
+                // force-close it on a crash exit. Without this, a panic or
+                // second-SIGINT process::exit would leak the SO_REUSEPORT
+                // socket on its bound port.
+                crate::socket_registry::REGISTRY.register(fd);
                 worker.run()
             })
             .map_err(|e| ServerError::ThreadSpawn(format!("{e}")))?;
@@ -275,8 +280,76 @@ pub fn install_signal_handler(shutdown_requested: Arc<AtomicBool>) -> Result<(),
             {
                 crate::profiler_force_dump();
             }
+            // Force-close every registered socket fd before exit. Without
+            // this, `process::exit` skips Drop and the kernel keeps the
+            // SO_REUSEPORT sockets bound — leaking the port for the next
+            // process that tries to bind it.
+            crate::socket_registry::REGISTRY.close_all();
             std::process::exit(130);
         }
     })
     .map_err(|e| ServerError::SignalHandler(format!("{e}")))
+}
+
+/// Install one-shot handlers for SIGSEGV/SIGABRT/SIGBUS/SIGFPE/SIGILL.
+///
+/// Each handler force-closes every registered socket fd, then resets its
+/// own disposition to `SIG_DFL` and re-raises the signal so the default
+/// core-dump / process-termination behavior still fires.
+///
+/// # Why
+///
+/// Without this, a crash from unsafe code or a `libc::abort` from a C
+/// dependency leaves SO_REUSEPORT sockets in `UNCONN` state on the bound
+/// port. Subsequent server restarts route handshakes to those zombie
+/// sockets and time out.
+///
+/// # Safety
+///
+/// The handlers use only async-signal-safe primitives: atomic swaps and
+/// `libc::close`. `SA_RESETHAND` ensures the handler auto-resets on entry
+/// so a fault inside the handler terminates immediately instead of
+/// recursing.
+pub fn install_crash_handlers() {
+    /// Signal-handler body. Must be async-signal-safe.
+    extern "C" fn crash_handler(signum: libc::c_int) {
+        unsafe {
+            crate::socket_registry::REGISTRY.close_all();
+            // Restore default disposition so re-raise produces the normal
+            // core-dump / termination behavior. SA_RESETHAND already did
+            // this on entry, but be explicit in case of SA_NODEFER.
+            let mut dfl: libc::sigaction = std::mem::zeroed();
+            dfl.sa_sigaction = libc::SIG_DFL;
+            libc::sigaction(signum, &dfl, std::ptr::null_mut());
+            libc::raise(signum);
+        }
+    }
+
+    // Crash signals we want to clean up before. Not SIGKILL (can't be
+    // caught) and not SIGSTOP (same).
+    let crash_signals: [libc::c_int; 5] = [
+        libc::SIGSEGV,
+        libc::SIGABRT,
+        libc::SIGBUS,
+        libc::SIGFPE,
+        libc::SIGILL,
+    ];
+
+    for &sig in &crash_signals {
+        unsafe {
+            let mut act: libc::sigaction = std::mem::zeroed();
+            // Point both `sa_handler` and `sa_sigaction` (union members in
+            // libc) at our handler. The libc crate exposes `sa_sigaction`
+            // as a `usize`, so cast the function pointer.
+            act.sa_sigaction = crash_handler as usize;
+            // SA_RESETHAND — one-shot: kernel resets to SIG_DFL when the
+            //   handler is entered, so a fault during cleanup terminates
+            //   instead of recursing.
+            // SA_NODEFER   — don't add `sig` to the mask during handler
+            //   execution, so `raise(sig)` inside the handler is delivered
+            //   immediately.
+            act.sa_flags = libc::SA_RESETHAND | libc::SA_NODEFER;
+            libc::sigaction(sig, &act, std::ptr::null_mut());
+        }
+    }
 }

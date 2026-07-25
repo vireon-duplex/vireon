@@ -21,4 +21,7 @@ pub enum ServerError {
 
     #[error("config error: {0}")]
     Config(String),
+
+    #[error("worker thread panicked: {0}")]
+    WorkerPanic(String),
 }
