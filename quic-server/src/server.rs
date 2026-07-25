@@ -298,16 +298,17 @@ fn join_all(
 /// cloned senders (one per worker, including itself). The worker skips
 /// its own index during broadcast.
 ///
-/// Bounded at 8192 messages per inbox. `try_send` drops on full rather
-/// than blocking the reactor thread. 8192 absorbs typical bursts from a
-/// single worker's batch tick without dropping ReliableOrdered frames.
+/// Bounded at 65536 messages per inbox. `try_send` drops on full rather
+/// than blocking the reactor thread. 65536 absorbs sustained bursts
+/// from a worker publishing ~50k 8 KiB frames/sec; below this the
+/// inbox fills and ReliableOrdered frames get dropped.
 fn build_inter_worker_pubsub_channels(
     n: usize,
 ) -> Vec<(
     std::sync::mpsc::Receiver<InterWorkerPublish>,
     Vec<std::sync::mpsc::SyncSender<InterWorkerPublish>>,
 )> {
-    let cap = 8192;
+    let cap = 65_536;
     let channels: Vec<_> = (0..n)
         .map(|_| std::sync::mpsc::sync_channel::<InterWorkerPublish>(cap))
         .collect();
