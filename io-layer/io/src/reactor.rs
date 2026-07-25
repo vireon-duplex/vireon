@@ -524,6 +524,25 @@ impl Reactor {
 impl Drop for Reactor {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+
+        // Force kernel-side shutdown of the UDP socket before its fd is
+        // closed by the implicit `Socket::drop`. This signals intent to
+        // close so any pending io_uring recv/send SQEs are cancelled by
+        // the kernel and don't keep the socket file pinned past close().
+        //
+        // NOTE: empirically, on Ubuntu 24.04 a residual kernel ref
+        // (ref_count=2 in /proc/net/udp) persists for ~60s after a
+        // graceful shutdown that had active QUIC connections. The
+        // user-space fd is correctly closed (lsof shows no owner); the
+        // kernel itself holds the inode. This `shutdown()` does not
+        // fully eliminate the residual ref but is correct cleanup.
+        //
+        // SAFETY: `shutdown(2)` is async-signal-safe and idempotent; on
+        // an already-closed fd it returns EBADF (ignored here).
+        unsafe {
+            libc::shutdown(self.socket.raw_fd(), libc::SHUT_RDWR);
+        }
+
         // Best-effort final reap so any in-flight SQEs are flushed.
         let _ = self.ctx.ring_mut().submit_and_wait(0);
     }

@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::config::{ServerConfig, WorkerMode};
 use crate::error::ServerError;
 use crate::layers::InterWorkerPublish;
-use crate::worker::{Worker, install_signal_handler};
+use crate::worker::{Worker, install_crash_handlers, install_signal_handler};
 
 /// Top-level QUIC server.
 pub struct QuicServer {
@@ -71,6 +71,7 @@ impl QuicServer {
             shutdown_requested.clone(),
         )?;
         install_signal_handler(shutdown_requested)?;
+        install_crash_handlers();
 
         tracing::info!("starting single-worker server (core 0)");
         worker.run()
@@ -179,9 +180,10 @@ impl QuicServer {
         // Signal handler: first Ctrl-C initiates graceful drain, second
         // forces immediate exit. Each worker's VireonStack detects the
         // flag in on_tick and drives its own CONNECTION_CLOSE drain.
-        install_signal_handler(shutdown_requested)?;
+        install_signal_handler(shutdown_requested.clone())?;
+        install_crash_handlers();
 
-        join_all(handles)
+        join_all(handles, &shutdown_requested)
     }
 
     // ── Distributed (stub) ─────────────────────────────────────────
@@ -246,7 +248,15 @@ impl QuicServer {
 }
 
 /// Joins all worker threads.
-fn join_all(handles: Vec<thread::JoinHandle<Result<(), ServerError>>>) -> Result<(), ServerError> {
+///
+/// If any worker panics, sets `shutdown_requested` so the surviving workers
+/// begin their own graceful-drain sequence — otherwise they would outlive
+/// the failed worker indefinitely, holding their socket fds open.
+fn join_all(
+    handles: Vec<thread::JoinHandle<Result<(), ServerError>>>,
+    shutdown_requested: &std::sync::atomic::AtomicBool,
+) -> Result<(), ServerError> {
+    use std::sync::atomic::Ordering;
     let mut last_err = None;
 
     for handle in handles {
@@ -257,10 +267,17 @@ fn join_all(handles: Vec<thread::JoinHandle<Result<(), ServerError>>>) -> Result
             }
             Ok(Err(e)) => {
                 tracing::error!(thread = %name, error = %e, "worker exited with error");
+                // Signal survivors so they don't wait forever for the dead
+                // worker's share of the work.
+                shutdown_requested.store(true, Ordering::Release);
                 last_err = Some(e);
             }
             Err(_) => {
                 tracing::error!(thread = %name, "worker thread panicked");
+                // The panic hook in main.rs already closed the panicking
+                // worker's fd via the global registry; signal the others.
+                shutdown_requested.store(true, Ordering::Release);
+                last_err = Some(ServerError::WorkerPanic(name));
             }
         }
     }
