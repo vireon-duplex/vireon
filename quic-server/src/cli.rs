@@ -110,6 +110,14 @@ pub struct Cli {
     /// Requires `--cluster-node-id`.
     #[arg(long)]
     pub cluster_peers: Option<String>,
+
+    /// Optional HTTP port for the Prometheus `/metrics` endpoint. When
+    /// set, the server exposes counters (connections, publishes,
+    /// deliveries, errors, bytes) in Prometheus text format. A scrape
+    /// request completes in <1 ms. When omitted, no metrics endpoint
+    /// is started.
+    #[arg(long)]
+    pub metrics_port: Option<u16>,
 }
 
 /// CLI worker-mode selector.

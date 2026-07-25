@@ -1,6 +1,7 @@
 //! Server configuration — resolves CLI args into typed configuration.
 
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use quic_engine::{QuicConfig, QuicPreset};
@@ -66,6 +67,14 @@ pub struct ServerConfig {
     /// owned locally).
     #[allow(dead_code)]
     pub cluster: Option<crate::cluster::ClusterTransportConfig>,
+
+    /// Optional Prometheus `/metrics` endpoint port. When `Some`, the
+    /// server starts an HTTP listener on this port.
+    pub metrics_port: Option<u16>,
+    /// Shared thread-safe metrics store, cloned per worker. `None` when
+    /// metrics are disabled; `Some(Arc<...>)` when the endpoint is
+    /// active.
+    pub metrics: Option<Arc<crate::metrics::ServerMetrics>>,
 }
 
 /// Default queue depth if the CLI passes 0.
@@ -146,6 +155,8 @@ impl ServerConfig {
             acl_table,
             wal_root: cli.wal_root.as_deref().map(std::path::PathBuf::from),
             cluster,
+            metrics_port: cli.metrics_port,
+            metrics: cli.metrics_port.map(|_| Arc::new(crate::metrics::ServerMetrics::new())),
         })
     }
 
