@@ -266,7 +266,15 @@ pub struct VireonDispatcher {
     worker_inbox: Option<mpsc::Receiver<InterWorkerPublish>>,
     /// This worker's reactor_id — used to skip self when broadcasting.
     worker_self_idx: usize,
+    /// Aggregate count of cross-worker inbox-full drops. Logged every
+    /// `WORKER_DROP_LOG_INTERVAL`-th drop instead of per-message — a
+    /// sustained burst otherwise produces hundreds of identical WARN
+    /// lines per second and drowns the rest of the log.
+    worker_drop_count: u64,
 }
+
+/// Log cross-worker drop summaries every Nth drop.
+const WORKER_DROP_LOG_INTERVAL: u64 = 1024;
 
 impl VireonDispatcher {
     /// Creates a new dispatcher with default-configured modules.
@@ -311,6 +319,7 @@ impl VireonDispatcher {
             worker_outboxes: Vec::new(),
             worker_inbox: None,
             worker_self_idx: 0,
+            worker_drop_count: 0,
         }
     }
 
@@ -761,13 +770,26 @@ impl VireonDispatcher {
                     );
                     return;
                 }
-                tracing::info!(
-                    conn_idx = ctx.conn_idx,
-                    pattern = %pattern_str,
-                    quic_stream = ctx.quic_stream_id,
-                    active = self.pubsub_registry.len(),
-                    "[pubsub] subscribe"
-                );
+                // The SDK's dead-peer probe re-subscribes to
+                // `_heartbeat.probe` every ~1 s per connection. Logging
+                // it at INFO drowns real subscribe events — drop to DEBUG.
+                if pattern_str.starts_with("_heartbeat.") {
+                    tracing::debug!(
+                        conn_idx = ctx.conn_idx,
+                        pattern = %pattern_str,
+                        quic_stream = ctx.quic_stream_id,
+                        active = self.pubsub_registry.len(),
+                        "[pubsub] subscribe (heartbeat probe)"
+                    );
+                } else {
+                    tracing::info!(
+                        conn_idx = ctx.conn_idx,
+                        pattern = %pattern_str,
+                        quic_stream = ctx.quic_stream_id,
+                        active = self.pubsub_registry.len(),
+                        "[pubsub] subscribe"
+                    );
+                }
 
                 // P6: if we are not the owner of this pattern, notify
                 // the owner of our local interest so future publishes
@@ -1020,10 +1042,15 @@ impl VireonDispatcher {
                     topic: fwd_topic.clone(),
                     payload: fwd_payload.clone(),
                 }) {
-                    tracing::warn!(
-                        worker = i,
-                        "[pubsub] worker inbox full — publish dropped (raise cap in build_inter_worker_pubsub_channels)"
-                    );
+                    self.worker_drop_count = self.worker_drop_count.wrapping_add(1);
+                    if self.worker_drop_count % WORKER_DROP_LOG_INTERVAL == 0 {
+                        tracing::warn!(
+                            worker = i,
+                            total_drops = self.worker_drop_count,
+                            "[pubsub] worker inbox full — dropped {WORKER_DROP_LOG_INTERVAL} publishes \
+                             (raise cap in build_inter_worker_pubsub_channels)"
+                        );
+                    }
                 }
             }
         }
