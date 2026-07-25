@@ -96,6 +96,9 @@ fn print_banner(config: &ServerConfig) {
     if config.skip_crc {
         tracing::info!("  Skip CRC: ENABLED (trusted mode — no integrity check)");
     }
+    if let Some(ca) = &config.quic_config.client_ca {
+        tracing::info!("  mTLS:     ENABLED (client CA: {ca})");
+    }
     tracing::info!("============================================================");
 }
 

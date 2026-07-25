@@ -86,6 +86,7 @@ impl ServerConfig {
         let preset = preset_from_arg(&cli.preset);
         let mut quic_config = preset.to_config();
         quic_config.skip_crc = cli.skip_crc;
+        quic_config.client_ca = cli.client_ca.clone();
 
         let workers = resolve_workers(cli.workers, &cli.mode);
 
