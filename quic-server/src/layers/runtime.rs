@@ -53,6 +53,10 @@ pub struct RuntimeLayer {
     pub cqe_processor: CqeProcessor,
     /// Runtime-layer Reactor facade — config + stats orchestrator.
     pub reactor_facade: RuntimeReactor,
+    /// Throttle for connection-shard create failures — a sustained
+    /// connection storm (every inbound SYN hits a full shard) fires
+    /// `warn!` per attempt. Yields one log line per 64 events.
+    shard_fail_throttle: crate::log_throttle::RateCounter,
 }
 
 impl RuntimeLayer {
@@ -105,6 +109,7 @@ impl RuntimeLayer {
             task_queue,
             cqe_processor,
             reactor_facade,
+            shard_fail_throttle: crate::log_throttle::RateCounter::new(64),
         })
     }
 
@@ -119,7 +124,14 @@ impl RuntimeLayer {
         let conn_id = match self.shard.create(spec) {
             Ok(id) => id,
             Err(e) => {
-                tracing::warn!(conn_idx, error = ?e, "connection-shard create failed");
+                if self.shard_fail_throttle.tick() {
+                    tracing::warn!(
+                        conn_idx,
+                        error = ?e,
+                        total = self.shard_fail_throttle.count(),
+                        "connection-shard create failed (logging every 64th)"
+                    );
+                }
                 return None;
             }
         };

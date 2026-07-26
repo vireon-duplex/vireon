@@ -127,6 +127,13 @@ pub struct VireonStack {
     tick_count: u64,
     /// Throttle for memory-pressure warnings (logs at most every 5 s).
     pressure_throttle: PressureThrottle,
+    /// ── per-frame error throttles ────────────────────────────────
+    /// Encode failures on persistently malformed outgoing frames and
+    /// retry-queue evictions under sustained backpressure can both fire
+    /// per-tick. Each yields one log line per N events so a stuck
+    /// stream doesn't drown the rest of the log.
+    encode_fail_throttle: crate::log_throttle::RateCounter,
+    retry_evict_throttle: crate::log_throttle::RateCounter,
 
     // ── Memory-pressure eviction ────────────────────────────────
     /// Last time an eviction pass ran — used to enforce cooldown.
@@ -258,6 +265,8 @@ impl VireonStack {
             evict_scratch: Vec::with_capacity(32),
             tick_count: 0,
             pressure_throttle: PressureThrottle::new(),
+            encode_fail_throttle: crate::log_throttle::RateCounter::new(256),
+            retry_evict_throttle: crate::log_throttle::RateCounter::new(128),
             eviction_cooldown: None,
             eviction_config: crate::eviction::EvictionConfig::default(),
             echo,
@@ -583,7 +592,13 @@ impl VireonStack {
             }
             Err(e) => {
                 self.send_scratch.clear();
-                tracing::warn!(error = ?e, "encode outgoing frame failed");
+                if self.encode_fail_throttle.tick() {
+                    tracing::warn!(
+                        error = ?e,
+                        total = self.encode_fail_throttle.count(),
+                        "encode outgoing frame failed (logging every 256th)"
+                    );
+                }
             }
         }
     }
@@ -625,15 +640,19 @@ impl VireonStack {
             // cascade. This is a load-shed path of last resort; if you see
             // this warning at runtime, either raise the caps above or add
             // publisher-side backpressure.
-            tracing::warn!(
-                conn_idx,
-                quic_stream_id,
-                evicted_entries,
-                evicted_bytes,
-                queue_len = self.retry_queue.len(),
-                queue_bytes = self.retry_bytes,
-                "[retry] evicted entries to satisfy caps — subscriber stream may corrupt"
-            );
+            if self.retry_evict_throttle.tick() {
+                tracing::warn!(
+                    conn_idx,
+                    quic_stream_id,
+                    evicted_entries,
+                    evicted_bytes,
+                    queue_len = self.retry_queue.len(),
+                    queue_bytes = self.retry_bytes,
+                    total = self.retry_evict_throttle.count(),
+                    "[retry] evicted entries to satisfy caps — subscriber stream may corrupt \
+                     (logging every 128th)"
+                );
+            }
         }
         self.retry_bytes += data.len();
         self.retry_queue.push_back(PendingSend {

@@ -43,6 +43,29 @@ use rustc_hash::FxHashMap;
 use session_registry::NodeId;
 use session_registry::node::{NodeAddress, NodeInfo, NodeState, Region, Zone};
 
+// ── log throttles ─────────────────────────────────────────────────
+//
+// The transport thread sits in a tight `loop { recv_from(); ... }` and
+// a misconfigured peer, exhausted socket buffer, or attacker can fire
+// these `warn!` calls on every iteration — hundreds of identical lines
+// per second. Each counter yields one log line per N occurrences;
+// `Relaxed` ordering is sufficient (best-effort noise control, not
+// synchronization).
+//
+// 64 chosen so that at the worst observed rate (~10k err/s on a
+// misconfigured peer) we still surface ~150 lines/s — enough to see
+// the problem clearly without flooding the log sink.
+static DECODE_DROP: crate::log_throttle::AtomicRateCounter =
+    crate::log_throttle::AtomicRateCounter::new(64);
+static RECV_DROP: crate::log_throttle::AtomicRateCounter =
+    crate::log_throttle::AtomicRateCounter::new(64);
+static NO_PEER_DROP: crate::log_throttle::AtomicRateCounter =
+    crate::log_throttle::AtomicRateCounter::new(64);
+static SEND_DROP: crate::log_throttle::AtomicRateCounter =
+    crate::log_throttle::AtomicRateCounter::new(64);
+static ENCODE_DROP: crate::log_throttle::AtomicRateCounter =
+    crate::log_throttle::AtomicRateCounter::new(64);
+
 /// A message destined for another node in the cluster.
 ///
 /// Workers produce these (e.g. `InterNodeMessage::Publish` to forward
@@ -289,12 +312,15 @@ fn run_transport(
                             }
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                %peer_addr,
-                                len = n,
-                                ?e,
-                                "[cluster] decode failed — dropping"
-                            );
+                            if DECODE_DROP.tick() {
+                                tracing::warn!(
+                                    %peer_addr,
+                                    len = n,
+                                    total = DECODE_DROP.count(),
+                                    ?e,
+                                    "[cluster] decode failed — dropping (logging every 64th)"
+                                );
+                            }
                         }
                     }
                 }
@@ -305,10 +331,13 @@ fn run_transport(
                     continue; // Retry on EINTR.
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "[cluster] UDP recv failed — backing off"
-                    );
+                    if RECV_DROP.tick() {
+                        tracing::warn!(
+                            error = %e,
+                            total = RECV_DROP.count(),
+                            "[cluster] UDP recv failed — backing off (logging every 64th)"
+                        );
+                    }
                     break;
                 }
             }
@@ -353,29 +382,38 @@ fn process_outgoing(
         return;
     }
     let Some(addr) = peers.get(&out.target) else {
-        tracing::warn!(
-            target = %out.target,
-            "[cluster] no peer address for target — dropping"
-        );
+        if NO_PEER_DROP.tick() {
+            tracing::warn!(
+                target = %out.target,
+                total = NO_PEER_DROP.count(),
+                "[cluster] no peer address for target — dropping (logging every 64th)"
+            );
+        }
         return;
     };
     match out.msg.encode() {
         Ok(bytes) => {
             if let Err(e) = socket.send_to(&bytes, addr) {
-                tracing::warn!(
-                    target = %out.target,
-                    %addr,
-                    error = %e,
-                    "[cluster] UDP send failed"
-                );
+                if SEND_DROP.tick() {
+                    tracing::warn!(
+                        target = %out.target,
+                        %addr,
+                        error = %e,
+                        total = SEND_DROP.count(),
+                        "[cluster] UDP send failed (logging every 64th)"
+                    );
+                }
             }
         }
         Err(e) => {
-            tracing::warn!(
-                target = %out.target,
-                ?e,
-                "[cluster] encode failed — dropping"
-            );
+            if ENCODE_DROP.tick() {
+                tracing::warn!(
+                    target = %out.target,
+                    ?e,
+                    total = ENCODE_DROP.count(),
+                    "[cluster] encode failed — dropping (logging every 64th)"
+                );
+            }
         }
     }
 }
