@@ -45,6 +45,9 @@ pub struct ServerMetrics {
     pub bytes_recv_total: AtomicU64,
     /// Total bytes sent to clients (frame payloads only).
     pub bytes_sent_total: AtomicU64,
+    /// Total Initial packets rejected by the per-IP handshake rate
+    /// limiter (summed across all workers).
+    pub rate_limit_rejections_total: AtomicU64,
     /// Server start time (for uptime computation).
     pub started_at: Instant,
 }
@@ -61,6 +64,7 @@ impl ServerMetrics {
             errors_total: AtomicU64::new(0),
             bytes_recv_total: AtomicU64::new(0),
             bytes_sent_total: AtomicU64::new(0),
+            rate_limit_rejections_total: AtomicU64::new(0),
             started_at: Instant::now(),
         }
     }
@@ -91,6 +95,7 @@ impl ServerMetrics {
         let errs = self.errors_total.load(Ordering::Relaxed);
         let recv = self.bytes_recv_total.load(Ordering::Relaxed);
         let sent = self.bytes_sent_total.load(Ordering::Relaxed);
+        let rl_rej = self.rate_limit_rejections_total.load(Ordering::Relaxed);
         let uptime = self.started_at.elapsed().as_secs();
 
         // Prometheus text format v0.0.4.
@@ -122,6 +127,10 @@ impl ServerMetrics {
         out.push_str("# HELP vireon_bytes_sent_total Frame payload bytes sent.\n");
         out.push_str("# TYPE vireon_bytes_sent_total counter\n");
         out.push_str(&format!("vireon_bytes_sent_total {sent}\n\n"));
+
+        out.push_str("# HELP vireon_rate_limit_rejections_total Initial packets rejected by the per-IP handshake rate limiter.\n");
+        out.push_str("# TYPE vireon_rate_limit_rejections_total counter\n");
+        out.push_str(&format!("vireon_rate_limit_rejections_total {rl_rej}\n\n"));
 
         out.push_str("# HELP vireon_uptime_seconds Seconds since server start.\n");
         out.push_str("# TYPE vireon_uptime_seconds gauge\n");

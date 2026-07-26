@@ -153,6 +153,14 @@ pub struct VireonStack {
     /// a cap. Surfaced in the periodic `[distribution]` log.
     pending_drops: u64,
 
+    // ── Rate-limiter metric sync ────────────────────────────────
+    /// Last engine handshake-rejection count observed by the metrics
+    /// sync pass. The per-tick delta (`engine.handshake_rejections -
+    /// last_rl_rejections`) is added to
+    /// `ServerMetrics::rate_limit_rejections_total` so the Prometheus
+    /// counter reflects engine state without coupling the two crates.
+    last_rl_rejections: u64,
+
     // ── Graceful shutdown ────────────────────────────────────────
     /// Set by the signal handler to request graceful shutdown.
     shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
@@ -270,6 +278,7 @@ impl VireonStack {
             pending_sends: FxHashMap::with_capacity_and_hasher(64, Default::default()),
             pending_bytes: 0,
             pending_drops: 0,
+            last_rl_rejections: 0,
             shutdown_requested,
             reactor_stop: None,
             shutdown_state: ShutdownState::Running,
@@ -925,6 +934,20 @@ impl IoHandler for VireonStack {
 
     fn on_tick(&mut self, ctx: &mut TickContext) {
         self.tick_count = self.tick_count.wrapping_add(1);
+
+        // ── Sync engine handshake-rejection counter to metrics ─────
+        // The engine tracks rejections per-worker (no Arc<AtomicU64>
+        // in the hot path); we mirror the delta to the shared metrics
+        // store once per tick so Prometheus scrapes see up-to-date
+        // counts. Cheap (one relaxed load + one relaxed fetch_add).
+        if let Some(m) = self.metrics.as_ref() {
+            let current = self.engine.handshake_rejections;
+            let delta = current.wrapping_sub(self.last_rl_rejections);
+            if delta > 0 {
+                m.add(&m.rate_limit_rejections_total, delta);
+                self.last_rl_rejections = current;
+            }
+        }
 
         // ── Retry flow-control-blocked sends BEFORE the engine tick ─
         // Draining first lets successfully-retried frames ride the

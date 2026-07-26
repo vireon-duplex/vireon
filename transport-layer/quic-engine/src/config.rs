@@ -176,6 +176,14 @@ pub struct QuicConfig {
     /// and rejects any client that does not present a certificate
     /// signed by this CA. When `None`, client certs are not required.
     pub client_ca: Option<String>,
+    /// Maximum new QUIC handshakes per second from a single source IP.
+    /// `0` disables the limiter (default). When non-zero, an
+    /// [`IpRateLimiter`](crate::rate_limiter::IpRateLimiter) tracks
+    /// per-IP handshake arrivals and rejects Initial packets beyond
+    /// the cap before they allocate connection state. Defends against
+    /// handshake storms from a misbehaving or hostile peer without
+    /// affecting already-connected clients on the same IP.
+    pub max_handshakes_per_ip_per_sec: u32,
 }
 
 impl QuicConfig {
@@ -242,6 +250,7 @@ impl Default for QuicConfig {
             shutting_down: false,
             skip_crc: false,
             client_ca: None,
+            max_handshakes_per_ip_per_sec: 0,
         }
     }
 }
