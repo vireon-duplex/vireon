@@ -22,11 +22,13 @@
 //! The reactor (io-layer) drives the event loop and calls
 //! `IoHandler::on_datagram` / `IoHandler::on_tick` on this struct.
 
-use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
+
+use bytes::BytesMut;
+use rustc_hash::FxHashMap;
 
 use bytes::Bytes;
 use frame::codec::{self, FrameHeader, FrameRef};
@@ -44,51 +46,44 @@ use crate::layers::{ApplicationLayer, FrameContext, OutgoingFrame, RuntimeLayer}
 /// for typical RTTs and retransmitted CONNECTION_CLOSE.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
-// ── FlowBlocked retry queue ─────────────────────────────────────────
+// ── Per-stream pending-send buffer ──────────────────────────────────
 //
-// When `engine.send_stream` returns `FlowBlocked`, the per-stream outbound
-// buffer is full (peer hasn't acked enough to free credit). Previously
-// the server silently dropped the frame, which (under sustained load)
-// starves the peer of ACKs and creates a flow-control deadlock: the
-// client never receives the echo, never advances its `MAX_STREAM_DATA`
-// credit, and the outbound buffer never drains.
+// When `engine.send_stream` returns a partial write or `FlowBlocked`,
+// the unwritten bytes are buffered PER STREAM and retried on subsequent
+// ticks. The per-stream keying is CRITICAL for correctness: QUIC's
+// `stream_send` always APPENDS to the stream buffer. If frame N
+// partial-writes and its tail is buffered, frame N+1 sent directly
+// would land at stream offset [N_partial_end] — BEFORE the buffered
+// tail of N. When the tail is later flushed it appends AFTER N+1,
+// producing stream byte order [N_partial, N+1, N_tail] and corrupting
+// the subscriber's frame decoder (CrcMismatch cascade → silent loss).
 //
-// The retry queue holds blocked frames for one or more subsequent ticks,
-// giving the peer time to ACK and recharge flow-control credit. Caps:
+// The fix mirrors the client transport's `pending: HashMap<u64, BytesMut>`:
+// before sending a new frame, check if the stream already has pending
+// bytes. If so, APPEND the new frame to the pending buffer — preserving
+// byte order — instead of calling `send_stream` directly.
 //
-//   * `RETRY_QUEUE_CAP`     — max entries (prevents unbounded growth)
-//   * `RETRY_MAX_ATTEMPTS`  — per-frame retry budget (then drop)
-//   * `RETRY_BYTE_CAP`      — total bytes bound (prevents OOM under
-//                              conn storms where every conn is blocked)
+// Caps (load-shed of last resort; eviction corrupts the evicted stream):
 //
-// Drops are accounted in `retry_drops` and surfaced in the periodic
-// `[distribution]` log so operators can spot chronic flow-control
-// starvation (a sign that `initial_max_stream_data` is too small for
-// the workload).
-//
-// NOTE: dropping a queue entry whose bytes have already been PARTIALLY
-// written to quiche corrupts the stream — the subscriber sees a frame
-// header followed by the wrong bytes → CrcMismatch cascade. Caps must
-// therefore be sized so drops essentially never happen under realistic
-// load; if they do, the right answer is backpressure (slow the publisher)
-// rather than truncation. The defaults below are sized to give
-// subscribers seconds of headroom — under sustained overload, the
-// expectation is that the publisher's QUIC flow-control window fills
-// and backpressure kicks in before these caps are reached.
-const RETRY_QUEUE_CAP: usize = 65_536;
-const RETRY_MAX_ATTEMPTS: u8 = 255;
-const RETRY_BYTE_CAP: usize = 1024 * 1024 * 1024; // 1 GiB
+//   * `PENDING_MAX_STREAMS`  — max distinct streams with pending data
+//   * `PENDING_MAX_ATTEMPTS` — per-stream FlowBlocked retry budget
+//   * `PENDING_BYTE_CAP`     — total bytes bound (prevents OOM under
+//                              chronic subscriber starvation)
+const PENDING_MAX_STREAMS: usize = 65_536;
+const PENDING_MAX_ATTEMPTS: u8 = 255;
+const PENDING_BYTE_CAP: usize = 1024 * 1024 * 1024; // 1 GiB
 
-/// A frame pending retry after `QuicSendError::FlowBlocked`.
+/// Per-stream pending bytes awaiting (re)send.
 ///
-/// Owns the wire-encoded bytes (header + payload + CRC) so the encode
-/// work is not redone on each retry.
+/// Keyed by `(conn_idx, quic_stream_id)` in [`VireonStack::pending_sends`]
+/// so that all buffered bytes for one stream are contiguous and retried
+/// in FIFO order. Owns wire-encoded bytes (header + payload + CRC).
 #[derive(Debug)]
 struct PendingSend {
-    conn_idx: usize,
-    quic_stream_id: u64,
-    data: Vec<u8>,
-    attempts: u8,
+    data: BytesMut,
+    /// Consecutive `FlowBlocked` results since last progress.
+    /// Reset to 0 whenever `send_stream` accepts ≥1 byte.
+    blocked_attempts: u8,
 }
 
 /// The full multi-layer stack — owns the application chain, the
@@ -133,7 +128,7 @@ pub struct VireonStack {
     /// per-tick. Each yields one log line per N events so a stuck
     /// stream doesn't drown the rest of the log.
     encode_fail_throttle: crate::log_throttle::RateCounter,
-    retry_evict_throttle: crate::log_throttle::RateCounter,
+    pending_evict_throttle: crate::log_throttle::RateCounter,
 
     // ── Memory-pressure eviction ────────────────────────────────
     /// Last time an eviction pass ran — used to enforce cooldown.
@@ -145,16 +140,18 @@ pub struct VireonStack {
     /// When true, echo every received frame back on the same stream.
     echo: bool,
 
-    // ── FlowBlocked retry queue ─────────────────────────────────
-    /// Frames waiting to be retried after `QuicSendError::FlowBlocked`.
-    /// Drained once per `on_tick` BEFORE `flush_sends` so retried sends
-    /// get picked up in the same tick's flush.
-    retry_queue: VecDeque<PendingSend>,
-    /// Total bytes currently held in `retry_queue` (for `RETRY_BYTE_CAP`).
-    retry_bytes: usize,
-    /// Frames dropped after exhausting `RETRY_MAX_ATTEMPTS` or hitting a
-    /// cap. Surfaced in the periodic `[distribution]` log.
-    retry_drops: u64,
+    // ── Per-stream pending-send buffer ───────────────────────────
+    /// Per-`(conn_idx, quic_stream_id)` buffered bytes from partial
+    /// `send_stream` writes or `FlowBlocked`. Keyed by stream so that
+    /// new frames for a stream with pending data APPEND to the buffer
+    /// (preserving byte order) instead of being sent directly (which
+    /// would corrupt the stream — see `PENDING_BYTE_CAP` doc above).
+    pending_sends: FxHashMap<(usize, u64), PendingSend>,
+    /// Total bytes currently held in `pending_sends` (for cap enforcement).
+    pending_bytes: usize,
+    /// Frames dropped after exhausting `PENDING_MAX_ATTEMPTS` or hitting
+    /// a cap. Surfaced in the periodic `[distribution]` log.
+    pending_drops: u64,
 
     // ── Graceful shutdown ────────────────────────────────────────
     /// Set by the signal handler to request graceful shutdown.
@@ -266,13 +263,13 @@ impl VireonStack {
             tick_count: 0,
             pressure_throttle: PressureThrottle::new(),
             encode_fail_throttle: crate::log_throttle::RateCounter::new(256),
-            retry_evict_throttle: crate::log_throttle::RateCounter::new(128),
+            pending_evict_throttle: crate::log_throttle::RateCounter::new(128),
             eviction_cooldown: None,
             eviction_config: crate::eviction::EvictionConfig::default(),
             echo,
-            retry_queue: VecDeque::with_capacity(64),
-            retry_bytes: 0,
-            retry_drops: 0,
+            pending_sends: FxHashMap::with_capacity_and_hasher(64, Default::default()),
+            pending_bytes: 0,
+            pending_drops: 0,
             shutdown_requested,
             reactor_stop: None,
             shutdown_state: ShutdownState::Running,
@@ -522,10 +519,17 @@ impl VireonStack {
     /// QUIC engine.
     ///
     /// Uses `set_len` instead of `resize` to avoid zeroing bytes that
-    /// `encode_into_slice` will immediately overwrite. On
-    /// [`QuicSendError::FlowBlocked`] the frame is enqueued on
-    /// `retry_queue` (subject to caps) and retried on subsequent ticks;
+    /// `encode_into_slice` will immediately overwrite. On partial write
+    /// or [`QuicSendError::FlowBlocked`] the unwritten bytes are buffered
+    /// in `pending_sends` (per-stream) and retried on subsequent ticks;
     /// other errors are logged at debug.
+    ///
+    /// **Byte-order preservation:** if `pending_sends` already has an
+    /// entry for this `(conn_idx, quic_stream_id)`, the new frame's
+    /// bytes are APPENDED to that entry instead of being sent directly.
+    /// Sending directly would call `quiche::stream_send`, which appends
+    /// to the QUIC stream buffer — landing the new frame BEFORE the
+    /// buffered tail of the previous frame and corrupting the stream.
     fn encode_and_send(
         &mut self,
         conn_idx: usize,
@@ -541,55 +545,8 @@ impl VireonStack {
         // `wire_size` bytes on success. On error we `clear()` so no
         // uninitialized memory persists beyond this call.
         unsafe { self.send_scratch.set_len(wire_size) };
-        match codec::encode_into_slice(&mut self.send_scratch, header, payload) {
-            Ok(n) => {
-                let outcome = self.engine.send_stream(
-                    conn_idx,
-                    quic_stream_id,
-                    &self.send_scratch[..n],
-                    false,
-                );
-                match outcome {
-                    Ok(written) => {
-                        if let Some(m) = &self.metrics {
-                            m.add(&m.bytes_sent_total, written as u64);
-                        }
-                        // Partial-write tail: quiche accepted `written`
-                        // bytes but flow-control stopped it before the
-                        // full frame. Without buffering the tail, the
-                        // next frame's bytes would land at the wrong
-                        // offset on the stream → subscriber decoder
-                        // desyncs → CrcMismatch cascade. Same fix as the
-                        // client transport's partial-write buffer.
-                        if written < n {
-                            let tail = self.send_scratch[written..n].to_vec();
-                            self.enqueue_retry_owned(conn_idx, quic_stream_id, tail);
-                        }
-                    }
-                    Err(QuicSendError::FlowBlocked) => {
-                        // Per-stream outbound buffer full: peer hasn't
-                        // acked enough to free credit. Enqueue for retry
-                        // on a subsequent tick instead of dropping, so
-                        // the peer eventually receives the data and
-                        // recharges flow-control credit. Caps prevent
-                        // unbounded growth under chronic starvation.
-                        //
-                        // Clone out of `send_scratch` before enqueuing:
-                        // `enqueue_retry` takes `&mut self` and cannot
-                        // borrow the slice from `self.send_scratch`.
-                        let data = self.send_scratch[..n].to_vec();
-                        self.enqueue_retry_owned(conn_idx, quic_stream_id, data);
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            conn_idx,
-                            quic_stream_id,
-                            error = ?e,
-                            "send_stream failed"
-                        );
-                    }
-                }
-            }
+        let n = match codec::encode_into_slice(&mut self.send_scratch, header, payload) {
+            Ok(n) => n,
             Err(e) => {
                 self.send_scratch.clear();
                 if self.encode_fail_throttle.tick() {
@@ -599,6 +556,61 @@ impl VireonStack {
                         "encode outgoing frame failed (logging every 256th)"
                     );
                 }
+                return;
+            }
+        };
+
+        // If there's already pending data for this stream, APPEND the
+        // new frame to it — do NOT call send_stream directly. quiche's
+        // stream_send always appends to the stream buffer, so sending
+        // the new frame now would place its bytes BEFORE the buffered
+        // tail of the prior frame, corrupting the byte stream.
+        let key = (conn_idx, quic_stream_id);
+        if let Some(p) = self.pending_sends.get_mut(&key) {
+            let prev_len = p.data.len();
+            p.data.extend_from_slice(&self.send_scratch[..n]);
+            self.pending_bytes += p.data.len() - prev_len;
+            self.enforce_pending_caps_on_insert(conn_idx, quic_stream_id);
+            return;
+        }
+
+        // No pending data — send directly.
+        let outcome = self.engine.send_stream(
+            conn_idx,
+            quic_stream_id,
+            &self.send_scratch[..n],
+            false,
+        );
+        match outcome {
+            Ok(written) => {
+                if let Some(m) = &self.metrics {
+                    m.add(&m.bytes_sent_total, written as u64);
+                }
+                if written < n {
+                    // Partial-write tail: quiche accepted `written`
+                    // bytes but flow-control stopped it before the
+                    // full frame. Buffer the tail per-stream so the
+                    // next frame for this stream appends to it instead
+                    // of landing at the wrong offset.
+                    let tail = self.send_scratch[written..n].to_vec();
+                    self.insert_pending(conn_idx, quic_stream_id, BytesMut::from_iter(tail));
+                }
+            }
+            Err(QuicSendError::FlowBlocked) => {
+                // Per-stream outbound buffer full: peer hasn't acked
+                // enough to free credit. Buffer the whole frame for
+                // retry on a subsequent tick so the peer eventually
+                // receives the data and recharges flow-control credit.
+                let data = self.send_scratch[..n].to_vec();
+                self.insert_pending(conn_idx, quic_stream_id, BytesMut::from_iter(data));
+            }
+            Err(e) => {
+                tracing::debug!(
+                    conn_idx,
+                    quic_stream_id,
+                    error = ?e,
+                    "send_stream failed"
+                );
             }
         }
     }
@@ -607,127 +619,192 @@ impl VireonStack {
         tracing::trace!(conn_idx, stream_id, "QUIC stream FIN");
     }
 
-    // ── FlowBlocked retry queue ──────────────────────────────────
+    // ── Per-stream pending-send buffer ───────────────────────────
 
-    /// Enqueues an owned frame for retry, respecting caps.
-    ///
-    /// If the queue or byte cap is reached, the oldest entries are
-    /// dropped first (FIFO eviction) — under chronic flow-control
-    /// starvation, this means stalled streams lose their place in line
-    /// so freshly-blocked frames from healthier streams can still make
-    /// progress.
-    fn enqueue_retry_owned(&mut self, conn_idx: usize, quic_stream_id: u64, data: Vec<u8>) {
-        // Evict from the front until both caps are satisfied.
-        let mut evicted_bytes = 0u64;
-        let mut evicted_entries = 0u32;
-        while self.retry_queue.len() >= RETRY_QUEUE_CAP
-            || self.retry_bytes + data.len() > RETRY_BYTE_CAP
+    /// Inserts a new `PendingSend` for `(conn_idx, stream_id)`,
+    /// respecting the byte cap. The stream cap (`PENDING_MAX_STREAMS`)
+    /// is bounded by the number of active connections × streams and is
+    /// not expected to hit in practice; the byte cap is the primary
+    /// defense against OOM under chronic subscriber starvation.
+    fn insert_pending(&mut self, conn_idx: usize, quic_stream_id: u64, data: BytesMut) {
+        self.enforce_pending_caps(conn_idx, quic_stream_id, data.len());
+        self.pending_bytes += data.len();
+        self.pending_sends.insert(
+            (conn_idx, quic_stream_id),
+            PendingSend {
+                data,
+                blocked_attempts: 0,
+            },
+        );
+    }
+
+    /// Same as `insert_pending` but for the APPEND path — the entry
+    /// already exists. Caps are enforced by evicting OTHER streams if
+    /// needed; the current entry is preserved so we don't corrupt it
+    /// mid-append.
+    fn enforce_pending_caps_on_insert(&mut self, conn_idx: usize, quic_stream_id: u64) {
+        let key = (conn_idx, quic_stream_id);
+        while self.pending_bytes > PENDING_BYTE_CAP
+            || self.pending_sends.len() > PENDING_MAX_STREAMS
         {
-            match self.retry_queue.pop_front() {
-                Some(p) => {
-                    self.retry_bytes -= p.data.len();
-                    evicted_bytes += p.data.len() as u64;
-                    evicted_entries += 1;
-                }
-                None => break, // len cap satisfied, byte cap cannot be exceeded
-            }
-            self.retry_drops += 1;
-        }
-        if evicted_entries > 0 {
-            // Evicting an entry whose bytes were already partially written
-            // to quiche CORRUPTS the subscriber's stream — the next bytes
-            // the subscriber reads will be mid-frame, causing a CrcMismatch
-            // cascade. This is a load-shed path of last resort; if you see
-            // this warning at runtime, either raise the caps above or add
-            // publisher-side backpressure.
-            if self.retry_evict_throttle.tick() {
+            // Evict any OTHER entry. Pick by iteration — under chronic
+            // starvation all streams are equally stuck, so the choice
+            // is arbitrary. Evicting the current entry mid-append would
+            // corrupt its already-partially-written stream.
+            let Some((victim_key, victim_len)) = self
+                .pending_sends
+                .iter()
+                .find(|(k, _)| **k != key)
+                .map(|(k, v)| (*k, v.data.len()))
+            else {
+                break; // no other entry to evict
+            };
+            self.pending_sends.remove(&victim_key);
+            self.pending_bytes -= victim_len;
+            self.pending_drops += 1;
+            if self.pending_evict_throttle.tick() {
                 tracing::warn!(
-                    conn_idx,
-                    quic_stream_id,
-                    evicted_entries,
-                    evicted_bytes,
-                    queue_len = self.retry_queue.len(),
-                    queue_bytes = self.retry_bytes,
-                    total = self.retry_evict_throttle.count(),
-                    "[retry] evicted entries to satisfy caps — subscriber stream may corrupt \
+                    conn_idx = victim_key.0,
+                    quic_stream_id = victim_key.1,
+                    evicted_bytes = victim_len,
+                    queue_len = self.pending_sends.len(),
+                    queue_bytes = self.pending_bytes,
+                    total = self.pending_evict_throttle.count(),
+                    "[pending] evicted entry to satisfy caps — subscriber stream may corrupt \
                      (logging every 128th)"
                 );
             }
         }
-        self.retry_bytes += data.len();
-        self.retry_queue.push_back(PendingSend {
-            conn_idx,
-            quic_stream_id,
-            data,
-            attempts: 0,
-        });
     }
 
-    /// Drains the retry queue, re-attempting each pending send.
+    /// Evicts other-stream entries until inserting `incoming_len` bytes
+    /// would fit under both caps. Called by `insert_pending`.
+    fn enforce_pending_caps(
+        &mut self,
+        conn_idx: usize,
+        quic_stream_id: u64,
+        incoming_len: usize,
+    ) {
+        let key = (conn_idx, quic_stream_id);
+        while self.pending_bytes + incoming_len > PENDING_BYTE_CAP
+            || self.pending_sends.len() + 1 > PENDING_MAX_STREAMS
+        {
+            // Evict any OTHER entry to make room. Same rationale as
+            // `enforce_pending_caps_on_insert`.
+            let Some((victim_key, victim_len)) = self
+                .pending_sends
+                .iter()
+                .find(|(k, _)| **k != key)
+                .map(|(k, v)| (*k, v.data.len()))
+            else {
+                break;
+            };
+            self.pending_sends.remove(&victim_key);
+            self.pending_bytes -= victim_len;
+            self.pending_drops += 1;
+            if self.pending_evict_throttle.tick() {
+                tracing::warn!(
+                    conn_idx = victim_key.0,
+                    quic_stream_id = victim_key.1,
+                    evicted_bytes = victim_len,
+                    queue_len = self.pending_sends.len(),
+                    queue_bytes = self.pending_bytes,
+                    total = self.pending_evict_throttle.count(),
+                    "[pending] evicted entry to satisfy caps — subscriber stream may corrupt \
+                     (logging every 128th)"
+                );
+            }
+        }
+    }
+
+    /// Drains the pending-send buffer, re-attempting each stream's
+    /// buffered bytes.
     ///
-    /// Called once per `on_tick` before `flush_sends`. Entries that
-    /// succeed are dropped; entries that are still `FlowBlocked` are
-    /// re-enqueued with an incremented attempt counter. Entries that
-    /// exhaust `RETRY_MAX_ATTEMPTS` (or hit a non-retryable error) are
-    /// dropped and counted in `retry_drops`.
-    fn drain_retry_queue(&mut self) {
-        if self.retry_queue.is_empty() {
+    /// Called once per `on_tick` BEFORE `flush_sends` so retried sends
+    /// get picked up in the same tick's flush. Per-stream entries are
+    /// retried in place (no reorder). Entries that succeed fully are
+    /// dropped; partial writes update the buffered tail in place;
+    /// entries that exhaust `PENDING_MAX_ATTEMPTS` (or hit a
+    /// non-retryable error) are dropped and counted in `pending_drops`.
+    fn drain_pending_sends(&mut self) {
+        if self.pending_sends.is_empty() {
             return;
         }
-        // Drain into a local vec to avoid borrow conflicts while we
-        // call `engine.send_stream` (which takes &mut self).
-        let pending: Vec<_> = self.retry_queue.drain(..).collect();
-        let pending_bytes_start = self.retry_bytes;
-        self.retry_bytes = 0;
-        let mut still_blocked = 0u32;
+        // Snapshot keys to release the borrow on `pending_sends` before
+        // we call `engine.send_stream` (which takes &mut self).
+        let keys: Vec<(usize, u64)> = self.pending_sends.keys().copied().collect();
         let mut succeeded = 0u32;
+        let mut still_blocked = 0u32;
         let mut dropped = 0u32;
 
-        for mut p in pending {
-            match self
-                .engine
-                .send_stream(p.conn_idx, p.quic_stream_id, &p.data, false)
-            {
+        for key in keys {
+            let Some(p) = self.pending_sends.get_mut(&key) else {
+                continue;
+            };
+            // Take ownership of the buffer so we can call send_stream.
+            let mut buf = std::mem::take(&mut p.data);
+            // buf is now empty in map; we'll either re-populate or remove below.
+            let prev_len = buf.len();
+            match self.engine.send_stream(key.0, key.1, &buf, false) {
                 Ok(written) => {
-                    if written < p.data.len() {
-                        // Partial write on retry — keep the tail in the
-                        // queue without bumping `attempts` (this isn't a
-                        // flow-control block, just a continued partial).
-                        p.data = p.data[written..].to_vec();
-                        self.retry_bytes += p.data.len();
-                        self.retry_queue.push_back(p);
+                    if let Some(m) = &self.metrics {
+                        m.add(&m.bytes_sent_total, written as u64);
+                    }
+                    self.pending_bytes -= prev_len;
+                    if written < buf.len() {
+                        // Partial write — buffer the tail, reset attempts.
+                        let tail = buf.split_off(written);
+                        self.pending_bytes += tail.len();
+                        let p = self.pending_sends.get_mut(&key).expect("just get_mut'd above");
+                        p.data = tail;
+                        p.blocked_attempts = 0;
                         still_blocked += 1;
                     } else {
+                        // Full send — drop the entry.
+                        self.pending_sends.remove(&key);
                         succeeded += 1;
                     }
                 }
                 Err(QuicSendError::FlowBlocked) => {
-                    p.attempts += 1;
-                    if p.attempts >= RETRY_MAX_ATTEMPTS {
+                    // Restore the buffer; bump attempts.
+                    self.pending_bytes -= prev_len;
+                    self.pending_bytes += buf.len(); // same length, but be explicit
+                    let p = self.pending_sends.get_mut(&key).expect("just get_mut'd above");
+                    p.data = buf;
+                    p.blocked_attempts = p.blocked_attempts.saturating_add(1);
+                    if p.blocked_attempts >= PENDING_MAX_ATTEMPTS {
+                        self.pending_bytes -= p.data.len();
+                        self.pending_sends.remove(&key);
                         dropped += 1;
                     } else {
-                        self.retry_bytes += p.data.len();
-                        self.retry_queue.push_back(p);
                         still_blocked += 1;
                     }
                 }
-                Err(_) => {
-                    // Unknown connection or quiche error — drop silently.
+                Err(e) => {
+                    // Unknown connection or quiche error — drop and log.
+                    self.pending_bytes -= prev_len;
+                    self.pending_sends.remove(&key);
+                    tracing::warn!(
+                        conn_idx = key.0,
+                        quic_stream_id = key.1,
+                        bytes = prev_len,
+                        error = ?e,
+                        "[pending] dropping buffered frame — non-retryable error"
+                    );
                     dropped += 1;
                 }
             }
         }
 
-        let _ = pending_bytes_start; // accounting: bytes already reset above
-        self.retry_drops += u64::from(dropped);
+        self.pending_drops += u64::from(dropped);
         if succeeded > 0 || still_blocked > 0 || dropped > 0 {
             tracing::trace!(
                 succeeded,
                 still_blocked,
                 dropped,
-                queue_len = self.retry_queue.len(),
-                queue_bytes = self.retry_bytes,
-                "retry queue drain"
+                queue_len = self.pending_sends.len(),
+                queue_bytes = self.pending_bytes,
+                "pending sends drain"
             );
         }
     }
@@ -854,7 +931,7 @@ impl IoHandler for VireonStack {
         // same tick's `engine.on_tick` → `flush_sends`, so a recovered
         // stream re-enters the dirty bitset and emits packets without
         // waiting an extra tick.
-        self.drain_retry_queue();
+        self.drain_pending_sends();
 
         // ── Periodic observability (every 1000 ticks ≈ ~1s) ────────
         if self.tick_count % 1000 == 0 && !self.connections.is_empty() {
@@ -883,9 +960,9 @@ impl IoHandler for VireonStack {
             let active = self.engine.active_connections();
             let blocked = self.engine.stream_send_blocked;
             let send_bytes = self.engine.stream_send_bytes;
-            let retry_len = self.retry_queue.len();
-            let retry_bytes = self.retry_bytes;
-            let retry_drops = self.retry_drops;
+            let pending_len = self.pending_sends.len();
+            let pending_bytes = self.pending_bytes;
+            let pending_drops = self.pending_drops;
             if let Some(mesh) = self.engine.forward_mesh() {
                 tracing::info!(
                     reactor_id,
@@ -895,9 +972,9 @@ impl IoHandler for VireonStack {
                     forward_drops = mesh.forward_drops,
                     stream_send_blocked = blocked,
                     stream_send_bytes = send_bytes,
-                    retry_queue_len = retry_len,
-                    retry_queue_bytes = retry_bytes,
-                    retry_drops,
+                    pending_streams = pending_len,
+                    pending_bytes,
+                    pending_drops,
                     "[distribution] worker stats"
                 );
             } else {
@@ -906,9 +983,9 @@ impl IoHandler for VireonStack {
                     active_conns = active,
                     stream_send_blocked = blocked,
                     stream_send_bytes = send_bytes,
-                    retry_queue_len = retry_len,
-                    retry_queue_bytes = retry_bytes,
-                    retry_drops,
+                    pending_streams = pending_len,
+                    pending_bytes,
+                    pending_drops,
                     "[distribution] worker stats (single-worker mode)"
                 );
             }
