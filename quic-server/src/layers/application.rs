@@ -1886,7 +1886,7 @@ impl VireonDispatcher {
         // Drain into a local Vec first to release the borrow on
         // `self.cluster_incoming_rx` before we call back into
         // `self.cluster_deliver_local` / `self.coordinator`.
-        const CLUSTER_DRAIN_CAP: usize = 256;
+        const CLUSTER_DRAIN_CAP: usize = 1024;
         let mut batch: Vec<InterNodeMessage> = Vec::with_capacity(CLUSTER_DRAIN_CAP);
         if let Some(rx) = &mut self.cluster_incoming_rx {
             while batch.len() < CLUSTER_DRAIN_CAP {
@@ -2039,7 +2039,7 @@ impl VireonDispatcher {
         let Some(rx) = &mut self.worker_inbox else {
             return;
         };
-        const CAP: usize = 256;
+        const CAP: usize = 1024;
         let mut batch: Vec<InterWorkerPublish> = Vec::with_capacity(CAP);
         while batch.len() < CAP {
             match rx.try_recv() {
