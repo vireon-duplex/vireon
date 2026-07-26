@@ -271,6 +271,20 @@ pub struct VireonDispatcher {
     /// sustained burst otherwise produces hundreds of identical WARN
     /// lines per second and drowns the rest of the log.
     worker_drop_count: u64,
+    /// ── per-frame error throttles ────────────────────────────────
+    /// Persistently misbehaving clients (malformed payloads, denied
+    /// topics, stuck WAL disk) can fire warn!/info! per inbound frame.
+    /// Each counter yields one log line per N events.
+    decode_drop: crate::log_throttle::RateCounter,
+    acl_denied_drop: crate::log_throttle::RateCounter,
+    wal_fail_drop: crate::log_throttle::RateCounter,
+    malformed_drop: crate::log_throttle::RateCounter,
+    quota_drop: crate::log_throttle::RateCounter,
+    heartbeat_fail_drop: crate::log_throttle::RateCounter,
+    /// Invalid subscribe pattern — usually a buggy client retry loop.
+    invalid_pattern_drop: crate::log_throttle::RateCounter,
+    /// Misbehaving client sends FetchReply on a non-server stream.
+    fetch_reply_ignore_drop: crate::log_throttle::RateCounter,
 }
 
 /// Log cross-worker drop summaries every Nth drop.
@@ -320,6 +334,19 @@ impl VireonDispatcher {
             worker_inbox: None,
             worker_self_idx: 0,
             worker_drop_count: 0,
+            // Per-class throttles. `every` values chosen so that under
+            // a sustained ~5k frames/s/conn burst we still see ~5
+            // log lines/s per category — enough to diagnose without
+            // flooding. First occurrence always logs (RateCounter
+            // semantics).
+            decode_drop: crate::log_throttle::RateCounter::new(256),
+            acl_denied_drop: crate::log_throttle::RateCounter::new(256),
+            wal_fail_drop: crate::log_throttle::RateCounter::new(128),
+            malformed_drop: crate::log_throttle::RateCounter::new(256),
+            quota_drop: crate::log_throttle::RateCounter::new(64),
+            heartbeat_fail_drop: crate::log_throttle::RateCounter::new(64),
+            invalid_pattern_drop: crate::log_throttle::RateCounter::new(64),
+            fetch_reply_ignore_drop: crate::log_throttle::RateCounter::new(128),
         }
     }
 
@@ -707,27 +734,36 @@ impl VireonDispatcher {
                 self.handle_topic_delete(ctx, frame.stream_id, &topic);
             }
             Ok(Some(other)) => {
-                tracing::warn!(
-                    conn_idx = ctx.conn_idx,
-                    msg_type = ?frame.msg_type,
-                    parsed = ?other,
-                    "[pubsub] msg_type / payload mismatch"
-                );
+                if self.decode_drop.tick() {
+                    tracing::warn!(
+                        conn_idx = ctx.conn_idx,
+                        msg_type = ?frame.msg_type,
+                        parsed = ?other,
+                        total = self.decode_drop.count(),
+                        "[pubsub] msg_type / payload mismatch (logging every 256th)"
+                    );
+                }
             }
             Ok(None) => {
-                tracing::warn!(
-                    conn_idx = ctx.conn_idx,
-                    msg_type = ?frame.msg_type,
-                    "[pubsub] no structured payload for type"
-                );
+                if self.decode_drop.tick() {
+                    tracing::warn!(
+                        conn_idx = ctx.conn_idx,
+                        msg_type = ?frame.msg_type,
+                        total = self.decode_drop.count(),
+                        "[pubsub] no structured payload for type (logging every 256th)"
+                    );
+                }
             }
             Err(e) => {
-                tracing::warn!(
-                    conn_idx = ctx.conn_idx,
-                    msg_type = ?frame.msg_type,
-                    error = ?e,
-                    "[pubsub] payload decode failed"
-                );
+                if self.decode_drop.tick() {
+                    tracing::warn!(
+                        conn_idx = ctx.conn_idx,
+                        msg_type = ?frame.msg_type,
+                        error = ?e,
+                        total = self.decode_drop.count(),
+                        "[pubsub] payload decode failed (logging every 256th)"
+                    );
+                }
             }
         }
     }
@@ -744,11 +780,14 @@ impl VireonDispatcher {
             .check_acl(ctx.conn_idx, Action::Subscribe, pattern_str)
             .is_allow()
         {
-            tracing::info!(
-                conn_idx = ctx.conn_idx,
-                pattern = %pattern_str,
-                "[acl] subscribe denied"
-            );
+            if self.acl_denied_drop.tick() {
+                tracing::info!(
+                    conn_idx = ctx.conn_idx,
+                    pattern = %pattern_str,
+                    total = self.acl_denied_drop.count(),
+                    "[acl] subscribe denied (logging every 256th)"
+                );
+            }
             let ack = format!(
                 "{{\"error\":\"denied\",\"action\":\"subscribe\",\"pattern\":\"{pattern_str}\"}}"
             );
@@ -821,12 +860,15 @@ impl VireonDispatcher {
                 self.enqueue_response(ctx, stream, MessageType::Subscribe, Bytes::from(ack));
             }
             Err(e) => {
-                tracing::warn!(
-                    conn_idx = ctx.conn_idx,
-                    pattern = %pattern_str,
-                    error = ?e,
-                    "[pubsub] invalid pattern"
-                );
+                if self.invalid_pattern_drop.tick() {
+                    tracing::warn!(
+                        conn_idx = ctx.conn_idx,
+                        pattern = %pattern_str,
+                        error = ?e,
+                        total = self.invalid_pattern_drop.count(),
+                        "[pubsub] invalid pattern (logging every 64th)"
+                    );
+                }
             }
         }
     }
@@ -865,11 +907,14 @@ impl VireonDispatcher {
             .check_acl(ctx.conn_idx, Action::Publish, topic.as_str())
             .is_allow()
         {
-            tracing::info!(
-                conn_idx = ctx.conn_idx,
-                topic = %topic,
-                "[acl] publish denied"
-            );
+            if self.acl_denied_drop.tick() {
+                tracing::info!(
+                    conn_idx = ctx.conn_idx,
+                    topic = %topic,
+                    total = self.acl_denied_drop.count(),
+                    "[acl] publish denied (logging every 256th)"
+                );
+            }
             let ack =
                 format!("{{\"error\":\"denied\",\"action\":\"publish\",\"topic\":\"{topic}\"}}");
             self.enqueue_response(ctx, stream, MessageType::Publish, Bytes::from(ack));
@@ -981,12 +1026,16 @@ impl VireonDispatcher {
                     );
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        conn_idx = ctx.conn_idx,
-                        topic = topic_str,
-                        error = ?e,
-                        "[wal] append failed — live fan-out proceeds, replay will have a gap"
-                    );
+                    if self.wal_fail_drop.tick() {
+                        tracing::warn!(
+                            conn_idx = ctx.conn_idx,
+                            topic = topic_str,
+                            error = ?e,
+                            total = self.wal_fail_drop.count(),
+                            "[wal] append failed — live fan-out proceeds, replay will have a gap \
+                             (logging every 128th)"
+                        );
+                    }
                 }
             }
         }
@@ -1394,7 +1443,7 @@ impl VireonDispatcher {
         };
         match wal.read_range(topic_str, from, upper, &mut entries) {
             Ok(count) => {
-                tracing::info!(
+                tracing::debug!(
                     conn_idx = ctx.conn_idx,
                     topic = topic_str,
                     requested_max = max_count,
@@ -1739,7 +1788,14 @@ impl VireonDispatcher {
                 );
             }
             Err(e) => {
-                tracing::warn!(conn_idx = ctx.conn_idx, error = ?e, "[groups] heartbeat failed");
+                if self.heartbeat_fail_drop.tick() {
+                    tracing::warn!(
+                        conn_idx = ctx.conn_idx,
+                        error = ?e,
+                        total = self.heartbeat_fail_drop.count(),
+                        "[groups] heartbeat failed (logging every 64th)"
+                    );
+                }
                 let ack = r#"{"error":"heartbeat_failed"}"#.to_string();
                 self.enqueue_response(
                     ctx,
@@ -1778,7 +1834,7 @@ impl VireonDispatcher {
             .unwrap_or(0);
         let evicted = self.groups.tick(now_ns);
         if evicted > 0 {
-            tracing::info!(evicted, "[groups] tick evicted stale members");
+            tracing::debug!(evicted, "[groups] tick evicted stale members");
             // Clean up group_locals entries that have no live members.
             // The coordinator already removed stale consumers internally;
             // we mirror that in our local index by removing members whose
@@ -2037,10 +2093,13 @@ impl AppDispatcher for VireonDispatcher {
             MessageType::FetchReply => {
                 // Server doesn't accept FetchReply from clients — it's
                 // a server→subscriber data-plane frame. Log + drop.
-                tracing::warn!(
-                    conn_idx = ctx.conn_idx,
-                    "[app:pubsub] client-sent FetchReply ignored"
-                );
+                if self.fetch_reply_ignore_drop.tick() {
+                    tracing::warn!(
+                        conn_idx = ctx.conn_idx,
+                        total = self.fetch_reply_ignore_drop.count(),
+                        "[app:pubsub] client-sent FetchReply ignored (logging every 128th)"
+                    );
+                }
             }
             MessageType::Error => {
                 tracing::trace!(
@@ -2238,7 +2297,13 @@ impl ApplicationLayer {
             .quotas
             .reserve(self.default_tenant, &self.default_limit)
         {
-            tracing::warn!(error = ?e, "[app:quotas] reserve failed for default tenant");
+            if self.dispatcher.quota_drop.tick() {
+                tracing::warn!(
+                    error = ?e,
+                    total = self.dispatcher.quota_drop.count(),
+                    "[app:quotas] reserve failed for default tenant (logging every 64th)"
+                );
+            }
         }
 
         // Notify application dispatcher.
@@ -2275,13 +2340,18 @@ impl ApplicationLayer {
                     frame.stream_id,
                     meta.policy,
                 ),
-                Err(e) => tracing::warn!(
-                    conn_idx = ctx.conn_idx,
-                    stream_id = frame.stream_id.get(),
-                    error = ?e,
-                    "[send-policy] malformed StreamOpen payload — \
-                     stream will lazy-default to ReliableOrdered"
-                ),
+                Err(e) => {
+                    if self.dispatcher.malformed_drop.tick() {
+                        tracing::warn!(
+                            conn_idx = ctx.conn_idx,
+                            stream_id = frame.stream_id.get(),
+                            error = ?e,
+                            total = self.dispatcher.malformed_drop.count(),
+                            "[send-policy] malformed StreamOpen payload — \
+                             stream will lazy-default to ReliableOrdered (logging every 256th)"
+                        );
+                    }
+                }
             },
             MessageType::StreamClose | MessageType::StreamReset => {
                 self.dispatcher

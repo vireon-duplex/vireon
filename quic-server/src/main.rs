@@ -9,6 +9,7 @@ mod distributed;
 mod error;
 mod eviction;
 mod layers;
+mod log_throttle;
 mod metrics;
 mod server;
 mod socket_registry;
