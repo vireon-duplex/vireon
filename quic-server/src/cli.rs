@@ -118,6 +118,16 @@ pub struct Cli {
     /// is started.
     #[arg(long)]
     pub metrics_port: Option<u16>,
+
+    /// Maximum new QUIC handshakes per second accepted from a single
+    /// source IP. `0` disables the limit (default — opt-in for
+    /// multi-tenant deployments). When non-zero, an over-limit IP has
+    /// its Initial packets dropped before connection state is
+    /// allocated, defending against handshake storms (DoS, retry
+    /// loops, misbehaving clients). Already-connected clients on the
+    /// same IP are unaffected.
+    #[arg(long, default_value_t = 0)]
+    pub max_handshakes_per_ip_per_sec: u32,
 }
 
 /// CLI worker-mode selector.

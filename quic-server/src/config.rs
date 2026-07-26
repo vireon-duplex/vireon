@@ -102,6 +102,7 @@ impl ServerConfig {
         let mut quic_config = preset.to_config();
         quic_config.skip_crc = cli.skip_crc;
         quic_config.client_ca = cli.client_ca.clone();
+        quic_config.max_handshakes_per_ip_per_sec = cli.max_handshakes_per_ip_per_sec;
 
         let workers = resolve_workers(cli.workers, &cli.mode);
 
