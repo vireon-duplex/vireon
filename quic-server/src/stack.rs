@@ -229,6 +229,7 @@ impl VireonStack {
         echo: bool,
         acl_table: Option<topic_acl::AclTable>,
         wal_root: Option<&std::path::Path>,
+        wal_retention: Option<wal_store::RetentionPolicy>,
         cluster: Option<(&cluster_coordinator::ClusterConfig, ClusterWorkerHandle)>,
         worker_inbox: Option<std::sync::mpsc::Receiver<crate::layers::InterWorkerPublish>>,
         worker_outboxes: Vec<std::sync::mpsc::SyncSender<crate::layers::InterWorkerPublish>>,
@@ -237,6 +238,9 @@ impl VireonStack {
         let mut application = ApplicationLayer::new()?;
         if let Some(table) = acl_table {
             application.set_acl(table);
+        }
+        if let Some(policy) = wal_retention {
+            application.set_wal_retention(policy);
         }
         if let Some(root) = wal_root {
             // Each worker partitions under `<root>/worker_<reactor_id>/`

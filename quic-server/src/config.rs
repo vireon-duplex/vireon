@@ -60,6 +60,11 @@ pub struct ServerConfig {
     /// every accepted publish before fan-out. `None` disables WAL.
     #[allow(dead_code)]
     pub wal_root: Option<std::path::PathBuf>,
+    /// WAL retention policy applied per-topic by the periodic sweeper
+    /// (runs once per 60 s per worker). Both fields `None` = keep
+    /// forever (default). Configured via `--wal-retention-secs` and
+    /// `--wal-max-bytes`.
+    pub wal_retention: Option<wal_store::RetentionPolicy>,
 
     /// Optional cluster transport config (P6). When set, the server
     /// joins a multi-node cluster and routes publishes via UDP-based
@@ -161,6 +166,7 @@ impl ServerConfig {
             acl_rules_path: cli.acl_rules_path.clone(),
             acl_table,
             wal_root: cli.wal_root.as_deref().map(std::path::PathBuf::from),
+            wal_retention: build_wal_retention(cli.wal_retention_secs, cli.wal_max_bytes),
             cluster,
             metrics_port: cli.metrics_port,
             metrics: cli.metrics_port.map(|_| Arc::new(crate::metrics::ServerMetrics::new())),
@@ -205,6 +211,26 @@ fn resolve_workers(requested: usize, mode: &WorkerModeArg) -> usize {
             }
         }
     }
+}
+
+/// Build the WAL [`wal_store::RetentionPolicy`] from CLI flags.
+///
+/// Both `0` = "no limit on that dimension". When both are zero the
+/// result is `None` (keep-forever, also the default when WAL is
+/// disabled).
+fn build_wal_retention(
+    retention_secs: u64,
+    max_bytes: u64,
+) -> Option<wal_store::RetentionPolicy> {
+    let max_age_ns = (retention_secs > 0).then(|| retention_secs.saturating_mul(1_000_000_000));
+    let max_bytes = (max_bytes > 0).then_some(max_bytes);
+    if max_age_ns.is_none() && max_bytes.is_none() {
+        return None;
+    }
+    Some(wal_store::RetentionPolicy {
+        max_bytes,
+        max_age_ns,
+    })
 }
 
 /// Detects the number of logical CPUs via `kernel-nic::CpuTopology`.

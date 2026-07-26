@@ -96,6 +96,20 @@ pub struct Cli {
     #[arg(long)]
     pub wal_root: Option<String>,
 
+    /// WAL retention by age: entries older than this many seconds are
+    /// truncated by the periodic sweeper (runs once per 60 s per
+    /// worker). `0` (default) disables age-based retention. Only
+    /// effective when `--wal-root` is also set.
+    #[arg(long, default_value_t = 0)]
+    pub wal_retention_secs: u64,
+
+    /// WAL retention by total bytes: per-topic cap. When a topic
+    /// exceeds this, oldest entries are truncated until under the
+    /// cap. `0` (default) disables byte-based retention. Only
+    /// effective when `--wal-root` is also set.
+    #[arg(long, default_value_t = 0)]
+    pub wal_max_bytes: u64,
+
     /// Cluster self node id (P6). When set, the server joins a
     /// multi-node cluster and routes publishes to the owning node via
     /// UDP-based inter-node transport. Must be >0; must also appear in

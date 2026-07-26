@@ -113,6 +113,7 @@ impl Worker {
             config.echo,
             config.acl_table.clone(),
             config.wal_root.as_deref(),
+            config.wal_retention,
             cluster,
             worker_inbox,
             worker_outboxes,
