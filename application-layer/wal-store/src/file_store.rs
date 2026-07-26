@@ -453,6 +453,19 @@ impl WalStore for FileStore {
     }
 }
 
+impl FileStore {
+    /// Names of every topic the store currently tracks (i.e. every
+    /// topic that has been appended at least once since open). Used by
+    /// the retention sweeper to iterate over all topics without
+    /// requiring the caller to track them separately.
+    ///
+    /// Order is unspecified; callers must not depend on it.
+    #[must_use]
+    pub fn topic_names(&self) -> Vec<String> {
+        self.topics.keys().cloned().collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
