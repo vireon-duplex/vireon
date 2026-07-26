@@ -29,6 +29,7 @@
 use rustc_hash::FxHashMap;
 use std::net::SocketAddr;
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use auth_framework::authenticator::AuthenticationPipeline;
 use cluster_coordinator::{
@@ -285,10 +286,28 @@ pub struct VireonDispatcher {
     invalid_pattern_drop: crate::log_throttle::RateCounter,
     /// Misbehaving client sends FetchReply on a non-server stream.
     fetch_reply_ignore_drop: crate::log_throttle::RateCounter,
+
+    // ── WAL retention ────────────────────────────────────────────
+    /// Active retention policy. Defaults to `keep_forever`; mutated
+    /// via [`Self::set_wal_retention`]. The sweep is applied to every
+    /// tracked topic when [`Self::wal_retention_last_run`] is older
+    /// than [`WAL_RETENTION_SWEEP_INTERVAL`].
+    wal_retention: wal_store::RetentionPolicy,
+    /// Last time the retention sweep ran ( Instant::now()-based,
+    /// throttled to once per ~60 s to amortise directory walks).
+    wal_retention_last_run: Option<std::time::Instant>,
 }
 
 /// Log cross-worker drop summaries every Nth drop.
 const WORKER_DROP_LOG_INTERVAL: u64 = 1024;
+
+/// Minimum gap between WAL retention sweeps. The sweep walks every
+/// tracked topic and may issue a truncation (which copies surviving
+/// entries through a tempfile). 60 s keeps the cost negligible even
+/// on slow disks — retention is a coarse-grained lever, not a per-tick
+/// concern. Sweeps additionally bail early when the policy is
+/// `keep_forever` (no work to do).
+const WAL_RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 impl VireonDispatcher {
     /// Creates a new dispatcher with default-configured modules.
@@ -347,6 +366,8 @@ impl VireonDispatcher {
             heartbeat_fail_drop: crate::log_throttle::RateCounter::new(64),
             invalid_pattern_drop: crate::log_throttle::RateCounter::new(64),
             fetch_reply_ignore_drop: crate::log_throttle::RateCounter::new(128),
+            wal_retention: wal_store::RetentionPolicy::keep_forever(),
+            wal_retention_last_run: None,
         }
     }
 
@@ -429,6 +450,14 @@ impl VireonDispatcher {
     #[allow(dead_code)]
     pub fn set_wal(&mut self, wal: wal_store::FileStore) {
         self.wal = Some(wal);
+    }
+
+    /// Sets the retention policy applied to the WAL by the periodic
+    /// sweep in [`ApplicationLayer::on_batch_tick`]. Replaces any
+    /// prior policy. The sweep is a no-op when WAL is `None` or the
+    /// policy is `keep_forever`.
+    pub fn set_wal_retention(&mut self, policy: wal_store::RetentionPolicy) {
+        self.wal_retention = policy;
     }
 
     /// Attaches a cluster coordinator + transport channels (P6).
@@ -2059,6 +2088,71 @@ impl VireonDispatcher {
             self.cluster_deliver_local(&msg.topic, &msg.payload, 0, 0);
         }
     }
+
+    /// Apply the configured WAL retention policy to every tracked
+    /// topic if the sweep interval has elapsed. Cheap no-op when WAL
+    /// is unconfigured or the policy is `keep_forever`.
+    ///
+    /// Throttled to one sweep per [`WAL_RETENTION_SWEEP_INTERVAL`]
+    /// (60 s). The sweep walks every topic known to the store, calls
+    /// [`wal_store::RetentionPolicy::apply`], and aggregates the
+    /// removed-entry count for a single summary log line.
+    fn maybe_run_wal_retention(&mut self) {
+        // Fast path: no WAL, no policy, or interval not yet elapsed.
+        if self.wal.is_none() {
+            return;
+        }
+        if self.wal_retention.max_bytes.is_none() && self.wal_retention.max_age_ns.is_none() {
+            return;
+        }
+        let now = Instant::now();
+        let due = self
+            .wal_retention_last_run
+            .map_or(true, |t| now.duration_since(t) >= WAL_RETENTION_SWEEP_INTERVAL);
+        if !due {
+            return;
+        }
+        self.wal_retention_last_run = Some(now);
+
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+
+        // Borrow-checker dance: split the wal mutably from the policy
+        // copy so `apply` can take &mut store + &policy by value.
+        let policy = self.wal_retention;
+        let Some(wal) = self.wal.as_mut() else {
+            return;
+        };
+        let topics = wal.topic_names();
+        if topics.is_empty() {
+            return;
+        }
+        let mut total_removed: usize = 0;
+        let mut errored: u64 = 0;
+        for topic in &topics {
+            match policy.apply::<wal_store::FileStore>(wal, topic, now_ns) {
+                Ok(stats) => total_removed = total_removed.saturating_add(stats.removed),
+                Err(_) => errored = errored.saturating_add(1),
+            }
+        }
+        if total_removed > 0 || errored > 0 {
+            tracing::info!(
+                topics = topics.len(),
+                removed = total_removed,
+                errored,
+                retained_bytes = wal.retained_bytes(),
+                "[wal] retention sweep"
+            );
+        } else {
+            tracing::debug!(
+                topics = topics.len(),
+                retained_bytes = wal.retained_bytes(),
+                "[wal] retention sweep (no removals)"
+            );
+        }
+    }
 }
 
 impl Default for VireonDispatcher {
@@ -2382,6 +2476,7 @@ impl ApplicationLayer {
         self.dispatcher.tick_groups();
         self.dispatcher.drain_cluster_inbox();
         self.dispatcher.drain_worker_inbox();
+        self.dispatcher.maybe_run_wal_retention();
     }
 
     /// Drains queued outgoing frames produced by the dispatcher.
@@ -2464,6 +2559,12 @@ impl ApplicationLayer {
     #[allow(dead_code)]
     pub fn set_wal(&mut self, wal: wal_store::FileStore) {
         self.dispatcher.wal = Some(wal);
+    }
+
+    /// Delegates to [`VireonDispatcher::set_wal_retention`]. The
+    /// retention sweep runs from `on_batch_tick` once per ~60 s.
+    pub fn set_wal_retention(&mut self, policy: wal_store::RetentionPolicy) {
+        self.dispatcher.set_wal_retention(policy);
     }
 
     /// Installs a cluster coordinator + transport channels (P6).
@@ -3268,5 +3369,57 @@ mod tests {
             body.contains("\"error\":\"wal_disabled\""),
             "expected wal_disabled ack, got: {body}"
         );
+    }
+
+    #[test]
+    fn wal_retention_bytes_truncates_after_threshold() {
+        let (mut d, _keepalive) = dispatcher_with_wal();
+        // Cap at 200 bytes (≈ 5 entries survive at ~38 B/entry).
+        d.set_wal_retention(wal_store::RetentionPolicy::by_bytes(200));
+
+        let topic = pubsub_engine::Topic::new("sensor.temp").unwrap();
+        for i in 0..20u8 {
+            d.handle_publish(&ctx(1, 200), StreamId::new(2), &topic, &[i]);
+        }
+        let _ = d.drain_outbox();
+
+        // Pre-sweep: 20 entries retained.
+        assert_eq!(d.wal.as_ref().unwrap().len("sensor.temp"), 20);
+
+        // Drive the sweep directly (we don't wait 60 s in unit tests).
+        // The dispatcher exposes a private helper; replicate the call.
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let policy = d.wal_retention;
+        let wal = d.wal.as_mut().unwrap();
+        let stats = policy
+            .apply::<wal_store::FileStore>(wal, "sensor.temp", now_ns)
+            .expect("retention apply");
+        assert!(stats.removed > 0, "sweep should remove entries");
+        assert!(
+            wal.retained_bytes() <= 200,
+            "retained bytes ({}) should be under cap (200)",
+            wal.retained_bytes()
+        );
+    }
+
+    #[test]
+    fn wal_retention_keep_forever_is_noop() {
+        let (mut d, _keepalive) = dispatcher_with_wal();
+        // Default policy = keep forever.
+        let topic = pubsub_engine::Topic::new("sensor.temp").unwrap();
+        for i in 0..10u8 {
+            d.handle_publish(&ctx(1, 200), StreamId::new(2), &topic, &[i]);
+        }
+        let _ = d.drain_outbox();
+
+        // maybe_run_wal_retention should be a no-op with keep_forever,
+        // regardless of how much time has elapsed.
+        d.wal_retention_last_run = None; // force "due"
+        d.maybe_run_wal_retention();
+
+        assert_eq!(d.wal.as_ref().unwrap().len("sensor.temp"), 10);
     }
 }
