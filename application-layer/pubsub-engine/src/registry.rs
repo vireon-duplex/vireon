@@ -193,6 +193,27 @@ impl TopicRegistry {
         removed
     }
 
+    /// Like [`remove_connection`](Self::remove_connection) but also
+    /// returns the distinct patterns that were removed (one entry per
+    /// removed subscription, so duplicates appear when multiple subs
+    /// of the same pattern were registered). Callers tracking
+    /// per-pattern counts (e.g. quota enforcers) use this to keep
+    /// their mirror in sync without scanning the registry.
+    pub fn remove_connection_with_patterns(&mut self, conn_idx: usize) -> Vec<String> {
+        let ids = match self.by_conn.remove(&conn_idx) {
+            Some(ids) => ids,
+            None => return Vec::new(),
+        };
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(record) = self.by_id.remove(&id) {
+                let _ = self.trie.remove(&record.pattern, id);
+                out.push(record.pattern);
+            }
+        }
+        out
+    }
+
     /// Number of active subscriptions.
     #[must_use]
     pub fn len(&self) -> usize {

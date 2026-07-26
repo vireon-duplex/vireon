@@ -65,6 +65,11 @@ pub struct ServerConfig {
     /// forever (default). Configured via `--wal-retention-secs` and
     /// `--wal-max-bytes`.
     pub wal_retention: Option<wal_store::RetentionPolicy>,
+    /// Cap on total topics in the catalog. `None` = unlimited.
+    pub max_topics: Option<usize>,
+    /// Cap on subscribers per distinct subscription pattern.
+    /// `None` = unlimited.
+    pub max_subscribers_per_topic: Option<usize>,
 
     /// Optional cluster transport config (P6). When set, the server
     /// joins a multi-node cluster and routes publishes via UDP-based
@@ -167,6 +172,8 @@ impl ServerConfig {
             acl_table,
             wal_root: cli.wal_root.as_deref().map(std::path::PathBuf::from),
             wal_retention: build_wal_retention(cli.wal_retention_secs, cli.wal_max_bytes),
+            max_topics: (cli.max_topics > 0).then_some(cli.max_topics),
+            max_subscribers_per_topic: (cli.max_subscribers_per_topic > 0).then_some(cli.max_subscribers_per_topic),
             cluster,
             metrics_port: cli.metrics_port,
             metrics: cli.metrics_port.map(|_| Arc::new(crate::metrics::ServerMetrics::new())),

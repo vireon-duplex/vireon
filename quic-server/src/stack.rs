@@ -230,6 +230,8 @@ impl VireonStack {
         acl_table: Option<topic_acl::AclTable>,
         wal_root: Option<&std::path::Path>,
         wal_retention: Option<wal_store::RetentionPolicy>,
+        max_topics: Option<usize>,
+        max_subscribers_per_topic: Option<usize>,
         cluster: Option<(&cluster_coordinator::ClusterConfig, ClusterWorkerHandle)>,
         worker_inbox: Option<std::sync::mpsc::Receiver<crate::layers::InterWorkerPublish>>,
         worker_outboxes: Vec<std::sync::mpsc::SyncSender<crate::layers::InterWorkerPublish>>,
@@ -241,6 +243,12 @@ impl VireonStack {
         }
         if let Some(policy) = wal_retention {
             application.set_wal_retention(policy);
+        }
+        if let Some(max) = max_topics {
+            application.set_max_topics(Some(max));
+        }
+        if let Some(max) = max_subscribers_per_topic {
+            application.set_max_subscribers_per_topic(Some(max));
         }
         if let Some(root) = wal_root {
             // Each worker partitions under `<root>/worker_<reactor_id>/`
