@@ -527,15 +527,7 @@ impl Drop for Reactor {
 
         // Force kernel-side shutdown of the UDP socket before its fd is
         // closed by the implicit `Socket::drop`. This signals intent to
-        // close so any pending io_uring recv/send SQEs are cancelled by
-        // the kernel and don't keep the socket file pinned past close().
-        //
-        // NOTE: empirically, on Ubuntu 24.04 a residual kernel ref
-        // (ref_count=2 in /proc/net/udp) persists for ~60s after a
-        // graceful shutdown that had active QUIC connections. The
-        // user-space fd is correctly closed (lsof shows no owner); the
-        // kernel itself holds the inode. This `shutdown()` does not
-        // fully eliminate the residual ref but is correct cleanup.
+        // close so the kernel starts tearing down the transport.
         //
         // SAFETY: `shutdown(2)` is async-signal-safe and idempotent; on
         // an already-closed fd it returns EBADF (ignored here).
@@ -543,8 +535,28 @@ impl Drop for Reactor {
             libc::shutdown(self.socket.raw_fd(), libc::SHUT_RDWR);
         }
 
-        // Best-effort final reap so any in-flight SQEs are flushed.
-        let _ = self.ctx.ring_mut().submit_and_wait(0);
+        // Cancel ALL in-flight io_uring operations (especially the multishot
+        // RECV armed at init). Without this explicit cancellation, the
+        // kernel holds a reference to the socket inode until its deferred
+        // teardown completes (~60s on Linux 6.x), leaving ghost UDP sockets
+        // on the port that block subsequent server starts.
+        //
+        // CancelBuilder::any() requires kernel ≥ 5.19 — already a hard
+        // requirement for PBUF_RING used by the buffer pool.
+        let cancel_entry = io_uring::opcode::AsyncCancel2::new(
+            io_uring::types::CancelBuilder::any(),
+        )
+        .build()
+        .user_data(0);
+        // Best-effort push; if the SQ ring is full the submit_and_wait
+        // below will flush what's already queued and the kernel's
+        // ring-fd close (when IoUring drops) cancels the rest anyway.
+        let _ = crate::ops::push_entry(self.ctx.ring_mut(), cancel_entry);
+        // Submit the cancel + drain all remaining CQEs. Waiting for ≥1
+        // completion ensures the cancel SQE is processed (it always
+        // produces a CQE — success or -ENOENT). Additional pending CQEs
+        // from the cancelled multishot are also reaped.
+        let _ = self.ctx.ring_mut().submit_and_wait(1);
     }
 }
 
