@@ -40,6 +40,7 @@ use io::handler::{IoHandler, TickContext};
 use crate::config::QuicConfig;
 use crate::dirty::{Control, DirtyBitset};
 use crate::gso::GsoBatcher;
+use crate::rate_limiter::IpRateLimiter;
 use crate::stream_bridge::StreamCarry;
 
 /// Maximum QUIC packet size — covers full IPv4 UDP jumbo payload
@@ -258,6 +259,18 @@ pub struct QuicEngine {
     /// Scratch buffer for draining forwarded packets (avoids per-tick
     /// allocation). Cleared at the start of each `on_tick` drain.
     forwarded_buf: Vec<crate::forward::ForwardedPacket>,
+
+    // ── Per-IP handshake rate limiting ────────────────────────────
+    /// Caps new-connection arrivals per source IP. Disabled (no-op)
+    /// when `config.max_handshakes_per_ip_per_sec == 0`.
+    rate_limiter: IpRateLimiter,
+    /// Total Initial packets rejected by the rate limiter since startup.
+    /// Surfaces via periodic stats log and Prometheus
+    /// `vireon_rate_limit_rejections_total`.
+    pub handshake_rejections: u64,
+    /// Tick-based throttle for `rate_limiter.gc()` (runs ~once per
+    /// second of reactor time, not every tick).
+    last_rate_limit_gc: Option<std::time::Instant>,
 }
 
 impl std::fmt::Debug for QuicEngine {
@@ -284,6 +297,7 @@ impl QuicEngine {
         local_addr: SocketAddr,
         pool: BufferPool,
     ) -> Self {
+        let rate_limiter = IpRateLimiter::new(config.max_handshakes_per_ip_per_sec);
         Self {
             reactor_id,
             config,
@@ -313,6 +327,9 @@ impl QuicEngine {
             forward_mesh: None,
             num_workers: 1,
             forwarded_buf: Vec::new(),
+            rate_limiter,
+            handshake_rejections: 0,
+            last_rate_limit_gc: None,
         }
     }
 
@@ -331,6 +348,13 @@ impl QuicEngine {
     /// Returns a mutable reference to the forward mesh, if configured.
     pub fn forward_mesh_mut(&mut self) -> Option<&mut crate::forward::ForwardMesh> {
         self.forward_mesh.as_mut()
+    }
+
+    /// Read-only access to the per-IP rate limiter's tracked entry count
+    /// (for diagnostics; zero when disabled).
+    #[must_use]
+    pub fn rate_limiter_tracked_ips(&self) -> usize {
+        self.rate_limiter.tracked_ip_count()
     }
 
     /// Current outstanding bytes in the buffer pool.
@@ -551,6 +575,24 @@ impl QuicEngine {
     fn accept_new(&mut self, dcid: &[u8], peer: SocketAddr) -> Option<usize> {
         if self.active_count >= self.config.max_connections {
             return None; // At capacity — drop.
+        }
+
+        // Per-IP handshake rate limit. Checked BEFORE quiche::accept so
+        // rate-limited Initials never allocate connection state. Only
+        // fires when the operator opted in via
+        // `--max-handshakes-per-ip-per-sec`; disabled by default.
+        if self.rate_limiter.is_enabled() {
+            let now = std::time::Instant::now();
+            if !self.rate_limiter.check(peer.ip(), now) {
+                self.handshake_rejections = self.handshake_rejections.wrapping_add(1);
+                tracing::debug!(
+                    reactor_id = self.reactor_id,
+                    peer = %peer,
+                    rejections = self.handshake_rejections,
+                    "[rate-limit] rejecting new handshake from over-limit IP"
+                );
+                return None;
+            }
         }
 
         // Generate a unique 20-byte server source CID.  Using MAX_CONN_ID_LEN
@@ -817,6 +859,18 @@ impl IoHandler for QuicEngine {
         // No blanket clear: flush_sends already cleared every bit it
         // processed. Bits for connections that exceeded the flush budget
         // stay set and roll forward to the next tick.
+
+        // Periodic GC of the per-IP rate-limiter table. Runs at most
+        // once per second of wall-clock — keeps the table bounded
+        // under IP churn without taxing every tick.
+        if self.rate_limiter.is_enabled() {
+            let now = std::time::Instant::now();
+            let due = self.last_rate_limit_gc.map_or(true, |t| now.duration_since(t) >= std::time::Duration::from_secs(1));
+            if due {
+                self.rate_limiter.gc(now);
+                self.last_rate_limit_gc = Some(now);
+            }
+        }
     }
 }
 
