@@ -296,6 +296,23 @@ pub struct VireonDispatcher {
     /// Last time the retention sweep ran ( Instant::now()-based,
     /// throttled to once per ~60 s to amortise directory walks).
     wal_retention_last_run: Option<std::time::Instant>,
+
+    // ── Resource quotas ─────────────────────────────────────────
+    /// Cap on total topics tracked by `topic_catalog`. `None` = unlimited.
+    /// Enforced in `handle_topic_create` BEFORE catalog insertion.
+    max_topics: Option<usize>,
+    /// Cap on subscribers per distinct pattern string. `None` = unlimited.
+    /// Tracked via `pattern_sub_counts`; enforced in `handle_subscribe`
+    /// BEFORE registry insertion.
+    max_subscribers_per_topic: Option<usize>,
+    /// Per-pattern subscriber count (mirrors what's in `pubsub_registry`
+    /// but keyed by pattern string for O(1) cap lookups). Incremented
+    /// on successful subscribe, decremented on unsubscribe.
+    pattern_sub_counts: FxHashMap<String, usize>,
+    /// Total TopicCreate / Subscribe requests rejected by the caps.
+    /// Logged via the periodic stats; surfaced in `[quota] reject` lines.
+    quota_topic_rejects: u64,
+    quota_subscriber_rejects: u64,
 }
 
 /// Log cross-worker drop summaries every Nth drop.
@@ -368,6 +385,11 @@ impl VireonDispatcher {
             fetch_reply_ignore_drop: crate::log_throttle::RateCounter::new(128),
             wal_retention: wal_store::RetentionPolicy::keep_forever(),
             wal_retention_last_run: None,
+            max_topics: None,
+            max_subscribers_per_topic: None,
+            pattern_sub_counts: FxHashMap::default(),
+            quota_topic_rejects: 0,
+            quota_subscriber_rejects: 0,
         }
     }
 
@@ -458,6 +480,20 @@ impl VireonDispatcher {
     /// policy is `keep_forever`.
     pub fn set_wal_retention(&mut self, policy: wal_store::RetentionPolicy) {
         self.wal_retention = policy;
+    }
+
+    /// Cap the total number of topics tracked in the catalog. TopicCreate
+    /// requests that would exceed the cap are rejected with an error ack.
+    /// `None` (default) = unlimited.
+    pub fn set_max_topics(&mut self, max: Option<usize>) {
+        self.max_topics = max;
+    }
+
+    /// Cap the number of subscribers per distinct subscription pattern.
+    /// Subscribe requests whose pattern already has `max` subscribers
+    /// are rejected with an error ack. `None` (default) = unlimited.
+    pub fn set_max_subscribers_per_topic(&mut self, max: Option<usize>) {
+        self.max_subscribers_per_topic = max;
     }
 
     /// Attaches a cluster coordinator + transport channels (P6).
@@ -825,6 +861,33 @@ impl VireonDispatcher {
         }
         match TopicPattern::new(pattern_str) {
             Ok(_) => {
+                // Resource quota: max-subscribers-per-topic. Counts
+                // subscribers per distinct pattern string — the practical
+                // interpretation for a pattern-based routing model.
+                // Skip the check for the SDK's heartbeat probe to avoid
+                // penalising liveness traffic against the cap.
+                if let Some(cap) = self.max_subscribers_per_topic {
+                    let current = self.pattern_sub_counts.get(pattern_str).copied().unwrap_or(0);
+                    if current >= cap {
+                        self.quota_subscriber_rejects =
+                            self.quota_subscriber_rejects.wrapping_add(1);
+                        if pattern_str != "_heartbeat.probe" {
+                            tracing::info!(
+                                conn_idx = ctx.conn_idx,
+                                pattern = %pattern_str,
+                                cap,
+                                current,
+                                rejects = self.quota_subscriber_rejects,
+                                "[quota] subscribe rejected — max_subscribers_per_topic reached"
+                            );
+                        }
+                        let ack = format!(
+                            "{{\"error\":\"quota_exceeded\",\"limit\":\"max_subscribers_per_topic\",\"cap\":{cap},\"pattern\":\"{pattern_str}\"}}"
+                        );
+                        self.enqueue_response(ctx, stream, MessageType::Subscribe, Bytes::from(ack));
+                        return;
+                    }
+                }
                 let subscriber = Subscriber {
                     conn_idx: ctx.conn_idx,
                     quic_stream_id: ctx.quic_stream_id,
@@ -838,6 +901,9 @@ impl VireonDispatcher {
                     );
                     return;
                 }
+                // Bump per-pattern subscriber counter for quota accounting.
+                // Only reached on successful registry insertion.
+                *self.pattern_sub_counts.entry(pattern_str.to_string()).or_insert(0) += 1;
                 // The SDK's dead-peer probe re-subscribes to
                 // `_heartbeat.probe` every ~1 s per connection. Logging
                 // it at INFO drowns real subscribe events — drop to DEBUG.
@@ -908,6 +974,19 @@ impl VireonDispatcher {
         let removed = self
             .pubsub_registry
             .unsubscribe_pattern(ctx.conn_idx, pattern_str);
+        // Mirror the per-pattern counter decrement. Only decrement by
+        // the number actually removed so the counter stays in sync with
+        // the registry's view.
+        if removed > 0 {
+            if let Some(count) = self.pattern_sub_counts.get_mut(pattern_str) {
+                *count = count.saturating_sub(removed);
+                if *count == 0 {
+                    // Drop empty entries so the map stays bounded under
+                    // pattern churn.
+                    self.pattern_sub_counts.remove(pattern_str);
+                }
+            }
+        }
         tracing::info!(
             conn_idx = ctx.conn_idx,
             pattern = %pattern_str,
@@ -1180,6 +1259,30 @@ impl VireonDispatcher {
             );
             self.enqueue_response(ctx, stream, MessageType::TopicCreate, Bytes::from(ack));
             return;
+        }
+        // Resource quota: max-topics. Skip the check when the topic is
+        // already tracked (re-create is idempotent and shouldn't bump
+        // the counter). Reject BEFORE catalog insertion so the cap is
+        // exact even under bursts.
+        if let Some(cap) = self.max_topics {
+            if !self.topic_catalog.get(topic).is_some()
+                && self.topic_catalog.len() >= cap
+            {
+                self.quota_topic_rejects = self.quota_topic_rejects.wrapping_add(1);
+                tracing::info!(
+                    conn_idx = ctx.conn_idx,
+                    topic = %topic,
+                    cap,
+                    total = self.topic_catalog.len(),
+                    rejects = self.quota_topic_rejects,
+                    "[quota] topic_create rejected — max_topics reached"
+                );
+                let ack = format!(
+                    "{{\"error\":\"quota_exceeded\",\"limit\":\"max_topics\",\"cap\":{cap},\"topic\":\"{topic}\"}}"
+                );
+                self.enqueue_response(ctx, stream, MessageType::TopicCreate, Bytes::from(ack));
+                return;
+            }
         }
         let config = TopicConfig {
             partitions: partitions.max(1),
@@ -2237,7 +2340,19 @@ impl AppDispatcher for VireonDispatcher {
         session_id: SessionId,
         reason: Option<&str>,
     ) {
-        let removed = self.pubsub_registry.remove_connection(conn_idx);
+        let removed_patterns = self.pubsub_registry.remove_connection_with_patterns(conn_idx);
+        let removed = removed_patterns.len();
+        // Decrement per-pattern quota counters to match.
+        if !removed_patterns.is_empty() {
+            for pat in &removed_patterns {
+                if let Some(count) = self.pattern_sub_counts.get_mut(pat) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.pattern_sub_counts.remove(pat);
+                    }
+                }
+            }
+        }
         let principal = self.principals.remove(&conn_idx);
 
         // P5: leave all consumer groups the disconnected connection
@@ -2565,6 +2680,16 @@ impl ApplicationLayer {
     /// retention sweep runs from `on_batch_tick` once per ~60 s.
     pub fn set_wal_retention(&mut self, policy: wal_store::RetentionPolicy) {
         self.dispatcher.set_wal_retention(policy);
+    }
+
+    /// Delegates to [`VireonDispatcher::set_max_topics`].
+    pub fn set_max_topics(&mut self, max: Option<usize>) {
+        self.dispatcher.set_max_topics(max);
+    }
+
+    /// Delegates to [`VireonDispatcher::set_max_subscribers_per_topic`].
+    pub fn set_max_subscribers_per_topic(&mut self, max: Option<usize>) {
+        self.dispatcher.set_max_subscribers_per_topic(max);
     }
 
     /// Installs a cluster coordinator + transport channels (P6).
@@ -3421,5 +3546,125 @@ mod tests {
         d.maybe_run_wal_retention();
 
         assert_eq!(d.wal.as_ref().unwrap().len("sensor.temp"), 10);
+    }
+
+    #[test]
+    fn quota_max_topics_rejects_beyond_cap() {
+        let mut d = VireonDispatcher::new();
+        d.set_max_topics(Some(2));
+
+        d.handle_topic_create(&ctx(0, 100), StreamId::new(1), "topic.a", 1, 0);
+        d.handle_topic_create(&ctx(0, 100), StreamId::new(1), "topic.b", 1, 0);
+        let _ = d.drain_outbox();
+        assert_eq!(d.topic_catalog.len(), 2);
+        assert_eq!(d.quota_topic_rejects, 0);
+
+        // Third topic should be rejected.
+        d.handle_topic_create(&ctx(0, 100), StreamId::new(1), "topic.c", 1, 0);
+        let out = drain_outbox_bytes(&mut d);
+        assert_eq!(d.topic_catalog.len(), 2, "catalog must not grow past cap");
+        assert_eq!(d.quota_topic_rejects, 1);
+        assert_eq!(out.len(), 1);
+        let body = String::from_utf8_lossy(&out[0].1);
+        assert!(
+            body.contains("quota_exceeded") && body.contains("max_topics"),
+            "expected quota_exceeded ack, got: {body}"
+        );
+
+        // Re-creating an existing topic should NOT be rejected (idempotent).
+        d.handle_topic_create(&ctx(0, 100), StreamId::new(1), "topic.a", 1, 0);
+        let _ = d.drain_outbox();
+        assert_eq!(d.topic_catalog.len(), 2);
+        assert_eq!(d.quota_topic_rejects, 1, "idempotent re-create shouldn't bump rejects");
+    }
+
+    #[test]
+    fn quota_max_topics_disabled_when_none() {
+        let mut d = VireonDispatcher::new();
+        // Default: None = unlimited.
+        for i in 0..100 {
+            let topic = format!("topic.{i}");
+            d.handle_topic_create(&ctx(0, 100), StreamId::new(1), &topic, 1, 0);
+        }
+        let _ = d.drain_outbox();
+        assert_eq!(d.topic_catalog.len(), 100);
+        assert_eq!(d.quota_topic_rejects, 0);
+    }
+
+    #[test]
+    fn quota_max_subscribers_per_topic_rejects_beyond_cap() {
+        let mut d = VireonDispatcher::new();
+        d.set_max_subscribers_per_topic(Some(2));
+
+        // Two subscribers on the same pattern from different conns.
+        d.handle_subscribe(&ctx(1, 200), StreamId::new(0), "sensor.*");
+        d.handle_subscribe(&ctx(2, 200), StreamId::new(0), "sensor.*");
+        let _ = d.drain_outbox();
+        assert_eq!(
+            d.pattern_sub_counts.get("sensor.*").copied(),
+            Some(2),
+            "counter should track 2 subscribers"
+        );
+
+        // Third subscriber on the same pattern should be rejected.
+        d.handle_subscribe(&ctx(3, 200), StreamId::new(0), "sensor.*");
+        let out = drain_outbox_bytes(&mut d);
+        assert_eq!(
+            d.pattern_sub_counts.get("sensor.*").copied(),
+            Some(2),
+            "counter must not grow past cap"
+        );
+        assert_eq!(d.quota_subscriber_rejects, 1);
+        let body = String::from_utf8_lossy(&out[0].1);
+        assert!(
+            body.contains("quota_exceeded") && body.contains("max_subscribers_per_topic"),
+            "expected quota_exceeded ack, got: {body}"
+        );
+
+        // A different pattern should be unaffected.
+        d.handle_subscribe(&ctx(4, 200), StreamId::new(0), "alert.*");
+        let _ = d.drain_outbox();
+        assert_eq!(d.pattern_sub_counts.get("alert.*").copied(), Some(1));
+    }
+
+    #[test]
+    fn quota_subscribers_decrement_on_unsubscribe_and_close() {
+        let mut d = VireonDispatcher::new();
+        d.set_max_subscribers_per_topic(Some(2));
+
+        d.handle_subscribe(&ctx(1, 200), StreamId::new(0), "sensor.*");
+        d.handle_subscribe(&ctx(2, 200), StreamId::new(0), "sensor.*");
+        let _ = d.drain_outbox();
+        assert_eq!(d.pattern_sub_counts.get("sensor.*").copied(), Some(2));
+
+        // Third is rejected.
+        d.handle_subscribe(&ctx(3, 200), StreamId::new(0), "sensor.*");
+        let _ = d.drain_outbox();
+        assert_eq!(d.quota_subscriber_rejects, 1);
+
+        // Conn 1 unsubscribes — counter drops to 1.
+        d.handle_unsubscribe(&ctx(1, 200), StreamId::new(0), "sensor.*");
+        let _ = d.drain_outbox();
+        assert_eq!(d.pattern_sub_counts.get("sensor.*").copied(), Some(1));
+
+        // Now the previously-rejected conn 3 should succeed.
+        d.handle_subscribe(&ctx(3, 200), StreamId::new(0), "sensor.*");
+        let _ = d.drain_outbox();
+        assert_eq!(d.pattern_sub_counts.get("sensor.*").copied(), Some(2));
+        assert_eq!(d.quota_subscriber_rejects, 1, "no new rejection after decrement");
+
+        // Connection-close also decrements.
+        let removed = d.pubsub_registry.remove_connection_with_patterns(2);
+        assert_eq!(removed.len(), 1);
+        // Reconcile mirror.
+        for pat in &removed {
+            if let Some(c) = d.pattern_sub_counts.get_mut(pat) {
+                *c = c.saturating_sub(1);
+                if *c == 0 {
+                    d.pattern_sub_counts.remove(pat);
+                }
+            }
+        }
+        assert_eq!(d.pattern_sub_counts.get("sensor.*").copied(), Some(1));
     }
 }
