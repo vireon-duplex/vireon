@@ -78,7 +78,13 @@ pub struct ServerConfig {
 }
 
 /// Default queue depth if the CLI passes 0.
-const DEFAULT_QUEUE_DEPTH: u32 = 256;
+///
+/// Matches `io::QUEUE_DEPTH` (1024) — generous enough for the 1 M-connection
+/// per-core target once provided-buffer rings absorb per-recv buffering.
+/// The previous value (256) bottlenecked recv batching under bursty loads
+/// (e.g. 100-connection handshake storms) because the SQ filled before the
+/// kernel could drain provided-buffer completions.
+const DEFAULT_QUEUE_DEPTH: u32 = 1024;
 
 impl ServerConfig {
     /// Parse CLI args into a resolved configuration.
