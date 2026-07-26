@@ -110,6 +110,19 @@ pub struct Cli {
     #[arg(long, default_value_t = 0)]
     pub wal_max_bytes: u64,
 
+    /// Maximum number of distinct topics tracked in the catalog.
+    /// `TopicCreate` requests beyond this cap are rejected with a
+    /// `quota_exceeded` ack. `0` (default) = unlimited.
+    #[arg(long, default_value_t = 0)]
+    pub max_topics: usize,
+
+    /// Maximum subscribers per distinct subscription pattern.
+    /// `Subscribe` requests whose pattern already has this many
+    /// subscribers are rejected with a `quota_exceeded` ack.
+    /// `0` (default) = unlimited.
+    #[arg(long, default_value_t = 0)]
+    pub max_subscribers_per_topic: usize,
+
     /// Cluster self node id (P6). When set, the server joins a
     /// multi-node cluster and routes publishes to the owning node via
     /// UDP-based inter-node transport. Must be >0; must also appear in
