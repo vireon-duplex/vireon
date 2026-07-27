@@ -72,7 +72,10 @@ impl RateCounter {
     /// `every == 0` makes every tick log (useful for tests / opt-in).
     #[must_use]
     pub const fn new(every: u64) -> Self {
-        Self { count: 0, every: if every == 0 { 1 } else { every } }
+        Self {
+            count: 0,
+            every: if every == 0 { 1 } else { every },
+        }
     }
 
     /// Record one event. Returns `true` if the caller should log.
@@ -163,7 +166,10 @@ impl AtomicRateCounter {
     /// Create a counter that yields a log signal every `every` ticks.
     #[must_use]
     pub const fn new(every: u64) -> Self {
-        Self { count: AtomicU64::new(0), every: if every == 0 { 1 } else { every } }
+        Self {
+            count: AtomicU64::new(0),
+            every: if every == 0 { 1 } else { every },
+        }
     }
 
     /// Atomically record one event. Returns `true` if the caller

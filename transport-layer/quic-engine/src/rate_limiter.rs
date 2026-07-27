@@ -268,10 +268,14 @@ mod tests {
         let t1 = t0 + Duration::from_millis(1001);
         let mut allowed = 0;
         for _ in 0..5 {
-            if rl.check(ip4(1, 1, 1, 1), t0) { allowed += 1; }
+            if rl.check(ip4(1, 1, 1, 1), t0) {
+                allowed += 1;
+            }
         }
         for _ in 0..5 {
-            if rl.check(ip4(1, 1, 1, 1), t1) { allowed += 1; }
+            if rl.check(ip4(1, 1, 1, 1), t1) {
+                allowed += 1;
+            }
         }
         assert_eq!(allowed, 10);
     }

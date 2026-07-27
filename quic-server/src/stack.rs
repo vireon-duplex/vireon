@@ -376,7 +376,12 @@ impl VireonStack {
         // Capacity is preserved across ticks — no per-tick allocation.
         let direct = std::mem::take(&mut self.flush_direct);
         for out in &direct {
-            self.encode_and_send(out.conn_idx, out.quic_stream_id, out.header.clone(), &out.payload);
+            self.encode_and_send(
+                out.conn_idx,
+                out.quic_stream_id,
+                out.header.clone(),
+                &out.payload,
+            );
             if let Some(m) = &self.metrics {
                 m.inc(&m.deliveries_total);
             }
@@ -387,7 +392,12 @@ impl VireonStack {
         self.application.drain_ready_egress(&mut self.flush_policy);
         let policy = std::mem::take(&mut self.flush_policy);
         for out in &policy {
-            self.encode_and_send(out.conn_idx, out.quic_stream_id, out.header.clone(), &out.payload);
+            self.encode_and_send(
+                out.conn_idx,
+                out.quic_stream_id,
+                out.header.clone(),
+                &out.payload,
+            );
             if let Some(m) = &self.metrics {
                 m.inc(&m.deliveries_total);
             }
@@ -610,12 +620,9 @@ impl VireonStack {
         }
 
         // No pending data — send directly.
-        let outcome = self.engine.send_stream(
-            conn_idx,
-            quic_stream_id,
-            &self.send_scratch[..n],
-            false,
-        );
+        let outcome =
+            self.engine
+                .send_stream(conn_idx, quic_stream_id, &self.send_scratch[..n], false);
         match outcome {
             Ok(written) => {
                 if let Some(m) = &self.metrics {
@@ -714,12 +721,7 @@ impl VireonStack {
 
     /// Evicts other-stream entries until inserting `incoming_len` bytes
     /// would fit under both caps. Called by `insert_pending`.
-    fn enforce_pending_caps(
-        &mut self,
-        conn_idx: usize,
-        quic_stream_id: u64,
-        incoming_len: usize,
-    ) {
+    fn enforce_pending_caps(&mut self, conn_idx: usize, quic_stream_id: u64, incoming_len: usize) {
         let key = (conn_idx, quic_stream_id);
         while self.pending_bytes + incoming_len > PENDING_BYTE_CAP
             || self.pending_sends.len() + 1 > PENDING_MAX_STREAMS
@@ -790,7 +792,10 @@ impl VireonStack {
                         // Partial write — buffer the tail, reset attempts.
                         let tail = buf.split_off(written);
                         self.pending_bytes += tail.len();
-                        let p = self.pending_sends.get_mut(&key).expect("just get_mut'd above");
+                        let p = self
+                            .pending_sends
+                            .get_mut(&key)
+                            .expect("just get_mut'd above");
                         p.data = tail;
                         p.blocked_attempts = 0;
                         still_blocked += 1;
@@ -804,7 +809,10 @@ impl VireonStack {
                     // Restore the buffer; bump attempts.
                     self.pending_bytes -= prev_len;
                     self.pending_bytes += buf.len(); // same length, but be explicit
-                    let p = self.pending_sends.get_mut(&key).expect("just get_mut'd above");
+                    let p = self
+                        .pending_sends
+                        .get_mut(&key)
+                        .expect("just get_mut'd above");
                     p.data = buf;
                     p.blocked_attempts = p.blocked_attempts.saturating_add(1);
                     if p.blocked_attempts >= PENDING_MAX_ATTEMPTS {

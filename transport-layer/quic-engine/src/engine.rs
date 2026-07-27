@@ -865,7 +865,9 @@ impl IoHandler for QuicEngine {
         // under IP churn without taxing every tick.
         if self.rate_limiter.is_enabled() {
             let now = std::time::Instant::now();
-            let due = self.last_rate_limit_gc.map_or(true, |t| now.duration_since(t) >= std::time::Duration::from_secs(1));
+            let due = self.last_rate_limit_gc.map_or(true, |t| {
+                now.duration_since(t) >= std::time::Duration::from_secs(1)
+            });
             if due {
                 self.rate_limiter.gc(now);
                 self.last_rate_limit_gc = Some(now);
