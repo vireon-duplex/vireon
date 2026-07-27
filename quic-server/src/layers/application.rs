@@ -1045,6 +1045,12 @@ impl VireonDispatcher {
             return;
         }
 
+        // Copy payload once — the &[u8] points into the io_uring buffer
+        // pool which gets recycled after this function returns. All
+        // downstream paths (WAL, cluster, fan-out) clone this Bytes
+        // instead of each doing their own copy_from_slice.
+        let payload_bytes = Bytes::copy_from_slice(payload);
+
         // P6: cluster routing. If a coordinator is wired, consult it
         // to decide whether this publish belongs to us (deliver
         // locally + fan out to remote subscribers) or another node
@@ -1062,7 +1068,7 @@ impl VireonDispatcher {
                             ctx.conn_idx as u32,
                             ctx.quic_stream_id,
                             topic.as_str().to_string(),
-                            Bytes::copy_from_slice(payload),
+                            payload_bytes.clone(),
                         );
                         let _ = tx.send(OutgoingMsg { msg, target: owner });
                     }
@@ -1089,7 +1095,7 @@ impl VireonDispatcher {
                             ctx.conn_idx as u32,
                             ctx.quic_stream_id,
                             topic.as_str().to_string(),
-                            Bytes::copy_from_slice(payload),
+                            payload_bytes.clone(),
                         );
                         for target in remote_targets {
                             let _ = tx.send(OutgoingMsg {
@@ -1124,7 +1130,7 @@ impl VireonDispatcher {
         self.encode_scratch.clear();
         self.encode_scratch.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
         self.encode_scratch.extend_from_slice(topic_str.as_bytes());
-        self.encode_scratch.extend_from_slice(payload);
+        self.encode_scratch.extend_from_slice(&payload_bytes);
         let bytes = self.encode_scratch.split().freeze();
 
         // Phase 4: durable append before fan-out. A failure here is
@@ -1139,7 +1145,7 @@ impl VireonDispatcher {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(0);
-            let record = wal_store::WalRecord::new(now_ns, Bytes::copy_from_slice(payload));
+            let record = wal_store::WalRecord::new(now_ns, payload_bytes.clone());
             match wal.append(topic_str, record) {
                 Ok(offset) => {
                     tracing::trace!(
