@@ -1,4 +1,8 @@
 //! CLI argument parsing via clap.
+//!
+//! Args that previously had `default_value` are now `Option<T>` so that
+//! we can detect whether the user explicitly passed them. Resolution
+//! (CLI > config file > hardcoded default) happens in [`crate::config`].
 
 use clap::Parser;
 
@@ -10,17 +14,22 @@ use clap::Parser;
     about = "High-performance QUIC server (io_uring + quiche)"
 )]
 pub struct Cli {
+    /// Path to a TOML config file. Settings in the file are overridden by
+    /// explicit CLI flags. See `vireon.conf.example` for the schema.
+    #[arg(long)]
+    pub config: Option<String>,
+
     /// UDP port to listen on.
-    #[arg(short, long, default_value = "4433")]
-    pub port: u16,
+    #[arg(short, long)]
+    pub port: Option<u16>,
 
-    /// PEM certificate chain path.
+    /// PEM certificate chain path (or set `cert` in config file).
     #[arg(long)]
-    pub cert: String,
+    pub cert: Option<String>,
 
-    /// PEM private key path.
+    /// PEM private key path (or set `key` in config file).
     #[arg(long)]
-    pub key: String,
+    pub key: Option<String>,
 
     /// Optional PEM-encoded CA bundle for mutual TLS (mTLS). When set,
     /// the server requires every client to present a certificate signed
@@ -31,24 +40,24 @@ pub struct Cli {
     pub client_ca: Option<String>,
 
     /// Number of worker threads. 0 = auto-detect (one per CPU core).
-    #[arg(short, long, default_value = "0")]
-    pub workers: usize,
+    #[arg(short, long)]
+    pub workers: Option<usize>,
 
     /// Worker mode: `single` (one thread) or `multi` (thread-per-core).
-    #[arg(long, default_value = "single")]
-    pub mode: WorkerModeArg,
+    #[arg(long)]
+    pub mode: Option<WorkerModeArg>,
 
     /// Configuration preset.
-    #[arg(long, default_value = "bare-metal")]
-    pub preset: PresetArg,
+    #[arg(long)]
+    pub preset: Option<PresetArg>,
 
     /// Bind address (IP only; port comes from --port).
-    #[arg(long, default_value = "0.0.0.0")]
-    pub bind: String,
+    #[arg(long)]
+    pub bind: Option<String>,
 
     /// io_uring queue depth (0 = default).
-    #[arg(long, default_value = "0")]
-    pub queue_depth: u32,
+    #[arg(long)]
+    pub queue_depth: Option<u32>,
 
     /// Enable verbose logging.
     #[arg(short, long)]
@@ -69,8 +78,8 @@ pub struct Cli {
     ///
     /// Pass `--enforce-crc` to opt back into verification (e.g. when
     /// debugging an upstream frame codec bug).
-    #[arg(long, default_value_t = true)]
-    pub skip_crc: bool,
+    #[arg(long)]
+    pub skip_crc: Option<bool>,
 
     /// Force CRC32C verification (overrides the default `--skip-crc`).
     ///
@@ -82,8 +91,8 @@ pub struct Cli {
     /// Enable SQPOLL kernel thread (kernel ≥ 5.11, requires CAP_SYS_NICE).
     /// The kernel thread polls the SQ ring, eliminating submit syscalls.
     /// Falls back to standard mode if the kernel denies SQPOLL.
-    #[arg(long, default_value_t = true)]
-    pub sqpoll: bool,
+    #[arg(long)]
+    pub sqpoll: Option<bool>,
 
     /// Dump profiler report to this file on shutdown.
     /// Requires building with --features profiling.
@@ -114,28 +123,28 @@ pub struct Cli {
     /// truncated by the periodic sweeper (runs once per 60 s per
     /// worker). `0` (default) disables age-based retention. Only
     /// effective when `--wal-root` is also set.
-    #[arg(long, default_value_t = 0)]
-    pub wal_retention_secs: u64,
+    #[arg(long)]
+    pub wal_retention_secs: Option<u64>,
 
     /// WAL retention by total bytes: per-topic cap. When a topic
     /// exceeds this, oldest entries are truncated until under the
     /// cap. `0` (default) disables byte-based retention. Only
     /// effective when `--wal-root` is also set.
-    #[arg(long, default_value_t = 0)]
-    pub wal_max_bytes: u64,
+    #[arg(long)]
+    pub wal_max_bytes: Option<u64>,
 
     /// Maximum number of distinct topics tracked in the catalog.
     /// `TopicCreate` requests beyond this cap are rejected with a
     /// `quota_exceeded` ack. `0` (default) = unlimited.
-    #[arg(long, default_value_t = 0)]
-    pub max_topics: usize,
+    #[arg(long)]
+    pub max_topics: Option<usize>,
 
     /// Maximum subscribers per distinct subscription pattern.
     /// `Subscribe` requests whose pattern already has this many
     /// subscribers are rejected with a `quota_exceeded` ack.
     /// `0` (default) = unlimited.
-    #[arg(long, default_value_t = 0)]
-    pub max_subscribers_per_topic: usize,
+    #[arg(long)]
+    pub max_subscribers_per_topic: Option<usize>,
 
     /// Cluster self node id (P6). When set, the server joins a
     /// multi-node cluster and routes publishes to the owning node via
@@ -167,8 +176,8 @@ pub struct Cli {
     /// allocated, defending against handshake storms (DoS, retry
     /// loops, misbehaving clients). Already-connected clients on the
     /// same IP are unaffected.
-    #[arg(long, default_value_t = 0)]
-    pub max_handshakes_per_ip_per_sec: u32,
+    #[arg(long)]
+    pub max_handshakes_per_ip_per_sec: Option<u32>,
 }
 
 /// CLI worker-mode selector.

@@ -95,6 +95,7 @@ impl Worker {
             .buffer_pool(
                 buffer_pool::BufferPoolBuilder::new()
                     .max_memory(pool_budget)
+                    .huge_threshold(config.tuning.buffer_huge_threshold)
                     .numa_node(numa_node)
                     .build()
                     .map_err(|e| ServerError::EngineInit(format!("buffer pool: {e:?}")))?,
@@ -120,6 +121,7 @@ impl Worker {
             worker_inbox,
             worker_outboxes,
             shutdown_requested,
+            &config.tuning,
         )?;
         handler.metrics = config.metrics.clone();
 
