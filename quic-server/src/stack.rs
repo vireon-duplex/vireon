@@ -627,8 +627,8 @@ impl VireonStack {
                     // full frame. Buffer the tail per-stream so the
                     // next frame for this stream appends to it instead
                     // of landing at the wrong offset.
-                    let tail = self.send_scratch[written..n].to_vec();
-                    self.insert_pending(conn_idx, quic_stream_id, BytesMut::from_iter(tail));
+                    let tail = BytesMut::from_iter(&self.send_scratch[written..n]);
+                    self.insert_pending(conn_idx, quic_stream_id, tail);
                 }
             }
             Err(QuicSendError::FlowBlocked) => {
@@ -636,8 +636,8 @@ impl VireonStack {
                 // enough to free credit. Buffer the whole frame for
                 // retry on a subsequent tick so the peer eventually
                 // receives the data and recharges flow-control credit.
-                let data = self.send_scratch[..n].to_vec();
-                self.insert_pending(conn_idx, quic_stream_id, BytesMut::from_iter(data));
+                let data = BytesMut::from_iter(&self.send_scratch[..n]);
+                self.insert_pending(conn_idx, quic_stream_id, data);
             }
             Err(e) => {
                 tracing::debug!(
