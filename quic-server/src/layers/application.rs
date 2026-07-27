@@ -65,7 +65,7 @@ use super::message::FrameAction;
 use super::session::SessionLayer;
 use crate::cluster::OutgoingMsg;
 use crate::error::ServerError;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 // ── Inter-worker pub/sub forwarding ────────────────────────────────
 
@@ -322,6 +322,11 @@ pub struct VireonDispatcher {
     /// Logged via the periodic stats; surfaced in `[quota] reject` lines.
     quota_topic_rejects: u64,
     quota_subscriber_rejects: u64,
+
+    // ── Reusable encode scratch ────────────────────────────────────
+    // Eliminates per-publish Vec allocation in the fan-out path.
+    // clear() + split().freeze() produces a Bytes without allocating.
+    encode_scratch: BytesMut,
 }
 
 /// Minimum gap between cross-worker drop warning logs.
@@ -400,6 +405,7 @@ impl VireonDispatcher {
             pattern_sub_counts: FxHashMap::default(),
             quota_topic_rejects: 0,
             quota_subscriber_rejects: 0,
+            encode_scratch: BytesMut::new(),
         }
     }
 
@@ -1115,11 +1121,11 @@ impl VireonDispatcher {
         // Re-encode as a Publish frame so downstream subscribers receive the
         // same wire shape the publisher used (topic_len + topic + payload).
         let topic_str = topic.as_str();
-        let mut framed = Vec::with_capacity(2 + topic_str.len() + payload.len());
-        framed.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
-        framed.extend_from_slice(topic_str.as_bytes());
-        framed.extend_from_slice(payload);
-        let bytes = Bytes::from(framed);
+        self.encode_scratch.clear();
+        self.encode_scratch.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
+        self.encode_scratch.extend_from_slice(topic_str.as_bytes());
+        self.encode_scratch.extend_from_slice(payload);
+        let bytes = self.encode_scratch.split().freeze();
 
         // Phase 4: durable append before fan-out. A failure here is
         // operator-visible (warn log) but does not abort the publish —
@@ -2130,11 +2136,11 @@ impl VireonDispatcher {
         // Re-encode as a Publish frame so downstream subscribers receive the
         // same wire shape the publisher used (topic_len + topic + payload).
         let topic_str = topic_ref.as_str();
-        let mut framed = Vec::with_capacity(2 + topic_str.len() + payload.len());
-        framed.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
-        framed.extend_from_slice(topic_str.as_bytes());
-        framed.extend_from_slice(payload);
-        let bytes = Bytes::from(framed);
+        self.encode_scratch.clear();
+        self.encode_scratch.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
+        self.encode_scratch.extend_from_slice(topic_str.as_bytes());
+        self.encode_scratch.extend_from_slice(payload);
+        let bytes = self.encode_scratch.split().freeze();
 
         // Use a synthetic logical stream for inter-node-delivered
         // publishes — they aren't bound to a particular subscriber's
