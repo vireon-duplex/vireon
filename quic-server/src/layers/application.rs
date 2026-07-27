@@ -274,11 +274,13 @@ pub struct VireonDispatcher {
     worker_inbox: Option<mpsc::Receiver<InterWorkerPublish>>,
     /// This worker's reactor_id — used to skip self when broadcasting.
     worker_self_idx: usize,
-    /// Aggregate count of cross-worker inbox-full drops. Logged every
-    /// `WORKER_DROP_LOG_INTERVAL`-th drop instead of per-message — a
-    /// sustained burst otherwise produces hundreds of identical WARN
+    /// Aggregate count of cross-worker inbox-full drops. Logged at most
+    /// once every `WORKER_DROP_LOG_COOLDOWN` via [`worker_drop_cooldown`]
+    /// — a sustained burst otherwise produces hundreds of identical WARN
     /// lines per second and drowns the rest of the log.
     worker_drop_count: u64,
+    /// Time-based throttle for worker-inbox-full warnings.
+    worker_drop_cooldown: crate::log_throttle::Cooldown,
     /// ── per-frame error throttles ────────────────────────────────
     /// Persistently misbehaving clients (malformed payloads, denied
     /// topics, stuck WAL disk) can fire warn!/info! per inbound frame.
@@ -322,8 +324,8 @@ pub struct VireonDispatcher {
     quota_subscriber_rejects: u64,
 }
 
-/// Log cross-worker drop summaries every Nth drop.
-const WORKER_DROP_LOG_INTERVAL: u64 = 1024;
+/// Minimum gap between cross-worker drop warning logs.
+const WORKER_DROP_LOG_COOLDOWN: Duration = Duration::from_secs(5);
 
 /// Minimum gap between WAL retention sweeps. The sweep walks every
 /// tracked topic and may issue a truncation (which copies surviving
@@ -377,6 +379,7 @@ impl VireonDispatcher {
             worker_inbox: None,
             worker_self_idx: 0,
             worker_drop_count: 0,
+            worker_drop_cooldown: crate::log_throttle::Cooldown::new(WORKER_DROP_LOG_COOLDOWN),
             // Per-class throttles. `every` values chosen so that under
             // a sustained ~5k frames/s/conn burst we still see ~5
             // log lines/s per category — enough to diagnose without
@@ -1211,11 +1214,11 @@ impl VireonDispatcher {
                     framed: bytes.clone(),
                 }) {
                     self.worker_drop_count = self.worker_drop_count.wrapping_add(1);
-                    if self.worker_drop_count % WORKER_DROP_LOG_INTERVAL == 0 {
+                    if self.worker_drop_cooldown.tick() {
                         tracing::warn!(
                             worker = i,
                             total_drops = self.worker_drop_count,
-                            "[pubsub] worker inbox full — dropped {WORKER_DROP_LOG_INTERVAL} publishes \
+                            "[pubsub] worker inbox full — dropping publishes \
                              (raise cap in build_inter_worker_pubsub_channels)"
                         );
                     }
