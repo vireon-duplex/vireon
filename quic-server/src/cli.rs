@@ -59,11 +59,25 @@ pub struct Cli {
     #[arg(long)]
     pub echo: bool,
 
-    /// Skip CRC32C verification on received frames.
-    /// Use ONLY in trusted environments where QUIC's AEAD guarantees
-    /// integrity. Saves ~50% of decode time for small frames.
-    #[arg(long)]
+    /// Skip CRC32C verification on received frames (default: ON).
+    ///
+    /// QUIC's AEAD (AES-GCM) already guarantees frame integrity end-to-end;
+    /// the per-frame CRC32C trailer is redundant in every standard
+    /// deployment. Skipping verification saves ~5–8% of decode CPU
+    /// (flamegraph-verified, 2026-07-26) without changing wire shape —
+    /// the trailer is still written by senders for backwards compat.
+    ///
+    /// Pass `--enforce-crc` to opt back into verification (e.g. when
+    /// debugging an upstream frame codec bug).
+    #[arg(long, default_value_t = true)]
     pub skip_crc: bool,
+
+    /// Force CRC32C verification (overrides the default `--skip-crc`).
+    ///
+    /// Paranoid mode for debugging suspected frame-codec corruption.
+    /// No effect on the wire — senders still compute the trailer.
+    #[arg(long)]
+    pub enforce_crc: bool,
 
     /// Enable SQPOLL kernel thread (kernel ≥ 5.11, requires CAP_SYS_NICE).
     /// The kernel thread polls the SQ ring, eliminating submit syscalls.
