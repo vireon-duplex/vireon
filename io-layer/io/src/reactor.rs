@@ -34,7 +34,7 @@
 //! | [`Error`](Completion::Error) | record and continue |
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use io_uring::cqueue;
@@ -67,6 +67,98 @@ const TICK_TIMER_ID: u64 = 0;
 /// overhead (1000 wakeups/s when idle — negligible vs the busy-poll
 /// budget already spent in the kernel for BareMetal/HundredGbe).
 const TICK_INTERVAL: Duration = Duration::from_millis(1);
+
+// ── Crash-handler ring registry ───────────────────────────────────
+//
+// When the process crashes (SIGSEGV, SIGABRT), Reactor::drop does not
+// run, so the AsyncCancel2 that normally cancels the multishot RECV is
+// never submitted. The kernel holds the socket inode reference via the
+// pending multishot RECV, leaving a ghost UDP socket that blocks the
+// port for subsequent server restarts.
+//
+// This static array stores raw pointers to each Reactor's IoUringCtx.
+// The crash handler calls [`cancel_all_rings`] which writes an
+// AsyncCancel2 SQE to each ring and calls `submit_and_wait(1)`,
+// replicating what Reactor::drop does — but from a signal handler.
+
+const MAX_RINGS: usize = 128;
+static RING_PTRS: [AtomicUsize; MAX_RINGS] = [const { AtomicUsize::new(0) }; MAX_RINGS];
+
+/// Register this reactor's IoUringCtx for crash-handler cleanup.
+///
+/// Stores a raw pointer to `self.ctx.ring`. Valid as long as `self`
+/// is alive. Unregistered in `Drop`.
+fn register_ring(ring: &io_uring::IoUring) {
+    let ptr = ring as *const _ as usize;
+    for slot in &RING_PTRS {
+        if slot
+            .compare_exchange(0, ptr, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
+/// Remove this reactor's ring from the crash-handler registry.
+fn unregister_ring(ring: &io_uring::IoUring) {
+    let ptr = ring as *const _ as usize;
+    for slot in &RING_PTRS {
+        if slot.load(Ordering::Acquire) == ptr {
+            slot.store(0, Ordering::Release);
+            return;
+        }
+    }
+}
+
+/// Cancel all pending io_uring multishot operations across all reactors.
+///
+/// Called from signal handlers / panic hooks **before** closing fds.
+/// Writes an `AsyncCancel2(CancelBuilder::any())` SQE to each
+/// registered ring and calls `submit_and_wait(1)` so the kernel
+/// synchronously cancels pending multishot RECV and releases socket
+/// inode references.
+///
+/// # Safety (caller)
+///
+/// This function is designed for crash-handler use. It casts stored
+/// raw pointers to `&mut IoUring` without runtime validation. If a
+/// Reactor was already dropped without unregistering, the pointer is
+/// dangling and behaviour is undefined. The `Drop` impl unregisters
+/// to prevent this.
+pub fn cancel_all_rings() {
+    use io_uring::opcode::AsyncCancel2;
+    use io_uring::types::CancelBuilder;
+
+    for slot in &RING_PTRS {
+        let ptr_val = slot.load(Ordering::Acquire);
+        if ptr_val == 0 {
+            continue;
+        }
+        // SAFETY: the pointer was stored by `register_ring` from a
+        // live Reactor. We're in a crash handler, so the Reactor is
+        // still alive (the process hasn't exited yet). Casting to
+        // `&mut` is UB in general but acceptable here — the process
+        // is about to die.
+        let ring: &mut io_uring::IoUring = unsafe { &mut *(ptr_val as *mut _) };
+
+        let cancel_entry = AsyncCancel2::new(CancelBuilder::any())
+            .build()
+            .user_data(0);
+        // Drain existing CQEs BEFORE calling submit_and_wait. Without
+        // this, submit_and_wait(1) may see pending CQEs from the multishot
+        // RECV and return immediately — before the kernel processes
+        // the AsyncCancel2 SQE. The socket inode reference stays alive.
+        loop {
+            let mut cq = ring.completion();
+            if cq.next().is_none() {
+                break;
+            }
+        }
+        let _ = crate::ops::push_entry(ring, cancel_entry);
+        let _ = ring.submit_and_wait(1);
+    }
+}
 
 /// Thread-per-core reactor.
 pub struct Reactor {
@@ -280,6 +372,20 @@ impl Reactor {
         &self.socket
     }
 
+    /// Returns the raw fd of the io_uring ring.
+    ///
+    /// Needed by the crash-exit socket registry: when a signal handler
+    /// force-closes fds, the ring fd must be closed so the kernel cancels
+    /// pending multishot RECV operations and releases the socket inode
+    /// reference. Without this, closing only the socket fd leaves a ghost
+    /// UDP socket on the port.
+    #[inline]
+    #[must_use]
+    pub fn ring_fd(&self) -> std::os::fd::RawFd {
+        use std::os::unix::io::AsRawFd;
+        self.ctx.ring().as_raw_fd()
+    }
+
     /// Immutable access to the receiver.
     #[inline]
     #[must_use]
@@ -343,6 +449,36 @@ impl Reactor {
     /// peer addresses; outgoing sends happen in `on_tick` via
     /// [`TickContext`].
     pub fn run_with_handler<H: IoHandler>(&mut self, handler: &mut H) -> Result<(), IoError> {
+        // Register the ring for crash-handler cleanup NOW — at this point
+        // the Reactor has been moved to its final stack address (inside
+        // Worker::run → self.reactor.run_with_handler). The stored raw
+        // pointer remains valid until Drop runs, which unregisters it.
+        register_ring(self.ctx.ring());
+
+        // Arm a periodic wakeup timer so the event loop returns from
+        // submit_and_wait even when no packets arrive. Without this,
+        // SIGINT/SIGTERM caught by ctrlc's background thread sets the
+        // stop flag but the blocked submit_and_wait never returns to
+        // check it — the server becomes unresponsive to graceful
+        // shutdown when idle. Orchestration systems (systemd, k8s)
+        // escalate to SIGKILL after a timeout, which leaves ghost
+        // sockets.
+        //
+        // The timer fires every 200ms; its CQE is processed as a
+        // no-op Completion::Timeout (on_timeout defaults to no-op).
+        // Requires kernel ≥ 6.2 (IORING_TIMEOUT_MULTISHOT).
+        const WAKEUP_PERIOD: Duration = Duration::from_millis(200);
+        if let Err(e) = self
+            .timers
+            .add_periodic_tick(self.ctx.ring_mut(), 0, WAKEUP_PERIOD)
+        {
+            tracing::warn!(
+                error = ?e,
+                "failed to arm wakeup timer — server may be slow to respond \
+                 to SIGINT/SIGTERM when idle (requires kernel ≥ 6.2)"
+            );
+        }
+
         while !self.stop.load(Ordering::Relaxed) {
             match self.ctx.ring_mut().submit_and_wait(1) {
                 Ok(_) => {}
@@ -523,6 +659,11 @@ impl Reactor {
 
 impl Drop for Reactor {
     fn drop(&mut self) {
+        // Remove from crash-handler registry FIRST — after the cancel
+        // below runs, the ring state is indeterminate and the crash
+        // handler must not touch it.
+        unregister_ring(self.ctx.ring());
+
         self.stop.store(true, Ordering::Release);
 
         // Force kernel-side shutdown of the UDP socket before its fd is
