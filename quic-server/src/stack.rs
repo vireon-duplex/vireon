@@ -240,8 +240,9 @@ impl VireonStack {
         worker_inbox: Option<std::sync::mpsc::Receiver<crate::layers::InterWorkerPublish>>,
         worker_outboxes: Vec<std::sync::mpsc::SyncSender<crate::layers::InterWorkerPublish>>,
         shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
+        tuning: &crate::conf::LayerTuning,
     ) -> Result<Self, ServerError> {
-        let mut application = ApplicationLayer::new()?;
+        let mut application = ApplicationLayer::new(tuning)?;
         if let Some(table) = acl_table {
             application.set_acl(table);
         }
@@ -277,7 +278,7 @@ impl VireonStack {
         }
         Ok(Self {
             application,
-            runtime: RuntimeLayer::new(reactor_id)?,
+            runtime: RuntimeLayer::new(reactor_id, tuning)?,
             engine,
             metrics: None,
             connections: ConnectionRegistry::new(),
@@ -291,7 +292,13 @@ impl VireonStack {
             encode_fail_throttle: crate::log_throttle::RateCounter::new(256),
             pending_evict_throttle: crate::log_throttle::RateCounter::new(128),
             eviction_cooldown: None,
-            eviction_config: crate::eviction::EvictionConfig::default(),
+            eviction_config: crate::eviction::EvictionConfig {
+                cooldown: Duration::from_secs(5),
+                high_idle_threshold_ns: tuning.eviction_idle_threshold_ns,
+                high_evict_fraction: tuning.eviction_high_fraction,
+                critical_evict_fraction: tuning.eviction_critical_fraction,
+                min_survivors: tuning.eviction_min_survivors,
+            },
             echo,
             pending_sends: FxHashMap::with_capacity_and_hasher(64, Default::default()),
             pending_bytes: 0,

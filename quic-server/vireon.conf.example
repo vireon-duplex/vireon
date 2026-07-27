@@ -1,0 +1,475 @@
+# ═══════════════════════════════════════════════════════════════════
+#  Vireon QUIC Server — Configuration File
+#
+#  Usage:  quic-server --config vireon.conf
+#
+#  Precedence (highest → lowest):
+#    1. CLI flag (explicit, e.g. --port 44332)
+#    2. Value in this file
+#    3. Hardcoded default
+#
+#  Value formats:
+#    Booleans:  true / false
+#    Integers:  4433, 0, 1073741824
+#    Strings:   "bare-metal"
+#    Bytes:     "100MiB" | "1GiB" | "256KiB" | 104857600  (raw integer = bytes)
+#    Duration:  "30s" | "5m" | "1h" | "500ms" | 30         (raw integer = seconds)
+# ═══════════════════════════════════════════════════════════════════
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Network
+# ─────────────────────────────────────────────────────────────────────
+
+# UDP port the server listens on.
+port = 4433
+
+# Bind address (IP only; port comes from `port` above).
+# "0.0.0.0" = all interfaces. Use "127.0.0.1" for localhost-only.
+bind = "0.0.0.0"
+
+# PEM-encoded TLS certificate chain path.
+# Required — server will not start without it.
+cert = "cert.pem"
+
+# PEM-encoded private key matching `cert`.
+# Required — server will not start without it.
+key = "key.pem"
+
+# PEM-encoded CA bundle for mutual TLS (mTLS).
+# When set, every client MUST present a certificate signed by this CA
+# during the TLS handshake. Clients without a valid cert are rejected
+# at the TLS layer before any application frame is processed.
+# Leave empty ("") to disable mTLS (default).
+client_ca = ""
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Worker / Threading
+# ─────────────────────────────────────────────────────────────────────
+
+# Worker mode:
+#   "single"       — 1 reactor on the main thread (benchmarks, dev)
+#   "multi"        — thread-per-core, one reactor per CPU core (production)
+#   "distributed"  — multi-worker + inter-node coordination (stub)
+mode = "single"
+
+# Number of worker threads.
+#   0 = auto-detect (one per CPU core)
+#   Ignored in "single" mode (always 1).
+workers = 0
+
+# io_uring submission queue depth.
+#   0 = use built-in default (1024).
+#   Higher = more concurrent in-flight I/O ops, but more kernel memory.
+#   1024 is sufficient for 100K+ connections per core.
+queue_depth = 0
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Tuning Preset
+# ─────────────────────────────────────────────────────────────────────
+
+# Deployment-class preset — sets sensible QUIC defaults for the target
+# environment. Individual QUIC values can be overridden in the [quic]
+# section below.
+#
+#   "cloud"           — multi-tenant cloud, conservative limits
+#   "bare-metal"      — general production server (recommended)
+#   "hundred-gbe"     — 100 GbE+ NIC, aggressive flow-control windows
+#   "low-latency"     — sub-ms tail latency (RPC, gaming)
+#   "max-throughput"  — bulk-transfer (storage, ML checkpoints)
+preset = "bare-metal"
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  CRC32C Verification
+# ─────────────────────────────────────────────────────────────────────
+
+# Skip CRC32C verification on received frames (default: ON).
+#
+# QUIC's AEAD encryption (AES-GCM) already guarantees frame integrity
+# end-to-end. The per-frame CRC32C trailer is redundant in every
+# standard deployment. Skipping verification saves ~5–8% of decode CPU
+# (flamegraph-verified). The trailer is still written for backwards
+# compatibility with older receivers.
+skip_crc = true
+
+# Force CRC32C verification even when skip_crc = true.
+# Use when debugging suspected frame-codec corruption.
+# No effect on the wire — senders always compute the trailer.
+enforce_crc = false
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Performance
+# ─────────────────────────────────────────────────────────────────────
+
+# Enable the io_uring SQPOLL kernel thread (kernel ≥ 5.11).
+# Requires CAP_SYS_NICE. The kernel thread polls the submission
+# ring, eliminating submit syscalls. Falls back to standard mode if
+# the kernel denies SQPOLL.
+sqpoll = false
+
+# Echo mode — bounce every received frame back on the same QUIC stream.
+# For load-testing with bench-harness (rr / multi-rr / pipeline modes).
+# Bypasses the application layer entirely.
+echo = false
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Write-Ahead Log (WAL)
+# ─────────────────────────────────────────────────────────────────────
+
+# Root directory for the WAL.
+# When set, every accepted publish is appended to a per-worker
+# FileStore under `<root>/worker_<core_id>/` before fan-out.
+# Subscribers can then use Fetch(offset) to replay missed messages.
+# Empty ("") = WAL disabled (publish is fire-and-forget, Fetch errors).
+wal_root = ""
+
+# WAL retention by AGE: entries older than this many seconds are
+# truncated by a periodic sweeper.
+#   0 = no age-based retention.
+wal_retention_secs = 0
+
+# WAL retention by SIZE: per-topic byte cap. When a topic exceeds this,
+# oldest entries are truncated until under the cap.
+#   0 = no byte-based retention.
+wal_max_bytes = 0
+
+# Interval between WAL retention sweeps (seconds).
+# The sweeper walks every topic and applies the retention policy.
+# Lower = more frequent cleanup, higher CPU. Higher = lazier cleanup.
+#   60 = default (once per minute).
+wal_sweep_interval_secs = 60
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Resource Limits / Quotas
+# ─────────────────────────────────────────────────────────────────────
+
+# Maximum number of distinct topics in the catalog.
+# TopicCreate requests beyond this cap are rejected (quota_exceeded ack).
+#   0 = unlimited.
+max_topics = 0
+
+# Maximum subscribers per distinct subscription pattern.
+# Subscribe requests beyond this cap are rejected (quota_exceeded ack).
+#   0 = unlimited.
+max_subscribers_per_topic = 0
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Security
+# ─────────────────────────────────────────────────────────────────────
+
+# Maximum new QUIC handshakes per second from a single source IP.
+#   0 = no limit (default — opt-in for multi-tenant deployments).
+# When non-zero, an over-limit IP has its Initial packets dropped
+# before connection state is allocated. Defends against handshake
+# storms (DoS, retry loops, misbehaving clients). Already-connected
+# clients on the same IP are unaffected.
+max_handshakes_per_ip_per_sec = 0
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Observability
+# ─────────────────────────────────────────────────────────────────────
+
+# Prometheus metrics endpoint port.
+# When set, the server exposes counters (connections, publishes,
+# deliveries, errors, bytes) in Prometheus text format at
+# http://<host>:<port>/metrics. A scrape completes in <1 ms.
+#   0 = metrics endpoint disabled.
+metrics_port = 0
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Cluster (P6 — multi-node)
+# ─────────────────────────────────────────────────────────────────────
+
+# Self node ID in a multi-node cluster.
+# Must be >0 and appear in cluster_peers.
+#   0 = single-node mode (all topics owned locally).
+cluster_node_id = 0
+
+# Cluster peer list: "id=host:port,id=host:port,..."
+# Every node (including self) must be listed.
+# Example: "1=10.0.0.1:4433,2=10.0.0.2:4433,3=10.0.0.3:4433"
+cluster_peers = ""
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Access Control (ACL)
+# ─────────────────────────────────────────────────────────────────────
+
+# Path to a TOML ACL rules file for tenant isolation.
+# When set, the server loads rules from this file and replaces the
+# default permissive allow("*.*", None, ALL) table.
+# Empty ("") = permissive default (single-tenant mode).
+acl_rules_path = ""
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  QUIC Engine Overrides
+#
+#  All fields optional — the [preset] above sets sensible defaults.
+#  Only override what you need to tune.
+# ═══════════════════════════════════════════════════════════════════
+[quic]
+
+# Maximum concurrent connections per shard (per reactor/core).
+# Workspace-wide limit = this value × num_cores.
+# Range: [256, 1_048_576].
+max_connections = 65536
+
+# Maximum concurrent bidirectional streams per connection.
+# Each stream costs ~1 KiB of state.
+max_streams_bidi = 1024
+
+# Maximum concurrent unidirectional streams per connection.
+max_streams_uni = 1024
+
+# Connection-level flow-control initial window (MAX_DATA).
+# Larger = less flow-control stalling, more buffer pressure.
+# Accepts human-readable: "100MiB", "1GiB", or raw bytes.
+initial_max_data = "100MiB"
+
+# Stream-level flow-control initial window (MAX_STREAM_DATA).
+initial_max_stream_data = "10MiB"
+
+# Idle timeout — connections with no packet exchange for this long
+# are torn down. Minimum 100 ms.
+# Accepts human-readable: "30s", "5m", "1h", or raw seconds.
+idle_timeout = "30s"
+
+# Handshake timeout — abandons connections that fail to complete
+# the TLS handshake within this duration.
+handshake_timeout = "30s"
+
+# Congestion control algorithm.
+#   "reno"   — RFC 9002 §7 default, conservative
+#   "cubic"  — high-speed window-based, Linux default since 2.6.19
+#   "bbr"    — Google BBRv1, bandwidth estimation (recommended)
+#   "bbr2"   — BBRv2 draft, fixes BBRv1 fairness issues
+congestion = "cubic"
+
+# Initial congestion window in packets (RFC 9002 §7.2).
+# Larger = faster ramp-up on new connections.
+initial_cwnd_packets = 100
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Buffer Pool
+#
+#  Per-worker buffer allocation pool. Controls how much memory each
+#  worker caches for reusable buffers.
+# ═══════════════════════════════════════════════════════════════════
+[buffer_pool]
+
+# Allocations above this size bypass the pool entirely (allocated via
+# the system allocator, freed on drop). Too low = many allocations
+# miss the pool; too high = pool memory wasted on oversized buffers.
+# Accepts human-readable: "1MiB", "512KiB", or raw bytes.
+huge_threshold = "1MiB"
+
+# Fraction of cgroup memory limit to budget for the pool (0.0–1.0).
+# Only effective when a cgroup memory limit is detectable.
+# Example: 0.5 on a 4 GiB cgroup = 2 GiB pool budget.
+cgroup_fraction = 0.5
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Backpressure / Connection Shard
+#
+#  Controls when the server starts rejecting new work under load.
+# ═══════════════════════════════════════════════════════════════════
+[backpressure]
+
+# Connection slots per shard (per reactor/core).
+# Each slot costs ~4 KiB resident memory.
+# 65536 × 16 cores = ~4 GiB max capacity.
+connection_capacity = 65536
+
+# Soft backpressure percentage (0–100). Above this occupancy,
+# the shard starts slowing down acceptance (longer processing cycles).
+soft_pct = 80
+
+# Hard backpressure percentage (0–100). Above this, the shard
+# rejects new connections entirely.
+hard_pct = 95
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Reactor Tick Budget
+#
+#  Controls how much work the io_uring reactor does per tick before
+#  yielding back to the kernel. Lower = lower latency, higher = more
+#  throughput per syscall.
+# ═══════════════════════════════════════════════════════════════════
+[reactor]
+
+# Max completion queue events drained per tick.
+max_cqes = 256
+
+# Max reactor-local tasks processed per tick.
+max_tasks = 64
+
+# Max send-flush operations per tick.
+max_send_flush = 128
+
+# Soft time deadline per tick in microseconds. The reactor yields
+# if a tick takes longer than this.
+tick_deadline_us = 200
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Send Queue / Packet Batching
+#
+#  Controls outbound packet coalescing (GSO / sendmsg batching).
+#  Larger batches = fewer syscalls but higher latency.
+# ═══════════════════════════════════════════════════════════════════
+[send_batch]
+
+# Max packets coalesced into a single GSO/sendmsg call.
+max_packets = 64
+
+# Max bytes accumulated before a flush is forced.
+# Accepts human-readable: "64KiB", or raw bytes.
+max_bytes = "64KiB"
+
+# Max microseconds to wait before flushing a partial batch.
+# Lower = lower latency, higher = better coalescing.
+max_age_us = 50
+
+# High watermark percentage (0–100). Queue depth above this
+# signals backpressure upstream.
+high_watermark_pct = 90
+
+# Low watermark percentage (0–100). Backpressure clears below this.
+low_watermark_pct = 75
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Connection Eviction
+#
+#  When the buffer pool is under pressure, idle connections are
+#  evicted to free memory. This controls the thresholds.
+# ═══════════════════════════════════════════════════════════════════
+[eviction]
+
+# Idle threshold in seconds. Connections idle longer than this
+# are candidates for eviction under memory pressure.
+idle_threshold_secs = 5
+
+# Fraction of active connections evicted at soft pressure (0.0–1.0).
+high_evict_fraction = 0.05
+
+# Fraction evicted at critical/hard pressure (0.0–1.0).
+critical_evict_fraction = 0.10
+
+# Minimum connections that must survive any eviction pass.
+# Prevents total connection drain under sustained pressure.
+min_survivors = 2
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Session Layer
+#
+#  Per-connection session limits and timeouts.
+# ═══════════════════════════════════════════════════════════════════
+[session]
+
+# Maximum concurrent sessions across all tenants.
+max_sessions = 100000
+
+# Maximum sessions per single tenant.
+max_per_tenant = 10000
+
+# Session idle timeout. Sessions with no activity for this long
+# are automatically closed.
+# Accepts human-readable: "300s", "5m", or raw seconds.
+idle_timeout = "300s"
+
+# Handshake timeout. Sessions that fail to complete the
+# application-layer handshake within this are abandoned.
+handshake_timeout = "30s"
+
+# Max concurrent logical streams per session.
+max_streams_per_session = 100
+
+# Max memory budget per session (buffer allocations).
+# Accepts human-readable: "1MiB", or raw bytes.
+max_memory_per_session = "1MiB"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Stream Layer
+#
+#  Per-connection stream limits.
+# ═══════════════════════════════════════════════════════════════════
+[stream]
+
+# Max concurrent bidirectional streams per connection.
+max_streams_bidi = 100
+
+# Max concurrent unidirectional streams per connection.
+max_streams_uni = 100
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Task Queue
+#
+#  Reactor-local deferred task execution. Tasks are batched and
+#  drained once per reactor tick.
+# ═══════════════════════════════════════════════════════════════════
+[task_queue]
+
+# Queue capacity (pending tasks). Exceeding this causes backpressure.
+capacity = 4096
+
+# Max tasks processed per drain batch.
+batch_max_tasks = 128
+
+# Max microseconds to wait before draining a partial batch.
+batch_max_time_us = 100
+
+# Grace period for shutdown drain (seconds). Pending tasks get this
+# long to complete before the worker force-exits.
+shutdown_grace_secs = 5
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Timer Wheel
+#
+#  Hierarchical timer wheel for idle-timeout tracking.
+# ═══════════════════════════════════════════════════════════════════
+[timer_wheel]
+
+# Timer tick resolution in microseconds.
+# Lower = more precise timeouts, higher CPU. Higher = lazier.
+tick_us = 1000
+
+# Max timers tracked per shard.
+# Each timer entry costs ~64 bytes.
+capacity_per_shard = 65536
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Stream Scheduler
+#
+#  Fair scheduling across active streams per reactor tick.
+# ═══════════════════════════════════════════════════════════════════
+[stream_scheduler]
+
+# Max streams polled per tick. Higher = more fairness, more CPU.
+max_streams_per_tick = 64
+
+# Max bytes sent per tick before yielding to other streams.
+# Accepts human-readable: "64KiB", or raw bytes.
+max_bytes_per_tick = "64KiB"
+
+# Starvation threshold in microseconds. A stream waiting longer
+# than this is prioritized on the next tick.
+starvation_threshold_us = 10000

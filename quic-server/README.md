@@ -83,7 +83,8 @@ ApplicationLayer                          // application-layer
 quic-server/src/
 ├── main.rs              Entry point: CLI parse, tracing init, boot server
 ├── cli.rs               clap-based CLI argument definitions
-├── config.rs            ServerConfig resolution (uses kernel-nic CPU detection)
+├── conf.rs              TOML config file parser (ServerConf + QuicConf)
+├── config.rs            ServerConfig resolution: CLI > config file > default
 ├── server.rs            QuicServer: orchestrates workers (single/multi/distributed)
 ├── worker.rs            Worker: owns Reactor + VireonStack, runs event loop
 ├── stack.rs             VireonStack: composition root, impls IoHandler
@@ -277,14 +278,28 @@ cargo run -p quic-server --release -- \
 cargo run -p quic-server --release -- \
     --cert cert.pem --key key.pem --port 4433 \
     --mode multi --workers 4 --queue-depth 512 -v
+
+# Using a TOML config file (like redis.conf / server.properties)
+cp quic-server/vireon.conf.example my.conf
+# edit my.conf: set port, mode, workers, [quic] overrides, etc.
+cargo run -p quic-server --release -- \
+    --config my.conf --cert cert.pem --key key.pem
+
+# CLI flags override config file values
+cargo run -p quic-server --release -- \
+    --config my.conf --port 44332   # overrides port from my.conf
 ```
 
 ### CLI Arguments
+
+All flags can also be set via a [config file](#configuration-file). CLI
+flags always override config file values.
 
 #### Connection / networking
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--config` | *(none)* | Path to a TOML config file. See [Configuration File](#configuration-file). |
 | `--port` | `4433` | UDP port to bind |
 | `--bind` | `0.0.0.0` | Bind address (IP only; port from `--port`) |
 | `--cert` | *(required)* | PEM certificate chain path |
@@ -296,7 +311,7 @@ cargo run -p quic-server --release -- \
 |------|---------|-------------|
 | `--mode` | `single` | `single` (1 reactor on main thread), `multi` (thread-per-core), `distributed` (multi + inter-node, stub) |
 | `--workers N` | `0` (auto) | Worker thread count. `0` = one per CPU core. Ignored in `single` mode (always 1). |
-| `--queue-depth N` | `256` | io_uring submission queue depth (0 = default). Higher = more in-flight I/O but more memory. |
+| `--queue-depth N` | `1024` | io_uring submission queue depth (0 = default). Higher = more in-flight I/O but more memory. |
 
 #### Tuning presets
 
@@ -309,8 +324,8 @@ cargo run -p quic-server --release -- \
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--echo` | off | Bounce every received frame back on the same QUIC stream. Required for `bench-harness` `rr` / `multi-rr` / `pipeline` modes. Bypasses the application layer. |
-| `--skip-crc` | off | Skip CRC32C verification on received frames. Trusted environments only — QUIC's AEAD already guarantees integrity. Saves ~50% of small-frame decode time. |
-| `--sqpoll` | on | Enable the io_uring SQPOLL kernel thread (kernel ≥ 5.11, needs CAP_SYS_NICE). The kernel polls the SQ ring, eliminating submit syscalls. Auto-falls-back if denied. |
+| `--skip-crc` | **on** | Skip CRC32C verification on received frames (default ON). QUIC's AEAD already guarantees frame integrity end-to-end; skipping saves ~5–8% of decode CPU. Use `--enforce-crc` to opt back into verification (debugging). |
+| `--sqpoll` | off | Enable the io_uring SQPOLL kernel thread (kernel ≥ 5.11, needs CAP_SYS_NICE). The kernel polls the SQ ring, eliminating submit syscalls. Auto-falls-back if denied. |
 | `-v` | off | Enable verbose (debug-level) tracing. |
 | `--profile-output FILE` | off | Dump profiler report on shutdown. Requires `--features profiling`. Extension selects format: `.json`, `.csv`, `.ctrace`, `.folded`, `.dot`, else text. |
 
@@ -332,6 +347,85 @@ cargo run -p quic-server --release -- \
 | `hundred-gbe` | 100 GbE+ high-throughput |
 | `low-latency` | Sub-ms tail latency (RPC, gaming) |
 | `max-throughput` | Bulk-transfer max throughput |
+
+## Configuration File
+
+All CLI flags can alternatively be set in a TOML config file (like
+`redis.conf` or Kafka's `server.properties`). This is the recommended
+way to configure production deployments.
+
+### Precedence
+
+```
+CLI flag (explicit)  >  config file value  >  hardcoded default
+```
+
+If `--config` is not given, behavior is 100% backward-compatible.
+
+### Usage
+
+```bash
+# Copy the template and edit
+cp quic-server/vireon.conf.example my.conf
+
+# Run with the config file
+quic-server --config my.conf --cert cert.pem --key key.pem
+
+# CLI flags override config file values
+quic-server --config my.conf --port 44332    # CLI wins
+```
+
+### Example (`vireon.conf`)
+
+```toml
+# ── Network ───────────────────────────────────────────────────
+port = 4433
+bind = "0.0.0.0"
+cert = "cert.pem"
+key = "key.pem"
+
+# ── Workers ───────────────────────────────────────────────────
+mode = "multi"                  # single | multi | distributed
+workers = 0                     # 0 = auto-detect (one per CPU core)
+queue_depth = 0                 # 0 = default (1024)
+
+# ── Preset ────────────────────────────────────────────────────
+preset = "bare-metal"
+
+# ── CRC ───────────────────────────────────────────────────────
+skip_crc = true                 # default ON (QUIC AEAD guarantees integrity)
+
+# ── WAL ───────────────────────────────────────────────────────
+wal_root = "/var/lib/vireon/wal"
+wal_retention_secs = 3600       # entries older than 1h are truncated
+wal_max_bytes = 1073741824      # 1 GiB per topic
+
+# ── Metrics ───────────────────────────────────────────────────
+metrics_port = 9090
+
+# ── Security ──────────────────────────────────────────────────
+max_handshakes_per_ip_per_sec = 100
+
+# ── QUIC engine overrides (optional — preset defaults apply) ──
+[quic]
+max_connections = 131072
+initial_max_data = "100MiB"         # human-readable: 100MiB, 1GiB, 256KiB
+idle_timeout = "30s"                 # human-readable: 30s, 5m, 1h
+congestion = "bbr"                   # reno | cubic | bbr | bbr2
+```
+
+A fully commented template is at
+[`quic-server/vireon.conf.example`](vireon.conf.example).
+
+### Human-Readable Values
+
+The `[quic]` section accepts human-readable strings for byte sizes and
+durations:
+
+| Type | Examples |
+|------|----------|
+| Bytes | `"100MiB"`, `"1GiB"`, `"256KiB"`, `1073741824` (raw) |
+| Duration | `"30s"`, `"5m"`, `"1h"`, `"500ms"`, `30` (raw seconds) |
 
 ## Worker Modes
 

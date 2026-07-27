@@ -17,6 +17,7 @@
 
 pub mod acl_loader;
 pub mod cluster;
+pub mod conf;
 pub mod error;
 pub mod layers;
 pub mod log_throttle;
