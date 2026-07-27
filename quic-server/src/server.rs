@@ -83,8 +83,7 @@ impl QuicServer {
         // Single-worker without ghosts: no steering needed (only one socket
         // receives all packets). Single-worker WITH ghosts: attach steering
         // with an offset so packets bypass dead sockets.
-        let total_on_port =
-            kernel_nic::count_udp_sockets_on_port(self.config.port).unwrap_or(1);
+        let total_on_port = kernel_nic::count_udp_sockets_on_port(self.config.port).unwrap_or(1);
         let ghost_offset = total_on_port.saturating_sub(1) as u32;
 
         if ghost_offset > 0 {
@@ -95,8 +94,7 @@ impl QuicServer {
                  attaching offset eBPF steering",
                 self.config.port,
             );
-            match kernel_nic::attach_quic_reuseport_steering(worker.socket_fd(), 1, ghost_offset)
-            {
+            match kernel_nic::attach_quic_reuseport_steering(worker.socket_fd(), 1, ghost_offset) {
                 Ok(()) => {
                     tracing::info!(
                         ghost_offset,
@@ -149,8 +147,10 @@ impl QuicServer {
         let mut handles = Vec::with_capacity(num_workers);
         let mut stop_rx_list = Vec::with_capacity(num_workers);
 
-        for (core_id, ((inbox_rx, outboxes), (ps_inbox, ps_outboxes))) in
-            mesh_channels.into_iter().zip(pubsub_channels.into_iter()).enumerate()
+        for (core_id, ((inbox_rx, outboxes), (ps_inbox, ps_outboxes))) in mesh_channels
+            .into_iter()
+            .zip(pubsub_channels.into_iter())
+            .enumerate()
         {
             let core_id = core_id as u32;
             // Pop the next cluster handle in order (core_id matches).
@@ -202,8 +202,8 @@ impl QuicServer {
         // [ghost_count, ghost_count + num_workers). The eBPF program
         // does `(DCID % num_workers) + ghost_offset` to return indices
         // that fall entirely within the live range.
-        let total_on_port = kernel_nic::count_udp_sockets_on_port(self.config.port)
-            .unwrap_or(socket_fds.len());
+        let total_on_port =
+            kernel_nic::count_udp_sockets_on_port(self.config.port).unwrap_or(socket_fds.len());
         let num_live = socket_fds.len();
         let ghost_offset = total_on_port.saturating_sub(num_live) as u32;
 

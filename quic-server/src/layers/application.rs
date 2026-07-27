@@ -883,7 +883,11 @@ impl VireonDispatcher {
                 // Skip the check for the SDK's heartbeat probe to avoid
                 // penalising liveness traffic against the cap.
                 if let Some(cap) = self.max_subscribers_per_topic {
-                    let current = self.pattern_sub_counts.get(pattern_str).copied().unwrap_or(0);
+                    let current = self
+                        .pattern_sub_counts
+                        .get(pattern_str)
+                        .copied()
+                        .unwrap_or(0);
                     if current >= cap {
                         self.quota_subscriber_rejects =
                             self.quota_subscriber_rejects.wrapping_add(1);
@@ -900,7 +904,12 @@ impl VireonDispatcher {
                         let ack = format!(
                             "{{\"error\":\"quota_exceeded\",\"limit\":\"max_subscribers_per_topic\",\"cap\":{cap},\"pattern\":\"{pattern_str}\"}}"
                         );
-                        self.enqueue_response(ctx, stream, MessageType::Subscribe, Bytes::from(ack));
+                        self.enqueue_response(
+                            ctx,
+                            stream,
+                            MessageType::Subscribe,
+                            Bytes::from(ack),
+                        );
                         return;
                     }
                 }
@@ -919,7 +928,10 @@ impl VireonDispatcher {
                 }
                 // Bump per-pattern subscriber counter for quota accounting.
                 // Only reached on successful registry insertion.
-                *self.pattern_sub_counts.entry(pattern_str.to_string()).or_insert(0) += 1;
+                *self
+                    .pattern_sub_counts
+                    .entry(pattern_str.to_string())
+                    .or_insert(0) += 1;
                 // The SDK's dead-peer probe re-subscribes to
                 // `_heartbeat.probe` every ~1 s per connection. Logging
                 // it at INFO drowns real subscribe events — drop to DEBUG.
@@ -1128,7 +1140,8 @@ impl VireonDispatcher {
         // same wire shape the publisher used (topic_len + topic + payload).
         let topic_str = topic.as_str();
         self.encode_scratch.clear();
-        self.encode_scratch.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
+        self.encode_scratch
+            .extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
         self.encode_scratch.extend_from_slice(topic_str.as_bytes());
         self.encode_scratch.extend_from_slice(&payload_bytes);
         let bytes = self.encode_scratch.split().freeze();
@@ -1221,9 +1234,11 @@ impl VireonDispatcher {
                 if i == self.worker_self_idx {
                     continue;
                 }
-                if let Err(std::sync::mpsc::TrySendError::Full(_)) = outbox.try_send(InterWorkerPublish {
-                    framed: bytes.clone(),
-                }) {
+                if let Err(std::sync::mpsc::TrySendError::Full(_)) =
+                    outbox.try_send(InterWorkerPublish {
+                        framed: bytes.clone(),
+                    })
+                {
                     self.worker_drop_count = self.worker_drop_count.wrapping_add(1);
                     if self.worker_drop_cooldown.tick() {
                         tracing::warn!(
@@ -1290,9 +1305,7 @@ impl VireonDispatcher {
         // the counter). Reject BEFORE catalog insertion so the cap is
         // exact even under bursts.
         if let Some(cap) = self.max_topics {
-            if !self.topic_catalog.get(topic).is_some()
-                && self.topic_catalog.len() >= cap
-            {
+            if !self.topic_catalog.get(topic).is_some() && self.topic_catalog.len() >= cap {
                 self.quota_topic_rejects = self.quota_topic_rejects.wrapping_add(1);
                 tracing::info!(
                     conn_idx = ctx.conn_idx,
@@ -2142,7 +2155,8 @@ impl VireonDispatcher {
         // same wire shape the publisher used (topic_len + topic + payload).
         let topic_str = topic_ref.as_str();
         self.encode_scratch.clear();
-        self.encode_scratch.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
+        self.encode_scratch
+            .extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
         self.encode_scratch.extend_from_slice(topic_str.as_bytes());
         self.encode_scratch.extend_from_slice(payload);
         let bytes = self.encode_scratch.split().freeze();
@@ -2312,9 +2326,9 @@ impl VireonDispatcher {
             return;
         }
         let now = Instant::now();
-        let due = self
-            .wal_retention_last_run
-            .map_or(true, |t| now.duration_since(t) >= WAL_RETENTION_SWEEP_INTERVAL);
+        let due = self.wal_retention_last_run.map_or(true, |t| {
+            now.duration_since(t) >= WAL_RETENTION_SWEEP_INTERVAL
+        });
         if !due {
             return;
         }
@@ -2443,7 +2457,9 @@ impl AppDispatcher for VireonDispatcher {
         session_id: SessionId,
         reason: Option<&str>,
     ) {
-        let removed_patterns = self.pubsub_registry.remove_connection_with_patterns(conn_idx);
+        let removed_patterns = self
+            .pubsub_registry
+            .remove_connection_with_patterns(conn_idx);
         let removed = removed_patterns.len();
         // Decrement per-pattern quota counters to match.
         if !removed_patterns.is_empty() {
@@ -2818,7 +2834,8 @@ impl ApplicationLayer {
         inbox: mpsc::Receiver<InterWorkerPublish>,
         outboxes: Vec<mpsc::SyncSender<InterWorkerPublish>>,
     ) {
-        self.dispatcher.set_worker_channels(self_idx, inbox, outboxes);
+        self.dispatcher
+            .set_worker_channels(self_idx, inbox, outboxes);
     }
 }
 
@@ -3678,7 +3695,10 @@ mod tests {
         d.handle_topic_create(&ctx(0, 100), StreamId::new(1), "topic.a", 1, 0);
         let _ = d.drain_outbox();
         assert_eq!(d.topic_catalog.len(), 2);
-        assert_eq!(d.quota_topic_rejects, 1, "idempotent re-create shouldn't bump rejects");
+        assert_eq!(
+            d.quota_topic_rejects, 1,
+            "idempotent re-create shouldn't bump rejects"
+        );
     }
 
     #[test]
@@ -3754,7 +3774,10 @@ mod tests {
         d.handle_subscribe(&ctx(3, 200), StreamId::new(0), "sensor.*");
         let _ = d.drain_outbox();
         assert_eq!(d.pattern_sub_counts.get("sensor.*").copied(), Some(2));
-        assert_eq!(d.quota_subscriber_rejects, 1, "no new rejection after decrement");
+        assert_eq!(
+            d.quota_subscriber_rejects, 1,
+            "no new rejection after decrement"
+        );
 
         // Connection-close also decrements.
         let removed = d.pubsub_registry.remove_connection_with_patterns(2);
