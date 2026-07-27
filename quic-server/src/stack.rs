@@ -116,6 +116,10 @@ pub struct VireonStack {
     send_scratch: Vec<u8>,
     /// Pre-allocated scratch for eviction metadata (avoids per-pass Vec alloc).
     evict_scratch: Vec<crate::eviction::ConnEvictInfo>,
+    /// Pre-allocated scratch for flush_outbox direct-send path (avoids per-tick Vec alloc).
+    flush_direct: Vec<OutgoingFrame>,
+    /// Pre-allocated scratch for flush_outbox policy-ready path (avoids per-tick Vec alloc).
+    flush_policy: Vec<OutgoingFrame>,
 
     // ── Observability ────────────────────────────────────────────
     /// Tick counter — used to throttle periodic stats logging.
@@ -280,6 +284,8 @@ impl VireonStack {
             reap_buf: Vec::with_capacity(16),
             send_scratch: Vec::with_capacity(4096),
             evict_scratch: Vec::with_capacity(32),
+            flush_direct: Vec::new(),
+            flush_policy: Vec::new(),
             tick_count: 0,
             pressure_throttle: PressureThrottle::new(),
             encode_fail_throttle: crate::log_throttle::RateCounter::new(256),
@@ -358,27 +364,35 @@ impl VireonStack {
     /// deliveries that arrived while this worker had no QUIC traffic).
     fn flush_outbox(&mut self) {
         let outbox = self.application.drain_outbox();
-        let mut direct_send: Vec<OutgoingFrame> = Vec::with_capacity(outbox.len());
+        self.flush_direct.clear();
+        self.flush_direct.reserve(outbox.len());
         for out in outbox {
             match self.application.enqueue_egress(out) {
                 None => {} // consumed by policy
-                Some(out) => direct_send.push(out),
+                Some(out) => self.flush_direct.push(out),
             }
         }
-        for out in direct_send {
-            self.encode_and_send(out.conn_idx, out.quic_stream_id, out.header, &out.payload);
+        // mem::take moves the Vec out so encode_and_send can borrow self.
+        // Capacity is preserved across ticks — no per-tick allocation.
+        let direct = std::mem::take(&mut self.flush_direct);
+        for out in &direct {
+            self.encode_and_send(out.conn_idx, out.quic_stream_id, out.header.clone(), &out.payload);
             if let Some(m) = &self.metrics {
                 m.inc(&m.deliveries_total);
             }
         }
-        let mut policy_ready: Vec<OutgoingFrame> = Vec::new();
-        self.application.drain_ready_egress(&mut policy_ready);
-        for out in policy_ready {
-            self.encode_and_send(out.conn_idx, out.quic_stream_id, out.header, &out.payload);
+        self.flush_direct = direct;
+
+        self.flush_policy.clear();
+        self.application.drain_ready_egress(&mut self.flush_policy);
+        let policy = std::mem::take(&mut self.flush_policy);
+        for out in &policy {
+            self.encode_and_send(out.conn_idx, out.quic_stream_id, out.header.clone(), &out.payload);
             if let Some(m) = &self.metrics {
                 m.inc(&m.deliveries_total);
             }
         }
+        self.flush_policy = policy;
     }
 
     // ── Connection lifecycle ──────────────────────────────────────
