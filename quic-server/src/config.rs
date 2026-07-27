@@ -110,7 +110,12 @@ impl ServerConfig {
 
         let preset = preset_from_arg(&cli.preset);
         let mut quic_config = preset.to_config();
-        quic_config.skip_crc = cli.skip_crc;
+        // `--enforce-crc` wins over the default `--skip-crc=true`. Both
+        // flags can be present without error; the explicit "verify"
+        // semantic takes precedence so operators can flip back without
+        // editing the launch line.
+        quic_config.skip_crc = cli.skip_crc && !cli.enforce_crc;
+        let preset_skip_crc = quic_config.skip_crc;
         quic_config.client_ca = cli.client_ca.clone();
         quic_config.max_handshakes_per_ip_per_sec = cli.max_handshakes_per_ip_per_sec;
 
@@ -167,7 +172,7 @@ impl ServerConfig {
             },
             echo: cli.echo,
             sqpoll: cli.sqpoll,
-            skip_crc: cli.skip_crc,
+            skip_crc: preset_skip_crc,
             acl_rules_path: cli.acl_rules_path.clone(),
             acl_table,
             wal_root: cli.wal_root.as_deref().map(std::path::PathBuf::from),
