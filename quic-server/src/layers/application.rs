@@ -1185,10 +1185,9 @@ impl VireonDispatcher {
         // load-balances across its members. The selected consumer may
         // be on the same connection as the publisher; we still deliver
         // in that case (the consumer is a different logical subscriber).
-        let topic_str_owned = topic_str.to_string();
         let mut group_targets: Vec<(usize, u64)> = Vec::new();
         for ((t, _g), local) in &mut self.group_locals {
-            if t != &topic_str_owned || local.members.is_empty() {
+            if t.as_str() != topic_str || local.members.is_empty() {
                 continue;
             }
             let idx = local.rr_idx % local.members.len();
@@ -2164,10 +2163,9 @@ impl VireonDispatcher {
         }
 
         // Consumer-group fan-out (P5) — mirror handle_publish.
-        let topic_str_owned = topic_str.to_string();
         let mut group_targets: Vec<(usize, u64)> = Vec::new();
         for ((t, _g), local) in &mut self.group_locals {
-            if t != &topic_str_owned || local.members.is_empty() {
+            if t.as_str() != topic_str || local.members.is_empty() {
                 continue;
             }
             let idx = local.rr_idx % local.members.len();
@@ -2276,10 +2274,9 @@ impl VireonDispatcher {
         }
 
         // Consumer-group fan-out (P5) — same logic as `cluster_deliver_local`.
-        let topic_str_owned = topic_str.to_string();
         let mut group_targets: Vec<(usize, u64)> = Vec::new();
         for ((t, _g), local) in &mut self.group_locals {
-            if t != &topic_str_owned || local.members.is_empty() {
+            if t.as_str() != topic_str || local.members.is_empty() {
                 continue;
             }
             let idx = local.rr_idx % local.members.len();
