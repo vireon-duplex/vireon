@@ -24,7 +24,8 @@
 //!
 //! // After all workers have bound their sockets:
 //! # let socket_fd: std::os::fd::RawFd = 3; // any fd in the group
-//! attach_quic_reuseport_steering(socket_fd, 4)
+//! // offset = 0 when no ghost sockets are present
+//! attach_quic_reuseport_steering(socket_fd, 4, 0)
 //!     .expect("eBPF steering program attached");
 //! ```
 
@@ -100,15 +101,24 @@ struct BpfProgLoadAttr {
 /// # Arguments
 ///
 /// * `fd` — Raw fd of any socket in the REUSEPORT group.
-/// * `num_sockets` — Number of sockets in the group. Baked into the BPF
-///   bytecode as the modulus divisor. Must be in `[1, 65535]`.
+/// * `num_sockets` — Number of **live** sockets in the group. Baked into
+///   the BPF bytecode as the modulus divisor. Must be in `[1, 65535]`.
+/// * `offset` — Index of the first live socket in the kernel's socket
+///   array. When ghost sockets from a previous run precede the live
+///   sockets, this shifts the program's output range past them. Use
+///   [`count_udp_sockets_on_port`] to detect ghosts and compute the
+///   offset: `offset = total_on_port - num_live`.
 ///
 /// # Errors
 ///
 /// Returns [`KernelNicError::Ebpf`] if the kernel rejects the program
 /// (with the verifier log in the error message), or
 /// [`KernelNicError::Socket`] if `setsockopt` fails.
-pub fn attach_quic_reuseport_steering(fd: RawFd, num_sockets: u32) -> Result<(), KernelNicError> {
+pub fn attach_quic_reuseport_steering(
+    fd: RawFd,
+    num_sockets: u32,
+    offset: u32,
+) -> Result<(), KernelNicError> {
     if num_sockets == 0 {
         return Err(KernelNicError::InvalidConfig(
             "num_sockets must be > 0".into(),
@@ -121,8 +131,15 @@ pub fn attach_quic_reuseport_steering(fd: RawFd, num_sockets: u32) -> Result<(),
             "num_sockets must be <= 65535 (is {num_sockets})"
         )));
     }
+    // ADD32 imm is i32; offset is non-negative. 65535 + 65535 = 131070
+    // which fits in i32, but cap for sanity.
+    if offset > 65535 {
+        return Err(KernelNicError::InvalidConfig(format!(
+            "offset must be <= 65535 (is {offset})"
+        )));
+    }
 
-    let insns = build_quic_dcid_program(num_sockets);
+    let insns = build_quic_dcid_program(num_sockets, offset);
     let prog_fd = load_sk_reuseport_prog(&insns)?;
 
     // Attach to the REUSEPORT group. The program fd can be closed
@@ -145,17 +162,56 @@ pub fn attach_quic_reuseport_steering(fd: RawFd, num_sockets: u32) -> Result<(),
         return Err(KernelNicError::Socket(std::io::Error::last_os_error()));
     }
 
-    tracing::info!(
-        num_sockets,
-        insns = insns.len(),
-        "eBPF QUIC DCID reuseport steering program loaded and attached"
-    );
+    if offset > 0 {
+        tracing::info!(
+            num_sockets,
+            offset,
+            insns = insns.len(),
+            "eBPF QUIC DCID reuseport steering attached (ghost offset: skipping {offset} ghost socket(s))"
+        );
+    } else {
+        tracing::info!(
+            num_sockets,
+            insns = insns.len(),
+            "eBPF QUIC DCID reuseport steering program loaded and attached"
+        );
+    }
     Ok(())
+}
+
+/// Counts UDP sockets bound to `port` by parsing `/proc/net/udp`.
+///
+/// Returns the total number of sockets on the port, **including ghost
+/// sockets** from dead processes. Used at startup to detect ghost sockets
+/// and compute the eBPF steering offset.
+///
+/// # Errors
+///
+/// Returns `io::Error` if `/proc/net/udp` cannot be read.
+pub fn count_udp_sockets_on_port(port: u16) -> std::io::Result<usize> {
+    let content = std::fs::read_to_string("/proc/net/udp")?;
+    let hex_port = format!("{:04X}", port);
+    let mut count = 0;
+    for line in content.lines().skip(1) {
+        // Format: "  sl  local_address rem_address   st ..."
+        // local_address example: "00000000:AD61" (0.0.0.0:44433)
+        let mut iter = line.split_whitespace();
+        let _sl = iter.next();
+        if let Some(local_addr) = iter.next() {
+            // local_addr format: "HEX_IP:HEX_PORT"
+            if let Some(hex_val) = local_addr.rsplit(':').next() {
+                if hex_val.eq_ignore_ascii_case(&hex_port) {
+                    count += 1;
+                }
+            }
+        }
+    }
+    Ok(count)
 }
 
 // ── BPF program construction ────────────────────────────────────────
 
-/// Builds the 17-instruction `SK_REUSEPORT` eBPF program.
+/// Builds the `SK_REUSEPORT` eBPF program with optional ghost offset.
 ///
 /// The program:
 /// 1. Reads `ctx->data` and `ctx->data_end`.
@@ -164,13 +220,38 @@ pub fn attach_quic_reuseport_steering(fd: RawFd, num_sockets: u32) -> Result<(),
 /// 4. **Short header** (1-RTT / 0-RTT): loads 4 bytes of DCID at offset 1.
 /// 5. **Long header** (Initial / Handshake): loads 4 bytes of DCID at
 ///    offset 6 (after flags[1] + version[4] + dcid_len[1]).
-/// 6. `r0 %= num_sockets` → returns the target socket index.
-/// 7. **Fallback** (packet too short): uses `ctx->hash` (kernel-provided
-///    `skb->hash`) modulo `num_sockets`.
+/// 6. `r0 %= num_sockets` → socket index in `[0, num_sockets-1]`.
+/// 7. If `offset > 0`: `r0 += offset` → shifts range to
+///    `[offset, offset+num_sockets-1]`, bypassing ghost sockets.
+/// 8. **Fallback** (packet too short): uses `ctx->hash` (kernel-provided
+///    `skb->hash`) modulo `num_sockets`, same offset applied.
+///
+/// When `offset == 0` the program is identical to the original
+/// 17-instruction build (no ADD inserted). When `offset > 0`, three
+/// `ADD32` instructions are inserted (one per path), yielding 20
+/// instructions with adjusted jump offsets.
 #[allow(clippy::too_many_lines)]
-fn build_quic_dcid_program(num_sockets: u32) -> Vec<BpfInsn> {
+fn build_quic_dcid_program(num_sockets: u32, offset: u32) -> Vec<BpfInsn> {
     let ns = num_sockets as i32;
-    vec![
+    let off = offset as i32;
+    let has_offset = off != 0;
+
+    // Compute jump offsets. The JGT at insn 4 jumps to the fallback
+    // block; the JEQ at insn 7 jumps to the long-header block. When
+    // offset instructions are inserted, these targets shift.
+    //
+    // Layout (no offset):                    Layout (with offset):
+    //  0-4: prologue + bounds check           0-4: same
+    //  5-7: long-header check                 5-7: same
+    //  8: short LDX   9: MOD   10: EXIT       8: short LDX  9: MOD  10: ADD  11: EXIT
+    // 11: long  LDX  12: MOD  13: EXIT       12: long  LDX 13: MOD  14: ADD  15: EXIT
+    // 14: fb    LDX  15: MOD  16: EXIT       16: fb    LDX 17: MOD  18: ADD  19: EXIT
+    let fallback_insn = if has_offset { 16 } else { 14 };
+    let long_hdr_insn = if has_offset { 12 } else { 11 };
+    let jgt_off = (fallback_insn - 5) as i16; // relative from insn 5
+    let jeq_off = (long_hdr_insn - 8) as i16; // relative from insn 8
+
+    let mut prog = vec![
         // ── Load context pointers ──────────────────────────────────
         // r2 = *(u64*)(r1+0)  → ctx->data
         BpfInsn {
@@ -201,11 +282,11 @@ fn build_quic_dcid_program(num_sockets: u32) -> Vec<BpfInsn> {
             off: 0,
             imm: 10,
         },
-        // if (u64)r4 > (u64)r3 goto fallback (insn 14: +9 from next)
+        // if (u64)r4 > (u64)r3 goto fallback
         BpfInsn {
             code: 0x2d,
             regs: 0x34,
-            off: 9,
+            off: jgt_off,
             imm: 0,
         },
         // ── Check long-header bit ──────────────────────────────────
@@ -223,16 +304,15 @@ fn build_quic_dcid_program(num_sockets: u32) -> Vec<BpfInsn> {
             off: 0,
             imm: 0x80,
         },
-        // if r5 == 0x80 goto long_header (insn 11: +3 from next)
+        // if r5 == 0x80 goto long_header
         BpfInsn {
             code: 0x15,
             regs: 0x05,
-            off: 3,
+            off: jeq_off,
             imm: 0x80,
         },
         // ── Short header path ──────────────────────────────────────
         // DCID starts at byte 1 (quiche uses 8-byte DCIDs).
-        // Load 4 bytes of DCID for hashing.
         // r0 = *(u32*)(r2+1)
         BpfInsn {
             code: 0x61,
@@ -247,61 +327,94 @@ fn build_quic_dcid_program(num_sockets: u32) -> Vec<BpfInsn> {
             off: 0,
             imm: ns,
         },
-        // exit
-        BpfInsn {
-            code: 0x95,
+    ];
+
+    if has_offset {
+        // r0 += offset  (skip ghost sockets)
+        prog.push(BpfInsn {
+            code: 0x07,
             regs: 0x00,
             off: 0,
-            imm: 0,
-        },
-        // ── Long header path ───────────────────────────────────────
-        // Layout: flags[1] + version[4] + dcid_len[1] + dcid[N]
-        // DCID starts at offset 6. Load 4 bytes for hashing.
-        // r0 = *(u32*)(r2+6)
-        BpfInsn {
-            code: 0x61,
-            regs: 0x20,
-            off: 6,
-            imm: 0,
-        },
-        // r0 %= num_sockets
-        BpfInsn {
-            code: 0x94,
+            imm: off,
+        });
+    }
+
+    // exit
+    prog.push(BpfInsn {
+        code: 0x95,
+        regs: 0x00,
+        off: 0,
+        imm: 0,
+    });
+
+    // ── Long header path ───────────────────────────────────────────
+    // Layout: flags[1] + version[4] + dcid_len[1] + dcid[N]
+    // DCID starts at offset 6. Load 4 bytes for hashing.
+    prog.push(BpfInsn {
+        code: 0x61,
+        regs: 0x20,
+        off: 6,
+        imm: 0,
+    });
+    // r0 %= num_sockets
+    prog.push(BpfInsn {
+        code: 0x94,
+        regs: 0x00,
+        off: 0,
+        imm: ns,
+    });
+
+    if has_offset {
+        prog.push(BpfInsn {
+            code: 0x07,
             regs: 0x00,
             off: 0,
-            imm: ns,
-        },
-        // exit
-        BpfInsn {
-            code: 0x95,
+            imm: off,
+        });
+    }
+
+    // exit
+    prog.push(BpfInsn {
+        code: 0x95,
+        regs: 0x00,
+        off: 0,
+        imm: 0,
+    });
+
+    // ── Fallback (packet too short to parse) ───────────────────────
+    // Use the kernel-provided skb hash.
+    prog.push(BpfInsn {
+        code: 0x61,
+        regs: 0x10,
+        off: 16,
+        imm: 0,
+    });
+    // r0 %= num_sockets
+    prog.push(BpfInsn {
+        code: 0x94,
+        regs: 0x00,
+        off: 0,
+        imm: ns,
+    });
+
+    if has_offset {
+        prog.push(BpfInsn {
+            code: 0x07,
             regs: 0x00,
             off: 0,
-            imm: 0,
-        },
-        // ── Fallback (packet too short to parse) ───────────────────
-        // Use the kernel-provided skb hash.
-        // r0 = *(u32*)(r1+16)  → ctx->hash
-        BpfInsn {
-            code: 0x61,
-            regs: 0x10,
-            off: 16,
-            imm: 0,
-        },
-        // r0 %= num_sockets
-        BpfInsn {
-            code: 0x94,
-            regs: 0x00,
-            off: 0,
-            imm: ns,
-        },
-        // exit
-        BpfInsn {
-            code: 0x95,
-            regs: 0x00,
-            off: 0,
-            imm: 0,
-        },
-    ]
+            imm: off,
+        });
+    }
+
+    // exit
+    prog.push(BpfInsn {
+        code: 0x95,
+        regs: 0x00,
+        off: 0,
+        imm: 0,
+    });
+
+    prog
 }
 
 // ── BPF program loader ──────────────────────────────────────────────
@@ -362,14 +475,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn program_has_17_instructions() {
-        let prog = build_quic_dcid_program(4);
+    fn program_has_17_instructions_no_offset() {
+        let prog = build_quic_dcid_program(4, 0);
         assert_eq!(prog.len(), 17);
     }
 
     #[test]
+    fn program_has_20_instructions_with_offset() {
+        let prog = build_quic_dcid_program(4, 2);
+        assert_eq!(prog.len(), 20);
+    }
+
+    #[test]
     fn num_sockets_baked_into_mod_instructions() {
-        let prog = build_quic_dcid_program(8);
+        let prog = build_quic_dcid_program(8, 0);
         // MOD32 at insns 9, 12, 15
         assert_eq!(prog[9].imm, 8);
         assert_eq!(prog[12].imm, 8);
@@ -381,8 +500,21 @@ mod tests {
     }
 
     #[test]
-    fn jump_offsets_correct() {
-        let prog = build_quic_dcid_program(2);
+    fn offset_baked_into_add_instructions() {
+        let prog = build_quic_dcid_program(8, 3);
+        // With offset, ADD32 at insns 10, 14, 18
+        assert_eq!(prog[10].imm, 3);
+        assert_eq!(prog[14].imm, 3);
+        assert_eq!(prog[18].imm, 3);
+        // Verify opcode is ADD32 (BPF_ALU | BPF_ADD | BPF_K = 0x07)
+        assert_eq!(prog[10].code, 0x07);
+        assert_eq!(prog[14].code, 0x07);
+        assert_eq!(prog[18].code, 0x07);
+    }
+
+    #[test]
+    fn jump_offsets_correct_no_offset() {
+        let prog = build_quic_dcid_program(2, 0);
         // insn 4: JGT → fallback at insn 14. off = 14 - 5 = 9.
         assert_eq!(prog[4].off, 9);
         // insn 7: JEQ → long header at insn 11. off = 11 - 8 = 3.
@@ -390,8 +522,17 @@ mod tests {
     }
 
     #[test]
+    fn jump_offsets_correct_with_offset() {
+        let prog = build_quic_dcid_program(2, 1);
+        // insn 4: JGT → fallback at insn 16. off = 16 - 5 = 11.
+        assert_eq!(prog[4].off, 11);
+        // insn 7: JEQ → long header at insn 12. off = 12 - 8 = 4.
+        assert_eq!(prog[7].off, 4);
+    }
+
+    #[test]
     fn first_and_last_instructions() {
-        let prog = build_quic_dcid_program(1);
+        let prog = build_quic_dcid_program(1, 0);
         // insn 0: LDX DW (0x79)
         assert_eq!(prog[0].code, 0x79);
         // insn 16: EXIT (0x95)
@@ -400,7 +541,7 @@ mod tests {
 
     #[test]
     fn rejects_zero_sockets() {
-        let result = attach_quic_reuseport_steering(0, 0);
+        let result = attach_quic_reuseport_steering(0, 0, 0);
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -410,7 +551,17 @@ mod tests {
 
     #[test]
     fn rejects_too_many_sockets() {
-        let result = attach_quic_reuseport_steering(0, 70000);
+        let result = attach_quic_reuseport_steering(0, 70000, 0);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            KernelNicError::InvalidConfig(_)
+        ));
+    }
+
+    #[test]
+    fn rejects_too_large_offset() {
+        let result = attach_quic_reuseport_steering(0, 4, 70000);
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -433,7 +584,7 @@ mod tests {
     /// Skipped on permission denied (e.g. running as non-root in CI).
     #[test]
     fn kernel_loads_reuseport_program() {
-        let insns = build_quic_dcid_program(2);
+        let insns = build_quic_dcid_program(2, 0);
         match load_sk_reuseport_prog(&insns) {
             Ok(fd) => {
                 assert!(fd >= 0);
@@ -445,6 +596,32 @@ mod tests {
                 verifier_log,
             }) => {
                 // EACCES / EPERM means we're not running as root — skip.
+                if source.raw_os_error() == Some(libc::EACCES)
+                    || source.raw_os_error() == Some(libc::EPERM)
+                {
+                    eprintln!("skipped (no CAP_SYS_ADMIN): {stage}");
+                    return;
+                }
+                panic!("BPF_PROG_LOAD failed: {stage}: {source}\n{verifier_log}");
+            }
+            Err(e) => panic!("unexpected error: {e:?}"),
+        }
+    }
+
+    /// Verifies the offset variant also loads.
+    #[test]
+    fn kernel_loads_offset_reuseport_program() {
+        let insns = build_quic_dcid_program(2, 1);
+        match load_sk_reuseport_prog(&insns) {
+            Ok(fd) => {
+                assert!(fd >= 0);
+                unsafe { libc::close(fd) };
+            }
+            Err(KernelNicError::Ebpf {
+                stage,
+                source,
+                verifier_log,
+            }) => {
                 if source.raw_os_error() == Some(libc::EACCES)
                     || source.raw_os_error() == Some(libc::EPERM)
                 {
