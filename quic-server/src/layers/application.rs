@@ -64,6 +64,7 @@ use resource_quotas::{QuotaLimit, TenantId, TenantTier};
 use super::message::FrameAction;
 use super::session::SessionLayer;
 use crate::cluster::OutgoingMsg;
+use crate::conf::LayerTuning;
 use crate::error::ServerError;
 use bytes::{Bytes, BytesMut};
 
@@ -303,8 +304,10 @@ pub struct VireonDispatcher {
     /// than [`WAL_RETENTION_SWEEP_INTERVAL`].
     wal_retention: wal_store::RetentionPolicy,
     /// Last time the retention sweep ran ( Instant::now()-based,
-    /// throttled to once per ~60 s to amortise directory walks).
+    /// throttled by `wal_sweep_interval` to amortise directory walks).
     wal_retention_last_run: Option<std::time::Instant>,
+    /// Interval between WAL retention sweeps. Default 60 s.
+    wal_sweep_interval: Duration,
 
     // ── Resource quotas ─────────────────────────────────────────
     /// Cap on total topics tracked by `topic_catalog`. `None` = unlimited.
@@ -400,6 +403,7 @@ impl VireonDispatcher {
             fetch_reply_ignore_drop: crate::log_throttle::RateCounter::new(128),
             wal_retention: wal_store::RetentionPolicy::keep_forever(),
             wal_retention_last_run: None,
+            wal_sweep_interval: Duration::from_secs(60),
             max_topics: None,
             max_subscribers_per_topic: None,
             pattern_sub_counts: FxHashMap::default(),
@@ -407,6 +411,13 @@ impl VireonDispatcher {
             quota_subscriber_rejects: 0,
             encode_scratch: BytesMut::new(),
         }
+    }
+
+    /// Sets the WAL retention sweep interval.
+    #[must_use]
+    pub fn with_wal_sweep_interval(mut self, interval: Duration) -> Self {
+        self.wal_sweep_interval = interval;
+        self
     }
 
     /// Builds a response header with an incrementing per-stream seq and
@@ -2327,7 +2338,7 @@ impl VireonDispatcher {
         }
         let now = Instant::now();
         let due = self.wal_retention_last_run.map_or(true, |t| {
-            now.duration_since(t) >= WAL_RETENTION_SWEEP_INTERVAL
+            now.duration_since(t) >= self.wal_sweep_interval
         });
         if !due {
             return;
@@ -2572,7 +2583,7 @@ impl ApplicationLayer {
     /// Pre-registers hot-path metric keys and the default tenant into
     /// the platform services so that the data path can use them without
     /// per-frame allocation.
-    pub fn new() -> Result<Self, ServerError> {
+    pub fn new(t: &LayerTuning) -> Result<Self, ServerError> {
         let mut platform = PlatformServices::new()?;
 
         // Pre-register hot-path metrics (Counters).
@@ -2596,9 +2607,10 @@ impl ApplicationLayer {
             .register_tenant(default_tenant, TenantTier::Internal);
 
         Ok(Self {
-            session: SessionLayer::new()?,
+            session: SessionLayer::new(t)?,
             platform,
-            dispatcher: VireonDispatcher::new(),
+            dispatcher: VireonDispatcher::new()
+                .with_wal_sweep_interval(t.wal_sweep_interval),
             metric_frames_rx,
             metric_connections,
             default_tenant,

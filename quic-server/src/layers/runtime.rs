@@ -26,6 +26,7 @@ use send_queue::{SendQueue, SendQueueBuilder};
 use task_queue::{TaskContext, TaskQueue, TaskQueueBuilder};
 use vireon_reactor::{Reactor as RuntimeReactor, ReactorBuilder};
 
+use crate::conf::LayerTuning;
 use crate::error::ServerError;
 
 /// Idle timeout — connections with no traffic for this duration are closed.
@@ -66,36 +67,63 @@ impl RuntimeLayer {
     ///
     /// Returns [`ServerError`] if ConnectionShard or TimerWheel
     /// cannot be constructed.
-    pub fn new(reactor_id: u32) -> Result<Self, ServerError> {
+    pub fn new(reactor_id: u32, t: &LayerTuning) -> Result<Self, ServerError> {
         let shard = ConnectionShardBuilder::new()
             .reactor_id(reactor_id)
+            .capacity(t.connection_capacity)
+            .soft_bp_pct(t.soft_bp_pct)
+            .hard_bp_pct(t.hard_bp_pct)
             .build()
             .map_err(|e| ServerError::EngineInit(format!("connection-shard: {e:?}")))?;
 
         let timer = TimerWheelBuilder::new()
             .shards(1)
+            .tick_duration(t.timer_tick_ns)
+            .capacity_per_shard(t.timer_capacity_per_shard)
             .cpu_pin(reactor_id)
             .spawn()
             .map_err(|e| ServerError::EngineInit(format!("timer-wheel: {e:?}")))?;
 
+        // Watermarks are percentages (0–100); convert to absolute queue
+        // depths so the builder gets concrete slot counts.
+        let sq_cap = t.send_queue_capacity;
+        let high_wm = sq_cap * t.send_high_watermark_pct as usize / 100;
+        let low_wm = sq_cap * t.send_low_watermark_pct as usize / 100;
+
         let send_queue = SendQueueBuilder::new()
-            .capacity(4096)
+            .capacity(sq_cap)
+            .batch_max_packets(t.send_batch_max_packets)
+            .batch_max_bytes(t.send_batch_max_bytes)
+            .batch_max_age_ns(t.send_batch_max_age_ns)
+            .high_watermark(high_wm)
+            .low_watermark(low_wm)
             .build()
             .map_err(|e| ServerError::EngineInit(format!("send-queue: {e:?}")))?;
 
         let task_queue = TaskQueueBuilder::new()
-            .capacity(1024)
+            .capacity(t.task_queue_capacity)
+            .batch_max_tasks(t.task_batch_max_tasks)
+            .batch_max_time_ns(t.task_batch_max_time_ns)
+            .shutdown_grace_ns(t.task_shutdown_grace_ns)
+            .reactor_id(reactor_id)
             .build()
             .map_err(|e| ServerError::EngineInit(format!("task-queue: {e:?}")))?;
 
         let cqe_processor = CqeProcessorBuilder::new()
-            .batch_max_cqes(256)
+            .batch_max_cqes(t.cqe_batch_max)
             .reactor_id(reactor_id)
             .build()
             .map_err(|e| ServerError::EngineInit(format!("cqe-processor: {e:?}")))?;
 
+        let budget = vireon_reactor::budget::BudgetConfig {
+            max_cqes: t.reactor_max_cqes as u32,
+            max_tasks: t.reactor_max_tasks as u32,
+            max_send_flush: t.reactor_max_send_flush as u32,
+            deadline_ns: t.reactor_tick_deadline_ns,
+        };
         let reactor_facade = ReactorBuilder::new()
             .cpu_id(reactor_id)
+            .budget(budget)
             .build()
             .map_err(|e| ServerError::EngineInit(format!("runtime-reactor: {e:?}")))?;
 
