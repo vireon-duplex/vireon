@@ -79,6 +79,41 @@ impl QuicServer {
         install_signal_handler(shutdown_requested)?;
         install_crash_handlers();
 
+        // Detect ghost sockets and attach eBPF steering if any are present.
+        // Single-worker without ghosts: no steering needed (only one socket
+        // receives all packets). Single-worker WITH ghosts: attach steering
+        // with an offset so packets bypass dead sockets.
+        let total_on_port =
+            kernel_nic::count_udp_sockets_on_port(self.config.port).unwrap_or(1);
+        let ghost_offset = total_on_port.saturating_sub(1) as u32;
+
+        if ghost_offset > 0 {
+            tracing::warn!(
+                total_sockets = total_on_port,
+                ghost_offset,
+                "detected {ghost_offset} ghost UDP socket(s) on port {} — \
+                 attaching offset eBPF steering",
+                self.config.port,
+            );
+            match kernel_nic::attach_quic_reuseport_steering(worker.socket_fd(), 1, ghost_offset)
+            {
+                Ok(()) => {
+                    tracing::info!(
+                        ghost_offset,
+                        "eBPF steering attached for single worker (ghost bypass)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "eBPF REUSEPORT steering unavailable — ghost sockets may cause \
+                         packet loss. To enable: sudo setcap cap_bpf,cap_net_admin+ep \
+                         ./target/x86_64-unknown-linux-gnu/release/quic-server"
+                    );
+                }
+            }
+        }
+
         tracing::info!("starting single-worker server (core 0)");
         worker.run()
     }
@@ -158,14 +193,45 @@ impl QuicServer {
         );
 
         // Attach eBPF QUIC DCID steering program to the REUSEPORT group.
-        // Only meaningful with >1 worker (single worker trivially receives
-        // all packets). Must run AFTER all sockets are bound.
-        if socket_fds.len() > 1 {
-            match kernel_nic::attach_quic_reuseport_steering(socket_fds[0], socket_fds.len() as u32)
-            {
+        // Detects ghost sockets from previous (pre-fix) runs and applies
+        // a steering offset so packets bypass dead sockets.
+        //
+        // The kernel's REUSEPORT socket array is ordered by bind time:
+        // ghost sockets (bound first, never closed) occupy indices
+        // [0, ghost_count), and live worker sockets occupy
+        // [ghost_count, ghost_count + num_workers). The eBPF program
+        // does `(DCID % num_workers) + ghost_offset` to return indices
+        // that fall entirely within the live range.
+        let total_on_port = kernel_nic::count_udp_sockets_on_port(self.config.port)
+            .unwrap_or(socket_fds.len());
+        let num_live = socket_fds.len();
+        let ghost_offset = total_on_port.saturating_sub(num_live) as u32;
+
+        if ghost_offset > 0 {
+            tracing::warn!(
+                total_sockets = total_on_port,
+                live_workers = num_live,
+                ghost_offset,
+                "detected {ghost_offset} ghost UDP socket(s) on port {} — \
+                 using offset eBPF steering to bypass them. \
+                 These are permanent on kernel 6.8.0-134 (reboot to clear).",
+                self.config.port,
+            );
+        }
+
+        // Attach when multi-worker OR when ghost sockets are detected
+        // (single-worker with ghosts needs steering to avoid routing
+        // packets to dead sockets).
+        if num_live > 1 || ghost_offset > 0 {
+            match kernel_nic::attach_quic_reuseport_steering(
+                socket_fds[0],
+                num_live as u32,
+                ghost_offset,
+            ) {
                 Ok(()) => {
                     tracing::info!(
-                        workers = socket_fds.len(),
+                        workers = num_live,
+                        ghost_offset,
                         "eBPF QUIC DCID reuseport steering attached"
                     );
                 }

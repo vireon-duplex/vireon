@@ -88,23 +88,28 @@ impl SocketRegistry {
 
     /// Close every registered fd, then empty all slots.
     ///
-    /// Idempotent: re-running finds every slot at `EMPTY` and does nothing.
-    /// Safe to call from a signal handler or panic hook.
+    /// For each fd, calls `shutdown(fd, SHUT_RDWR)` before `close(fd)`.
+    /// The `shutdown` call is critical for sockets with pending io_uring
+    /// multishot RECV operations: it forces the kernel to terminate those
+    /// operations and release the socket inode reference immediately.
+    /// Without `shutdown`, the kernel defers io_uring cleanup for ~60s
+    /// after `close`, leaving ghost UDP sockets that block the port.
     ///
-    /// # Safety
-    /// The function itself is safe to call. Internally it invokes
-    /// `libc::close`, which is async-signal-safe per POSIX. A slot may
-    /// already hold a fd that another thread's `Drop` has just closed —
-    /// `close` returns `EBADF` in that case and we ignore it.
+    /// For non-socket fds (e.g. io_uring ring fds), `shutdown` returns
+    /// `ENOTSOCK` which is ignored — `close` then proceeds normally.
+    ///
+    /// Both `shutdown(2)` and `close(2)` are async-signal-safe per POSIX.
+    /// Idempotent: re-running finds every slot at `EMPTY` and does nothing.
     pub fn close_all(&self) {
         for slot in &self.entries {
             // Acquire the fd exclusively; concurrent close_all calls
             // observe EMPTY and skip.
             let fd = slot.swap(EMPTY, Ordering::AcqRel);
             if fd >= 0 {
-                // SAFETY: `close(2)` is async-signal-safe. EBADF on a
-                // double-close is harmless.
+                // SAFETY: `shutdown(2)` and `close(2)` are async-signal-safe.
+                // EBADF/ENOTSOCK on invalid/non-socket fds is harmless.
                 unsafe {
+                    libc::shutdown(fd as RawFd, libc::SHUT_RDWR);
                     libc::close(fd as RawFd);
                 }
             }

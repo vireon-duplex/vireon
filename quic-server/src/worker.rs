@@ -160,6 +160,12 @@ impl Worker {
         self.core_id
     }
 
+    /// Returns the reactor's UDP socket fd (for eBPF REUSEPORT steering).
+    #[must_use]
+    pub fn socket_fd(&self) -> RawFd {
+        self.reactor.socket().raw_fd()
+    }
+
     /// Spawns a worker on a dedicated thread pinned to `core_id`.
     ///
     /// Returns the `JoinHandle` plus a receiver that yields a tuple of
@@ -211,11 +217,18 @@ impl Worker {
                 // Send stop handle + socket fd back before entering run loop.
                 let fd = worker.reactor.socket().raw_fd();
                 let _ = tx.send((worker.stop_handle(), fd));
-                // Register the fd so the signal handler / panic hook can
-                // force-close it on a crash exit. Without this, a panic or
-                // second-SIGINT process::exit would leak the SO_REUSEPORT
-                // socket on its bound port.
+                // Register the io_uring ring fd FIRST (lower slot index) so
+                // close_all() closes it before the socket fd. Closing the ring
+                // triggers kernel cancellation of pending multishot RECV,
+                // releasing the socket inode reference. Without this, closing
+                // only the socket fd leaves a ghost UDP socket on the port.
+                crate::socket_registry::REGISTRY.register(worker.reactor.ring_fd());
+                // Register the socket fd so the signal handler / panic hook
+                // can force-close it on a crash exit.
                 crate::socket_registry::REGISTRY.register(fd);
+                // NOTE: ring pointer registration for crash-handler
+                // AsyncCancel2 happens inside run_with_handler, where the
+                // Reactor is at its final stack address.
                 worker.run()
             })
             .map_err(|e| ServerError::ThreadSpawn(format!("{e}")))?;
@@ -284,10 +297,8 @@ pub fn install_signal_handler(shutdown_requested: Arc<AtomicBool>) -> Result<(),
             {
                 crate::profiler_force_dump();
             }
-            // Force-close every registered socket fd before exit. Without
-            // this, `process::exit` skips Drop and the kernel keeps the
-            // SO_REUSEPORT sockets bound — leaking the port for the next
-            // process that tries to bind it.
+            // Cancel io_uring multishot RECV ops, then shutdown+close fds.
+            io::cancel_all_rings();
             crate::socket_registry::REGISTRY.close_all();
             std::process::exit(130);
         }
@@ -318,6 +329,12 @@ pub fn install_crash_handlers() {
     /// Signal-handler body. Must be async-signal-safe.
     extern "C" fn crash_handler(signum: libc::c_int) {
         unsafe {
+            // Cancel io_uring multishot operations on all registered rings.
+            // For the current thread's ring, this is race-free (the signal
+            // interrupted the event loop). For other threads' rings, the
+            // submit may fail due to concurrent SQ access — close_all's
+            // shutdown() provides the fallback for those.
+            io::cancel_all_rings();
             crate::socket_registry::REGISTRY.close_all();
             // Restore default disposition so re-raise produces the normal
             // core-dump / termination behavior. SA_RESETHAND already did
@@ -342,16 +359,7 @@ pub fn install_crash_handlers() {
     for &sig in &crash_signals {
         unsafe {
             let mut act: libc::sigaction = std::mem::zeroed();
-            // Point both `sa_handler` and `sa_sigaction` (union members in
-            // libc) at our handler. The libc crate exposes `sa_sigaction`
-            // as a `usize`, so cast the function pointer.
             act.sa_sigaction = crash_handler as usize;
-            // SA_RESETHAND — one-shot: kernel resets to SIG_DFL when the
-            //   handler is entered, so a fault during cleanup terminates
-            //   instead of recursing.
-            // SA_NODEFER   — don't add `sig` to the mask during handler
-            //   execution, so `raise(sig)` inside the handler is delivered
-            //   immediately.
             act.sa_flags = libc::SA_RESETHAND | libc::SA_NODEFER;
             libc::sigaction(sig, &act, std::ptr::null_mut());
         }

@@ -44,6 +44,8 @@ fn main() -> Result<(), ServerError> {
     // panicked.
     std::panic::set_hook(Box::new(|info| {
         eprintln!("[panic] {info}");
+        // Cancel io_uring multishot RECV ops, then shutdown+close fds.
+        io::cancel_all_rings();
         crate::socket_registry::REGISTRY.close_all();
         eprintln!("note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace");
     }));
