@@ -1,6 +1,7 @@
 //! Server configuration — resolves CLI args into typed configuration.
 
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use quic_engine::{QuicConfig, QuicPreset};
@@ -59,6 +60,16 @@ pub struct ServerConfig {
     /// every accepted publish before fan-out. `None` disables WAL.
     #[allow(dead_code)]
     pub wal_root: Option<std::path::PathBuf>,
+    /// WAL retention policy applied per-topic by the periodic sweeper
+    /// (runs once per 60 s per worker). Both fields `None` = keep
+    /// forever (default). Configured via `--wal-retention-secs` and
+    /// `--wal-max-bytes`.
+    pub wal_retention: Option<wal_store::RetentionPolicy>,
+    /// Cap on total topics in the catalog. `None` = unlimited.
+    pub max_topics: Option<usize>,
+    /// Cap on subscribers per distinct subscription pattern.
+    /// `None` = unlimited.
+    pub max_subscribers_per_topic: Option<usize>,
 
     /// Optional cluster transport config (P6). When set, the server
     /// joins a multi-node cluster and routes publishes via UDP-based
@@ -66,10 +77,24 @@ pub struct ServerConfig {
     /// owned locally).
     #[allow(dead_code)]
     pub cluster: Option<crate::cluster::ClusterTransportConfig>,
+
+    /// Optional Prometheus `/metrics` endpoint port. When `Some`, the
+    /// server starts an HTTP listener on this port.
+    pub metrics_port: Option<u16>,
+    /// Shared thread-safe metrics store, cloned per worker. `None` when
+    /// metrics are disabled; `Some(Arc<...>)` when the endpoint is
+    /// active.
+    pub metrics: Option<Arc<crate::metrics::ServerMetrics>>,
 }
 
 /// Default queue depth if the CLI passes 0.
-const DEFAULT_QUEUE_DEPTH: u32 = 256;
+///
+/// Matches `io::QUEUE_DEPTH` (1024) — generous enough for the 1 M-connection
+/// per-core target once provided-buffer rings absorb per-recv buffering.
+/// The previous value (256) bottlenecked recv batching under bursty loads
+/// (e.g. 100-connection handshake storms) because the SQ filled before the
+/// kernel could drain provided-buffer completions.
+const DEFAULT_QUEUE_DEPTH: u32 = 1024;
 
 impl ServerConfig {
     /// Parse CLI args into a resolved configuration.
@@ -85,7 +110,14 @@ impl ServerConfig {
 
         let preset = preset_from_arg(&cli.preset);
         let mut quic_config = preset.to_config();
-        quic_config.skip_crc = cli.skip_crc;
+        // `--enforce-crc` wins over the default `--skip-crc=true`. Both
+        // flags can be present without error; the explicit "verify"
+        // semantic takes precedence so operators can flip back without
+        // editing the launch line.
+        quic_config.skip_crc = cli.skip_crc && !cli.enforce_crc;
+        let preset_skip_crc = quic_config.skip_crc;
+        quic_config.client_ca = cli.client_ca.clone();
+        quic_config.max_handshakes_per_ip_per_sec = cli.max_handshakes_per_ip_per_sec;
 
         let workers = resolve_workers(cli.workers, &cli.mode);
 
@@ -140,11 +172,19 @@ impl ServerConfig {
             },
             echo: cli.echo,
             sqpoll: cli.sqpoll,
-            skip_crc: cli.skip_crc,
+            skip_crc: preset_skip_crc,
             acl_rules_path: cli.acl_rules_path.clone(),
             acl_table,
             wal_root: cli.wal_root.as_deref().map(std::path::PathBuf::from),
+            wal_retention: build_wal_retention(cli.wal_retention_secs, cli.wal_max_bytes),
+            max_topics: (cli.max_topics > 0).then_some(cli.max_topics),
+            max_subscribers_per_topic: (cli.max_subscribers_per_topic > 0)
+                .then_some(cli.max_subscribers_per_topic),
             cluster,
+            metrics_port: cli.metrics_port,
+            metrics: cli
+                .metrics_port
+                .map(|_| Arc::new(crate::metrics::ServerMetrics::new())),
         })
     }
 
@@ -186,6 +226,23 @@ fn resolve_workers(requested: usize, mode: &WorkerModeArg) -> usize {
             }
         }
     }
+}
+
+/// Build the WAL [`wal_store::RetentionPolicy`] from CLI flags.
+///
+/// Both `0` = "no limit on that dimension". When both are zero the
+/// result is `None` (keep-forever, also the default when WAL is
+/// disabled).
+fn build_wal_retention(retention_secs: u64, max_bytes: u64) -> Option<wal_store::RetentionPolicy> {
+    let max_age_ns = (retention_secs > 0).then(|| retention_secs.saturating_mul(1_000_000_000));
+    let max_bytes = (max_bytes > 0).then_some(max_bytes);
+    if max_age_ns.is_none() && max_bytes.is_none() {
+        return None;
+    }
+    Some(wal_store::RetentionPolicy {
+        max_bytes,
+        max_age_ns,
+    })
 }
 
 /// Detects the number of logical CPUs via `kernel-nic::CpuTopology`.

@@ -34,7 +34,7 @@
 //! | [`Error`](Completion::Error) | record and continue |
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use io_uring::cqueue;
@@ -61,9 +61,102 @@ const ENOBUFS: i32 = -libc::ENOBUFS;
 const TICK_TIMER_ID: u64 = 0;
 
 /// Periodic tick interval — wakes `submit_and_wait(1)` at this rate.
-/// 10 ms balances responsiveness (sub-ms not needed for QUIC idle
-/// checks) with CPU overhead (100 wakeups/s).
-const TICK_INTERVAL: Duration = Duration::from_millis(10);
+///
+/// 1 ms balances responsiveness (needed for cross-worker pub/sub
+/// delivery on workers with no inbound QUIC traffic) with CPU
+/// overhead (1000 wakeups/s when idle — negligible vs the busy-poll
+/// budget already spent in the kernel for BareMetal/HundredGbe).
+const TICK_INTERVAL: Duration = Duration::from_millis(1);
+
+// ── Crash-handler ring registry ───────────────────────────────────
+//
+// When the process crashes (SIGSEGV, SIGABRT), Reactor::drop does not
+// run, so the AsyncCancel2 that normally cancels the multishot RECV is
+// never submitted. The kernel holds the socket inode reference via the
+// pending multishot RECV, leaving a ghost UDP socket that blocks the
+// port for subsequent server restarts.
+//
+// This static array stores raw pointers to each Reactor's IoUringCtx.
+// The crash handler calls [`cancel_all_rings`] which writes an
+// AsyncCancel2 SQE to each ring and calls `submit_and_wait(1)`,
+// replicating what Reactor::drop does — but from a signal handler.
+
+const MAX_RINGS: usize = 128;
+static RING_PTRS: [AtomicUsize; MAX_RINGS] = [const { AtomicUsize::new(0) }; MAX_RINGS];
+
+/// Register this reactor's IoUringCtx for crash-handler cleanup.
+///
+/// Stores a raw pointer to `self.ctx.ring`. Valid as long as `self`
+/// is alive. Unregistered in `Drop`.
+fn register_ring(ring: &io_uring::IoUring) {
+    let ptr = ring as *const _ as usize;
+    for slot in &RING_PTRS {
+        if slot
+            .compare_exchange(0, ptr, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
+/// Remove this reactor's ring from the crash-handler registry.
+fn unregister_ring(ring: &io_uring::IoUring) {
+    let ptr = ring as *const _ as usize;
+    for slot in &RING_PTRS {
+        if slot.load(Ordering::Acquire) == ptr {
+            slot.store(0, Ordering::Release);
+            return;
+        }
+    }
+}
+
+/// Cancel all pending io_uring multishot operations across all reactors.
+///
+/// Called from signal handlers / panic hooks **before** closing fds.
+/// Writes an `AsyncCancel2(CancelBuilder::any())` SQE to each
+/// registered ring and calls `submit_and_wait(1)` so the kernel
+/// synchronously cancels pending multishot RECV and releases socket
+/// inode references.
+///
+/// # Safety (caller)
+///
+/// This function is designed for crash-handler use. It casts stored
+/// raw pointers to `&mut IoUring` without runtime validation. If a
+/// Reactor was already dropped without unregistering, the pointer is
+/// dangling and behaviour is undefined. The `Drop` impl unregisters
+/// to prevent this.
+pub fn cancel_all_rings() {
+    use io_uring::opcode::AsyncCancel2;
+    use io_uring::types::CancelBuilder;
+
+    for slot in &RING_PTRS {
+        let ptr_val = slot.load(Ordering::Acquire);
+        if ptr_val == 0 {
+            continue;
+        }
+        // SAFETY: the pointer was stored by `register_ring` from a
+        // live Reactor. We're in a crash handler, so the Reactor is
+        // still alive (the process hasn't exited yet). Casting to
+        // `&mut` is UB in general but acceptable here — the process
+        // is about to die.
+        let ring: &mut io_uring::IoUring = unsafe { &mut *(ptr_val as *mut _) };
+
+        let cancel_entry = AsyncCancel2::new(CancelBuilder::any()).build().user_data(0);
+        // Drain existing CQEs BEFORE calling submit_and_wait. Without
+        // this, submit_and_wait(1) may see pending CQEs from the multishot
+        // RECV and return immediately — before the kernel processes
+        // the AsyncCancel2 SQE. The socket inode reference stays alive.
+        loop {
+            let mut cq = ring.completion();
+            if cq.next().is_none() {
+                break;
+            }
+        }
+        let _ = crate::ops::push_entry(ring, cancel_entry);
+        let _ = ring.submit_and_wait(1);
+    }
+}
 
 /// Thread-per-core reactor.
 pub struct Reactor {
@@ -277,6 +370,20 @@ impl Reactor {
         &self.socket
     }
 
+    /// Returns the raw fd of the io_uring ring.
+    ///
+    /// Needed by the crash-exit socket registry: when a signal handler
+    /// force-closes fds, the ring fd must be closed so the kernel cancels
+    /// pending multishot RECV operations and releases the socket inode
+    /// reference. Without this, closing only the socket fd leaves a ghost
+    /// UDP socket on the port.
+    #[inline]
+    #[must_use]
+    pub fn ring_fd(&self) -> std::os::fd::RawFd {
+        use std::os::unix::io::AsRawFd;
+        self.ctx.ring().as_raw_fd()
+    }
+
     /// Immutable access to the receiver.
     #[inline]
     #[must_use]
@@ -340,6 +447,22 @@ impl Reactor {
     /// peer addresses; outgoing sends happen in `on_tick` via
     /// [`TickContext`].
     pub fn run_with_handler<H: IoHandler>(&mut self, handler: &mut H) -> Result<(), IoError> {
+        // Register the ring for crash-handler cleanup NOW — at this point
+        // the Reactor has been moved to its final stack address (inside
+        // Worker::run → self.reactor.run_with_handler). The stored raw
+        // pointer remains valid until Drop runs, which unregisters it.
+        register_ring(self.ctx.ring());
+
+        // The periodic wakeup timer (TICK_TIMER_ID, armed in init) ensures
+        // submit_and_wait(1) returns at least every TICK_INTERVAL (1ms)
+        // even when no packets arrive. This makes SIGINT/SIGTERM responsive:
+        // ctrlc's background thread sets the stop flag, and the next tick
+        // CQE unblocks the loop to check it.
+        //
+        // The multishot Timespec lives in TimerWheel::active and is NOT
+        // dropped on each fire — the reactor checks `more` (CQE_F_MORE)
+        // and only retires when the multishot terminates.
+
         while !self.stop.load(Ordering::Relaxed) {
             match self.ctx.ring_mut().submit_and_wait(1) {
                 Ok(_) => {}
@@ -423,8 +546,12 @@ impl Reactor {
                 }
 
                 // ── Timeout fired (naturally or cancelled) ──
-                Completion::Timeout { id } => {
-                    self.timers.retire(encode(OpKind::Timeout, id));
+                // For multishot timers (more=true), do NOT retire — the
+                // kernel still references the Timespec for subsequent fires.
+                Completion::Timeout { id, more } => {
+                    if !more {
+                        self.timers.retire(encode(OpKind::Timeout, id));
+                    }
                 }
 
                 // ── Cancel result: informational ──
@@ -501,8 +628,10 @@ impl Reactor {
 
                 Completion::Send { .. } => {}
 
-                Completion::Timeout { id } => {
-                    self.timers.retire(encode(OpKind::Timeout, id));
+                Completion::Timeout { id, more } => {
+                    if !more {
+                        self.timers.retire(encode(OpKind::Timeout, id));
+                    }
                     handler.on_timeout(id);
                 }
 
@@ -520,9 +649,44 @@ impl Reactor {
 
 impl Drop for Reactor {
     fn drop(&mut self) {
+        // Remove from crash-handler registry FIRST — after the cancel
+        // below runs, the ring state is indeterminate and the crash
+        // handler must not touch it.
+        unregister_ring(self.ctx.ring());
+
         self.stop.store(true, Ordering::Release);
-        // Best-effort final reap so any in-flight SQEs are flushed.
-        let _ = self.ctx.ring_mut().submit_and_wait(0);
+
+        // Force kernel-side shutdown of the UDP socket before its fd is
+        // closed by the implicit `Socket::drop`. This signals intent to
+        // close so the kernel starts tearing down the transport.
+        //
+        // SAFETY: `shutdown(2)` is async-signal-safe and idempotent; on
+        // an already-closed fd it returns EBADF (ignored here).
+        unsafe {
+            libc::shutdown(self.socket.raw_fd(), libc::SHUT_RDWR);
+        }
+
+        // Cancel ALL in-flight io_uring operations (especially the multishot
+        // RECV armed at init). Without this explicit cancellation, the
+        // kernel holds a reference to the socket inode until its deferred
+        // teardown completes (~60s on Linux 6.x), leaving ghost UDP sockets
+        // on the port that block subsequent server starts.
+        //
+        // CancelBuilder::any() requires kernel ≥ 5.19 — already a hard
+        // requirement for PBUF_RING used by the buffer pool.
+        let cancel_entry =
+            io_uring::opcode::AsyncCancel2::new(io_uring::types::CancelBuilder::any())
+                .build()
+                .user_data(0);
+        // Best-effort push; if the SQ ring is full the submit_and_wait
+        // below will flush what's already queued and the kernel's
+        // ring-fd close (when IoUring drops) cancels the rest anyway.
+        let _ = crate::ops::push_entry(self.ctx.ring_mut(), cancel_entry);
+        // Submit the cancel + drain all remaining CQEs. Waiting for ≥1
+        // completion ensures the cancel SQE is processed (it always
+        // produces a CQE — success or -ENOENT). Additional pending CQEs
+        // from the cancelled multishot are also reaped.
+        let _ = self.ctx.ring_mut().submit_and_wait(1);
     }
 }
 

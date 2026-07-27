@@ -188,15 +188,18 @@ pub mod handlers {
     /// Handler for `Completion::Timeout`.
     #[inline]
     pub fn process_timeout(proc: &mut CqeProcessor, c: &Completion) -> Outcome {
-        let Completion::Timeout { id } = c else {
+        let Completion::Timeout { id, more } = c else {
             return Outcome::default();
         };
         proc.stats
             .timer_fires
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // Only retire the timer when the multishot has terminated
+        // (more=false). For recurring timers, the kernel still references
+        // the Timespec and will fire again.
         Outcome {
             consumed: true,
-            retire_timer: Some(*id),
+            retire_timer: if *more { None } else { Some(*id) },
             ..Outcome::default()
         }
     }
@@ -265,7 +268,7 @@ mod tests {
     #[test]
     fn noop_handler_returns_default() {
         let mut proc = CqeProcessorBuilder::new().build().expect("build");
-        let c = Completion::Timeout { id: 0 };
+        let c = Completion::Timeout { id: 0, more: false };
         let o = noop_handler(&mut proc, &c);
         assert!(!o.consumed);
     }
