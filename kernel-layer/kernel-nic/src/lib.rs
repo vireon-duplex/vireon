@@ -71,7 +71,7 @@ pub use affinity::{IrqPolicy, affine_irqs};
 pub use busy_poll::{BusyPollMode, BusyPollPolicy};
 pub use config::{NicConfig, Preset};
 pub use cpuset::CpuSet;
-pub use ebpf::attach_quic_reuseport_steering;
+pub use ebpf::{attach_quic_reuseport_steering, count_udp_sockets_on_port};
 pub use error::KernelNicError;
 pub use features::KernelFeatures;
 pub use irq::{IrqInfo, IrqKind, IrqMap};

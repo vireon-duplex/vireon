@@ -499,7 +499,7 @@ mod tests {
     #[test]
     fn dispatch_one_timeout_retires_timer() {
         let mut p = make_proc();
-        let c = Completion::Timeout { id: 5 };
+        let c = Completion::Timeout { id: 5, more: false };
         let ud = encode(OpKind::Timeout, 5);
         let outcome = p.dispatch_one(ud, &c, 0);
         assert!(outcome.consumed);
@@ -523,7 +523,7 @@ mod tests {
         let reclaim = Completion::SendBufferReclaim { id: 1 };
         p.dispatch_one(encode(OpKind::Send, 1), &reclaim, 0);
 
-        let timeout = Completion::Timeout { id: 5 };
+        let timeout = Completion::Timeout { id: 5, more: false };
         p.dispatch_one(encode(OpKind::Timeout, 5), &timeout, 0);
 
         let recv = Completion::Receive {
@@ -555,7 +555,7 @@ mod tests {
         }
         assert_eq!(p.consecutive_empty, 3);
         // Dispatch one CQE → resets via drain_cq path (we simulate by hand).
-        let c = Completion::Timeout { id: 0 };
+        let c = Completion::Timeout { id: 0, more: false };
         p.dispatch_one(encode(OpKind::Timeout, 0), &c, 0);
         // dispatch_one does not touch consecutive_empty; only drain_cq does.
         assert_eq!(p.consecutive_empty, 3);

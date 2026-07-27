@@ -92,6 +92,7 @@ pub mod pacing;
 pub mod packet;
 pub mod packet_scheduler;
 pub mod path;
+pub mod rate_limiter;
 pub mod shard_binding;
 pub mod state;
 pub mod stats;

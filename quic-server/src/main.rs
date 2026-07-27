@@ -9,7 +9,10 @@ mod distributed;
 mod error;
 mod eviction;
 mod layers;
+mod log_throttle;
+mod metrics;
 mod server;
+mod socket_registry;
 mod stack;
 mod worker;
 
@@ -31,6 +34,21 @@ static PROFILE_OUTPUT: OnceLock<Option<String>> = OnceLock::new();
 fn main() -> Result<(), ServerError> {
     let cli = Cli::parse();
     init_tracing(&cli);
+
+    // Install a panic hook that force-closes every registered socket fd.
+    // With `panic = "unwind"` (default), Drop chains already run on panic
+    // — but a panic on a worker thread doesn't trigger the main-thread
+    // Drop chain for that thread's Reactor/Socket if the thread is still
+    // mid-flight when the hook runs. Closing via the registry is a
+    // belt-and-braces safety net that runs regardless of which thread
+    // panicked.
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("[panic] {info}");
+        // Cancel io_uring multishot RECV ops, then shutdown+close fds.
+        io::cancel_all_rings();
+        crate::socket_registry::REGISTRY.close_all();
+        eprintln!("note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace");
+    }));
 
     tracing::info!("vireon quic-server starting");
     tracing::debug!(cli = ?cli, "parsed CLI");
@@ -81,6 +99,12 @@ fn print_banner(config: &ServerConfig) {
     }
     if config.skip_crc {
         tracing::info!("  Skip CRC: ENABLED (trusted mode — no integrity check)");
+    }
+    if let Some(ca) = &config.quic_config.client_ca {
+        tracing::info!("  mTLS:     ENABLED (client CA: {ca})");
+    }
+    if let Some(port) = config.metrics_port {
+        tracing::info!("  Metrics:  http://0.0.0.0:{port}/metrics");
     }
     tracing::info!("============================================================");
 }

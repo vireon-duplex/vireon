@@ -17,12 +17,18 @@ use crate::error::QuicError;
 /// Builds a [`quiche::Config`] from the engine's [`QuicConfig`] plus
 /// certificate / key file paths.
 ///
+/// When `quic_cfg.client_ca` is `Some`, mutual TLS is enabled: the
+/// server loads the CA bundle and verifies peer (client) certificates
+/// during the handshake. Clients that do not present a certificate
+/// signed by this CA are rejected.
+///
 /// # Errors
 ///
 /// Returns [`QuicError`] if:
 /// - `quiche::Config::new` fails (unsupported version)
 /// - cert / key loading fails (file not found, malformed PEM)
 /// - ALPN or congestion-control configuration fails
+/// - client CA bundle loading fails (when `client_ca` is set)
 #[profile]
 pub fn build_quiche_config(
     quic_cfg: &QuicConfig,
@@ -34,6 +40,14 @@ pub fn build_quiche_config(
     // TLS identity.
     config.load_cert_chain_from_pem_file(cert_path)?;
     config.load_priv_key_from_pem_file(key_path)?;
+
+    // Mutual TLS: when a client CA is configured, the server verifies
+    // peer certificates during the handshake. Clients without a valid
+    // cert signed by this CA are rejected at the TLS layer.
+    if let Some(ca_path) = &quic_cfg.client_ca {
+        config.load_verify_locations_from_file(ca_path)?;
+        config.verify_peer(true);
+    }
 
     // ALPN — advertise common protocols.
     config.set_application_protos(&[b"hq-interop", b"http/1.1", b"h3-29"])?;
