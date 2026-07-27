@@ -17,6 +17,7 @@ use session_router::decision::RoutingDecision;
 
 use super::message::FrameAction;
 use super::stream::StreamLayer;
+use crate::conf::LayerTuning;
 use crate::error::ServerError;
 
 /// The local node ID for single-node / multi-worker mode.
@@ -45,17 +46,27 @@ pub struct SessionLayer {
 }
 
 impl SessionLayer {
-    /// Creates a new session layer with default configuration and
+    /// Creates a new session layer with tuned configuration and
     /// distributed session infrastructure.
-    pub fn new() -> Result<Self, ServerError> {
+    pub fn new(t: &LayerTuning) -> Result<Self, ServerError> {
         let replication_config =
             session_replication_service::builder::ReplicationServiceBuilder::new()
                 .build()
                 .map_err(|e| ServerError::EngineInit(format!("replication: {e:?}")))?;
 
+        let sm_cfg = SessionManagerConfig {
+            max_sessions: t.session_max_sessions,
+            max_sessions_per_tenant: t.session_max_per_tenant,
+            session_idle_timeout_ms: t.session_idle_timeout_ns / 1_000_000,
+            handshake_timeout_ms: t.session_handshake_timeout_ns / 1_000_000,
+            max_streams_per_session: t.session_max_streams_per_session,
+            max_memory_per_session: t.session_max_memory_per_session,
+            ..SessionManagerConfig::default()
+        };
+
         Ok(Self {
-            stream: StreamLayer::new()?,
-            table: SessionTable::new(SessionManagerConfig::default()),
+            stream: StreamLayer::new(t)?,
+            table: SessionTable::new(sm_cfg),
             ownership: OwnershipTable::new(),
             local_node: NodeId::new(LOCAL_NODE_ID),
             migration: MigrationCoordinator::new(),
