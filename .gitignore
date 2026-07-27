@@ -26,3 +26,4 @@ before.txt
 after.txt
 *.txt
 profiles
+vireon.conf

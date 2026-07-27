@@ -17,6 +17,7 @@ use stream_scheduler::builder::SchedulerBuilder;
 use stream_scheduler::scheduler::StreamScheduler;
 
 use super::message::{FrameAction, MessageLayer};
+use crate::conf::LayerTuning;
 use crate::error::ServerError;
 
 /// Minimum interval between repeated warn logs for the same condition.
@@ -86,9 +87,12 @@ pub struct StreamLayer {
 }
 
 impl StreamLayer {
-    /// Creates a new stream layer with default capacity.
-    pub fn new() -> Result<Self, ServerError> {
+    /// Creates a new stream layer with tuned scheduler configuration.
+    pub fn new(t: &LayerTuning) -> Result<Self, ServerError> {
         let scheduler = SchedulerBuilder::new()
+            .max_streams_per_tick(t.scheduler_max_streams_per_tick)
+            .batch_size_max(t.scheduler_max_streams_per_tick.min(64))
+            .starvation_threshold_us(t.scheduler_starvation_threshold_us)
             .build()
             .map_err(|e| ServerError::EngineInit(format!("stream-scheduler: {e:?}")))?;
 
@@ -291,7 +295,7 @@ mod tests {
 
     #[test]
     fn stream_open_close_lifecycle() {
-        let mut sl = StreamLayer::new().unwrap();
+        let mut sl = StreamLayer::new(&LayerTuning::default()).unwrap();
         sl.on_connect(0);
 
         assert_eq!(
@@ -309,7 +313,7 @@ mod tests {
 
     #[test]
     fn data_frame_dispatches_to_app() {
-        let mut sl = StreamLayer::new().unwrap();
+        let mut sl = StreamLayer::new(&LayerTuning::default()).unwrap();
         sl.on_connect(0);
         assert_eq!(
             send_frame(&mut sl, 0, MessageType::TextToken, 1),
@@ -319,7 +323,7 @@ mod tests {
 
     #[test]
     fn on_close_releases_all_streams() {
-        let mut sl = StreamLayer::new().unwrap();
+        let mut sl = StreamLayer::new(&LayerTuning::default()).unwrap();
         sl.on_connect(0);
         send_frame(&mut sl, 0, MessageType::StreamOpen, 1);
         send_frame(&mut sl, 0, MessageType::StreamOpen, 2);

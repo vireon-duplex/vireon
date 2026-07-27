@@ -3,6 +3,7 @@
 mod acl_loader;
 mod cli;
 mod cluster;
+mod conf;
 mod config;
 mod connection;
 mod distributed;

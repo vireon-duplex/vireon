@@ -7,7 +7,7 @@
 # Usage: bash scripts/stress_test.sh
 set -euo pipefail
 
-PORT=44331
+PORT=44355
 BIN="./target/x86_64-unknown-linux-gnu/release/quic-server"
 CERT="cert.pem"
 KEY="key.pem"

@@ -83,6 +83,10 @@ rustc-hash = "2.1"
 # Production-grade function profiler (#[profile] attribute macro).
 profiler = { path = "profiler/runtime" }
 
+# Config file (TOML) support for quic-server.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
 [dependencies]
 anyhow = { workspace = true }
 tracing = { workspace = true }
