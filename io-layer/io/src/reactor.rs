@@ -455,29 +455,15 @@ impl Reactor {
         // pointer remains valid until Drop runs, which unregisters it.
         register_ring(self.ctx.ring());
 
-        // Arm a periodic wakeup timer so the event loop returns from
-        // submit_and_wait even when no packets arrive. Without this,
-        // SIGINT/SIGTERM caught by ctrlc's background thread sets the
-        // stop flag but the blocked submit_and_wait never returns to
-        // check it — the server becomes unresponsive to graceful
-        // shutdown when idle. Orchestration systems (systemd, k8s)
-        // escalate to SIGKILL after a timeout, which leaves ghost
-        // sockets.
+        // The periodic wakeup timer (TICK_TIMER_ID, armed in init) ensures
+        // submit_and_wait(1) returns at least every TICK_INTERVAL (1ms)
+        // even when no packets arrive. This makes SIGINT/SIGTERM responsive:
+        // ctrlc's background thread sets the stop flag, and the next tick
+        // CQE unblocks the loop to check it.
         //
-        // The timer fires every 200ms; its CQE is processed as a
-        // no-op Completion::Timeout (on_timeout defaults to no-op).
-        // Requires kernel ≥ 6.2 (IORING_TIMEOUT_MULTISHOT).
-        const WAKEUP_PERIOD: Duration = Duration::from_millis(200);
-        if let Err(e) = self
-            .timers
-            .add_periodic_tick(self.ctx.ring_mut(), 0, WAKEUP_PERIOD)
-        {
-            tracing::warn!(
-                error = ?e,
-                "failed to arm wakeup timer — server may be slow to respond \
-                 to SIGINT/SIGTERM when idle (requires kernel ≥ 6.2)"
-            );
-        }
+        // The multishot Timespec lives in TimerWheel::active and is NOT
+        // dropped on each fire — the reactor checks `more` (CQE_F_MORE)
+        // and only retires when the multishot terminates.
 
         while !self.stop.load(Ordering::Relaxed) {
             match self.ctx.ring_mut().submit_and_wait(1) {
@@ -562,8 +548,12 @@ impl Reactor {
                 }
 
                 // ── Timeout fired (naturally or cancelled) ──
-                Completion::Timeout { id } => {
-                    self.timers.retire(encode(OpKind::Timeout, id));
+                // For multishot timers (more=true), do NOT retire — the
+                // kernel still references the Timespec for subsequent fires.
+                Completion::Timeout { id, more } => {
+                    if !more {
+                        self.timers.retire(encode(OpKind::Timeout, id));
+                    }
                 }
 
                 // ── Cancel result: informational ──
@@ -640,8 +630,10 @@ impl Reactor {
 
                 Completion::Send { .. } => {}
 
-                Completion::Timeout { id } => {
-                    self.timers.retire(encode(OpKind::Timeout, id));
+                Completion::Timeout { id, more } => {
+                    if !more {
+                        self.timers.retire(encode(OpKind::Timeout, id));
+                    }
                     handler.on_timeout(id);
                 }
 

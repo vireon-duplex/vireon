@@ -74,6 +74,7 @@ mod tests {
         let mut s = CqeScheduler::new(16);
         let c = Completion::Timeout {
             id: encode(OpKind::Timeout, 5),
+            more: false,
         };
         s.push(c.clone(), 0);
         assert_eq!(s.pending_count(), 1);
