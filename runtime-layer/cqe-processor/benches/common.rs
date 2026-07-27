@@ -66,7 +66,7 @@ pub fn reclaim_completion(id: u64) -> Completion {
 
 /// Build a synthetic Timeout completion.
 pub fn timeout_completion(id: u64) -> Completion {
-    Completion::Timeout { id }
+    Completion::Timeout { id, more: false }
 }
 
 /// Build a synthetic Cancel completion.
