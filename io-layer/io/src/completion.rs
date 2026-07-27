@@ -75,9 +75,16 @@ pub enum Completion {
     },
 
     /// A `TIMEOUT` operation fired.
+    ///
+    /// For multishot timers, `more` is `true` when the kernel will post
+    /// additional CQEs (`IORING_CQE_F_MORE`). The reactor must NOT retire
+    /// the timer's `Timespec` while `more` is true — the kernel still
+    /// references it for subsequent expiries.
     Timeout {
         /// Caller-supplied ID from `user_data`.
         id: u64,
+        /// `true` if more CQEs will follow (multishot timer still armed).
+        more: bool,
     },
 
     /// An `ASYNC_CANCEL` completed (or a cancelled operation reported
@@ -138,7 +145,10 @@ impl CompletionDecoder {
         match kind {
             OpKind::Recv => Self::decode_recv(id, res, flags),
             OpKind::Send => Self::decode_send(id, res, flags),
-            OpKind::Timeout => Completion::Timeout { id },
+            OpKind::Timeout => Completion::Timeout {
+                id,
+                more: cqueue::more(flags),
+            },
             OpKind::Cancel => Completion::Cancel { id, res },
         }
     }
@@ -240,7 +250,23 @@ mod tests {
     fn decode_timeout() {
         let ud = encode(OpKind::Timeout, 123);
         match CompletionDecoder::decode_raw(ud, -libc::ETIME, 0) {
-            Completion::Timeout { id } => assert_eq!(id, 123),
+            Completion::Timeout { id, more } => {
+                assert_eq!(id, 123);
+                assert!(!more);
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_timeout_multishot() {
+        let ud = encode(OpKind::Timeout, 7);
+        // IORING_CQE_F_MORE = 1 << 1
+        match CompletionDecoder::decode_raw(ud, -libc::ETIME, 1 << 1) {
+            Completion::Timeout { id, more } => {
+                assert_eq!(id, 7);
+                assert!(more, "multishot timer should report more=true");
+            }
             other => panic!("expected Timeout, got {other:?}"),
         }
     }
