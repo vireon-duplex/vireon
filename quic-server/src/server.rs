@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use crate::config::{ServerConfig, WorkerMode};
 use crate::error::ServerError;
-use crate::worker::{Worker, install_signal_handler};
+use crate::layers::InterWorkerPublish;
+use crate::worker::{Worker, install_crash_handlers, install_signal_handler};
 
 /// Top-level QUIC server.
 pub struct QuicServer {
@@ -31,6 +32,12 @@ impl QuicServer {
         let nic_manager = kernel_nic::NicManagerBuilder::new()
             .build()
             .map_err(|e| ServerError::EngineInit(format!("kernel-nic: {e:?}")))?;
+
+        // Start the Prometheus /metrics endpoint if configured.
+        if let (Some(port), Some(metrics)) = (self.config.metrics_port, &self.config.metrics) {
+            crate::metrics::start_metrics_endpoint(metrics.clone(), port)
+                .map_err(|e| ServerError::Config(format!("metrics endpoint: {e}")))?;
+        }
 
         tracing::info!(
             cpus = nic_manager.topology().thread_count(),
@@ -64,10 +71,46 @@ impl QuicServer {
             1,
             dummy_rx,
             vec![dummy_tx],
+            None,
+            Vec::new(),
             cluster_handle,
             shutdown_requested.clone(),
         )?;
         install_signal_handler(shutdown_requested)?;
+        install_crash_handlers();
+
+        // Detect ghost sockets and attach eBPF steering if any are present.
+        // Single-worker without ghosts: no steering needed (only one socket
+        // receives all packets). Single-worker WITH ghosts: attach steering
+        // with an offset so packets bypass dead sockets.
+        let total_on_port = kernel_nic::count_udp_sockets_on_port(self.config.port).unwrap_or(1);
+        let ghost_offset = total_on_port.saturating_sub(1) as u32;
+
+        if ghost_offset > 0 {
+            tracing::warn!(
+                total_sockets = total_on_port,
+                ghost_offset,
+                "detected {ghost_offset} ghost UDP socket(s) on port {} — \
+                 attaching offset eBPF steering",
+                self.config.port,
+            );
+            match kernel_nic::attach_quic_reuseport_steering(worker.socket_fd(), 1, ghost_offset) {
+                Ok(()) => {
+                    tracing::info!(
+                        ghost_offset,
+                        "eBPF steering attached for single worker (ghost bypass)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "eBPF REUSEPORT steering unavailable — ghost sockets may cause \
+                         packet loss. To enable: sudo setcap cap_bpf,cap_net_admin+ep \
+                         ./target/x86_64-unknown-linux-gnu/release/quic-server"
+                    );
+                }
+            }
+        }
 
         tracing::info!("starting single-worker server (core 0)");
         worker.run()
@@ -96,10 +139,19 @@ impl QuicServer {
         // reactor_id from DCID[0..4] and forwards the packet.
         let mesh_channels = quic_engine::ForwardMesh::build_channels(num_workers as u32);
 
+        // Build inter-worker pub/sub channels. Each worker broadcasts
+        // publishes to all others so subscribers on any worker receive
+        // the message regardless of which worker the publisher landed on.
+        let pubsub_channels = build_inter_worker_pubsub_channels(num_workers);
+
         let mut handles = Vec::with_capacity(num_workers);
         let mut stop_rx_list = Vec::with_capacity(num_workers);
 
-        for (core_id, (inbox_rx, outboxes)) in mesh_channels.into_iter().enumerate() {
+        for (core_id, ((inbox_rx, outboxes), (ps_inbox, ps_outboxes))) in mesh_channels
+            .into_iter()
+            .zip(pubsub_channels.into_iter())
+            .enumerate()
+        {
             let core_id = core_id as u32;
             // Pop the next cluster handle in order (core_id matches).
             let cluster_handle = cluster_handles.as_mut().and_then(|q| q.pop_front());
@@ -109,6 +161,8 @@ impl QuicServer {
                 num_workers as u32,
                 inbox_rx,
                 outboxes,
+                Some(ps_inbox),
+                ps_outboxes,
                 cluster_handle,
                 shutdown_requested.clone(),
             )?;
@@ -139,14 +193,45 @@ impl QuicServer {
         );
 
         // Attach eBPF QUIC DCID steering program to the REUSEPORT group.
-        // Only meaningful with >1 worker (single worker trivially receives
-        // all packets). Must run AFTER all sockets are bound.
-        if socket_fds.len() > 1 {
-            match kernel_nic::attach_quic_reuseport_steering(socket_fds[0], socket_fds.len() as u32)
-            {
+        // Detects ghost sockets from previous (pre-fix) runs and applies
+        // a steering offset so packets bypass dead sockets.
+        //
+        // The kernel's REUSEPORT socket array is ordered by bind time:
+        // ghost sockets (bound first, never closed) occupy indices
+        // [0, ghost_count), and live worker sockets occupy
+        // [ghost_count, ghost_count + num_workers). The eBPF program
+        // does `(DCID % num_workers) + ghost_offset` to return indices
+        // that fall entirely within the live range.
+        let total_on_port =
+            kernel_nic::count_udp_sockets_on_port(self.config.port).unwrap_or(socket_fds.len());
+        let num_live = socket_fds.len();
+        let ghost_offset = total_on_port.saturating_sub(num_live) as u32;
+
+        if ghost_offset > 0 {
+            tracing::warn!(
+                total_sockets = total_on_port,
+                live_workers = num_live,
+                ghost_offset,
+                "detected {ghost_offset} ghost UDP socket(s) on port {} — \
+                 using offset eBPF steering to bypass them. \
+                 These are permanent on kernel 6.8.0-134 (reboot to clear).",
+                self.config.port,
+            );
+        }
+
+        // Attach when multi-worker OR when ghost sockets are detected
+        // (single-worker with ghosts needs steering to avoid routing
+        // packets to dead sockets).
+        if num_live > 1 || ghost_offset > 0 {
+            match kernel_nic::attach_quic_reuseport_steering(
+                socket_fds[0],
+                num_live as u32,
+                ghost_offset,
+            ) {
                 Ok(()) => {
                     tracing::info!(
-                        workers = socket_fds.len(),
+                        workers = num_live,
+                        ghost_offset,
                         "eBPF QUIC DCID reuseport steering attached"
                     );
                 }
@@ -167,9 +252,10 @@ impl QuicServer {
         // Signal handler: first Ctrl-C initiates graceful drain, second
         // forces immediate exit. Each worker's VireonStack detects the
         // flag in on_tick and drives its own CONNECTION_CLOSE drain.
-        install_signal_handler(shutdown_requested)?;
+        install_signal_handler(shutdown_requested.clone())?;
+        install_crash_handlers();
 
-        join_all(handles)
+        join_all(handles, &shutdown_requested)
     }
 
     // ── Distributed (stub) ─────────────────────────────────────────
@@ -234,7 +320,15 @@ impl QuicServer {
 }
 
 /// Joins all worker threads.
-fn join_all(handles: Vec<thread::JoinHandle<Result<(), ServerError>>>) -> Result<(), ServerError> {
+///
+/// If any worker panics, sets `shutdown_requested` so the surviving workers
+/// begin their own graceful-drain sequence — otherwise they would outlive
+/// the failed worker indefinitely, holding their socket fds open.
+fn join_all(
+    handles: Vec<thread::JoinHandle<Result<(), ServerError>>>,
+    shutdown_requested: &std::sync::atomic::AtomicBool,
+) -> Result<(), ServerError> {
+    use std::sync::atomic::Ordering;
     let mut last_err = None;
 
     for handle in handles {
@@ -245,13 +339,48 @@ fn join_all(handles: Vec<thread::JoinHandle<Result<(), ServerError>>>) -> Result
             }
             Ok(Err(e)) => {
                 tracing::error!(thread = %name, error = %e, "worker exited with error");
+                // Signal survivors so they don't wait forever for the dead
+                // worker's share of the work.
+                shutdown_requested.store(true, Ordering::Release);
                 last_err = Some(e);
             }
             Err(_) => {
                 tracing::error!(thread = %name, "worker thread panicked");
+                // The panic hook in main.rs already closed the panicking
+                // worker's fd via the global registry; signal the others.
+                shutdown_requested.store(true, Ordering::Release);
+                last_err = Some(ServerError::WorkerPanic(name));
             }
         }
     }
 
     last_err.map_or(Ok(()), Err)
+}
+
+/// Builds the inter-worker pub/sub channel mesh.
+///
+/// Returns one `(inbox, outboxes)` pair per worker — same topology as
+/// `ForwardMesh::build_channels`. Each worker's `outboxes` is a Vec of
+/// cloned senders (one per worker, including itself). The worker skips
+/// its own index during broadcast.
+///
+/// Bounded at 65536 messages per inbox. `try_send` drops on full rather
+/// than blocking the reactor thread. 65536 absorbs sustained bursts
+/// from a worker publishing ~50k 8 KiB frames/sec; below this the
+/// inbox fills and ReliableOrdered frames get dropped.
+fn build_inter_worker_pubsub_channels(
+    n: usize,
+) -> Vec<(
+    std::sync::mpsc::Receiver<InterWorkerPublish>,
+    Vec<std::sync::mpsc::SyncSender<InterWorkerPublish>>,
+)> {
+    let cap = 65_536;
+    let channels: Vec<_> = (0..n)
+        .map(|_| std::sync::mpsc::sync_channel::<InterWorkerPublish>(cap))
+        .collect();
+    let senders: Vec<_> = channels.iter().map(|(s, _)| s.clone()).collect();
+    channels
+        .into_iter()
+        .map(|(_, rx)| (rx, senders.clone()))
+        .collect()
 }

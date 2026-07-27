@@ -39,6 +39,8 @@ impl Worker {
         num_workers: u32,
         inbox_rx: mpsc::Receiver<ForwardedPacket>,
         outboxes: Vec<mpsc::SyncSender<ForwardedPacket>>,
+        worker_inbox: Option<mpsc::Receiver<crate::layers::InterWorkerPublish>>,
+        worker_outboxes: Vec<mpsc::SyncSender<crate::layers::InterWorkerPublish>>,
         cluster_handle: Option<ClusterWorkerHandle>,
         shutdown_requested: Arc<AtomicBool>,
     ) -> Result<Self, ServerError> {
@@ -105,15 +107,21 @@ impl Worker {
         let cluster =
             cluster_handle.and_then(|h| config.cluster.as_ref().map(|cfg| (&cfg.cluster_cfg, h)));
 
-        let handler = VireonStack::new(
+        let mut handler = VireonStack::new(
             engine,
             core_id,
             config.echo,
             config.acl_table.clone(),
             config.wal_root.as_deref(),
+            config.wal_retention,
+            config.max_topics,
+            config.max_subscribers_per_topic,
             cluster,
+            worker_inbox,
+            worker_outboxes,
             shutdown_requested,
         )?;
+        handler.metrics = config.metrics.clone();
 
         Ok(Self {
             core_id,
@@ -152,6 +160,12 @@ impl Worker {
         self.core_id
     }
 
+    /// Returns the reactor's UDP socket fd (for eBPF REUSEPORT steering).
+    #[must_use]
+    pub fn socket_fd(&self) -> RawFd {
+        self.reactor.socket().raw_fd()
+    }
+
     /// Spawns a worker on a dedicated thread pinned to `core_id`.
     ///
     /// Returns the `JoinHandle` plus a receiver that yields a tuple of
@@ -168,6 +182,8 @@ impl Worker {
         num_workers: u32,
         inbox_rx: mpsc::Receiver<ForwardedPacket>,
         outboxes: Vec<mpsc::SyncSender<ForwardedPacket>>,
+        worker_inbox: Option<mpsc::Receiver<crate::layers::InterWorkerPublish>>,
+        worker_outboxes: Vec<mpsc::SyncSender<crate::layers::InterWorkerPublish>>,
         cluster_handle: Option<ClusterWorkerHandle>,
         shutdown_requested: Arc<AtomicBool>,
     ) -> Result<
@@ -187,6 +203,8 @@ impl Worker {
                     num_workers,
                     inbox_rx,
                     outboxes,
+                    worker_inbox,
+                    worker_outboxes,
                     cluster_handle,
                     shutdown_requested,
                 ) {
@@ -199,6 +217,18 @@ impl Worker {
                 // Send stop handle + socket fd back before entering run loop.
                 let fd = worker.reactor.socket().raw_fd();
                 let _ = tx.send((worker.stop_handle(), fd));
+                // Register the io_uring ring fd FIRST (lower slot index) so
+                // close_all() closes it before the socket fd. Closing the ring
+                // triggers kernel cancellation of pending multishot RECV,
+                // releasing the socket inode reference. Without this, closing
+                // only the socket fd leaves a ghost UDP socket on the port.
+                crate::socket_registry::REGISTRY.register(worker.reactor.ring_fd());
+                // Register the socket fd so the signal handler / panic hook
+                // can force-close it on a crash exit.
+                crate::socket_registry::REGISTRY.register(fd);
+                // NOTE: ring pointer registration for crash-handler
+                // AsyncCancel2 happens inside run_with_handler, where the
+                // Reactor is at its final stack address.
                 worker.run()
             })
             .map_err(|e| ServerError::ThreadSpawn(format!("{e}")))?;
@@ -267,8 +297,71 @@ pub fn install_signal_handler(shutdown_requested: Arc<AtomicBool>) -> Result<(),
             {
                 crate::profiler_force_dump();
             }
+            // Cancel io_uring multishot RECV ops, then shutdown+close fds.
+            io::cancel_all_rings();
+            crate::socket_registry::REGISTRY.close_all();
             std::process::exit(130);
         }
     })
     .map_err(|e| ServerError::SignalHandler(format!("{e}")))
+}
+
+/// Install one-shot handlers for SIGSEGV/SIGABRT/SIGBUS/SIGFPE/SIGILL.
+///
+/// Each handler force-closes every registered socket fd, then resets its
+/// own disposition to `SIG_DFL` and re-raises the signal so the default
+/// core-dump / process-termination behavior still fires.
+///
+/// # Why
+///
+/// Without this, a crash from unsafe code or a `libc::abort` from a C
+/// dependency leaves SO_REUSEPORT sockets in `UNCONN` state on the bound
+/// port. Subsequent server restarts route handshakes to those zombie
+/// sockets and time out.
+///
+/// # Safety
+///
+/// The handlers use only async-signal-safe primitives: atomic swaps and
+/// `libc::close`. `SA_RESETHAND` ensures the handler auto-resets on entry
+/// so a fault inside the handler terminates immediately instead of
+/// recursing.
+pub fn install_crash_handlers() {
+    /// Signal-handler body. Must be async-signal-safe.
+    extern "C" fn crash_handler(signum: libc::c_int) {
+        unsafe {
+            // Cancel io_uring multishot operations on all registered rings.
+            // For the current thread's ring, this is race-free (the signal
+            // interrupted the event loop). For other threads' rings, the
+            // submit may fail due to concurrent SQ access — close_all's
+            // shutdown() provides the fallback for those.
+            io::cancel_all_rings();
+            crate::socket_registry::REGISTRY.close_all();
+            // Restore default disposition so re-raise produces the normal
+            // core-dump / termination behavior. SA_RESETHAND already did
+            // this on entry, but be explicit in case of SA_NODEFER.
+            let mut dfl: libc::sigaction = std::mem::zeroed();
+            dfl.sa_sigaction = libc::SIG_DFL;
+            libc::sigaction(signum, &dfl, std::ptr::null_mut());
+            libc::raise(signum);
+        }
+    }
+
+    // Crash signals we want to clean up before. Not SIGKILL (can't be
+    // caught) and not SIGSTOP (same).
+    let crash_signals: [libc::c_int; 5] = [
+        libc::SIGSEGV,
+        libc::SIGABRT,
+        libc::SIGBUS,
+        libc::SIGFPE,
+        libc::SIGILL,
+    ];
+
+    for &sig in &crash_signals {
+        unsafe {
+            let mut act: libc::sigaction = std::mem::zeroed();
+            act.sa_sigaction = crash_handler as usize;
+            act.sa_flags = libc::SA_RESETHAND | libc::SA_NODEFER;
+            libc::sigaction(sig, &act, std::ptr::null_mut());
+        }
+    }
 }

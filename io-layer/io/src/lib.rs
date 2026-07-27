@@ -109,7 +109,7 @@ pub use metrics::{MetricsCollector, MetricsSnapshot};
 pub use ops::{
     DatagramMeta, OpKind, ParsedFrame, Receiver, Sender, decode_id, decode_kind, encode,
 };
-pub use reactor::Reactor;
+pub use reactor::{Reactor, cancel_all_rings};
 pub use registry::IoRegistry;
 pub use socket::Socket;
 pub use timer_wheel::TimerWheel;

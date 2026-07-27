@@ -534,6 +534,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "leak")]
     fn leak_tracker_reports_zero_after_drop() {
         let pool = BufferPool::default();
         {

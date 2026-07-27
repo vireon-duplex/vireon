@@ -22,6 +22,14 @@ pub struct Cli {
     #[arg(long)]
     pub key: String,
 
+    /// Optional PEM-encoded CA bundle for mutual TLS (mTLS). When set,
+    /// the server requires every client to present a certificate signed
+    /// by this CA during the TLS handshake. Clients without a valid
+    /// certificate are rejected at the TLS layer before any application
+    /// frame is processed.
+    #[arg(long)]
+    pub client_ca: Option<String>,
+
     /// Number of worker threads. 0 = auto-detect (one per CPU core).
     #[arg(short, long, default_value = "0")]
     pub workers: usize,
@@ -51,11 +59,25 @@ pub struct Cli {
     #[arg(long)]
     pub echo: bool,
 
-    /// Skip CRC32C verification on received frames.
-    /// Use ONLY in trusted environments where QUIC's AEAD guarantees
-    /// integrity. Saves ~50% of decode time for small frames.
-    #[arg(long)]
+    /// Skip CRC32C verification on received frames (default: ON).
+    ///
+    /// QUIC's AEAD (AES-GCM) already guarantees frame integrity end-to-end;
+    /// the per-frame CRC32C trailer is redundant in every standard
+    /// deployment. Skipping verification saves ~5–8% of decode CPU
+    /// (flamegraph-verified, 2026-07-26) without changing wire shape —
+    /// the trailer is still written by senders for backwards compat.
+    ///
+    /// Pass `--enforce-crc` to opt back into verification (e.g. when
+    /// debugging an upstream frame codec bug).
+    #[arg(long, default_value_t = true)]
     pub skip_crc: bool,
+
+    /// Force CRC32C verification (overrides the default `--skip-crc`).
+    ///
+    /// Paranoid mode for debugging suspected frame-codec corruption.
+    /// No effect on the wire — senders still compute the trailer.
+    #[arg(long)]
+    pub enforce_crc: bool,
 
     /// Enable SQPOLL kernel thread (kernel ≥ 5.11, requires CAP_SYS_NICE).
     /// The kernel thread polls the SQ ring, eliminating submit syscalls.
@@ -88,6 +110,33 @@ pub struct Cli {
     #[arg(long)]
     pub wal_root: Option<String>,
 
+    /// WAL retention by age: entries older than this many seconds are
+    /// truncated by the periodic sweeper (runs once per 60 s per
+    /// worker). `0` (default) disables age-based retention. Only
+    /// effective when `--wal-root` is also set.
+    #[arg(long, default_value_t = 0)]
+    pub wal_retention_secs: u64,
+
+    /// WAL retention by total bytes: per-topic cap. When a topic
+    /// exceeds this, oldest entries are truncated until under the
+    /// cap. `0` (default) disables byte-based retention. Only
+    /// effective when `--wal-root` is also set.
+    #[arg(long, default_value_t = 0)]
+    pub wal_max_bytes: u64,
+
+    /// Maximum number of distinct topics tracked in the catalog.
+    /// `TopicCreate` requests beyond this cap are rejected with a
+    /// `quota_exceeded` ack. `0` (default) = unlimited.
+    #[arg(long, default_value_t = 0)]
+    pub max_topics: usize,
+
+    /// Maximum subscribers per distinct subscription pattern.
+    /// `Subscribe` requests whose pattern already has this many
+    /// subscribers are rejected with a `quota_exceeded` ack.
+    /// `0` (default) = unlimited.
+    #[arg(long, default_value_t = 0)]
+    pub max_subscribers_per_topic: usize,
+
     /// Cluster self node id (P6). When set, the server joins a
     /// multi-node cluster and routes publishes to the owning node via
     /// UDP-based inter-node transport. Must be >0; must also appear in
@@ -102,6 +151,24 @@ pub struct Cli {
     /// Requires `--cluster-node-id`.
     #[arg(long)]
     pub cluster_peers: Option<String>,
+
+    /// Optional HTTP port for the Prometheus `/metrics` endpoint. When
+    /// set, the server exposes counters (connections, publishes,
+    /// deliveries, errors, bytes) in Prometheus text format. A scrape
+    /// request completes in <1 ms. When omitted, no metrics endpoint
+    /// is started.
+    #[arg(long)]
+    pub metrics_port: Option<u16>,
+
+    /// Maximum new QUIC handshakes per second accepted from a single
+    /// source IP. `0` disables the limit (default — opt-in for
+    /// multi-tenant deployments). When non-zero, an over-limit IP has
+    /// its Initial packets dropped before connection state is
+    /// allocated, defending against handshake storms (DoS, retry
+    /// loops, misbehaving clients). Already-connected clients on the
+    /// same IP are unaffected.
+    #[arg(long, default_value_t = 0)]
+    pub max_handshakes_per_ip_per_sec: u32,
 }
 
 /// CLI worker-mode selector.

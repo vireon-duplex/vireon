@@ -29,6 +29,7 @@
 use rustc_hash::FxHashMap;
 use std::net::SocketAddr;
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use auth_framework::authenticator::AuthenticationPipeline;
 use cluster_coordinator::{
@@ -64,7 +65,30 @@ use super::message::FrameAction;
 use super::session::SessionLayer;
 use crate::cluster::OutgoingMsg;
 use crate::error::ServerError;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+
+// ── Inter-worker pub/sub forwarding ────────────────────────────────
+
+/// A published message forwarded from one worker to another for
+/// cross-worker fan-out. Each worker broadcasts publishes to all other
+/// workers so their local subscribers receive the message.
+///
+/// Receiving workers drain their inbox in `drain_worker_inbox` and call
+/// `cluster_deliver_local` (the same code path as inter-node delivery).
+/// Forwarded publishes are NOT re-broadcast, preventing loops.
+pub struct InterWorkerPublish {
+    /// Pre-encoded wire frame: `[topic_len:u16 BE][topic bytes][payload bytes]`.
+    ///
+    /// Worker A encodes this once on the publish path (it has to anyway,
+    /// for local subscriber fan-out) and forwards the same `Bytes` to
+    /// every other worker. Worker B clones the `Bytes` (atomic refcount
+    /// bump — zero memcpy) and enqueues it directly to its subscribers.
+    ///
+    /// The topic is re-parsed from the first 2 bytes via a zero-copy
+    /// `Bytes::slice` read for `TopicRegistry::lookup` — no `String`
+    /// allocation on the receive path.
+    pub framed: Bytes,
+}
 
 // ── FrameContext & OutgoingFrame ──────────────────────────────────
 
@@ -241,7 +265,80 @@ pub struct VireonDispatcher {
     /// worker drains its own queue in `on_batch_tick` →
     /// [`Self::drain_cluster_inbox`]. `None` in single-node mode.
     cluster_incoming_rx: Option<mpsc::Receiver<InterNodeMessage>>,
+    /// Outboxes to all workers for pub/sub fan-out. Index = worker
+    /// reactor_id. The sender at `worker_self_idx` is skipped during
+    /// broadcast. Empty in single-worker mode.
+    worker_outboxes: Vec<mpsc::SyncSender<InterWorkerPublish>>,
+    /// Inbox of forwarded publishes from other workers. Drained in
+    /// [`Self::drain_worker_inbox`]. `None` in single-worker mode.
+    worker_inbox: Option<mpsc::Receiver<InterWorkerPublish>>,
+    /// This worker's reactor_id — used to skip self when broadcasting.
+    worker_self_idx: usize,
+    /// Aggregate count of cross-worker inbox-full drops. Logged at most
+    /// once every `WORKER_DROP_LOG_COOLDOWN` via [`worker_drop_cooldown`]
+    /// — a sustained burst otherwise produces hundreds of identical WARN
+    /// lines per second and drowns the rest of the log.
+    worker_drop_count: u64,
+    /// Time-based throttle for worker-inbox-full warnings.
+    worker_drop_cooldown: crate::log_throttle::Cooldown,
+    /// ── per-frame error throttles ────────────────────────────────
+    /// Persistently misbehaving clients (malformed payloads, denied
+    /// topics, stuck WAL disk) can fire warn!/info! per inbound frame.
+    /// Each counter yields one log line per N events.
+    decode_drop: crate::log_throttle::RateCounter,
+    acl_denied_drop: crate::log_throttle::RateCounter,
+    wal_fail_drop: crate::log_throttle::RateCounter,
+    malformed_drop: crate::log_throttle::RateCounter,
+    quota_drop: crate::log_throttle::RateCounter,
+    heartbeat_fail_drop: crate::log_throttle::RateCounter,
+    /// Invalid subscribe pattern — usually a buggy client retry loop.
+    invalid_pattern_drop: crate::log_throttle::RateCounter,
+    /// Misbehaving client sends FetchReply on a non-server stream.
+    fetch_reply_ignore_drop: crate::log_throttle::RateCounter,
+
+    // ── WAL retention ────────────────────────────────────────────
+    /// Active retention policy. Defaults to `keep_forever`; mutated
+    /// via [`Self::set_wal_retention`]. The sweep is applied to every
+    /// tracked topic when [`Self::wal_retention_last_run`] is older
+    /// than [`WAL_RETENTION_SWEEP_INTERVAL`].
+    wal_retention: wal_store::RetentionPolicy,
+    /// Last time the retention sweep ran ( Instant::now()-based,
+    /// throttled to once per ~60 s to amortise directory walks).
+    wal_retention_last_run: Option<std::time::Instant>,
+
+    // ── Resource quotas ─────────────────────────────────────────
+    /// Cap on total topics tracked by `topic_catalog`. `None` = unlimited.
+    /// Enforced in `handle_topic_create` BEFORE catalog insertion.
+    max_topics: Option<usize>,
+    /// Cap on subscribers per distinct pattern string. `None` = unlimited.
+    /// Tracked via `pattern_sub_counts`; enforced in `handle_subscribe`
+    /// BEFORE registry insertion.
+    max_subscribers_per_topic: Option<usize>,
+    /// Per-pattern subscriber count (mirrors what's in `pubsub_registry`
+    /// but keyed by pattern string for O(1) cap lookups). Incremented
+    /// on successful subscribe, decremented on unsubscribe.
+    pattern_sub_counts: FxHashMap<String, usize>,
+    /// Total TopicCreate / Subscribe requests rejected by the caps.
+    /// Logged via the periodic stats; surfaced in `[quota] reject` lines.
+    quota_topic_rejects: u64,
+    quota_subscriber_rejects: u64,
+
+    // ── Reusable encode scratch ────────────────────────────────────
+    // Eliminates per-publish Vec allocation in the fan-out path.
+    // clear() + split().freeze() produces a Bytes without allocating.
+    encode_scratch: BytesMut,
 }
+
+/// Minimum gap between cross-worker drop warning logs.
+const WORKER_DROP_LOG_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// Minimum gap between WAL retention sweeps. The sweep walks every
+/// tracked topic and may issue a truncation (which copies surviving
+/// entries through a tempfile). 60 s keeps the cost negligible even
+/// on slow disks — retention is a coarse-grained lever, not a per-tick
+/// concern. Sweeps additionally bail early when the policy is
+/// `keep_forever` (no work to do).
+const WAL_RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 impl VireonDispatcher {
     /// Creates a new dispatcher with default-configured modules.
@@ -283,6 +380,32 @@ impl VireonDispatcher {
             node_id: session_registry::NodeId::NIL,
             cluster_outgoing_tx: None,
             cluster_incoming_rx: None,
+            worker_outboxes: Vec::new(),
+            worker_inbox: None,
+            worker_self_idx: 0,
+            worker_drop_count: 0,
+            worker_drop_cooldown: crate::log_throttle::Cooldown::new(WORKER_DROP_LOG_COOLDOWN),
+            // Per-class throttles. `every` values chosen so that under
+            // a sustained ~5k frames/s/conn burst we still see ~5
+            // log lines/s per category — enough to diagnose without
+            // flooding. First occurrence always logs (RateCounter
+            // semantics).
+            decode_drop: crate::log_throttle::RateCounter::new(256),
+            acl_denied_drop: crate::log_throttle::RateCounter::new(256),
+            wal_fail_drop: crate::log_throttle::RateCounter::new(128),
+            malformed_drop: crate::log_throttle::RateCounter::new(256),
+            quota_drop: crate::log_throttle::RateCounter::new(64),
+            heartbeat_fail_drop: crate::log_throttle::RateCounter::new(64),
+            invalid_pattern_drop: crate::log_throttle::RateCounter::new(64),
+            fetch_reply_ignore_drop: crate::log_throttle::RateCounter::new(128),
+            wal_retention: wal_store::RetentionPolicy::keep_forever(),
+            wal_retention_last_run: None,
+            max_topics: None,
+            max_subscribers_per_topic: None,
+            pattern_sub_counts: FxHashMap::default(),
+            quota_topic_rejects: 0,
+            quota_subscriber_rejects: 0,
+            encode_scratch: BytesMut::new(),
         }
     }
 
@@ -367,6 +490,28 @@ impl VireonDispatcher {
         self.wal = Some(wal);
     }
 
+    /// Sets the retention policy applied to the WAL by the periodic
+    /// sweep in [`ApplicationLayer::on_batch_tick`]. Replaces any
+    /// prior policy. The sweep is a no-op when WAL is `None` or the
+    /// policy is `keep_forever`.
+    pub fn set_wal_retention(&mut self, policy: wal_store::RetentionPolicy) {
+        self.wal_retention = policy;
+    }
+
+    /// Cap the total number of topics tracked in the catalog. TopicCreate
+    /// requests that would exceed the cap are rejected with an error ack.
+    /// `None` (default) = unlimited.
+    pub fn set_max_topics(&mut self, max: Option<usize>) {
+        self.max_topics = max;
+    }
+
+    /// Cap the number of subscribers per distinct subscription pattern.
+    /// Subscribe requests whose pattern already has `max` subscribers
+    /// are rejected with an error ack. `None` (default) = unlimited.
+    pub fn set_max_subscribers_per_topic(&mut self, max: Option<usize>) {
+        self.max_subscribers_per_topic = max;
+    }
+
     /// Attaches a cluster coordinator + transport channels (P6).
     ///
     /// When set, the dispatcher consults the coordinator's
@@ -398,6 +543,23 @@ impl VireonDispatcher {
                 );
             }
         }
+    }
+
+    /// Installs inter-worker pub/sub channels for cross-worker fan-out.
+    ///
+    /// When set, every local publish is broadcast to all other workers
+    /// via `try_send`. Receiving workers drain their inbox in
+    /// `on_batch_tick` → [`Self::drain_worker_inbox`] and deliver to
+    /// their local subscribers.
+    pub fn set_worker_channels(
+        &mut self,
+        self_idx: usize,
+        inbox: mpsc::Receiver<InterWorkerPublish>,
+        outboxes: Vec<mpsc::SyncSender<InterWorkerPublish>>,
+    ) {
+        self.worker_self_idx = self_idx;
+        self.worker_inbox = Some(inbox);
+        self.worker_outboxes = outboxes;
     }
 
     /// Evaluates `(conn_idx's principal, action, topic_or_pattern)` against
@@ -653,27 +815,36 @@ impl VireonDispatcher {
                 self.handle_topic_delete(ctx, frame.stream_id, &topic);
             }
             Ok(Some(other)) => {
-                tracing::warn!(
-                    conn_idx = ctx.conn_idx,
-                    msg_type = ?frame.msg_type,
-                    parsed = ?other,
-                    "[pubsub] msg_type / payload mismatch"
-                );
+                if self.decode_drop.tick() {
+                    tracing::warn!(
+                        conn_idx = ctx.conn_idx,
+                        msg_type = ?frame.msg_type,
+                        parsed = ?other,
+                        total = self.decode_drop.count(),
+                        "[pubsub] msg_type / payload mismatch (logging every 256th)"
+                    );
+                }
             }
             Ok(None) => {
-                tracing::warn!(
-                    conn_idx = ctx.conn_idx,
-                    msg_type = ?frame.msg_type,
-                    "[pubsub] no structured payload for type"
-                );
+                if self.decode_drop.tick() {
+                    tracing::warn!(
+                        conn_idx = ctx.conn_idx,
+                        msg_type = ?frame.msg_type,
+                        total = self.decode_drop.count(),
+                        "[pubsub] no structured payload for type (logging every 256th)"
+                    );
+                }
             }
             Err(e) => {
-                tracing::warn!(
-                    conn_idx = ctx.conn_idx,
-                    msg_type = ?frame.msg_type,
-                    error = ?e,
-                    "[pubsub] payload decode failed"
-                );
+                if self.decode_drop.tick() {
+                    tracing::warn!(
+                        conn_idx = ctx.conn_idx,
+                        msg_type = ?frame.msg_type,
+                        error = ?e,
+                        total = self.decode_drop.count(),
+                        "[pubsub] payload decode failed (logging every 256th)"
+                    );
+                }
             }
         }
     }
@@ -690,11 +861,14 @@ impl VireonDispatcher {
             .check_acl(ctx.conn_idx, Action::Subscribe, pattern_str)
             .is_allow()
         {
-            tracing::info!(
-                conn_idx = ctx.conn_idx,
-                pattern = %pattern_str,
-                "[acl] subscribe denied"
-            );
+            if self.acl_denied_drop.tick() {
+                tracing::info!(
+                    conn_idx = ctx.conn_idx,
+                    pattern = %pattern_str,
+                    total = self.acl_denied_drop.count(),
+                    "[acl] subscribe denied (logging every 256th)"
+                );
+            }
             let ack = format!(
                 "{{\"error\":\"denied\",\"action\":\"subscribe\",\"pattern\":\"{pattern_str}\"}}"
             );
@@ -703,6 +877,42 @@ impl VireonDispatcher {
         }
         match TopicPattern::new(pattern_str) {
             Ok(_) => {
+                // Resource quota: max-subscribers-per-topic. Counts
+                // subscribers per distinct pattern string — the practical
+                // interpretation for a pattern-based routing model.
+                // Skip the check for the SDK's heartbeat probe to avoid
+                // penalising liveness traffic against the cap.
+                if let Some(cap) = self.max_subscribers_per_topic {
+                    let current = self
+                        .pattern_sub_counts
+                        .get(pattern_str)
+                        .copied()
+                        .unwrap_or(0);
+                    if current >= cap {
+                        self.quota_subscriber_rejects =
+                            self.quota_subscriber_rejects.wrapping_add(1);
+                        if pattern_str != "_heartbeat.probe" {
+                            tracing::info!(
+                                conn_idx = ctx.conn_idx,
+                                pattern = %pattern_str,
+                                cap,
+                                current,
+                                rejects = self.quota_subscriber_rejects,
+                                "[quota] subscribe rejected — max_subscribers_per_topic reached"
+                            );
+                        }
+                        let ack = format!(
+                            "{{\"error\":\"quota_exceeded\",\"limit\":\"max_subscribers_per_topic\",\"cap\":{cap},\"pattern\":\"{pattern_str}\"}}"
+                        );
+                        self.enqueue_response(
+                            ctx,
+                            stream,
+                            MessageType::Subscribe,
+                            Bytes::from(ack),
+                        );
+                        return;
+                    }
+                }
                 let subscriber = Subscriber {
                     conn_idx: ctx.conn_idx,
                     quic_stream_id: ctx.quic_stream_id,
@@ -716,13 +926,32 @@ impl VireonDispatcher {
                     );
                     return;
                 }
-                tracing::info!(
-                    conn_idx = ctx.conn_idx,
-                    pattern = %pattern_str,
-                    quic_stream = ctx.quic_stream_id,
-                    active = self.pubsub_registry.len(),
-                    "[pubsub] subscribe"
-                );
+                // Bump per-pattern subscriber counter for quota accounting.
+                // Only reached on successful registry insertion.
+                *self
+                    .pattern_sub_counts
+                    .entry(pattern_str.to_string())
+                    .or_insert(0) += 1;
+                // The SDK's dead-peer probe re-subscribes to
+                // `_heartbeat.probe` every ~1 s per connection. Logging
+                // it at INFO drowns real subscribe events — drop to DEBUG.
+                if pattern_str.starts_with("_heartbeat.") {
+                    tracing::debug!(
+                        conn_idx = ctx.conn_idx,
+                        pattern = %pattern_str,
+                        quic_stream = ctx.quic_stream_id,
+                        active = self.pubsub_registry.len(),
+                        "[pubsub] subscribe (heartbeat probe)"
+                    );
+                } else {
+                    tracing::info!(
+                        conn_idx = ctx.conn_idx,
+                        pattern = %pattern_str,
+                        quic_stream = ctx.quic_stream_id,
+                        active = self.pubsub_registry.len(),
+                        "[pubsub] subscribe"
+                    );
+                }
 
                 // P6: if we are not the owner of this pattern, notify
                 // the owner of our local interest so future publishes
@@ -754,12 +983,15 @@ impl VireonDispatcher {
                 self.enqueue_response(ctx, stream, MessageType::Subscribe, Bytes::from(ack));
             }
             Err(e) => {
-                tracing::warn!(
-                    conn_idx = ctx.conn_idx,
-                    pattern = %pattern_str,
-                    error = ?e,
-                    "[pubsub] invalid pattern"
-                );
+                if self.invalid_pattern_drop.tick() {
+                    tracing::warn!(
+                        conn_idx = ctx.conn_idx,
+                        pattern = %pattern_str,
+                        error = ?e,
+                        total = self.invalid_pattern_drop.count(),
+                        "[pubsub] invalid pattern (logging every 64th)"
+                    );
+                }
             }
         }
     }
@@ -770,6 +1002,19 @@ impl VireonDispatcher {
         let removed = self
             .pubsub_registry
             .unsubscribe_pattern(ctx.conn_idx, pattern_str);
+        // Mirror the per-pattern counter decrement. Only decrement by
+        // the number actually removed so the counter stays in sync with
+        // the registry's view.
+        if removed > 0 {
+            if let Some(count) = self.pattern_sub_counts.get_mut(pattern_str) {
+                *count = count.saturating_sub(removed);
+                if *count == 0 {
+                    // Drop empty entries so the map stays bounded under
+                    // pattern churn.
+                    self.pattern_sub_counts.remove(pattern_str);
+                }
+            }
+        }
         tracing::info!(
             conn_idx = ctx.conn_idx,
             pattern = %pattern_str,
@@ -798,16 +1043,25 @@ impl VireonDispatcher {
             .check_acl(ctx.conn_idx, Action::Publish, topic.as_str())
             .is_allow()
         {
-            tracing::info!(
-                conn_idx = ctx.conn_idx,
-                topic = %topic,
-                "[acl] publish denied"
-            );
+            if self.acl_denied_drop.tick() {
+                tracing::info!(
+                    conn_idx = ctx.conn_idx,
+                    topic = %topic,
+                    total = self.acl_denied_drop.count(),
+                    "[acl] publish denied (logging every 256th)"
+                );
+            }
             let ack =
                 format!("{{\"error\":\"denied\",\"action\":\"publish\",\"topic\":\"{topic}\"}}");
             self.enqueue_response(ctx, stream, MessageType::Publish, Bytes::from(ack));
             return;
         }
+
+        // Copy payload once — the &[u8] points into the io_uring buffer
+        // pool which gets recycled after this function returns. All
+        // downstream paths (WAL, cluster, fan-out) clone this Bytes
+        // instead of each doing their own copy_from_slice.
+        let payload_bytes = Bytes::copy_from_slice(payload);
 
         // P6: cluster routing. If a coordinator is wired, consult it
         // to decide whether this publish belongs to us (deliver
@@ -826,7 +1080,7 @@ impl VireonDispatcher {
                             ctx.conn_idx as u32,
                             ctx.quic_stream_id,
                             topic.as_str().to_string(),
-                            Bytes::copy_from_slice(payload),
+                            payload_bytes.clone(),
                         );
                         let _ = tx.send(OutgoingMsg { msg, target: owner });
                     }
@@ -853,7 +1107,7 @@ impl VireonDispatcher {
                             ctx.conn_idx as u32,
                             ctx.quic_stream_id,
                             topic.as_str().to_string(),
-                            Bytes::copy_from_slice(payload),
+                            payload_bytes.clone(),
                         );
                         for target in remote_targets {
                             let _ = tx.send(OutgoingMsg {
@@ -874,7 +1128,7 @@ impl VireonDispatcher {
             .filter(|s| s.conn_idx != ctx.conn_idx)
             .collect();
 
-        tracing::info!(
+        tracing::debug!(
             conn_idx = ctx.conn_idx,
             topic = %topic,
             targets = targets.len(),
@@ -885,11 +1139,12 @@ impl VireonDispatcher {
         // Re-encode as a Publish frame so downstream subscribers receive the
         // same wire shape the publisher used (topic_len + topic + payload).
         let topic_str = topic.as_str();
-        let mut framed = Vec::with_capacity(2 + topic_str.len() + payload.len());
-        framed.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
-        framed.extend_from_slice(topic_str.as_bytes());
-        framed.extend_from_slice(payload);
-        let bytes = Bytes::from(framed);
+        self.encode_scratch.clear();
+        self.encode_scratch
+            .extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
+        self.encode_scratch.extend_from_slice(topic_str.as_bytes());
+        self.encode_scratch.extend_from_slice(&payload_bytes);
+        let bytes = self.encode_scratch.split().freeze();
 
         // Phase 4: durable append before fan-out. A failure here is
         // operator-visible (warn log) but does not abort the publish —
@@ -903,7 +1158,7 @@ impl VireonDispatcher {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(0);
-            let record = wal_store::WalRecord::new(now_ns, Bytes::copy_from_slice(payload));
+            let record = wal_store::WalRecord::new(now_ns, payload_bytes.clone());
             match wal.append(topic_str, record) {
                 Ok(offset) => {
                     tracing::trace!(
@@ -914,12 +1169,16 @@ impl VireonDispatcher {
                     );
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        conn_idx = ctx.conn_idx,
-                        topic = topic_str,
-                        error = ?e,
-                        "[wal] append failed — live fan-out proceeds, replay will have a gap"
-                    );
+                    if self.wal_fail_drop.tick() {
+                        tracing::warn!(
+                            conn_idx = ctx.conn_idx,
+                            topic = topic_str,
+                            error = ?e,
+                            total = self.wal_fail_drop.count(),
+                            "[wal] append failed — live fan-out proceeds, replay will have a gap \
+                             (logging every 128th)"
+                        );
+                    }
                 }
             }
         }
@@ -939,10 +1198,9 @@ impl VireonDispatcher {
         // load-balances across its members. The selected consumer may
         // be on the same connection as the publisher; we still deliver
         // in that case (the consumer is a different logical subscriber).
-        let topic_str_owned = topic_str.to_string();
         let mut group_targets: Vec<(usize, u64)> = Vec::new();
         for ((t, _g), local) in &mut self.group_locals {
-            if t != &topic_str_owned || local.members.is_empty() {
+            if t.as_str() != topic_str || local.members.is_empty() {
                 continue;
             }
             let idx = local.rr_idx % local.members.len();
@@ -958,6 +1216,40 @@ impl VireonDispatcher {
                 MessageType::Publish,
                 bytes.clone(),
             );
+        }
+
+        // Cross-worker fan-out: broadcast to all other workers so their
+        // local subscribers receive this publish. `try_send` is
+        // non-blocking — a full inbox drops the publish rather than
+        // stalling the reactor thread.
+        //
+        // Forward the already-encoded `bytes` (a `Bytes` handle) — worker
+        // B's clone is a refcount bump with zero memcpy. Previously this
+        // re-allocated a `String` topic + `Bytes::copy_from_slice(payload)`
+        // and worker B then re-encoded the wire frame from scratch (3×
+        // memcpy per delivered frame). At high throughput that path was
+        // the #1 CPU hotspot in multi-worker mode (~18% of total cycles).
+        if !self.worker_outboxes.is_empty() {
+            for (i, outbox) in self.worker_outboxes.iter().enumerate() {
+                if i == self.worker_self_idx {
+                    continue;
+                }
+                if let Err(std::sync::mpsc::TrySendError::Full(_)) =
+                    outbox.try_send(InterWorkerPublish {
+                        framed: bytes.clone(),
+                    })
+                {
+                    self.worker_drop_count = self.worker_drop_count.wrapping_add(1);
+                    if self.worker_drop_cooldown.tick() {
+                        tracing::warn!(
+                            worker = i,
+                            total_drops = self.worker_drop_count,
+                            "[pubsub] worker inbox full — dropping publishes \
+                             (raise cap in build_inter_worker_pubsub_channels)"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -1007,6 +1299,28 @@ impl VireonDispatcher {
             );
             self.enqueue_response(ctx, stream, MessageType::TopicCreate, Bytes::from(ack));
             return;
+        }
+        // Resource quota: max-topics. Skip the check when the topic is
+        // already tracked (re-create is idempotent and shouldn't bump
+        // the counter). Reject BEFORE catalog insertion so the cap is
+        // exact even under bursts.
+        if let Some(cap) = self.max_topics {
+            if !self.topic_catalog.get(topic).is_some() && self.topic_catalog.len() >= cap {
+                self.quota_topic_rejects = self.quota_topic_rejects.wrapping_add(1);
+                tracing::info!(
+                    conn_idx = ctx.conn_idx,
+                    topic = %topic,
+                    cap,
+                    total = self.topic_catalog.len(),
+                    rejects = self.quota_topic_rejects,
+                    "[quota] topic_create rejected — max_topics reached"
+                );
+                let ack = format!(
+                    "{{\"error\":\"quota_exceeded\",\"limit\":\"max_topics\",\"cap\":{cap},\"topic\":\"{topic}\"}}"
+                );
+                self.enqueue_response(ctx, stream, MessageType::TopicCreate, Bytes::from(ack));
+                return;
+            }
         }
         let config = TopicConfig {
             partitions: partitions.max(1),
@@ -1299,7 +1613,7 @@ impl VireonDispatcher {
         };
         match wal.read_range(topic_str, from, upper, &mut entries) {
             Ok(count) => {
-                tracing::info!(
+                tracing::debug!(
                     conn_idx = ctx.conn_idx,
                     topic = topic_str,
                     requested_max = max_count,
@@ -1644,7 +1958,14 @@ impl VireonDispatcher {
                 );
             }
             Err(e) => {
-                tracing::warn!(conn_idx = ctx.conn_idx, error = ?e, "[groups] heartbeat failed");
+                if self.heartbeat_fail_drop.tick() {
+                    tracing::warn!(
+                        conn_idx = ctx.conn_idx,
+                        error = ?e,
+                        total = self.heartbeat_fail_drop.count(),
+                        "[groups] heartbeat failed (logging every 64th)"
+                    );
+                }
                 let ack = r#"{"error":"heartbeat_failed"}"#.to_string();
                 self.enqueue_response(
                     ctx,
@@ -1683,7 +2004,7 @@ impl VireonDispatcher {
             .unwrap_or(0);
         let evicted = self.groups.tick(now_ns);
         if evicted > 0 {
-            tracing::info!(evicted, "[groups] tick evicted stale members");
+            tracing::debug!(evicted, "[groups] tick evicted stale members");
             // Clean up group_locals entries that have no live members.
             // The coordinator already removed stale consumers internally;
             // we mirror that in our local index by removing members whose
@@ -1735,7 +2056,7 @@ impl VireonDispatcher {
         // Drain into a local Vec first to release the borrow on
         // `self.cluster_incoming_rx` before we call back into
         // `self.cluster_deliver_local` / `self.coordinator`.
-        const CLUSTER_DRAIN_CAP: usize = 256;
+        const CLUSTER_DRAIN_CAP: usize = 1024;
         let mut batch: Vec<InterNodeMessage> = Vec::with_capacity(CLUSTER_DRAIN_CAP);
         if let Some(rx) = &mut self.cluster_incoming_rx {
             while batch.len() < CLUSTER_DRAIN_CAP {
@@ -1833,11 +2154,12 @@ impl VireonDispatcher {
         // Re-encode as a Publish frame so downstream subscribers receive the
         // same wire shape the publisher used (topic_len + topic + payload).
         let topic_str = topic_ref.as_str();
-        let mut framed = Vec::with_capacity(2 + topic_str.len() + payload.len());
-        framed.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
-        framed.extend_from_slice(topic_str.as_bytes());
-        framed.extend_from_slice(payload);
-        let bytes = Bytes::from(framed);
+        self.encode_scratch.clear();
+        self.encode_scratch
+            .extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
+        self.encode_scratch.extend_from_slice(topic_str.as_bytes());
+        self.encode_scratch.extend_from_slice(payload);
+        let bytes = self.encode_scratch.split().freeze();
 
         // Use a synthetic logical stream for inter-node-delivered
         // publishes — they aren't bound to a particular subscriber's
@@ -1855,10 +2177,9 @@ impl VireonDispatcher {
         }
 
         // Consumer-group fan-out (P5) — mirror handle_publish.
-        let topic_str_owned = topic_str.to_string();
         let mut group_targets: Vec<(usize, u64)> = Vec::new();
         for ((t, _g), local) in &mut self.group_locals {
-            if t != &topic_str_owned || local.members.is_empty() {
+            if t.as_str() != topic_str || local.members.is_empty() {
                 continue;
             }
             let idx = local.rr_idx % local.members.len();
@@ -1873,6 +2194,182 @@ impl VireonDispatcher {
                 stream,
                 MessageType::Publish,
                 bytes.clone(),
+            );
+        }
+    }
+
+    /// Drains forwarded publishes from other workers and delivers them
+    /// to local subscribers. Called from `on_batch_tick` each reactor
+    /// cycle. Bounded at 256 messages per drain to avoid monopolising
+    /// the reactor thread.
+    ///
+    /// Delivered publishes are NOT re-broadcast to other workers,
+    /// preventing forwarding loops.
+    pub fn drain_worker_inbox(&mut self) {
+        let Some(rx) = &mut self.worker_inbox else {
+            return;
+        };
+        const CAP: usize = 1024;
+        let mut batch: Vec<InterWorkerPublish> = Vec::with_capacity(CAP);
+        while batch.len() < CAP {
+            match rx.try_recv() {
+                Ok(msg) => batch.push(msg),
+                Err(_) => break,
+            }
+        }
+        if batch.is_empty() {
+            return;
+        }
+        tracing::debug!(
+            worker = self.worker_self_idx,
+            count = batch.len(),
+            "[pubsub] worker inbox drained"
+        );
+        for msg in batch {
+            self.deliver_framed_local(msg.framed);
+        }
+    }
+
+    /// Fast path for cross-worker publishes: deliver an already-encoded
+    /// `[topic_len:u16 BE][topic][payload]` frame to local subscribers
+    /// without re-encoding.
+    ///
+    /// This is the receive-side counterpart to the producer change in
+    /// `handle_publish` — worker A encodes once and forwards the `Bytes`
+    /// handle; worker B clones it (refcount bump) per subscriber. The
+    /// topic is re-parsed from the frame header via zero-copy `Bytes`
+    /// slicing for the registry lookup, avoiding the `String` allocation
+    /// the previous `cluster_deliver_local` path incurred.
+    ///
+    /// Same semantics as `cluster_deliver_local` for the regular fan-out
+    /// AND consumer-group round-robin.
+    fn deliver_framed_local(&mut self, framed: Bytes) {
+        // Zero-copy topic parse: first 2 bytes = topic_len BE, then topic.
+        if framed.len() < 2 {
+            return;
+        }
+        let topic_len = u16::from_be_bytes([framed[0], framed[1]]) as usize;
+        if framed.len() < 2 + topic_len {
+            return;
+        }
+        let topic_str: &str = match std::str::from_utf8(&framed[2..2 + topic_len]) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let topic_ref = match pubsub_engine::Topic::new(topic_str) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    topic = topic_str,
+                    error = ?e,
+                    "[pubsub] forwarded publish has invalid topic — dropping"
+                );
+                return;
+            }
+        };
+
+        let targets: Vec<Subscriber> = self
+            .pubsub_registry
+            .lookup(&topic_ref)
+            .into_iter()
+            .collect();
+
+        // Synthetic stream id for forwarded publishes (same convention
+        // as `cluster_deliver_local`).
+        let stream = StreamId::new(0xFFFF_FFFF);
+        for target in targets {
+            self.enqueue_frame(
+                target.conn_idx,
+                target.quic_stream_id,
+                stream,
+                MessageType::Publish,
+                framed.clone(),
+            );
+        }
+
+        // Consumer-group fan-out (P5) — same logic as `cluster_deliver_local`.
+        let mut group_targets: Vec<(usize, u64)> = Vec::new();
+        for ((t, _g), local) in &mut self.group_locals {
+            if t.as_str() != topic_str || local.members.is_empty() {
+                continue;
+            }
+            let idx = local.rr_idx % local.members.len();
+            local.rr_idx = local.rr_idx.wrapping_add(1);
+            let m = &local.members[idx];
+            group_targets.push((m.conn_idx, m.quic_stream_id));
+        }
+        for (conn_idx, quic_stream_id) in group_targets {
+            self.enqueue_frame(
+                conn_idx,
+                quic_stream_id,
+                stream,
+                MessageType::Publish,
+                framed.clone(),
+            );
+        }
+    }
+
+    /// Apply the configured WAL retention policy to every tracked
+    /// topic if the sweep interval has elapsed. Cheap no-op when WAL
+    /// is unconfigured or the policy is `keep_forever`.
+    ///
+    /// Throttled to one sweep per [`WAL_RETENTION_SWEEP_INTERVAL`]
+    /// (60 s). The sweep walks every topic known to the store, calls
+    /// [`wal_store::RetentionPolicy::apply`], and aggregates the
+    /// removed-entry count for a single summary log line.
+    fn maybe_run_wal_retention(&mut self) {
+        // Fast path: no WAL, no policy, or interval not yet elapsed.
+        if self.wal.is_none() {
+            return;
+        }
+        if self.wal_retention.max_bytes.is_none() && self.wal_retention.max_age_ns.is_none() {
+            return;
+        }
+        let now = Instant::now();
+        let due = self.wal_retention_last_run.map_or(true, |t| {
+            now.duration_since(t) >= WAL_RETENTION_SWEEP_INTERVAL
+        });
+        if !due {
+            return;
+        }
+        self.wal_retention_last_run = Some(now);
+
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+
+        // Borrow-checker dance: split the wal mutably from the policy
+        // copy so `apply` can take &mut store + &policy by value.
+        let policy = self.wal_retention;
+        let Some(wal) = self.wal.as_mut() else {
+            return;
+        };
+        let topics = wal.topic_names();
+        if topics.is_empty() {
+            return;
+        }
+        let mut total_removed: usize = 0;
+        let mut errored: u64 = 0;
+        for topic in &topics {
+            match policy.apply::<wal_store::FileStore>(wal, topic, now_ns) {
+                Ok(stats) => total_removed = total_removed.saturating_add(stats.removed),
+                Err(_) => errored = errored.saturating_add(1),
+            }
+        }
+        if total_removed > 0 || errored > 0 {
+            tracing::info!(
+                topics = topics.len(),
+                removed = total_removed,
+                errored,
+                retained_bytes = wal.retained_bytes(),
+                "[wal] retention sweep"
+            );
+        } else {
+            tracing::debug!(
+                topics = topics.len(),
+                retained_bytes = wal.retained_bytes(),
+                "[wal] retention sweep (no removals)"
             );
         }
     }
@@ -1910,10 +2407,13 @@ impl AppDispatcher for VireonDispatcher {
             MessageType::FetchReply => {
                 // Server doesn't accept FetchReply from clients — it's
                 // a server→subscriber data-plane frame. Log + drop.
-                tracing::warn!(
-                    conn_idx = ctx.conn_idx,
-                    "[app:pubsub] client-sent FetchReply ignored"
-                );
+                if self.fetch_reply_ignore_drop.tick() {
+                    tracing::warn!(
+                        conn_idx = ctx.conn_idx,
+                        total = self.fetch_reply_ignore_drop.count(),
+                        "[app:pubsub] client-sent FetchReply ignored (logging every 128th)"
+                    );
+                }
             }
             MessageType::Error => {
                 tracing::trace!(
@@ -1957,7 +2457,21 @@ impl AppDispatcher for VireonDispatcher {
         session_id: SessionId,
         reason: Option<&str>,
     ) {
-        let removed = self.pubsub_registry.remove_connection(conn_idx);
+        let removed_patterns = self
+            .pubsub_registry
+            .remove_connection_with_patterns(conn_idx);
+        let removed = removed_patterns.len();
+        // Decrement per-pattern quota counters to match.
+        if !removed_patterns.is_empty() {
+            for pat in &removed_patterns {
+                if let Some(count) = self.pattern_sub_counts.get_mut(pat) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.pattern_sub_counts.remove(pat);
+                    }
+                }
+            }
+        }
         let principal = self.principals.remove(&conn_idx);
 
         // P5: leave all consumer groups the disconnected connection
@@ -2111,7 +2625,13 @@ impl ApplicationLayer {
             .quotas
             .reserve(self.default_tenant, &self.default_limit)
         {
-            tracing::warn!(error = ?e, "[app:quotas] reserve failed for default tenant");
+            if self.dispatcher.quota_drop.tick() {
+                tracing::warn!(
+                    error = ?e,
+                    total = self.dispatcher.quota_drop.count(),
+                    "[app:quotas] reserve failed for default tenant (logging every 64th)"
+                );
+            }
         }
 
         // Notify application dispatcher.
@@ -2148,13 +2668,18 @@ impl ApplicationLayer {
                     frame.stream_id,
                     meta.policy,
                 ),
-                Err(e) => tracing::warn!(
-                    conn_idx = ctx.conn_idx,
-                    stream_id = frame.stream_id.get(),
-                    error = ?e,
-                    "[send-policy] malformed StreamOpen payload — \
-                     stream will lazy-default to ReliableOrdered"
-                ),
+                Err(e) => {
+                    if self.dispatcher.malformed_drop.tick() {
+                        tracing::warn!(
+                            conn_idx = ctx.conn_idx,
+                            stream_id = frame.stream_id.get(),
+                            error = ?e,
+                            total = self.dispatcher.malformed_drop.count(),
+                            "[send-policy] malformed StreamOpen payload — \
+                             stream will lazy-default to ReliableOrdered (logging every 256th)"
+                        );
+                    }
+                }
             },
             MessageType::StreamClose | MessageType::StreamReset => {
                 self.dispatcher
@@ -2184,6 +2709,8 @@ impl ApplicationLayer {
         self.session.on_batch_tick();
         self.dispatcher.tick_groups();
         self.dispatcher.drain_cluster_inbox();
+        self.dispatcher.drain_worker_inbox();
+        self.dispatcher.maybe_run_wal_retention();
     }
 
     /// Drains queued outgoing frames produced by the dispatcher.
@@ -2268,6 +2795,22 @@ impl ApplicationLayer {
         self.dispatcher.wal = Some(wal);
     }
 
+    /// Delegates to [`VireonDispatcher::set_wal_retention`]. The
+    /// retention sweep runs from `on_batch_tick` once per ~60 s.
+    pub fn set_wal_retention(&mut self, policy: wal_store::RetentionPolicy) {
+        self.dispatcher.set_wal_retention(policy);
+    }
+
+    /// Delegates to [`VireonDispatcher::set_max_topics`].
+    pub fn set_max_topics(&mut self, max: Option<usize>) {
+        self.dispatcher.set_max_topics(max);
+    }
+
+    /// Delegates to [`VireonDispatcher::set_max_subscribers_per_topic`].
+    pub fn set_max_subscribers_per_topic(&mut self, max: Option<usize>) {
+        self.dispatcher.set_max_subscribers_per_topic(max);
+    }
+
     /// Installs a cluster coordinator + transport channels (P6).
     /// Should be called before the first frame is processed so every
     /// publish is routed via the coordinator from the start.
@@ -2279,6 +2822,20 @@ impl ApplicationLayer {
         incoming_rx: mpsc::Receiver<InterNodeMessage>,
     ) {
         self.dispatcher.set_cluster(cfg, outgoing_tx, incoming_rx);
+    }
+
+    /// Installs inter-worker pub/sub channels for cross-worker fan-out.
+    /// Should be called before the first frame is processed so every
+    /// publish is broadcast to other workers from the start.
+    #[allow(dead_code)]
+    pub fn set_worker_channels(
+        &mut self,
+        self_idx: usize,
+        inbox: mpsc::Receiver<InterWorkerPublish>,
+        outboxes: Vec<mpsc::SyncSender<InterWorkerPublish>>,
+    ) {
+        self.dispatcher
+            .set_worker_channels(self_idx, inbox, outboxes);
     }
 }
 
@@ -3057,5 +3614,183 @@ mod tests {
             body.contains("\"error\":\"wal_disabled\""),
             "expected wal_disabled ack, got: {body}"
         );
+    }
+
+    #[test]
+    fn wal_retention_bytes_truncates_after_threshold() {
+        let (mut d, _keepalive) = dispatcher_with_wal();
+        // Cap at 200 bytes (≈ 5 entries survive at ~38 B/entry).
+        d.set_wal_retention(wal_store::RetentionPolicy::by_bytes(200));
+
+        let topic = pubsub_engine::Topic::new("sensor.temp").unwrap();
+        for i in 0..20u8 {
+            d.handle_publish(&ctx(1, 200), StreamId::new(2), &topic, &[i]);
+        }
+        let _ = d.drain_outbox();
+
+        // Pre-sweep: 20 entries retained.
+        assert_eq!(d.wal.as_ref().unwrap().len("sensor.temp"), 20);
+
+        // Drive the sweep directly (we don't wait 60 s in unit tests).
+        // The dispatcher exposes a private helper; replicate the call.
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let policy = d.wal_retention;
+        let wal = d.wal.as_mut().unwrap();
+        let stats = policy
+            .apply::<wal_store::FileStore>(wal, "sensor.temp", now_ns)
+            .expect("retention apply");
+        assert!(stats.removed > 0, "sweep should remove entries");
+        assert!(
+            wal.retained_bytes() <= 200,
+            "retained bytes ({}) should be under cap (200)",
+            wal.retained_bytes()
+        );
+    }
+
+    #[test]
+    fn wal_retention_keep_forever_is_noop() {
+        let (mut d, _keepalive) = dispatcher_with_wal();
+        // Default policy = keep forever.
+        let topic = pubsub_engine::Topic::new("sensor.temp").unwrap();
+        for i in 0..10u8 {
+            d.handle_publish(&ctx(1, 200), StreamId::new(2), &topic, &[i]);
+        }
+        let _ = d.drain_outbox();
+
+        // maybe_run_wal_retention should be a no-op with keep_forever,
+        // regardless of how much time has elapsed.
+        d.wal_retention_last_run = None; // force "due"
+        d.maybe_run_wal_retention();
+
+        assert_eq!(d.wal.as_ref().unwrap().len("sensor.temp"), 10);
+    }
+
+    #[test]
+    fn quota_max_topics_rejects_beyond_cap() {
+        let mut d = VireonDispatcher::new();
+        d.set_max_topics(Some(2));
+
+        d.handle_topic_create(&ctx(0, 100), StreamId::new(1), "topic.a", 1, 0);
+        d.handle_topic_create(&ctx(0, 100), StreamId::new(1), "topic.b", 1, 0);
+        let _ = d.drain_outbox();
+        assert_eq!(d.topic_catalog.len(), 2);
+        assert_eq!(d.quota_topic_rejects, 0);
+
+        // Third topic should be rejected.
+        d.handle_topic_create(&ctx(0, 100), StreamId::new(1), "topic.c", 1, 0);
+        let out = drain_outbox_bytes(&mut d);
+        assert_eq!(d.topic_catalog.len(), 2, "catalog must not grow past cap");
+        assert_eq!(d.quota_topic_rejects, 1);
+        assert_eq!(out.len(), 1);
+        let body = String::from_utf8_lossy(&out[0].1);
+        assert!(
+            body.contains("quota_exceeded") && body.contains("max_topics"),
+            "expected quota_exceeded ack, got: {body}"
+        );
+
+        // Re-creating an existing topic should NOT be rejected (idempotent).
+        d.handle_topic_create(&ctx(0, 100), StreamId::new(1), "topic.a", 1, 0);
+        let _ = d.drain_outbox();
+        assert_eq!(d.topic_catalog.len(), 2);
+        assert_eq!(
+            d.quota_topic_rejects, 1,
+            "idempotent re-create shouldn't bump rejects"
+        );
+    }
+
+    #[test]
+    fn quota_max_topics_disabled_when_none() {
+        let mut d = VireonDispatcher::new();
+        // Default: None = unlimited.
+        for i in 0..100 {
+            let topic = format!("topic.{i}");
+            d.handle_topic_create(&ctx(0, 100), StreamId::new(1), &topic, 1, 0);
+        }
+        let _ = d.drain_outbox();
+        assert_eq!(d.topic_catalog.len(), 100);
+        assert_eq!(d.quota_topic_rejects, 0);
+    }
+
+    #[test]
+    fn quota_max_subscribers_per_topic_rejects_beyond_cap() {
+        let mut d = VireonDispatcher::new();
+        d.set_max_subscribers_per_topic(Some(2));
+
+        // Two subscribers on the same pattern from different conns.
+        d.handle_subscribe(&ctx(1, 200), StreamId::new(0), "sensor.*");
+        d.handle_subscribe(&ctx(2, 200), StreamId::new(0), "sensor.*");
+        let _ = d.drain_outbox();
+        assert_eq!(
+            d.pattern_sub_counts.get("sensor.*").copied(),
+            Some(2),
+            "counter should track 2 subscribers"
+        );
+
+        // Third subscriber on the same pattern should be rejected.
+        d.handle_subscribe(&ctx(3, 200), StreamId::new(0), "sensor.*");
+        let out = drain_outbox_bytes(&mut d);
+        assert_eq!(
+            d.pattern_sub_counts.get("sensor.*").copied(),
+            Some(2),
+            "counter must not grow past cap"
+        );
+        assert_eq!(d.quota_subscriber_rejects, 1);
+        let body = String::from_utf8_lossy(&out[0].1);
+        assert!(
+            body.contains("quota_exceeded") && body.contains("max_subscribers_per_topic"),
+            "expected quota_exceeded ack, got: {body}"
+        );
+
+        // A different pattern should be unaffected.
+        d.handle_subscribe(&ctx(4, 200), StreamId::new(0), "alert.*");
+        let _ = d.drain_outbox();
+        assert_eq!(d.pattern_sub_counts.get("alert.*").copied(), Some(1));
+    }
+
+    #[test]
+    fn quota_subscribers_decrement_on_unsubscribe_and_close() {
+        let mut d = VireonDispatcher::new();
+        d.set_max_subscribers_per_topic(Some(2));
+
+        d.handle_subscribe(&ctx(1, 200), StreamId::new(0), "sensor.*");
+        d.handle_subscribe(&ctx(2, 200), StreamId::new(0), "sensor.*");
+        let _ = d.drain_outbox();
+        assert_eq!(d.pattern_sub_counts.get("sensor.*").copied(), Some(2));
+
+        // Third is rejected.
+        d.handle_subscribe(&ctx(3, 200), StreamId::new(0), "sensor.*");
+        let _ = d.drain_outbox();
+        assert_eq!(d.quota_subscriber_rejects, 1);
+
+        // Conn 1 unsubscribes — counter drops to 1.
+        d.handle_unsubscribe(&ctx(1, 200), StreamId::new(0), "sensor.*");
+        let _ = d.drain_outbox();
+        assert_eq!(d.pattern_sub_counts.get("sensor.*").copied(), Some(1));
+
+        // Now the previously-rejected conn 3 should succeed.
+        d.handle_subscribe(&ctx(3, 200), StreamId::new(0), "sensor.*");
+        let _ = d.drain_outbox();
+        assert_eq!(d.pattern_sub_counts.get("sensor.*").copied(), Some(2));
+        assert_eq!(
+            d.quota_subscriber_rejects, 1,
+            "no new rejection after decrement"
+        );
+
+        // Connection-close also decrements.
+        let removed = d.pubsub_registry.remove_connection_with_patterns(2);
+        assert_eq!(removed.len(), 1);
+        // Reconcile mirror.
+        for pat in &removed {
+            if let Some(c) = d.pattern_sub_counts.get_mut(pat) {
+                *c = c.saturating_sub(1);
+                if *c == 0 {
+                    d.pattern_sub_counts.remove(pat);
+                }
+            }
+        }
+        assert_eq!(d.pattern_sub_counts.get("sensor.*").copied(), Some(1));
     }
 }
