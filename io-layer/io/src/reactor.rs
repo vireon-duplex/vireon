@@ -142,9 +142,7 @@ pub fn cancel_all_rings() {
         // is about to die.
         let ring: &mut io_uring::IoUring = unsafe { &mut *(ptr_val as *mut _) };
 
-        let cancel_entry = AsyncCancel2::new(CancelBuilder::any())
-            .build()
-            .user_data(0);
+        let cancel_entry = AsyncCancel2::new(CancelBuilder::any()).build().user_data(0);
         // Drain existing CQEs BEFORE calling submit_and_wait. Without
         // this, submit_and_wait(1) may see pending CQEs from the multishot
         // RECV and return immediately — before the kernel processes
@@ -676,11 +674,10 @@ impl Drop for Reactor {
         //
         // CancelBuilder::any() requires kernel ≥ 5.19 — already a hard
         // requirement for PBUF_RING used by the buffer pool.
-        let cancel_entry = io_uring::opcode::AsyncCancel2::new(
-            io_uring::types::CancelBuilder::any(),
-        )
-        .build()
-        .user_data(0);
+        let cancel_entry =
+            io_uring::opcode::AsyncCancel2::new(io_uring::types::CancelBuilder::any())
+                .build()
+                .user_data(0);
         // Best-effort push; if the SQ ring is full the submit_and_wait
         // below will flush what's already queued and the kernel's
         // ring-fd close (when IoUring drops) cancels the rest anyway.

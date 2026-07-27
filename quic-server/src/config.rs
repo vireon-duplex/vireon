@@ -178,10 +178,13 @@ impl ServerConfig {
             wal_root: cli.wal_root.as_deref().map(std::path::PathBuf::from),
             wal_retention: build_wal_retention(cli.wal_retention_secs, cli.wal_max_bytes),
             max_topics: (cli.max_topics > 0).then_some(cli.max_topics),
-            max_subscribers_per_topic: (cli.max_subscribers_per_topic > 0).then_some(cli.max_subscribers_per_topic),
+            max_subscribers_per_topic: (cli.max_subscribers_per_topic > 0)
+                .then_some(cli.max_subscribers_per_topic),
             cluster,
             metrics_port: cli.metrics_port,
-            metrics: cli.metrics_port.map(|_| Arc::new(crate::metrics::ServerMetrics::new())),
+            metrics: cli
+                .metrics_port
+                .map(|_| Arc::new(crate::metrics::ServerMetrics::new())),
         })
     }
 
@@ -230,10 +233,7 @@ fn resolve_workers(requested: usize, mode: &WorkerModeArg) -> usize {
 /// Both `0` = "no limit on that dimension". When both are zero the
 /// result is `None` (keep-forever, also the default when WAL is
 /// disabled).
-fn build_wal_retention(
-    retention_secs: u64,
-    max_bytes: u64,
-) -> Option<wal_store::RetentionPolicy> {
+fn build_wal_retention(retention_secs: u64, max_bytes: u64) -> Option<wal_store::RetentionPolicy> {
     let max_age_ns = (retention_secs > 0).then(|| retention_secs.saturating_mul(1_000_000_000));
     let max_bytes = (max_bytes > 0).then_some(max_bytes);
     if max_age_ns.is_none() && max_bytes.is_none() {
