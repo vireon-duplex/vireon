@@ -182,9 +182,7 @@ pub struct ServerConf {
     pub metrics_port: Option<u16>,
 
     // ── Cluster ──
-    pub cluster_node_id: Option<u32>,
-    pub cluster_peers: Option<String>,
-    pub cluster_replication_factor: Option<u8>,
+    pub cluster: Option<ClusterConf>,
 
     // ── ACL ──
     pub acl_rules_path: Option<String>,
@@ -222,6 +220,27 @@ pub struct QuicConf {
     pub handshake_timeout: Option<HumanDuration>,
     pub congestion: Option<String>,
     pub initial_cwnd_packets: Option<u32>,
+}
+
+/// `[cluster]` — multi-node cluster configuration (P6).
+///
+/// When `node_id` is `Some` and `peers` is non-empty, the server joins
+/// a cluster and routes publishes via consistent hashing. Both fields
+/// must be set together; setting only one is a config error.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct ClusterConf {
+    /// Self node ID. Must be >0 and appear in `peers`.
+    pub node_id: Option<u32>,
+    /// Peer list string: `"id=host:port,id=host:port,..."`.
+    /// All nodes (including self) must be listed.
+    pub peers: Option<String>,
+    /// Number of nodes (including owner) that should hold a replica of
+    /// each publish. `1` = no replication (default).
+    pub replication_factor: Option<u8>,
+    /// Virtual nodes per physical node on the consistent-hash ring.
+    /// Default 150 (Dynamo standard). Clamped to `[1, 1024]`.
+    pub vnodes: Option<u32>,
 }
 
 /// `[buffer_pool]` — per-worker buffer allocation pool tuning.
