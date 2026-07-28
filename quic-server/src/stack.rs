@@ -241,6 +241,7 @@ impl VireonStack {
         worker_inbox: Option<std::sync::mpsc::Receiver<crate::layers::InterWorkerPublish>>,
         worker_outboxes: Vec<std::sync::mpsc::SyncSender<crate::layers::InterWorkerPublish>>,
         shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
+        audit_log_template: Option<&str>,
         tuning: &crate::conf::LayerTuning,
     ) -> Result<Self, ServerError> {
         let mut application = ApplicationLayer::new(tuning)?;
@@ -293,6 +294,26 @@ impl VireonStack {
         }
         if let Some(inbox) = worker_inbox {
             application.set_worker_channels(reactor_id as usize, inbox, worker_outboxes);
+        }
+        if let Some(template) = audit_log_template {
+            let path_str = template.replace("{worker}", &reactor_id.to_string());
+            let path = std::path::Path::new(&path_str);
+            match crate::audit::AuditLog::open(path) {
+                Ok(log) => {
+                    tracing::info!(
+                        path = %path.display(),
+                        "[audit] opened per-worker audit log"
+                    );
+                    application.set_audit_log(log);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "[audit] failed to open — audit logging disabled for this worker"
+                    );
+                }
+            }
         }
         Ok(Self {
             application,

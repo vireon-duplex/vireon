@@ -1,6 +1,7 @@
 //! Vireon QUIC Server — production-grade QUIC server on io_uring + quiche.
 
 mod acl_loader;
+mod audit;
 mod cli;
 mod cluster;
 mod conf;

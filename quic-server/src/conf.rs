@@ -188,6 +188,10 @@ pub struct ServerConf {
     // ── ACL ──
     pub acl_rules_path: Option<String>,
 
+    // ── Audit ──
+    /// Path template for the audit log (e.g. `"/var/log/vireon/audit.{worker}.vaud"`).
+    pub audit_log: Option<String>,
+
     // ── QUIC engine overrides ──
     pub quic: Option<QuicConf>,
 
