@@ -274,6 +274,19 @@ cargo run -p quic-server --release -- \
     --cert cert.pem --key key.pem --port 4433 \
     --mode multi --wal-root /var/lib/vireon/wal
 
+# With metrics + JSON logs + tamper-evident audit log
+cargo run -p quic-server --release -- \
+    --cert cert.pem --key key.pem --port 4433 \
+    --mode multi --metrics-port 9090 --log-format json \
+    --audit-log /var/log/vireon/audit.{worker}.vaud
+
+# 3-node cluster with replication factor 2
+cargo run -p quic-server --release -- \
+    --cert cert.pem --key key.pem --port 4433 \
+    --cluster-node-id 1 \
+    --cluster-peers "1=10.0.0.1:4433,2=10.0.0.2:4433,3=10.0.0.3:4433" \
+    --cluster-replication-factor 2
+
 # Custom worker count + queue depth
 cargo run -p quic-server --release -- \
     --cert cert.pem --key key.pem --port 4433 \
@@ -304,6 +317,7 @@ flags always override config file values.
 | `--bind` | `0.0.0.0` | Bind address (IP only; port from `--port`) |
 | `--cert` | *(required)* | PEM certificate chain path |
 | `--key` | *(required)* | PEM private key path |
+| `--client-ca FILE` | off | PEM-encoded CA bundle for mutual TLS (mTLS). When set, every client must present a certificate signed by this CA during the TLS handshake. |
 
 #### Worker / threading
 
@@ -333,10 +347,29 @@ flags always override config file values.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--acl-rules FILE` | off | Load tenant-isolation ACL rules from a TOML file, replacing the default permissive `allow("*.*")` table. |
+| `--acl-rules-path FILE` | off | Load tenant-isolation ACL rules from a TOML file, replacing the default permissive `allow("*.*")` table. |
 | `--wal-root DIR` | off | Enable the write-ahead log. Every accepted publish is appended under `<DIR>/worker_<id>/`. Subscribers can `Fetch(offset)` to replay missed messages. Off = fire-and-forget. |
+| `--wal-retention-secs N` | `0` | WAL retention by age. Entries older than `N` seconds are truncated by a periodic sweeper. `0` = no age-based retention. |
+| `--wal-max-bytes N` | `0` | WAL retention by size: per-topic byte cap. When a topic exceeds this, oldest entries are truncated. `0` = no size cap. |
+| `--max-topics N` | `0` | Maximum distinct topics in the catalog. `TopicCreate` beyond this cap is rejected with `quota_exceeded`. `0` = unlimited. |
+| `--max-subscribers-per-topic N` | `0` | Maximum subscribers per distinct subscription pattern. `Subscribe` beyond this cap is rejected with `quota_exceeded`. `0` = unlimited. |
 | `--cluster-node-id N` | off | (P6) Join a multi-node cluster as node `N`. Must be >0 and appear in `--cluster-peers`. |
 | `--cluster-peers LIST` | off | (P6) Cluster peer list: `"1=host:port,2=host:port,..."`. All nodes including self must be listed. Requires `--cluster-node-id`. |
+| `--cluster-replication-factor N` | `1` | (P6) Replication factor for cluster durability. When >1, each publish is forwarded to `N-1` replica nodes (chosen by consistent hashing on the topic) in addition to the primary owner. Replicas append to their local WAL. Must be ≤ number of peers. |
+
+#### Security
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--max-handshakes-per-ip-per-sec N` | `0` | Maximum new QUIC handshakes per second from a single source IP. `0` = disabled (default). Over-limit IPs have their Initial packets dropped before connection state is allocated, defending against handshake storms. |
+
+#### Observability
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--metrics-port N` | `0` | HTTP port for the Prometheus `/metrics` endpoint. Exposes per-topic labeled counters (publishes, deliveries, bytes) plus global connection/error counters. `0` = metrics endpoint disabled. |
+| `--log-format FORMAT` | `text` | Log output format: `text` (default) or `json` (structured). JSON is compatible with journald, Loki, Fluentd, and other log aggregators that parse JSON on stdin. |
+| `--audit-log TEMPLATE` | off | Path template for the tamper-evident audit log. Records security-relevant events (ACL denies, quota rejections, topic create/delete) to a SHA-256 hash-chained append-only file. `{worker}` is replaced with the worker ID (e.g. `/var/log/vireon/audit.{worker}.vaud`). |
 
 ### Presets
 
@@ -383,6 +416,7 @@ port = 4433
 bind = "0.0.0.0"
 cert = "cert.pem"
 key = "key.pem"
+# client_ca = "ca.pem"          # uncomment to enable mTLS
 
 # ── Workers ───────────────────────────────────────────────────
 mode = "multi"                  # single | multi | distributed
@@ -395,16 +429,36 @@ preset = "bare-metal"
 # ── CRC ───────────────────────────────────────────────────────
 skip_crc = true                 # default ON (QUIC AEAD guarantees integrity)
 
+# ── Performance / logging ─────────────────────────────────────
+sqpoll = false
+log_format = "text"             # text | json (json for log aggregators)
+
 # ── WAL ───────────────────────────────────────────────────────
 wal_root = "/var/lib/vireon/wal"
 wal_retention_secs = 3600       # entries older than 1h are truncated
 wal_max_bytes = 1073741824      # 1 GiB per topic
 
-# ── Metrics ───────────────────────────────────────────────────
-metrics_port = 9090
+# ── WAL fsync policy (durability vs throughput) ───────────────
+# See [wal_sync] section in vireon.conf.example for full details.
+[wal_sync]
+mode = "group_commit"           # never | every_flush | group_commit
+group_commit_ms = 100
+
+# ── Limits / quotas ───────────────────────────────────────────
+max_topics = 0                  # 0 = unlimited
+max_subscribers_per_topic = 0
 
 # ── Security ──────────────────────────────────────────────────
 max_handshakes_per_ip_per_sec = 100
+
+# ── Observability ─────────────────────────────────────────────
+metrics_port = 9090
+# audit_log = "/var/log/vireon/audit.{worker}.vaud"   # tamper-evident
+
+# ── Cluster (P6 — multi-node) ─────────────────────────────────
+# cluster_node_id = 1
+# cluster_peers = "1=10.0.0.1:4433,2=10.0.0.2:4433,3=10.0.0.3:4433"
+# cluster_replication_factor = 2
 
 # ── QUIC engine overrides (optional — preset defaults apply) ──
 [quic]
