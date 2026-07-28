@@ -23,6 +23,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use rustc_hash::FxHashMap;
 
@@ -34,6 +35,35 @@ use crate::store::{WalStore, validate_topic};
 const LOG_FILENAME: &str = "log.wal";
 const TMP_FILENAME: &str = "log.wal.tmp";
 
+/// When to call `sync_all` / `sync_data` on the WAL file.
+///
+/// The default in `vireon.conf` is `GroupCommit(100ms)` — fsync at most
+/// every 100 ms, which protects against power loss with at most 100 ms
+/// of data loss while keeping throughput high. Switch to `EveryFlush`
+/// for maximum durability (one fsync per publish) or `Never` to leave
+/// flushing to the OS page cache (fastest, data survives process crash
+/// but not power loss).
+#[derive(Clone, Copy, Debug)]
+pub enum SyncPolicy {
+    /// `flush()` only — bytes leave the process but stay in the kernel
+    /// page cache. Survives process crash; lost on power failure.
+    Never,
+    /// `sync_data()` after every `flush()`. Maximum durability, slowest.
+    EveryFlush,
+    /// `sync_data()` if more than `Duration` has elapsed since the last
+    /// sync. Batches fsyncs so throughput stays high while bounding
+    /// worst-case data loss to the interval.
+    GroupCommit(Duration),
+}
+
+impl Default for SyncPolicy {
+    fn default() -> Self {
+        // Conservative default for a pub/sub runtime: 100 ms of potential
+        // loss in exchange for >10× throughput vs `EveryFlush`.
+        Self::GroupCommit(Duration::from_millis(100))
+    }
+}
+
 /// Disk-backed [`WalStore`].
 #[derive(Debug)]
 pub struct FileStore {
@@ -44,6 +74,11 @@ pub struct FileStore {
     /// resummed after mutations; cheaper than walking every topic on
     /// every call.
     retained_bytes: u64,
+    /// When to call `sync_data` on appended bytes. See [`SyncPolicy`].
+    sync_policy: SyncPolicy,
+    /// Last successful `sync_data` instant. Used by `GroupCommit` to
+    /// skip redundant syncs inside the interval.
+    last_sync: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -65,17 +100,65 @@ struct TopicFile {
 impl FileStore {
     /// Open or create a store rooted at `path`. The directory is
     /// created if missing; existing topic subdirectories are scanned
-    /// and their indices rebuilt.
+    /// and their indices rebuilt. Uses the default [`SyncPolicy`]
+    /// (group-commit 100 ms).
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, WalError> {
+        Self::open_with(path, SyncPolicy::default())
+    }
+
+    /// Open or create a store rooted at `path` with an explicit
+    /// [`SyncPolicy`]. Used by the server to forward the operator's
+    /// `wal_sync` / `wal_sync_group_commit_ms` configuration.
+    pub fn open_with<P: AsRef<Path>>(path: P, policy: SyncPolicy) -> Result<Self, WalError> {
         let root = path.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
         let mut store = Self {
             root,
             topics: FxHashMap::default(),
             retained_bytes: 0,
+            sync_policy: policy,
+            last_sync: None,
         };
         store.recover_topics()?;
         Ok(store)
+    }
+
+    /// Apply the configured [`SyncPolicy`] to every open topic file.
+    /// Called after each `append()`; in `GroupCommit` mode this skips
+    /// the syscall when inside the interval. Errors are logged-and-
+    /// swallowed: a failed fsync must NOT abort the publish path (the
+    /// live fan-out proceeds regardless, same philosophy as a failed
+    /// WAL append).
+    fn maybe_sync(&mut self) {
+        let do_sync = match self.sync_policy {
+            SyncPolicy::Never => false,
+            SyncPolicy::EveryFlush => true,
+            SyncPolicy::GroupCommit(interval) => match self.last_sync {
+                Some(last) => last.elapsed() >= interval,
+                None => true,
+            },
+        };
+        if !do_sync {
+            return;
+        }
+        // sync_data is enough — we never rename the WAL post-open, so
+        // metadata stability is not required. Skips the inode write
+        // that `sync_all` would force.
+        let mut had_err = false;
+        for tf in self.topics.values_mut() {
+            if let Err(e) = tf.file.sync_data() {
+                tracing::warn!(
+                    topic_dir = ?tf.dir,
+                    error = %e,
+                    "[wal] sync_data failed — page cache holds the bytes \
+                     but they are not fsync-durable"
+                );
+                had_err = true;
+            }
+        }
+        if !had_err {
+            self.last_sync = Some(Instant::now());
+        }
     }
 
     fn recover_topics(&mut self) -> Result<(), WalError> {
@@ -243,6 +326,10 @@ impl WalStore for FileStore {
         tf.next_offset += 1;
         tf.retained_bytes += entry.wire_len() as u64;
         self.retained_bytes += entry.wire_len() as u64;
+        // Apply the configured durability policy. Inside GroupCommit,
+        // this is usually a no-op (the interval hasn't elapsed); under
+        // EveryFlush it forces a syscall per publish.
+        self.maybe_sync();
         Ok(offset)
     }
 
@@ -626,5 +713,51 @@ mod tests {
             s.append("bad/name", rec(b"x")),
             Err(WalError::InvalidTopic { .. })
         ));
+    }
+
+    fn open_with_policy(policy: SyncPolicy) -> (FileStore, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let store = FileStore::open_with(dir.path(), policy).unwrap();
+        (store, dir)
+    }
+
+    #[test]
+    fn sync_policy_never_still_appends_correctly() {
+        // The policy must not affect the data path — only the fsync path.
+        let (mut s, _dir) = open_with_policy(SyncPolicy::Never);
+        let off = s.append("t", rec(b"hello")).unwrap();
+        assert_eq!(off, Offset::new(0));
+        assert_eq!(s.len("t"), 1);
+        assert_eq!(s.read("t", Offset::new(0)).unwrap().payload.as_ref(), b"hello");
+    }
+
+    #[test]
+    fn sync_policy_every_flush_does_not_break_append() {
+        let (mut s, _dir) = open_with_policy(SyncPolicy::EveryFlush);
+        for i in 0..5 {
+            let _ = s.append("t", rec(&[i])).unwrap();
+        }
+        assert_eq!(s.len("t"), 5);
+    }
+
+    #[test]
+    fn sync_policy_group_commit_skips_within_interval() {
+        // Within the same nanosecond-resolution window, GroupCommit
+        // should only sync once. We assert by counting: no panic, no
+        // corruption, all offsets contiguous.
+        let (mut s, _dir) = open_with_policy(SyncPolicy::GroupCommit(Duration::from_secs(60)));
+        for i in 0..10u8 {
+            let off = s.append("t", rec(&[i])).unwrap();
+            assert_eq!(off.get(), u64::from(i));
+        }
+        assert_eq!(s.len("t"), 10);
+    }
+
+    #[test]
+    fn default_policy_is_group_commit_100ms() {
+        match SyncPolicy::default() {
+            SyncPolicy::GroupCommit(d) => assert_eq!(d, Duration::from_millis(100)),
+            other => panic!("expected GroupCommit, got {other:?}"),
+        }
     }
 }

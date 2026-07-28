@@ -234,6 +234,7 @@ impl VireonStack {
         acl_table: Option<topic_acl::AclTable>,
         wal_root: Option<&std::path::Path>,
         wal_retention: Option<wal_store::RetentionPolicy>,
+        wal_sync: wal_store::SyncPolicy,
         max_topics: Option<usize>,
         max_subscribers_per_topic: Option<usize>,
         cluster: Option<(&cluster_coordinator::ClusterConfig, ClusterWorkerHandle)>,
@@ -260,7 +261,7 @@ impl VireonStack {
             // so concurrent reactors don't fight over the same files.
             // Cross-worker WAL sharing is a P5/P6 concern.
             let worker_dir = root.join(format!("worker_{reactor_id}"));
-            match wal_store::FileStore::open(&worker_dir) {
+            match wal_store::FileStore::open_with(&worker_dir, wal_sync) {
                 Ok(store) => application.set_wal(store),
                 Err(e) => {
                     return Err(ServerError::EngineInit(format!(

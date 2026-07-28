@@ -66,6 +66,11 @@ pub struct ServerConfig {
     /// forever (default). Configured via `--wal-retention-secs` and
     /// `--wal-max-bytes`.
     pub wal_retention: Option<wal_store::RetentionPolicy>,
+    /// When to call `sync_data` on appended WAL bytes. Defaults to
+    /// group-commit 100 ms — bounds worst-case power-loss data loss to
+    /// 100 ms while keeping throughput high. Configured via the
+    /// `[wal_sync]` section in `vireon.conf`.
+    pub wal_sync: wal_store::SyncPolicy,
     /// Cap on total topics in the catalog. `None` = unlimited.
     pub max_topics: Option<usize>,
     /// Cap on subscribers per distinct subscription pattern.
@@ -258,6 +263,28 @@ impl ServerConfig {
         let wal_max_bytes = cli.wal_max_bytes.or(conf.wal_max_bytes).unwrap_or(0);
         let wal_retention = build_wal_retention(wal_retention_secs, wal_max_bytes);
 
+        // fsync policy: how the WAL calls sync_data after a flush.
+        let wal_sync = match conf.wal_sync.as_ref() {
+            Some(s) => match s.mode.as_str() {
+                "never" => wal_store::SyncPolicy::Never,
+                "every_flush" | "every-flush" | "everyflush" => {
+                    wal_store::SyncPolicy::EveryFlush
+                }
+                "group_commit" | "group-commit" | "groupcommit" => {
+                    let ms = s.group_commit_ms.unwrap_or(100).max(1);
+                    wal_store::SyncPolicy::GroupCommit(std::time::Duration::from_millis(ms))
+                }
+                other => {
+                    tracing::warn!(
+                        value = other,
+                        "[config] unknown wal_sync mode, falling back to group_commit 100ms"
+                    );
+                    wal_store::SyncPolicy::default()
+                }
+            },
+            None => wal_store::SyncPolicy::default(),
+        };
+
         // ── Quotas ──────────────────────────────────────────────────
         let max_topics_raw = cli.max_topics.or(conf.max_topics).unwrap_or(0);
         let max_subscribers_raw = cli
@@ -330,6 +357,7 @@ impl ServerConfig {
             acl_table,
             wal_root,
             wal_retention,
+            wal_sync,
             max_topics,
             max_subscribers_per_topic,
             cluster,
