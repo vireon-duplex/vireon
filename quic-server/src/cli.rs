@@ -63,6 +63,12 @@ pub struct Cli {
     #[arg(short, long)]
     pub verbose: bool,
 
+    /// Log output format: `text` (default) or `json` (structured).
+    /// JSON format is compatible with journald, Loki, Fluentd, and
+    /// other log aggregators that parse JSON on stdin.
+    #[arg(long)]
+    pub log_format: Option<LogFormatArg>,
+
     /// Echo mode — echo every received frame back on the same stream.
     /// Used for load-testing (RR / pipeline benchmark modes).
     #[arg(long)]
@@ -208,4 +214,13 @@ pub enum PresetArg {
     /// Bulk-transfer max throughput.
     #[value(name = "max-throughput")]
     MaxThroughput,
+}
+
+/// CLI log-format selector.
+#[derive(Clone, Debug, clap::ValueEnum)]
+pub enum LogFormatArg {
+    /// Human-readable plain text (default).
+    Text,
+    /// JSON structured logging for log aggregators.
+    Json,
 }

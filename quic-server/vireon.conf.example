@@ -116,6 +116,11 @@ sqpoll = false
 # Bypasses the application layer entirely.
 echo = false
 
+# Log output format: "text" (default) or "json" (structured).
+# JSON is compatible with journald, Loki, Fluentd, and other log
+# aggregators that parse JSON on stdin.
+log_format = "text"
+
 
 # ─────────────────────────────────────────────────────────────────────
 #  Write-Ahead Log (WAL)
