@@ -167,6 +167,14 @@ pub struct Cli {
     #[arg(long)]
     pub cluster_peers: Option<String>,
 
+    /// Replication factor for cluster durability. When >1, each
+    /// publish is forwarded to N-1 replica nodes (chosen by
+    /// consistent hashing on the topic) in addition to the primary
+    /// owner. Replicas append to their local WAL. Default 1 (no
+    /// replication). Requires --cluster-node-id and --cluster-peers.
+    #[arg(long)]
+    pub cluster_replication_factor: Option<u8>,
+
     /// Optional HTTP port for the Prometheus `/metrics` endpoint. When
     /// set, the server exposes counters (connections, publishes,
     /// deliveries, errors, bytes) in Prometheus text format. A scrape

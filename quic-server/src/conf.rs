@@ -184,6 +184,7 @@ pub struct ServerConf {
     // ── Cluster ──
     pub cluster_node_id: Option<u32>,
     pub cluster_peers: Option<String>,
+    pub cluster_replication_factor: Option<u8>,
 
     // ── ACL ──
     pub acl_rules_path: Option<String>,

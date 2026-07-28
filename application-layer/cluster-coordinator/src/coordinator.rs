@@ -34,14 +34,21 @@ use crate::{ClusterConfig, ClusterError};
 pub enum PublishDecision {
     /// Self owns the topic. `remote_targets` lists every alive node
     /// that has at least one matching remote subscription for the
-    /// topic. The caller should:
+    /// topic. `replicas` lists the additional nodes (beyond self)
+    /// that should receive a replicated copy for durability. The
+    /// caller should:
     /// 1. Deliver to local subscribers via the existing
     ///    `pubsub_engine::TopicRegistry`.
     /// 2. For each node in `remote_targets`, send an
     ///    `InterNodeMessage::Fanout`.
+    /// 3. For each node in `replicas`, send an
+    ///    `InterNodeMessage::Publish` (replication copy).
     Own {
         /// Distinct alive nodes (no self) needing fanout.
         remote_targets: Vec<NodeId>,
+        /// Distinct alive nodes (no self) needing a replication copy.
+        /// Empty when `replication_factor <= 1`.
+        replicas: Vec<NodeId>,
     },
     /// Another node owns the topic. The caller should send an
     /// `InterNodeMessage::Publish` to `owner`.
@@ -90,6 +97,7 @@ pub struct ClusterCoordinator {
     router: TopicRouter,
     remote_subs: RemoteSubscriberRegistry,
     stats: ClusterStats,
+    replication_factor: u8,
 }
 
 impl ClusterCoordinator {
@@ -111,6 +119,7 @@ impl ClusterCoordinator {
         } else {
             cfg.vnodes
         };
+        let replication_factor = cfg.replication_factor.max(1);
         let membership = ClusterMembership::new(cfg)?;
         let mut router = TopicRouter::new(vnodes);
         for n in alive_nodes {
@@ -121,6 +130,7 @@ impl ClusterCoordinator {
             router,
             remote_subs: RemoteSubscriberRegistry::new(),
             stats: ClusterStats::default(),
+            replication_factor,
         })
     }
 
@@ -153,7 +163,11 @@ impl ClusterCoordinator {
                     .publishes_routed_local
                     .fetch_add(1, Ordering::Relaxed);
                 let remote_targets = self.collect_remote_targets(topic);
-                PublishDecision::Own { remote_targets }
+                let replicas = self.collect_replicas(topic);
+                PublishDecision::Own {
+                    remote_targets,
+                    replicas,
+                }
             }
             Some(owner) => {
                 self.stats
@@ -169,9 +183,24 @@ impl ClusterCoordinator {
                     .fetch_add(1, Ordering::Relaxed);
                 PublishDecision::Own {
                     remote_targets: Vec::new(),
+                    replicas: Vec::new(),
                 }
             }
         }
+    }
+
+    /// Collect replica node IDs for `topic` based on the configured
+    /// `replication_factor`. Excludes self (the primary owner).
+    fn collect_replicas(&self, topic: &str) -> Vec<NodeId> {
+        if self.replication_factor <= 1 {
+            return Vec::new();
+        }
+        let n = usize::from(self.replication_factor);
+        self.router
+            .replicas_of(topic, n)
+            .into_iter()
+            .filter(|&node| node != self.self_id())
+            .collect()
     }
 
     /// Collect the distinct alive nodes with subscribers matching
@@ -293,7 +322,7 @@ mod tests {
     impl PublishDecisionExt for PublishDecision {
         fn remote_targets(&self) -> &[NodeId] {
             match self {
-                PublishDecision::Own { remote_targets } => remote_targets,
+                PublishDecision::Own { remote_targets, .. } => remote_targets,
                 PublishDecision::Forward { .. } => &[],
             }
         }

@@ -32,6 +32,12 @@ pub struct ClusterConfig {
     /// Virtual nodes per physical node on the topic ring. Default is
     /// [`DEFAULT_VNODES`]. Clamped to `[1, 1024]` by [`ClusterMembership::new`].
     pub vnodes: u32,
+    /// Number of nodes (including owner) that should hold a replica
+    /// of each publish for durability. `1` = no replication (owner
+    /// only). `3` = owner + 2 replicas. Replicas are chosen via
+    /// consistent hashing on the topic so the same topic always
+    /// replicates to the same nodes.
+    pub replication_factor: u8,
 }
 
 impl ClusterConfig {
@@ -42,7 +48,15 @@ impl ClusterConfig {
             self_id,
             peers,
             vnodes: DEFAULT_VNODES,
+            replication_factor: 1,
         }
+    }
+
+    /// Builder: set the replication factor.
+    #[must_use]
+    pub fn with_replication_factor(mut self, rf: u8) -> Self {
+        self.replication_factor = rf.max(1);
+        self
     }
 }
 

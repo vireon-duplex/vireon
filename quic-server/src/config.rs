@@ -347,13 +347,20 @@ impl ServerConfig {
             .clone()
             .or(conf.cluster_peers.clone())
             .filter(|s| !s.is_empty());
+        let cluster_replication_factor = cli
+            .cluster_replication_factor
+            .or(conf.cluster_replication_factor);
         let cluster = match (cluster_node_id, cluster_peers.as_deref()) {
             (Some(id), Some(peers_str)) => {
                 let self_id = session_registry::NodeId::new(id);
                 let peers = crate::cluster::parse_cluster_peers(peers_str)
                     .map_err(|e| anyhow::anyhow!("cluster-peers: {e}"))?;
-                let cfg = crate::cluster::build_cluster_transport_config(self_id, &peers)
-                    .map_err(|e| anyhow::anyhow!("cluster-peers: {e}"))?;
+                let cfg = crate::cluster::build_cluster_transport_config(
+                    self_id,
+                    &peers,
+                    cluster_replication_factor,
+                )
+                .map_err(|e| anyhow::anyhow!("cluster-peers: {e}"))?;
                 Some(cfg)
             }
             (Some(_), None) => {
