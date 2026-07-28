@@ -456,9 +456,12 @@ metrics_port = 9090
 # audit_log = "/var/log/vireon/audit.{worker}.vaud"   # tamper-evident
 
 # ── Cluster (P6 — multi-node) ─────────────────────────────────
-# cluster_node_id = 1
-# cluster_peers = "1=10.0.0.1:4433,2=10.0.0.2:4433,3=10.0.0.3:4433"
-# cluster_replication_factor = 2
+# All cluster settings live under the [cluster] section.
+[cluster]
+# node_id = 1
+# peers = "1=10.0.0.1:4433,2=10.0.0.2:4433,3=10.0.0.3:4433"
+# replication_factor = 2
+# vnodes = 150              # consistent-hash ring density (advanced)
 
 # ── QUIC engine overrides (optional — preset defaults apply) ──
 [quic]
