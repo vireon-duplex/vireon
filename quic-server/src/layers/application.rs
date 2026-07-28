@@ -232,6 +232,14 @@ pub struct VireonDispatcher {
     /// matches Vireon's thread-per-core design. Cross-worker sharing
     /// is a P5/P6 concern.
     wal: Option<wal_store::FileStore>,
+    /// Where consumer-offsets snapshots are persisted. `None` when no
+    /// WAL is configured (consumer positions are then ephemeral).
+    /// Lives next to the WAL: `<wal_root>/worker_<id>/offsets.dat`.
+    offsets_path: Option<std::path::PathBuf>,
+    /// Per-(topic, consumer_id) ack tracking. Auto-updated when the
+    /// server delivers to a group member so that on restart the
+    /// consumer resumes from `last_acked.next()` rather than `OLDEST`.
+    consumer_offsets: wal_store::ConsumerOffsets,
 
     /// [application-layer] Consumer-group coordinator — tracks group
     /// membership, generations, and partition assignment for load-
@@ -404,6 +412,8 @@ impl VireonDispatcher {
             wal_retention: wal_store::RetentionPolicy::keep_forever(),
             wal_retention_last_run: None,
             wal_sweep_interval: Duration::from_secs(60),
+            offsets_path: None,
+            consumer_offsets: wal_store::ConsumerOffsets::new(),
             max_topics: None,
             max_subscribers_per_topic: None,
             pattern_sub_counts: FxHashMap::default(),
@@ -499,6 +509,18 @@ impl VireonDispatcher {
     #[allow(dead_code)]
     pub fn set_wal(&mut self, wal: wal_store::FileStore) {
         self.wal = Some(wal);
+    }
+
+    /// Sets the loaded consumer-offsets map + the on-disk path the
+    /// periodic sweeper should write snapshots to. Called once during
+    /// startup after [`Self::set_wal`].
+    pub fn set_consumer_offsets(
+        &mut self,
+        offsets: wal_store::ConsumerOffsets,
+        path: std::path::PathBuf,
+    ) {
+        self.consumer_offsets = offsets;
+        self.offsets_path = Some(path);
     }
 
     /// Sets the retention policy applied to the WAL by the periodic
@@ -1164,6 +1186,11 @@ impl VireonDispatcher {
         // preferable to dropping the live fan-out, which has no recovery
         // path. The `topic.as_str()` invariant (validated at publish
         // entry) guarantees the topic is also a valid WAL key.
+        //
+        // `wal_offset` is lifted out so the consumer-group fan-out
+        // below can auto-ack the chosen member at the right offset
+        // (without it, restart would replay from OLDEST).
+        let mut wal_offset: Option<wal_store::Offset> = None;
         if let Some(wal) = &mut self.wal {
             let now_ns = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1178,6 +1205,7 @@ impl VireonDispatcher {
                         offset = offset.get(),
                         "[wal] appended"
                     );
+                    wal_offset = Some(offset);
                 }
                 Err(e) => {
                     if self.wal_fail_drop.tick() {
@@ -1209,7 +1237,7 @@ impl VireonDispatcher {
         // load-balances across its members. The selected consumer may
         // be on the same connection as the publisher; we still deliver
         // in that case (the consumer is a different logical subscriber).
-        let mut group_targets: Vec<(usize, u64)> = Vec::new();
+        let mut group_targets: Vec<(usize, u64, String)> = Vec::new();
         for ((t, _g), local) in &mut self.group_locals {
             if t.as_str() != topic_str || local.members.is_empty() {
                 continue;
@@ -1217,9 +1245,17 @@ impl VireonDispatcher {
             let idx = local.rr_idx % local.members.len();
             local.rr_idx = local.rr_idx.wrapping_add(1);
             let m = &local.members[idx];
-            group_targets.push((m.conn_idx, m.quic_stream_id));
+            // Auto-ack: the server has chosen this consumer for the
+            // current publish. Recording the WAL offset (if any) as
+            // the consumer's acked position means a restart will resume
+            // from this publish.next() rather than OLDEST — at-least-
+            // once delivery for the consumer.
+            if let Some(off) = wal_offset {
+                self.consumer_offsets.ack(topic_str, m.consumer.as_str(), off);
+            }
+            group_targets.push((m.conn_idx, m.quic_stream_id, m.consumer.as_str().to_string()));
         }
-        for (conn_idx, quic_stream_id) in group_targets {
+        for (conn_idx, quic_stream_id, _consumer) in group_targets {
             self.enqueue_frame(
                 conn_idx,
                 quic_stream_id,
@@ -2329,13 +2365,12 @@ impl VireonDispatcher {
     /// [`wal_store::RetentionPolicy::apply`], and aggregates the
     /// removed-entry count for a single summary log line.
     fn maybe_run_wal_retention(&mut self) {
-        // Fast path: no WAL, no policy, or interval not yet elapsed.
-        if self.wal.is_none() {
+        // Fast path: no WAL — nothing to sweep, nothing to persist.
+        if self.wal.is_none() && self.offsets_path.is_none() {
             return;
         }
-        if self.wal_retention.max_bytes.is_none() && self.wal_retention.max_age_ns.is_none() {
-            return;
-        }
+        // Throttle interval applies to BOTH retention and offset-snapshot
+        // so the disk walk happens at most once per `wal_sweep_interval`.
         let now = Instant::now();
         let due = self.wal_retention_last_run.map_or(true, |t| {
             now.duration_since(t) >= self.wal_sweep_interval
@@ -2345,43 +2380,58 @@ impl VireonDispatcher {
         }
         self.wal_retention_last_run = Some(now);
 
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-
-        // Borrow-checker dance: split the wal mutably from the policy
-        // copy so `apply` can take &mut store + &policy by value.
-        let policy = self.wal_retention;
-        let Some(wal) = self.wal.as_mut() else {
-            return;
-        };
-        let topics = wal.topic_names();
-        if topics.is_empty() {
-            return;
-        }
-        let mut total_removed: usize = 0;
-        let mut errored: u64 = 0;
-        for topic in &topics {
-            match policy.apply::<wal_store::FileStore>(wal, topic, now_ns) {
-                Ok(stats) => total_removed = total_removed.saturating_add(stats.removed),
-                Err(_) => errored = errored.saturating_add(1),
+        // Run the retention walk only if a policy is configured. The
+        // common case (keep-forever) skips the directory walk entirely.
+        let has_policy = self.wal_retention.max_bytes.is_some()
+            || self.wal_retention.max_age_ns.is_some();
+        if has_policy {
+            if let Some(wal) = self.wal.as_mut() {
+                let now_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                let policy = self.wal_retention;
+                let topics = wal.topic_names();
+                if !topics.is_empty() {
+                    let mut total_removed: usize = 0;
+                    let mut errored: u64 = 0;
+                    for topic in &topics {
+                        match policy.apply::<wal_store::FileStore>(wal, topic, now_ns) {
+                            Ok(stats) => total_removed = total_removed.saturating_add(stats.removed),
+                            Err(_) => errored = errored.saturating_add(1),
+                        }
+                    }
+                    if total_removed > 0 || errored > 0 {
+                        tracing::info!(
+                            topics = topics.len(),
+                            removed = total_removed,
+                            errored,
+                            retained_bytes = wal.retained_bytes(),
+                            "[wal] retention sweep"
+                        );
+                    } else {
+                        tracing::debug!(
+                            topics = topics.len(),
+                            retained_bytes = wal.retained_bytes(),
+                            "[wal] retention sweep (no removals)"
+                        );
+                    }
+                }
             }
         }
-        if total_removed > 0 || errored > 0 {
-            tracing::info!(
-                topics = topics.len(),
-                removed = total_removed,
-                errored,
-                retained_bytes = wal.retained_bytes(),
-                "[wal] retention sweep"
-            );
-        } else {
-            tracing::debug!(
-                topics = topics.len(),
-                retained_bytes = wal.retained_bytes(),
-                "[wal] retention sweep (no removals)"
-            );
+
+        // Persist consumer offsets alongside the retention sweep. A
+        // failure here only risks at-least-once (replay restarts from
+        // the previous snapshot), so we warn-and-continue rather than
+        // surfacing an error that would abort the tick.
+        if let Some(path) = self.offsets_path.as_ref() {
+            if let Err(e) = self.consumer_offsets.save_to(path) {
+                tracing::warn!(
+                    path = ?path,
+                    error = %e,
+                    "[wal] consumer-offsets snapshot failed — previous snapshot retained"
+                );
+            }
         }
     }
 }
@@ -2811,6 +2861,17 @@ impl ApplicationLayer {
     /// retention sweep runs from `on_batch_tick` once per ~60 s.
     pub fn set_wal_retention(&mut self, policy: wal_store::RetentionPolicy) {
         self.dispatcher.set_wal_retention(policy);
+    }
+
+    /// Delegates to [`VireonDispatcher::set_consumer_offsets`]. Loads
+    /// the persisted consumer-offsets map + records the path the
+    /// periodic sweeper should write snapshots to.
+    pub fn set_consumer_offsets(
+        &mut self,
+        offsets: wal_store::ConsumerOffsets,
+        path: std::path::PathBuf,
+    ) {
+        self.dispatcher.set_consumer_offsets(offsets, path);
     }
 
     /// Delegates to [`VireonDispatcher::set_max_topics`].

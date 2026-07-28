@@ -9,10 +9,29 @@
 //! offset the consumer has acknowledged. Publishers do not consult
 //! this map; it is queried by the consumer-restart path to decide
 //! where to resume replay.
+//!
+//! ## Persistence
+//!
+//! [`ConsumerOffsets::save_to`] writes a binary snapshot to disk;
+//! [`ConsumerOffsets::load_from`] reads it back. The server calls
+//! `save_to` during the periodic WAL retention sweep so consumer
+//! positions survive restarts. The on-disk format is a length-prefixed
+//! list — see `MAGIC` for the file-tag.
+
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
+use std::path::Path;
 
 use rustc_hash::FxHashMap;
 
 use crate::offset::Offset;
+
+/// File-tag at the start of every consumer-offsets snapshot. Lets a
+/// future format bump detect the old layout and skip cleanly instead
+/// of misparsing it.
+const MAGIC: &[u8; 4] = b"VOFF";
+/// Snapshot format version. Bump on any breaking layout change.
+const FORMAT_VERSION: u32 = 1;
 
 /// In-memory `(topic, consumer_id) → Offset` map.
 ///
@@ -99,6 +118,117 @@ impl ConsumerOffsets {
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
+
+    /// Write a binary snapshot to `path`. Atomically renames a `.tmp`
+    /// file over the destination so a crash mid-write never leaves a
+    /// truncated snapshot — the previous snapshot survives intact.
+    ///
+    /// Format (all integers big-endian):
+    /// ```text
+    /// MAGIC("VOFF") | version(u32) | count(u32)
+    ///   | repeat:
+    ///       topic_len(u16) | topic(utf8)
+    ///       consumer_len(u16) | consumer(utf8)
+    ///       offset(u64)
+    /// ```
+    ///
+    /// # Errors
+    /// Surface any I/O error from the temp-file write or the rename.
+    pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
+        let tmp = path.with_extension("dat.tmp");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(MAGIC)?;
+        f.write_all(&FORMAT_VERSION.to_be_bytes())?;
+        let count = u32::try_from(self.map.len()).unwrap_or(u32::MAX);
+        f.write_all(&count.to_be_bytes())?;
+        for ((topic, consumer), offset) in &self.map {
+            let tlen = u16::try_from(topic.len()).unwrap_or(u16::MAX);
+            f.write_all(&tlen.to_be_bytes())?;
+            f.write_all(topic.as_bytes())?;
+            let clen = u16::try_from(consumer.len()).unwrap_or(u16::MAX);
+            f.write_all(&clen.to_be_bytes())?;
+            f.write_all(consumer.as_bytes())?;
+            f.write_all(&offset.get().to_be_bytes())?;
+        }
+        f.flush()?;
+        f.sync_data()?;
+        std::fs::rename(&tmp, path)
+    }
+
+    /// Load a snapshot previously written by [`Self::save_to`].
+    ///
+    /// Returns an empty map (not an error) if the file does not exist
+    /// — the common case on a fresh worker dir.
+    ///
+    /// # Errors
+    /// [`wal_store::WalError`]::`Io` if the file exists but is corrupt
+    /// (wrong magic, unsupported version, truncated entry).
+    pub fn load_from(path: &Path) -> std::io::Result<Self> {
+        let mut f = match OpenOptions::new().read(true).open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(e),
+        };
+        let mut magic = [0u8; 4];
+        f.read_exact(&mut magic)?;
+        if &magic != MAGIC {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "consumer-offsets snapshot: bad magic",
+            ));
+        }
+        let mut buf4 = [0u8; 4];
+        f.read_exact(&mut buf4)?;
+        let version = u32::from_be_bytes(buf4);
+        if version != FORMAT_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("consumer-offsets snapshot: unsupported version {version}"),
+            ));
+        }
+        f.read_exact(&mut buf4)?;
+        let count = u32::from_be_bytes(buf4) as usize;
+        let mut map = FxHashMap::with_capacity_and_hasher(count, Default::default());
+        let mut buf2 = [0u8; 2];
+        let mut buf8 = [0u8; 8];
+        for _ in 0..count {
+            f.read_exact(&mut buf2)?;
+            let tlen = u16::from_be_bytes(buf2) as usize;
+            let mut topic = vec![0u8; tlen];
+            f.read_exact(&mut topic)?;
+            f.read_exact(&mut buf2)?;
+            let clen = u16::from_be_bytes(buf2) as usize;
+            let mut consumer = vec![0u8; clen];
+            f.read_exact(&mut consumer)?;
+            f.read_exact(&mut buf8)?;
+            let offset = u64::from_be_bytes(buf8);
+            map.insert(
+                (
+                    String::from_utf8(topic).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "consumer-offsets snapshot: non-utf8 topic",
+                        )
+                    })?,
+                    String::from_utf8(consumer).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "consumer-offsets snapshot: non-utf8 consumer",
+                        )
+                    })?,
+                ),
+                Offset::new(offset),
+            );
+        }
+        Ok(Self { map })
+    }
 }
 
 #[cfg(test)]
@@ -173,5 +303,92 @@ mod tests {
         c.forget_topic("t1");
         assert_eq!(c.len(), 1);
         assert_eq!(c.get("t2", "u3"), Offset::new(3));
+    }
+
+    #[test]
+    fn save_load_round_trip_preserves_all_entries() {
+        let dir = std::env::temp_dir().join(format!(
+            "vireon-wal-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("offsets.voff");
+
+        let mut c = ConsumerOffsets::new();
+        c.ack("orders", "worker-1", Offset::new(42));
+        c.ack("orders", "worker-2", Offset::new(17));
+        c.ack("analytics.events", "consumer-a", Offset::new(1000));
+        c.save_to(&path).unwrap();
+
+        let loaded = ConsumerOffsets::load_from(&path).unwrap();
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded.get("orders", "worker-1"), Offset::new(42));
+        assert_eq!(loaded.get("orders", "worker-2"), Offset::new(17));
+        assert_eq!(loaded.get("analytics.events", "consumer-a"), Offset::new(1000));
+        // resume_from should also work after load.
+        assert_eq!(loaded.resume_from("orders", "worker-1"), Offset::new(43));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn load_from_missing_file_returns_empty() {
+        let path = std::env::temp_dir().join(format!(
+            "vireon-no-such-{}-{}.voff",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // File intentionally does not exist.
+        let loaded = ConsumerOffsets::load_from(&path).unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn load_from_bad_magic_is_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "vireon-bad-magic-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("bad.voff");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, b"XXXX").unwrap();
+        let err = ConsumerOffsets::load_from(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn save_empty_map_round_trips() {
+        let dir = std::env::temp_dir().join(format!(
+            "vireon-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("empty.voff");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let c = ConsumerOffsets::new();
+        c.save_to(&path).unwrap();
+        let loaded = ConsumerOffsets::load_from(&path).unwrap();
+        assert!(loaded.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }
