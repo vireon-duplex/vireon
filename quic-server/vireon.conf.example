@@ -226,6 +226,14 @@ cluster_node_id = 0
 # Example: "1=10.0.0.1:4433,2=10.0.0.2:4433,3=10.0.0.3:4433"
 cluster_peers = ""
 
+# Replication factor for cluster durability.
+# When >1, each publish is forwarded to N-1 replica nodes (chosen by
+# consistent hashing on the topic) in addition to the primary owner.
+# Replicas append to their local WAL.
+#   1 = no replication (default).
+# Must be ≤ number of peers.
+cluster_replication_factor = 1
+
 
 # ─────────────────────────────────────────────────────────────────────
 #  Access Control (ACL)

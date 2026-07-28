@@ -1212,7 +1212,35 @@ impl VireonDispatcher {
                     // Do not deliver locally — the owner handles it.
                     return;
                 }
-                PublishDecision::Own { remote_targets } => {
+                PublishDecision::Own {
+                    remote_targets,
+                    replicas,
+                } => {
+                    // Replication: forward the publish to replica
+                    // nodes for durability. Fire-and-forget — the
+                    // replicas append to their own WAL asynchronously.
+                    if !replicas.is_empty() {
+                        if let Some(tx) = &self.cluster_outgoing_tx {
+                            let msg = InterNodeMessage::publish(
+                                self.node_id,
+                                ctx.conn_idx as u32,
+                                ctx.quic_stream_id,
+                                topic.as_str().to_string(),
+                                payload_bytes.clone(),
+                            );
+                            for target in &replicas {
+                                let _ = tx.send(OutgoingMsg {
+                                    msg: msg.clone(),
+                                    target: *target,
+                                });
+                            }
+                            tracing::trace!(
+                                topic = %topic,
+                                replicas = replicas.len(),
+                                "[cluster] publish replicated to backup nodes"
+                            );
+                        }
+                    }
                     // Fan out to remote subscribers via UDP. Each
                     // remote target is a node whose local subscribers
                     // want this topic.
@@ -2377,6 +2405,25 @@ impl VireonDispatcher {
         self.encode_scratch.extend_from_slice(topic_str.as_bytes());
         self.encode_scratch.extend_from_slice(payload);
         let bytes = self.encode_scratch.split().freeze();
+
+        // WAL append: when a publish arrives via the cluster (either
+        // forwarded to the owner or replicated to a backup), persist
+        // it locally. This gives the cluster durable storage without
+        // requiring a separate replication transport.
+        if let Some(wal) = &mut self.wal {
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            let record = wal_store::WalRecord::new(now_ns, bytes.clone());
+            if let Err(e) = wal.append(topic_str, record) {
+                tracing::warn!(
+                    topic = topic_str,
+                    error = ?e,
+                    "[cluster] WAL append failed for incoming publish"
+                );
+            }
+        }
 
         // Use a synthetic logical stream for inter-node-delivered
         // publishes — they aren't bound to a particular subscriber's
