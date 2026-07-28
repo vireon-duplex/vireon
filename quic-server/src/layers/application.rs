@@ -342,6 +342,10 @@ pub struct VireonDispatcher {
     /// split().freeze() pattern as `encode_scratch` — zero allocation
     /// per ACK after warmup.
     ack_scratch: BytesMut,
+    /// Optional tamper-evident audit log. Records security-relevant
+    /// events (ACL denies, quota rejections, topic lifecycle). `None`
+    /// when `--audit-log` is not configured.
+    audit_log: Option<crate::audit::AuditLog>,
 }
 
 /// Minimum gap between cross-worker drop warning logs.
@@ -425,6 +429,7 @@ impl VireonDispatcher {
             quota_subscriber_rejects: 0,
             encode_scratch: BytesMut::new(),
             ack_scratch: BytesMut::new(),
+            audit_log: None,
         }
     }
 
@@ -553,6 +558,12 @@ impl VireonDispatcher {
     ) {
         self.consumer_offsets = offsets;
         self.offsets_path = Some(path);
+    }
+
+    /// Attaches an audit log. Once set, security-relevant events are
+    /// hash-chained to the log.
+    pub fn set_audit_log(&mut self, log: crate::audit::AuditLog) {
+        self.audit_log = Some(log);
     }
 
     /// Sets the retention policy applied to the WAL by the periodic
@@ -1143,6 +1154,15 @@ impl VireonDispatcher {
                     "[acl] publish denied (logging every 256th)"
                 );
             }
+            if let Some(log) = &mut self.audit_log {
+                let actor = format!("conn:{}", ctx.conn_idx);
+                let _ = log.record(
+                    crate::audit::AuditKind::AclPublishDenied,
+                    crate::audit::AuditResult::Denied,
+                    &actor,
+                    topic.as_str(),
+                );
+            }
             self.send_ack(
                 ctx,
                 stream,
@@ -1464,6 +1484,15 @@ impl VireonDispatcher {
             total_topics = self.topic_catalog.len(),
             "[pubsub] TopicCreate"
         );
+        if let Some(log) = &mut self.audit_log {
+            let actor = format!("conn:{}", ctx.conn_idx);
+            let _ = log.record(
+                crate::audit::AuditKind::TopicCreated,
+                crate::audit::AuditResult::Allowed,
+                &actor,
+                topic,
+            );
+        }
         self.send_ack(
             ctx,
             stream,
@@ -1512,6 +1541,15 @@ impl VireonDispatcher {
             total_topics = self.topic_catalog.len(),
             "[pubsub] TopicDelete"
         );
+        if let Some(log) = &mut self.audit_log {
+            let actor = format!("conn:{}", ctx.conn_idx);
+            let _ = log.record(
+                crate::audit::AuditKind::TopicDeleted,
+                crate::audit::AuditResult::Allowed,
+                &actor,
+                topic.as_str(),
+            );
+        }
         let existed_str = if existed { b"true" as &[u8] } else { b"false" };
         self.send_ack(
             ctx,
@@ -3004,6 +3042,11 @@ impl ApplicationLayer {
         path: std::path::PathBuf,
     ) {
         self.dispatcher.set_consumer_offsets(offsets, path);
+    }
+
+    /// Delegates to [`VireonDispatcher::set_audit_log`].
+    pub fn set_audit_log(&mut self, log: crate::audit::AuditLog) {
+        self.dispatcher.set_audit_log(log);
     }
 
     /// Delegates to [`VireonDispatcher::set_max_topics`].

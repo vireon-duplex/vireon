@@ -16,6 +16,7 @@
 //! ```
 
 pub mod acl_loader;
+pub mod audit;
 pub mod cluster;
 pub mod conf;
 pub mod error;

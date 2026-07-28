@@ -184,6 +184,14 @@ pub struct Cli {
     /// same IP are unaffected.
     #[arg(long)]
     pub max_handshakes_per_ip_per_sec: Option<u32>,
+
+    /// Path template for the tamper-evident audit log. When set, the
+    /// server records security-relevant events (ACL denies, quota
+    /// rejections, topic create/delete) to a SHA-256 hash-chained
+    /// append-only file. `{worker}` is replaced with the worker ID.
+    /// Example: `--audit-log /var/log/vireon/audit.{worker}.vaud`
+    #[arg(long)]
+    pub audit_log: Option<String>,
 }
 
 /// CLI worker-mode selector.

@@ -122,6 +122,7 @@ impl Worker {
             worker_inbox,
             worker_outboxes,
             shutdown_requested,
+            config.audit_log.as_deref(),
             &config.tuning,
         )?;
         handler.metrics = config.metrics.clone();

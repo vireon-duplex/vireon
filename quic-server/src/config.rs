@@ -114,6 +114,10 @@ pub struct ServerConfig {
     /// Log output format: plain text (default) or JSON (structured).
     pub log_format: LogFormat,
 
+    /// Optional audit log path template. `{worker}` is substituted with
+    /// the worker ID at startup. `None` = audit logging disabled.
+    pub audit_log: Option<String>,
+
     /// Resolved layer-tuning knobs (buffer pool, backpressure, reactor
     /// budget, send batching, eviction, session/stream limits, task
     /// queue, timer wheel, stream scheduler).
@@ -274,6 +278,13 @@ impl ServerConfig {
             .clone()
             .or(conf.acl_rules_path.clone())
             .filter(|s| !s.is_empty());
+
+        // ── Audit log ──────────────────────────────────────────────
+        let audit_log = cli
+            .audit_log
+            .clone()
+            .or(conf.audit_log.clone())
+            .filter(|s| !s.is_empty());
         let acl_table = match acl_rules_path.as_deref() {
             Some(path) => Some(
                 crate::acl_loader::load(std::path::Path::new(path))
@@ -394,6 +405,7 @@ impl ServerConfig {
             metrics_port,
             metrics,
             log_format,
+            audit_log,
             tuning,
         })
     }
