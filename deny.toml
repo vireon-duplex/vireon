@@ -41,6 +41,9 @@ allow = [
     "CC0-1.0",
     "0BSD",
     "Unlicense",
+    # The workspace itself is AGPL-3.0; workspace-member crates inherit it.
+    "AGPL-3.0-only",
+    "AGPL-3.0-or-later",
 ]
 confidence-threshold = 0.8
 
