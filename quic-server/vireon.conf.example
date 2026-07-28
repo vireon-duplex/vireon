@@ -214,17 +214,23 @@ metrics_port = 0
 
 # ─────────────────────────────────────────────────────────────────────
 #  Cluster (P6 — multi-node)
+#
+#  All cluster settings live under the [cluster] section. When both
+#  `node_id` and `peers` are set, the server joins a multi-node cluster
+#  and routes publishes to topic owners via UDP inter-node transport.
+#  CLI flags (--cluster-node-id, --cluster-peers, etc.) override these.
 # ─────────────────────────────────────────────────────────────────────
+[cluster]
 
-# Self node ID in a multi-node cluster.
-# Must be >0 and appear in cluster_peers.
-#   0 = single-node mode (all topics owned locally).
-cluster_node_id = 0
+# Self node ID in the cluster.
+#   0 = single-node mode (default — all topics owned locally).
+# Must be >0 and appear in `peers` below when cluster mode is on.
+node_id = 0
 
 # Cluster peer list: "id=host:port,id=host:port,..."
 # Every node (including self) must be listed.
 # Example: "1=10.0.0.1:4433,2=10.0.0.2:4433,3=10.0.0.3:4433"
-cluster_peers = ""
+peers = ""
 
 # Replication factor for cluster durability.
 # When >1, each publish is forwarded to N-1 replica nodes (chosen by
@@ -232,7 +238,13 @@ cluster_peers = ""
 # Replicas append to their local WAL.
 #   1 = no replication (default).
 # Must be ≤ number of peers.
-cluster_replication_factor = 1
+replication_factor = 1
+
+# Virtual nodes per physical node on the consistent-hash ring.
+# Higher = more even topic distribution, larger ring bookkeeping.
+# The Dynamo paper recommends 150; clamped to [1, 1024] at startup.
+# Leave commented out to keep the default.
+# vnodes = 150
 
 
 # ─────────────────────────────────────────────────────────────────────

@@ -336,41 +336,59 @@ impl ServerConfig {
         let max_subscribers_per_topic = (max_subscribers_raw > 0).then_some(max_subscribers_raw);
 
         // ── Cluster (P6) ────────────────────────────────────────────
-        // 0 = not set (single-node mode). Filter so Some(0) doesn't
-        // trigger the cluster-peers requirement.
-        let cluster_node_id = cli
-            .cluster_node_id
-            .or(conf.cluster_node_id)
-            .filter(|&id| id != 0);
-        let cluster_peers = cli
+        // CLI flags take precedence over the [cluster] section. Both
+        // `node_id` and `peers` must be set together (CLI × CLI, CLI ×
+        // conf, or conf × conf — any combination is allowed).
+        //
+        // 0 / "" = not set (single-node mode). Filter so Some(0) /
+        // Some("") don't trigger the cluster-peers requirement.
+        let cli_node = cli.cluster_node_id.filter(|&id| id != 0);
+        let cli_peers = cli
             .cluster_peers
             .clone()
-            .or(conf.cluster_peers.clone())
             .filter(|s| !s.is_empty());
-        let cluster_replication_factor = cli
-            .cluster_replication_factor
-            .or(conf.cluster_replication_factor);
+        let cli_rf = cli.cluster_replication_factor;
+
+        let (conf_node, conf_peers, conf_rf, conf_vnodes) = match &conf.cluster {
+            Some(c) => (
+                c.node_id.filter(|&id| id != 0),
+                c.peers.clone().filter(|s| !s.is_empty()),
+                c.replication_factor,
+                c.vnodes,
+            ),
+            None => (None, None, None, None),
+        };
+
+        let cluster_node_id = cli_node.or(conf_node);
+        let cluster_peers = cli_peers.or(conf_peers);
+        let cluster_replication_factor = cli_rf.or(conf_rf);
+        let cluster_vnodes = conf_vnodes;
+
         let cluster = match (cluster_node_id, cluster_peers.as_deref()) {
             (Some(id), Some(peers_str)) => {
                 let self_id = session_registry::NodeId::new(id);
                 let peers = crate::cluster::parse_cluster_peers(peers_str)
                     .map_err(|e| anyhow::anyhow!("cluster-peers: {e}"))?;
+                let opts = crate::cluster::ClusterOpts {
+                    replication_factor: cluster_replication_factor,
+                    vnodes: cluster_vnodes,
+                };
                 let cfg = crate::cluster::build_cluster_transport_config(
                     self_id,
                     &peers,
-                    cluster_replication_factor,
+                    opts,
                 )
                 .map_err(|e| anyhow::anyhow!("cluster-peers: {e}"))?;
                 Some(cfg)
             }
             (Some(_), None) => {
                 return Err(anyhow::anyhow!(
-                    "cluster-node-id requires cluster-peers (set via CLI or config file)"
+                    "cluster-node-id requires cluster-peers (set via CLI or [cluster] section)"
                 ));
             }
             (None, Some(_)) => {
                 return Err(anyhow::anyhow!(
-                    "cluster-peers requires cluster-node-id (set via CLI or config file)"
+                    "cluster-peers requires cluster-node-id (set via CLI or [cluster] section)"
                 ));
             }
             (None, None) => None,

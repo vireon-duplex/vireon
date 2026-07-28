@@ -157,12 +157,27 @@ pub fn parse_cluster_peers(s: &str) -> Result<Vec<(NodeId, SocketAddr)>, String>
 /// later concern.
 ///
 /// # Errors
+/// Optional cluster overrides applied on top of defaults during
+/// [`build_cluster_transport_config`]. All fields optional — `Default`
+/// gives the standard behavior (replication factor 1, default vnode
+/// count from `ClusterConfig::new`).
+#[derive(Default, Clone, Debug)]
+pub struct ClusterOpts {
+    /// Number of nodes (including owner) that should hold a replica of
+    /// each publish. `None` = `1` (no replication).
+    pub replication_factor: Option<u8>,
+    /// Virtual nodes per physical node on the consistent-hash ring.
+    /// `None` = `ClusterConfig::DEFAULT_VNODES` (150). Clamped to
+    /// `[1, 1024]` by `ClusterMembership::new`.
+    pub vnodes: Option<u32>,
+}
+
 /// Returns an error if `self_id` is nil, the peer list is empty, the
 /// peer list does not contain `self_id`, or there are duplicate ids.
 pub fn build_cluster_transport_config(
     self_id: NodeId,
     peers: &[(NodeId, SocketAddr)],
-    replication_factor: Option<u8>,
+    opts: ClusterOpts,
 ) -> Result<ClusterTransportConfig, String> {
     if self_id.is_nil() {
         return Err("cluster self_id is nil".into());
@@ -200,7 +215,10 @@ pub fn build_cluster_transport_config(
         )
     })?;
     let mut cluster_cfg = ClusterConfig::new(self_id, peer_infos);
-    cluster_cfg.replication_factor = replication_factor.unwrap_or(1).max(1);
+    cluster_cfg.replication_factor = opts.replication_factor.unwrap_or(1).max(1);
+    if let Some(v) = opts.vnodes {
+        cluster_cfg = cluster_cfg.with_vnodes(v);
+    }
     Ok(ClusterTransportConfig {
         cluster_cfg,
         bind_addr,
@@ -473,7 +491,7 @@ mod tests {
             (NodeId::new(1), "127.0.0.1:4001".parse().unwrap()),
             (NodeId::new(2), "127.0.0.1:4002".parse().unwrap()),
         ];
-        let cfg = build_cluster_transport_config(NodeId::new(2), &peers, None).unwrap();
+        let cfg = build_cluster_transport_config(NodeId::new(2), &peers, ClusterOpts::default()).unwrap();
         assert_eq!(cfg.bind_addr, peers[1].1);
         assert_eq!(cfg.cluster_cfg.self_id, NodeId::new(2));
         assert_eq!(cfg.cluster_cfg.peers.len(), 2);
@@ -486,7 +504,7 @@ mod tests {
             (NodeId::new(1), "127.0.0.1:4001".parse().unwrap()),
             (NodeId::new(2), "127.0.0.1:4002".parse().unwrap()),
         ];
-        let cfg = build_cluster_transport_config(NodeId::new(1), &peers, None).unwrap();
+        let cfg = build_cluster_transport_config(NodeId::new(1), &peers, ClusterOpts::default()).unwrap();
         for p in &cfg.cluster_cfg.peers {
             assert_eq!(p.state, NodeState::Alive);
         }
@@ -495,7 +513,7 @@ mod tests {
     #[test]
     fn build_config_rejects_nil_self() {
         let peers = vec![(NodeId::new(1), "127.0.0.1:4001".parse().unwrap())];
-        assert!(build_cluster_transport_config(NodeId::NIL, &peers, None).is_err());
+        assert!(build_cluster_transport_config(NodeId::NIL, &peers, ClusterOpts::default()).is_err());
     }
 
     #[test]
@@ -504,7 +522,7 @@ mod tests {
             (NodeId::new(1), "127.0.0.1:4001".parse().unwrap()),
             (NodeId::new(2), "127.0.0.1:4002".parse().unwrap()),
         ];
-        assert!(build_cluster_transport_config(NodeId::new(99), &peers, None).is_err());
+        assert!(build_cluster_transport_config(NodeId::new(99), &peers, ClusterOpts::default()).is_err());
     }
 
     #[test]
@@ -513,13 +531,13 @@ mod tests {
             (NodeId::new(1), "127.0.0.1:4001".parse().unwrap()),
             (NodeId::new(1), "127.0.0.1:4099".parse().unwrap()),
         ];
-        assert!(build_cluster_transport_config(NodeId::new(1), &peers, None).is_err());
+        assert!(build_cluster_transport_config(NodeId::new(1), &peers, ClusterOpts::default()).is_err());
     }
 
     #[test]
     fn build_config_rejects_empty_peers() {
         let peers = vec![];
-        assert!(build_cluster_transport_config(NodeId::new(1), &peers, None).is_err());
+        assert!(build_cluster_transport_config(NodeId::new(1), &peers, ClusterOpts::default()).is_err());
     }
 
     #[test]
@@ -528,7 +546,7 @@ mod tests {
             (NodeId::new(1), "127.0.0.1:4001".parse().unwrap()),
             (NodeId::new(2), "127.0.0.1:4002".parse().unwrap()),
         ];
-        let cfg = build_cluster_transport_config(NodeId::new(1), &peers, None).unwrap();
+        let cfg = build_cluster_transport_config(NodeId::new(1), &peers, ClusterOpts::default()).unwrap();
         let c1 = worker_coordinator(&cfg.cluster_cfg).unwrap();
         let c2 = worker_coordinator(&cfg.cluster_cfg).unwrap();
         // Two independent copies — both see the same self id.
@@ -541,7 +559,7 @@ mod tests {
             (NodeId::new(1), "127.0.0.1:4101".parse().unwrap()),
             (NodeId::new(2), "127.0.0.1:4102".parse().unwrap()),
         ];
-        let cfg = build_cluster_transport_config(NodeId::new(1), &peers, None).unwrap();
+        let cfg = build_cluster_transport_config(NodeId::new(1), &peers, ClusterOpts::default()).unwrap();
         let (handles, join) = launch_cluster(&cfg, 3).unwrap();
         assert_eq!(handles.len(), 3);
         // Drop all handles → outgoing_tx senders all drop → transport
@@ -561,8 +579,8 @@ mod tests {
             (NodeId::new(1), "127.0.0.1:4201".parse().unwrap()),
             (NodeId::new(2), "127.0.0.1:4202".parse().unwrap()),
         ];
-        let cfg1 = build_cluster_transport_config(NodeId::new(1), &peers, None).unwrap();
-        let cfg2 = build_cluster_transport_config(NodeId::new(2), &peers, None).unwrap();
+        let cfg1 = build_cluster_transport_config(NodeId::new(1), &peers, ClusterOpts::default()).unwrap();
+        let cfg2 = build_cluster_transport_config(NodeId::new(2), &peers, ClusterOpts::default()).unwrap();
         let (mut h1, _j1) = launch_cluster(&cfg1, 1).unwrap();
         let (mut h2, _j2) = launch_cluster(&cfg2, 1).unwrap();
         let h1rx = h1.remove(0);
