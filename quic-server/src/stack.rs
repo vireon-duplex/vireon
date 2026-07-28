@@ -270,6 +270,23 @@ impl VireonStack {
                     )));
                 }
             }
+            // Load consumer offsets from `<worker_dir>/offsets.dat`.
+            // Missing file = fresh start (no ack history).
+            let offsets_path = worker_dir.join("offsets.dat");
+            match wal_store::ConsumerOffsets::load_from(&offsets_path) {
+                Ok(loaded) => application.set_consumer_offsets(loaded, offsets_path),
+                Err(e) => {
+                    tracing::warn!(
+                        path = ?offsets_path,
+                        error = %e,
+                        "[wal] failed to load consumer offsets — starting fresh"
+                    );
+                    application.set_consumer_offsets(
+                        wal_store::ConsumerOffsets::new(),
+                        offsets_path,
+                    );
+                }
+            }
         }
         if let Some((cfg, handle)) = cluster {
             application.set_cluster(cfg, handle.outgoing_tx, handle.incoming_rx);
