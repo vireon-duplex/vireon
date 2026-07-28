@@ -409,6 +409,11 @@ impl VireonStack {
             );
             if let Some(m) = &self.metrics {
                 m.inc(&m.deliveries_total);
+                if out.header.msg_type == MessageType::Publish {
+                    if let Some(topic) = crate::metrics::extract_topic_from_publish(&out.payload) {
+                        m.record_topic_delivery(topic);
+                    }
+                }
             }
         }
         self.flush_direct = direct;
@@ -425,6 +430,11 @@ impl VireonStack {
             );
             if let Some(m) = &self.metrics {
                 m.inc(&m.deliveries_total);
+                if out.header.msg_type == MessageType::Publish {
+                    if let Some(topic) = crate::metrics::extract_topic_from_publish(&out.payload) {
+                        m.record_topic_delivery(topic);
+                    }
+                }
             }
         }
         self.flush_policy = policy;
@@ -537,6 +547,9 @@ impl VireonStack {
             m.add(&m.bytes_recv_total, payload.len() as u64);
             if header.msg_type == MessageType::Publish {
                 m.inc(&m.publishes_total);
+                if let Some(topic) = crate::metrics::extract_topic_from_publish(&payload[..]) {
+                    m.record_topic_publish(topic, payload.len() as u64);
+                }
             }
         }
 
