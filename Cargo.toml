@@ -90,6 +90,9 @@ toml = "0.8"
 # Branch-free integer formatting for zero-alloc JSON ACKs.
 itoa = "1"
 
+# SHA-256 for audit-log hash chaining.
+sha2 = "0.10"
+
 [dependencies]
 anyhow = { workspace = true }
 tracing = { workspace = true }

@@ -237,6 +237,13 @@ cluster_peers = ""
 # Empty ("") = permissive default (single-tenant mode).
 acl_rules_path = ""
 
+# Path template for the tamper-evident audit log. When set, the
+# server records security-relevant events (ACL denies, quota
+# rejections, topic create/delete) to a SHA-256 hash-chained file.
+# {worker} is replaced with the worker ID.
+# Empty ("") = audit logging disabled (default).
+audit_log = ""
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  QUIC Engine Overrides
