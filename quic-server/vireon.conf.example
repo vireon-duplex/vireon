@@ -146,6 +146,28 @@ wal_sweep_interval_secs = 60
 
 
 # ─────────────────────────────────────────────────────────────────────
+#  WAL fsync policy
+# ─────────────────────────────────────────────────────────────────────
+
+# When the WAL calls sync_data on appended bytes. Controls the
+# durability/throughput trade-off after every successful publish.
+#
+# - never       : flush() only — page cache holds the bytes. Survives
+#                 process crash, lost on power failure. Fastest.
+# - every_flush : sync_data() after every flush. Maximum durability,
+#                 one syscall per publish. Slowest.
+# - group_commit: sync_data() if more than `group_commit_ms` has
+#                 elapsed since the last sync. Bounds worst-case
+#                 power-loss data loss to the interval while keeping
+#                 throughput high. Recommended for production.
+#
+# Default (when the section is omitted): group_commit 100 ms.
+[wal_sync]
+mode = "group_commit"
+group_commit_ms = 100
+
+
+# ─────────────────────────────────────────────────────────────────────
 #  Resource Limits / Quotas
 # ─────────────────────────────────────────────────────────────────────
 
