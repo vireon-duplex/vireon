@@ -163,6 +163,9 @@ pub struct ServerConf {
     pub wal_retention_secs: Option<u64>,
     pub wal_max_bytes: Option<u64>,
     pub wal_sweep_interval_secs: Option<u64>,
+    /// fsync policy for the WAL. See `[wal_sync]` section in
+    /// `vireon.conf.example`. `None` = default (group-commit 100 ms).
+    pub wal_sync: Option<WalSyncConf>,
 
     // ── Limits ──
     pub max_topics: Option<usize>,
@@ -352,6 +355,19 @@ pub struct StreamSchedulerConf {
     /// Starvation threshold: a stream is considered starved if it
     /// waits longer than this.
     pub starvation_threshold_us: Option<u64>,
+}
+
+/// fsync policy for the WAL.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct WalSyncConf {
+    /// Strategy: `"never"` | `"every_flush"` | `"group_commit"`.
+    /// Default `group_commit` (when the section is present but the
+    /// field is omitted).
+    pub mode: String,
+    /// Used only by `group_commit`: max milliseconds between fsyncs.
+    /// Default 100 ms.
+    pub group_commit_ms: Option<u64>,
 }
 
 impl ServerConf {

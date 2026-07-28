@@ -115,6 +115,7 @@ impl Worker {
             config.acl_table.clone(),
             config.wal_root.as_deref(),
             config.wal_retention,
+            config.wal_sync,
             config.max_topics,
             config.max_subscribers_per_topic,
             cluster,
