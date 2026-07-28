@@ -158,6 +158,10 @@ pub struct ServerConf {
     pub verbose: Option<bool>,
     pub profile_output: Option<String>,
 
+    // ── Logging ──
+    /// `"text"` (default) or `"json"` (structured logging).
+    pub log_format: Option<String>,
+
     // ── WAL ──
     pub wal_root: Option<String>,
     pub wal_retention_secs: Option<u64>,

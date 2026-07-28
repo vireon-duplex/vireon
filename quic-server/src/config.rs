@@ -6,8 +6,27 @@ use std::time::Duration;
 
 use quic_engine::{QuicConfig, QuicPreset};
 
-use crate::cli::{Cli, PresetArg, WorkerModeArg};
+use crate::cli::{Cli, LogFormatArg, PresetArg, WorkerModeArg};
 use crate::conf::{LayerTuning, ServerConf};
+
+/// Log output format — resolved from CLI or config file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum LogFormat {
+    /// Human-readable plain text (default).
+    #[default]
+    Text,
+    /// JSON structured logging for log aggregators.
+    Json,
+}
+
+impl From<LogFormatArg> for LogFormat {
+    fn from(arg: LogFormatArg) -> Self {
+        match arg {
+            LogFormatArg::Text => Self::Text,
+            LogFormatArg::Json => Self::Json,
+        }
+    }
+}
 
 /// Worker mode — resolved from CLI or config file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,6 +110,9 @@ pub struct ServerConfig {
     /// metrics are disabled; `Some(Arc<...>)` when the endpoint is
     /// active.
     pub metrics: Option<Arc<crate::metrics::ServerMetrics>>,
+
+    /// Log output format: plain text (default) or JSON (structured).
+    pub log_format: LogFormat,
 
     /// Resolved layer-tuning knobs (buffer pool, backpressure, reactor
     /// budget, send batching, eviction, session/stream limits, task
@@ -238,6 +260,14 @@ impl ServerConfig {
         // ── Echo / verbose (CLI-only flags; conf has them too for parity) ──
         let echo = cli.echo || conf.echo.unwrap_or(false);
 
+        // ── Log format ─────────────────────────────────────────────
+        let log_format = cli.log_format.clone().map(LogFormat::from).or_else(|| {
+            conf.log_format.as_deref().map(|s| match s.to_ascii_lowercase().as_str() {
+                "json" => LogFormat::Json,
+                _ => LogFormat::Text,
+            })
+        }).unwrap_or_default();
+
         // ── ACL ─────────────────────────────────────────────────────
         let acl_rules_path = cli
             .acl_rules_path
@@ -363,6 +393,7 @@ impl ServerConfig {
             cluster,
             metrics_port,
             metrics,
+            log_format,
             tuning,
         })
     }
