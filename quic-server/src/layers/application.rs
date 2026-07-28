@@ -1237,7 +1237,7 @@ impl VireonDispatcher {
         // load-balances across its members. The selected consumer may
         // be on the same connection as the publisher; we still deliver
         // in that case (the consumer is a different logical subscriber).
-        let mut group_targets: Vec<(usize, u64, String)> = Vec::new();
+        let mut group_targets: Vec<(usize, u64)> = Vec::new();
         for ((t, _g), local) in &mut self.group_locals {
             if t.as_str() != topic_str || local.members.is_empty() {
                 continue;
@@ -1253,9 +1253,9 @@ impl VireonDispatcher {
             if let Some(off) = wal_offset {
                 self.consumer_offsets.ack(topic_str, m.consumer.as_str(), off);
             }
-            group_targets.push((m.conn_idx, m.quic_stream_id, m.consumer.as_str().to_string()));
+            group_targets.push((m.conn_idx, m.quic_stream_id));
         }
-        for (conn_idx, quic_stream_id, _consumer) in group_targets {
+        for (conn_idx, quic_stream_id) in group_targets {
             self.enqueue_frame(
                 conn_idx,
                 quic_stream_id,
