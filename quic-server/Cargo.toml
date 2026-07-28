@@ -92,6 +92,9 @@ rustc-hash = { workspace = true }
 # Refcounted byte slices for zero-copy frame payloads.
 bytes = { workspace = true }
 
+# Branch-free integer formatting for zero-alloc JSON ACK responses.
+itoa = { workspace = true }
+
 # Function profiler (#[profile] instrumentation).
 profiler = { workspace = true }
 

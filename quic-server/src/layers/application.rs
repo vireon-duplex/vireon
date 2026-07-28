@@ -338,6 +338,10 @@ pub struct VireonDispatcher {
     // Eliminates per-publish Vec allocation in the fan-out path.
     // clear() + split().freeze() produces a Bytes without allocating.
     encode_scratch: BytesMut,
+    /// Reusable scratch buffer for JSON ACK responses. Same clear +
+    /// split().freeze() pattern as `encode_scratch` — zero allocation
+    /// per ACK after warmup.
+    ack_scratch: BytesMut,
 }
 
 /// Minimum gap between cross-worker drop warning logs.
@@ -420,6 +424,7 @@ impl VireonDispatcher {
             quota_topic_rejects: 0,
             quota_subscriber_rejects: 0,
             encode_scratch: BytesMut::new(),
+            ack_scratch: BytesMut::new(),
         }
     }
 
@@ -446,6 +451,33 @@ impl VireonDispatcher {
             msg_type,
             payload,
         );
+    }
+
+    /// Assembles a JSON ACK from literal + dynamic parts into the
+    /// reusable `ack_scratch` buffer and returns it as `Bytes`.
+    ///
+    /// The `split().freeze()` pattern reuses the buffer's capacity —
+    /// zero allocation per ACK after warmup (unlike `format!` which
+    /// allocates a new String every call).
+    fn ack_parts(&mut self, parts: &[&[u8]]) -> Bytes {
+        self.ack_scratch.clear();
+        for p in parts {
+            self.ack_scratch.extend_from_slice(p);
+        }
+        self.ack_scratch.split().freeze()
+    }
+
+    /// Convenience: enqueues a JSON ACK built from `parts` as the
+    /// response payload for `msg_type`.
+    fn send_ack(
+        &mut self,
+        ctx: &FrameContext,
+        logical_stream: StreamId,
+        msg_type: MessageType,
+        parts: &[&[u8]],
+    ) {
+        let payload = self.ack_parts(parts);
+        self.enqueue_response(ctx, logical_stream, msg_type, payload);
     }
 
     /// Enqueues a frame targeting an explicit connection + QUIC stream.
@@ -902,10 +934,16 @@ impl VireonDispatcher {
                     "[acl] subscribe denied (logging every 256th)"
                 );
             }
-            let ack = format!(
-                "{{\"error\":\"denied\",\"action\":\"subscribe\",\"pattern\":\"{pattern_str}\"}}"
+            self.send_ack(
+                ctx,
+                stream,
+                MessageType::Subscribe,
+                &[
+                    b"{\"error\":\"denied\",\"action\":\"subscribe\",\"pattern\":\"",
+                    pattern_str.as_bytes(),
+                    b"\"}",
+                ],
             );
-            self.enqueue_response(ctx, stream, MessageType::Subscribe, Bytes::from(ack));
             return;
         }
         match TopicPattern::new(pattern_str) {
@@ -934,14 +972,19 @@ impl VireonDispatcher {
                                 "[quota] subscribe rejected — max_subscribers_per_topic reached"
                             );
                         }
-                        let ack = format!(
-                            "{{\"error\":\"quota_exceeded\",\"limit\":\"max_subscribers_per_topic\",\"cap\":{cap},\"pattern\":\"{pattern_str}\"}}"
-                        );
-                        self.enqueue_response(
+                        let mut cap_buf = itoa::Buffer::new();
+                        let cap_s = cap_buf.format(cap);
+                        self.send_ack(
                             ctx,
                             stream,
                             MessageType::Subscribe,
-                            Bytes::from(ack),
+                            &[
+                                b"{\"error\":\"quota_exceeded\",\"limit\":\"max_subscribers_per_topic\",\"cap\":",
+                                cap_s.as_bytes(),
+                                b",\"pattern\":\"",
+                                pattern_str.as_bytes(),
+                                b"\"}",
+                            ],
                         );
                         return;
                     }
@@ -1012,8 +1055,12 @@ impl VireonDispatcher {
                     }
                 }
 
-                let ack = format!("{{\"subscribed\":\"{pattern_str}\"}}");
-                self.enqueue_response(ctx, stream, MessageType::Subscribe, Bytes::from(ack));
+                self.send_ack(
+                    ctx,
+                    stream,
+                    MessageType::Subscribe,
+                    &[b"{\"subscribed\":\"", pattern_str.as_bytes(), b"\"}"],
+                );
             }
             Err(e) => {
                 if self.invalid_pattern_drop.tick() {
@@ -1055,8 +1102,20 @@ impl VireonDispatcher {
             active = self.pubsub_registry.len(),
             "[pubsub] unsubscribe"
         );
-        let ack = format!("{{\"unsubscribed\":\"{pattern_str}\",\"removed\":{removed}}}");
-        self.enqueue_response(ctx, stream, MessageType::Unsubscribe, Bytes::from(ack));
+        let mut rbuf = itoa::Buffer::new();
+        let r = rbuf.format(removed);
+        self.send_ack(
+            ctx,
+            stream,
+            MessageType::Unsubscribe,
+            &[
+                b"{\"unsubscribed\":\"",
+                pattern_str.as_bytes(),
+                b"\",\"removed\":",
+                r.as_bytes(),
+                b"}",
+            ],
+        );
     }
 
     /// Fans a published payload out to every subscriber whose pattern matches
@@ -1084,9 +1143,16 @@ impl VireonDispatcher {
                     "[acl] publish denied (logging every 256th)"
                 );
             }
-            let ack =
-                format!("{{\"error\":\"denied\",\"action\":\"publish\",\"topic\":\"{topic}\"}}");
-            self.enqueue_response(ctx, stream, MessageType::Publish, Bytes::from(ack));
+            self.send_ack(
+                ctx,
+                stream,
+                MessageType::Publish,
+                &[
+                    b"{\"error\":\"denied\",\"action\":\"publish\",\"topic\":\"",
+                    topic.as_str().as_bytes(),
+                    b"\"}",
+                ],
+            );
             return;
         }
 
@@ -1341,10 +1407,16 @@ impl VireonDispatcher {
                 topic = %topic,
                 "[acl] topic_create denied"
             );
-            let ack = format!(
-                "{{\"error\":\"denied\",\"action\":\"topic_create\",\"topic\":\"{topic}\"}}"
+            self.send_ack(
+                ctx,
+                stream,
+                MessageType::TopicCreate,
+                &[
+                    b"{\"error\":\"denied\",\"action\":\"topic_create\",\"topic\":\"",
+                    topic.as_bytes(),
+                    b"\"}",
+                ],
             );
-            self.enqueue_response(ctx, stream, MessageType::TopicCreate, Bytes::from(ack));
             return;
         }
         // Resource quota: max-topics. Skip the check when the topic is
@@ -1362,10 +1434,20 @@ impl VireonDispatcher {
                     rejects = self.quota_topic_rejects,
                     "[quota] topic_create rejected — max_topics reached"
                 );
-                let ack = format!(
-                    "{{\"error\":\"quota_exceeded\",\"limit\":\"max_topics\",\"cap\":{cap},\"topic\":\"{topic}\"}}"
+                let mut cap_buf = itoa::Buffer::new();
+                let cap_s = cap_buf.format(cap);
+                self.send_ack(
+                    ctx,
+                    stream,
+                    MessageType::TopicCreate,
+                    &[
+                        b"{\"error\":\"quota_exceeded\",\"limit\":\"max_topics\",\"cap\":",
+                        cap_s.as_bytes(),
+                        b",\"topic\":\"",
+                        topic.as_bytes(),
+                        b"\"}",
+                    ],
                 );
-                self.enqueue_response(ctx, stream, MessageType::TopicCreate, Bytes::from(ack));
                 return;
             }
         }
@@ -1382,8 +1464,12 @@ impl VireonDispatcher {
             total_topics = self.topic_catalog.len(),
             "[pubsub] TopicCreate"
         );
-        let ack = format!("{{\"topic_created\":\"{topic}\"}}");
-        self.enqueue_response(ctx, stream, MessageType::TopicCreate, Bytes::from(ack));
+        self.send_ack(
+            ctx,
+            stream,
+            MessageType::TopicCreate,
+            &[b"{\"topic_created\":\"", topic.as_bytes(), b"\"}"],
+        );
     }
 
     /// Removes a topic from the catalog.
@@ -1406,10 +1492,16 @@ impl VireonDispatcher {
                 topic = %topic,
                 "[acl] topic_delete denied"
             );
-            let ack = format!(
-                "{{\"error\":\"denied\",\"action\":\"topic_delete\",\"topic\":\"{topic}\"}}"
+            self.send_ack(
+                ctx,
+                stream,
+                MessageType::TopicDelete,
+                &[
+                    b"{\"error\":\"denied\",\"action\":\"topic_delete\",\"topic\":\"",
+                    topic.as_str().as_bytes(),
+                    b"\"}",
+                ],
             );
-            self.enqueue_response(ctx, stream, MessageType::TopicDelete, Bytes::from(ack));
             return;
         }
         let existed = self.topic_catalog.delete(topic.as_str());
@@ -1420,8 +1512,19 @@ impl VireonDispatcher {
             total_topics = self.topic_catalog.len(),
             "[pubsub] TopicDelete"
         );
-        let ack = format!("{{\"topic_deleted\":\"{topic}\",\"existed\":{existed}}}");
-        self.enqueue_response(ctx, stream, MessageType::TopicDelete, Bytes::from(ack));
+        let existed_str = if existed { b"true" as &[u8] } else { b"false" };
+        self.send_ack(
+            ctx,
+            stream,
+            MessageType::TopicDelete,
+            &[
+                b"{\"topic_deleted\":\"",
+                topic.as_str().as_bytes(),
+                b"\",\"existed\":",
+                existed_str,
+                b"}",
+            ],
+        );
     }
 
     /// Processes a `Handshake` frame: extract the claimed
@@ -1500,12 +1603,13 @@ impl VireonDispatcher {
                     version = ?hs.version,
                     "[auth] handshake ok — principal bound to connection"
                 );
-                let ack = format!("{{\"ok\":true,\"principal\":{}}}", resolved.raw());
-                self.enqueue_response(
+                let mut pbuf = itoa::Buffer::new();
+                let p = pbuf.format(resolved.raw());
+                self.send_ack(
                     ctx,
                     frame.stream_id,
                     MessageType::Handshake,
-                    Bytes::from(ack),
+                    &[b"{\"ok\":true,\"principal\":", p.as_bytes(), b"}"],
                 );
             }
             Err(e) => {
@@ -1597,12 +1701,15 @@ impl VireonDispatcher {
                 error = ?e,
                 "[wal] fetch on invalid topic name"
             );
-            let ack = format!("{{\"error\":\"invalid_topic\",\"topic\":\"{topic_str}\"}}");
-            self.enqueue_response(
+            self.send_ack(
                 ctx,
                 frame.stream_id,
                 MessageType::FetchReply,
-                Bytes::from(ack),
+                &[
+                    b"{\"error\":\"invalid_topic\",\"topic\":\"",
+                    topic_str.as_bytes(),
+                    b"\"}",
+                ],
             );
             return;
         }
@@ -1617,13 +1724,15 @@ impl VireonDispatcher {
                 topic = topic_str,
                 "[acl] fetch denied"
             );
-            let ack =
-                format!("{{\"error\":\"denied\",\"action\":\"fetch\",\"topic\":\"{topic_str}\"}}");
-            self.enqueue_response(
+            self.send_ack(
                 ctx,
                 frame.stream_id,
                 MessageType::FetchReply,
-                Bytes::from(ack),
+                &[
+                    b"{\"error\":\"denied\",\"action\":\"fetch\",\"topic\":\"",
+                    topic_str.as_bytes(),
+                    b"\"}",
+                ],
             );
             return;
         }
@@ -1675,12 +1784,15 @@ impl VireonDispatcher {
                     error = ?e,
                     "[wal] read_range failed"
                 );
-                let ack = format!("{{\"error\":\"read_failed\",\"topic\":\"{topic_str}\"}}");
-                self.enqueue_response(
+                self.send_ack(
                     ctx,
                     frame.stream_id,
                     MessageType::FetchReply,
-                    Bytes::from(ack),
+                    &[
+                        b"{\"error\":\"read_failed\",\"topic\":\"",
+                        topic_str.as_bytes(),
+                        b"\"}",
+                    ],
                 );
                 return;
             }
@@ -1869,12 +1981,21 @@ impl VireonDispatcher {
             generation = generation,
             "[groups] join"
         );
-        let ack = format!(r#"{{"joined":"{topic}","group":"{group}","generation":{generation}}}"#);
-        self.enqueue_response(
+        let mut gbuf = itoa::Buffer::new();
+        let g = gbuf.format(generation);
+        self.send_ack(
             ctx,
             frame.stream_id,
             MessageType::ConsumerGroupJoin,
-            Bytes::from(ack),
+            &[
+                b"{\"joined\":\"",
+                topic.as_bytes(),
+                b"\",\"group\":\"",
+                group.as_bytes(),
+                b"\",\"generation\":",
+                g.as_bytes(),
+                b"}",
+            ],
         );
     }
 
@@ -1928,12 +2049,17 @@ impl VireonDispatcher {
             group = group,
             "[groups] leave"
         );
-        let ack = format!(r#"{{"left":"{topic}","group":"{group}"}}"#);
-        self.enqueue_response(
+        self.send_ack(
             ctx,
             frame.stream_id,
             MessageType::ConsumerGroupLeave,
-            Bytes::from(ack),
+            &[
+                b"{\"left\":\"",
+                topic.as_bytes(),
+                b"\",\"group\":\"",
+                group.as_bytes(),
+                b"\"}",
+            ],
         );
     }
 
@@ -1994,14 +2120,21 @@ impl VireonDispatcher {
             .heartbeat(topic, &group_id, &consumer_id, generation, now_ns)
         {
             Ok(cur_gen) => {
-                let ack = format!(
-                    r#"{{"heartbeat":"{topic}","group":"{group}","generation":{cur_gen}}}"#
-                );
-                self.enqueue_response(
+                let mut gbuf = itoa::Buffer::new();
+                let g = gbuf.format(cur_gen);
+                self.send_ack(
                     ctx,
                     frame.stream_id,
                     MessageType::ConsumerGroupHeartbeat,
-                    Bytes::from(ack),
+                    &[
+                        b"{\"heartbeat\":\"",
+                        topic.as_bytes(),
+                        b"\",\"group\":\"",
+                        group.as_bytes(),
+                        b"\",\"generation\":",
+                        g.as_bytes(),
+                        b"}",
+                    ],
                 );
             }
             Err(e) => {
@@ -2013,12 +2146,11 @@ impl VireonDispatcher {
                         "[groups] heartbeat failed (logging every 64th)"
                     );
                 }
-                let ack = r#"{"error":"heartbeat_failed"}"#.to_string();
                 self.enqueue_response(
                     ctx,
                     frame.stream_id,
                     MessageType::ConsumerGroupHeartbeat,
-                    Bytes::from(ack),
+                    Bytes::from_static(br#"{"error":"heartbeat_failed"}"#),
                 );
             }
         }

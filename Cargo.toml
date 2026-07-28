@@ -87,6 +87,9 @@ profiler = { path = "profiler/runtime" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
+# Branch-free integer formatting for zero-alloc JSON ACKs.
+itoa = "1"
+
 [dependencies]
 anyhow = { workspace = true }
 tracing = { workspace = true }
