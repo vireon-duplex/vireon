@@ -361,6 +361,10 @@ pub struct VireonDispatcher {
     /// fan-out — avoids sending `Publish` to workers that have nobody
     /// listening for the topic.
     remote_pattern_interest: FxHashMap<pubsub_engine::TopicPattern, u32>,
+    /// Cache: topic → worker bitmap for cross-worker fan-out. Avoids
+    /// iterating `remote_pattern_interest` + calling `TopicPattern::matches`
+    /// on every publish. Invalidated (cleared) on SubGained/SubLost.
+    topic_worker_bitmap_cache: FxHashMap<String, u32>,
     /// ── per-frame error throttles ────────────────────────────────
     /// Persistently misbehaving clients (malformed payloads, denied
     /// topics, stuck WAL disk) can fire warn!/info! per inbound frame.
@@ -481,6 +485,7 @@ impl VireonDispatcher {
             worker_drop_count: 0,
             worker_drop_cooldown: crate::log_throttle::Cooldown::new(WORKER_DROP_LOG_COOLDOWN),
             remote_pattern_interest: FxHashMap::default(),
+            topic_worker_bitmap_cache: FxHashMap::default(),
             // Per-class throttles. `every` values chosen so that under
             // a sustained ~5k frames/s/conn burst we still see ~5
             // log lines/s per category — enough to diagnose without
@@ -1541,13 +1546,20 @@ impl VireonDispatcher {
     /// Iterates over `remote_pattern_interest` (typically a small map,
     /// one entry per distinct pattern across all workers) and checks
     /// each pattern against `topic` via `TopicPattern::matches`.
-    fn matching_worker_bitmap(&self, topic: &str) -> u32 {
+    fn matching_worker_bitmap(&mut self, topic: &str) -> u32 {
+        // Fast path: cache hit (common case — publishes go to a small
+        // number of distinct topics, so the hit rate is very high).
+        if let Some(&bm) = self.topic_worker_bitmap_cache.get(topic) {
+            return bm;
+        }
+        // Cache miss: compute by iterating remote_pattern_interest.
         let mut bitmap: u32 = 0;
         for (pattern, &mask) in self.remote_pattern_interest.iter() {
             if pattern.matches(topic) {
                 bitmap |= mask;
             }
         }
+        self.topic_worker_bitmap_cache.insert(topic.to_string(), bitmap);
         bitmap
     }
 
@@ -2810,6 +2822,7 @@ impl VireonDispatcher {
                             .entry(pat)
                             .or_insert(0) |= bit;
                     }
+                    self.topic_worker_bitmap_cache.clear();
                 }
                 InterWorkerMsg::SubLost { worker_idx, pattern } => {
                     if let Ok(pat) = pubsub_engine::TopicPattern::new(&pattern) {
@@ -2820,6 +2833,7 @@ impl VireonDispatcher {
                             }
                         }
                     }
+                    self.topic_worker_bitmap_cache.clear();
                 }
                 InterWorkerMsg::GroupGained {
                     worker_idx,
