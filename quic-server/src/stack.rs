@@ -150,6 +150,12 @@ pub struct VireonStack {
     // ── Benchmark mode ───────────────────────────────────────────
     /// When true, echo every received frame back on the same stream.
     echo: bool,
+    /// When true, skip CRC32C on outgoing frames (writes zero trailer).
+    /// Mirrors the engine's decode-side `skip_crc` so a `skip_crc`
+    /// deployment avoids the checksum cost on both directions. Profiler
+    /// runs showed encode-side CRC burning ~9% of CPU in broadcast mode
+    /// (3× fan-out per publish).
+    skip_crc: bool,
 
     // ── Per-stream pending-send buffer ───────────────────────────
     /// Per-`(conn_idx, quic_stream_id)` buffered bytes from partial
@@ -322,6 +328,7 @@ impl VireonStack {
                 }
             }
         }
+        let skip_crc = engine.config.skip_crc;
         Ok(Self {
             application,
             runtime: RuntimeLayer::new(reactor_id, tuning)?,
@@ -348,6 +355,7 @@ impl VireonStack {
                 min_survivors: tuning.eviction_min_survivors,
             },
             echo,
+            skip_crc,
             pending_sends: FxHashMap::with_capacity_and_hasher(64, Default::default()),
             pending_bytes: 0,
             pending_drops: 0,
@@ -658,7 +666,11 @@ impl VireonStack {
         // `wire_size` bytes on success. On error we `clear()` so no
         // uninitialized memory persists beyond this call.
         unsafe { self.send_scratch.set_len(wire_size) };
-        let n = match codec::encode_into_slice(&mut self.send_scratch, header, payload) {
+        let n = match if self.skip_crc {
+            codec::encode_into_slice_skip_crc(&mut self.send_scratch, header, payload)
+        } else {
+            codec::encode_into_slice(&mut self.send_scratch, header, payload)
+        } {
             Ok(n) => n,
             Err(e) => {
                 self.send_scratch.clear();
