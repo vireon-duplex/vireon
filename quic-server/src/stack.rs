@@ -126,6 +126,13 @@ pub struct VireonStack {
     tick_count: u64,
     /// Throttle for memory-pressure warnings (logs at most every 5 s).
     pressure_throttle: PressureThrottle,
+    /// Cached cgroup pressure level — re-read at most every 1 s.
+    /// `cgroup_pressure_level()` reads `/proc/self/status` (or cgroup
+    /// files) on every call, which profiler runs showed burning ~7% of
+    /// CPU in multi-worker mode because it ran every batch tick. RSS
+    /// doesn't move at sub-second timescales, so a 1 s TTL is safe.
+    cgroup_pressure_cache: buffer_pool::PressureLevel,
+    cgroup_pressure_last_check: Option<Instant>,
     /// ── per-frame error throttles ────────────────────────────────
     /// Encode failures on persistently malformed outgoing frames and
     /// retry-queue evictions under sustained backpressure can both fire
@@ -328,6 +335,8 @@ impl VireonStack {
             flush_policy: Vec::new(),
             tick_count: 0,
             pressure_throttle: PressureThrottle::new(),
+            cgroup_pressure_cache: buffer_pool::PressureLevel::Low,
+            cgroup_pressure_last_check: None,
             encode_fail_throttle: crate::log_throttle::RateCounter::new(256),
             pending_evict_throttle: crate::log_throttle::RateCounter::new(128),
             eviction_cooldown: None,
@@ -1114,7 +1123,16 @@ impl IoHandler for VireonStack {
         // Take the higher (more urgent) of the two — a cgroup OOM kills
         // the process regardless of how healthy the pool thinks it is.
         let pool_pressure = self.engine.pressure_level();
-        let cgroup_pressure = buffer_pool::maintenance::cgroup::cgroup_pressure_level();
+        // Throttle the cgroup read to once per second — see field comment.
+        let cgroup_pressure = match self.cgroup_pressure_last_check {
+            Some(t) if t.elapsed() < Duration::from_secs(1) => self.cgroup_pressure_cache,
+            _ => {
+                let level = buffer_pool::maintenance::cgroup::cgroup_pressure_level();
+                self.cgroup_pressure_cache = level;
+                self.cgroup_pressure_last_check = Some(Instant::now());
+                level
+            }
+        };
         let pressure = pool_pressure.max(cgroup_pressure);
 
         if pressure >= buffer_pool::PressureLevel::High && self.pressure_throttle.tick() {
