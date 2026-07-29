@@ -303,7 +303,7 @@ pub struct VireonDispatcher {
     /// Used to skip workers without matching subscribers during cross-worker
     /// fan-out — avoids sending `Publish` to workers that have nobody
     /// listening for the topic.
-    remote_pattern_interest: FxHashMap<String, u32>,
+    remote_pattern_interest: FxHashMap<pubsub_engine::TopicPattern, u32>,
     /// ── per-frame error throttles ────────────────────────────────
     /// Persistently misbehaving clients (malformed payloads, denied
     /// topics, stuck WAL disk) can fire warn!/info! per inbound frame.
@@ -1464,17 +1464,9 @@ impl VireonDispatcher {
     /// each pattern against `topic` via `TopicPattern::matches`.
     fn matching_worker_bitmap(&self, topic: &pubsub_engine::Topic) -> u32 {
         let mut bitmap: u32 = 0;
-        for pattern_str in self.remote_pattern_interest.keys() {
-            // Fast path: exact match (most common case — no wildcards).
-            if pattern_str == topic.as_str() {
-                bitmap |= self.remote_pattern_interest[pattern_str];
-                continue;
-            }
-            // Wildcard match.
-            if let Ok(pat) = pubsub_engine::TopicPattern::new(pattern_str) {
-                if pat.matches(topic) {
-                    bitmap |= self.remote_pattern_interest[pattern_str];
-                }
+        for (pattern, &mask) in self.remote_pattern_interest.iter() {
+            if pattern.matches(topic) {
+                bitmap |= mask;
             }
         }
         bitmap
@@ -2617,17 +2609,21 @@ impl VireonDispatcher {
                     self.deliver_framed_local(framed);
                 }
                 InterWorkerMsg::SubGained { worker_idx, pattern } => {
-                    let bit = 1u32 << worker_idx;
-                    *self
-                        .remote_pattern_interest
-                        .entry(pattern)
-                        .or_insert(0) |= bit;
+                    if let Ok(pat) = pubsub_engine::TopicPattern::new(&pattern) {
+                        let bit = 1u32 << worker_idx;
+                        *self
+                            .remote_pattern_interest
+                            .entry(pat)
+                            .or_insert(0) |= bit;
+                    }
                 }
                 InterWorkerMsg::SubLost { worker_idx, pattern } => {
-                    if let Some(bitmap) = self.remote_pattern_interest.get_mut(&pattern) {
-                        *bitmap &= !(1u32 << worker_idx);
-                        if *bitmap == 0 {
-                            self.remote_pattern_interest.remove(&pattern);
+                    if let Ok(pat) = pubsub_engine::TopicPattern::new(&pattern) {
+                        if let Some(bitmap) = self.remote_pattern_interest.get_mut(&pat) {
+                            *bitmap &= !(1u32 << worker_idx);
+                            if *bitmap == 0 {
+                                self.remote_pattern_interest.remove(&pat);
+                            }
                         }
                     }
                 }
