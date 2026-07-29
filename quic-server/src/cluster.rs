@@ -623,7 +623,7 @@ mod tests {
         let h2rx = h2.remove(0);
 
         // Node 1 sends a Subscribe to node 2.
-        let msg = InterNodeMessage::subscribe(NodeId::new(1), 42, 100, "sensor.*".into());
+        let msg = InterNodeMessage::subscribe(NodeId::new(1), 42, 100, "sensor.*");
         h1rx.outgoing_tx
             .send(OutgoingMsg {
                 msg: msg.clone(),

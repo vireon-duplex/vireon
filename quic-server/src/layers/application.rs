@@ -29,6 +29,7 @@
 use rustc_hash::FxHashMap;
 use std::net::SocketAddr;
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use auth_framework::authenticator::AuthenticationPipeline;
@@ -1231,6 +1232,11 @@ impl VireonDispatcher {
         // (forward the publish via UDP).
         if let Some(coord) = &self.coordinator {
             let decision = coord.route_publish(topic);
+            // Hoist ONE Arc<str> allocation for the topic — every
+            // InterNodeMessage we construct below (publish/fanout) and
+            // every msg.clone() in the fan-out loops reuses this via
+            // refcount bump instead of deep-allocating Strings.
+            let topic_arc: Arc<str> = Arc::from(topic);
             match decision {
                 PublishDecision::Forward { owner } => {
                     // Send the publish to the owning node via UDP.
@@ -1242,7 +1248,7 @@ impl VireonDispatcher {
                             self.node_id,
                             ctx.conn_idx as u32,
                             ctx.quic_stream_id,
-                            topic.to_string(),
+                            topic_arc.clone(),
                             payload_bytes.clone(),
                         );
                         let _ = tx.send(OutgoingMsg { msg, target: owner });
@@ -1270,7 +1276,7 @@ impl VireonDispatcher {
                                 self.node_id,
                                 ctx.conn_idx as u32,
                                 ctx.quic_stream_id,
-                                topic.to_string(),
+                                topic_arc.clone(),
                                 payload_bytes.clone(),
                             );
                             for target in &replicas {
@@ -1298,7 +1304,7 @@ impl VireonDispatcher {
                             self.node_id,
                             ctx.conn_idx as u32,
                             ctx.quic_stream_id,
-                            topic.to_string(),
+                            topic_arc.clone(),
                             payload_bytes.clone(),
                         );
                         for target in remote_targets {
