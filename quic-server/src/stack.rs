@@ -120,6 +120,8 @@ pub struct VireonStack {
     flush_direct: Vec<OutgoingFrame>,
     /// Pre-allocated scratch for flush_outbox policy-ready path (avoids per-tick Vec alloc).
     flush_policy: Vec<OutgoingFrame>,
+    /// Pre-allocated scratch for drain_pending_sends keys (avoids per-tick Vec alloc).
+    pending_keys_scratch: Vec<(usize, u64)>,
 
     // ── Observability ────────────────────────────────────────────
     /// Tick counter — used to throttle periodic stats logging.
@@ -340,6 +342,7 @@ impl VireonStack {
             evict_scratch: Vec::with_capacity(32),
             flush_direct: Vec::new(),
             flush_policy: Vec::new(),
+            pending_keys_scratch: Vec::with_capacity(16),
             tick_count: 0,
             pressure_throttle: PressureThrottle::new(),
             cgroup_pressure_cache: buffer_pool::PressureLevel::Low,
@@ -849,12 +852,13 @@ impl VireonStack {
         }
         // Snapshot keys to release the borrow on `pending_sends` before
         // we call `engine.send_stream` (which takes &mut self).
-        let keys: Vec<(usize, u64)> = self.pending_sends.keys().copied().collect();
+        self.pending_keys_scratch.clear();
+        self.pending_keys_scratch.extend(self.pending_sends.keys().copied());
         let mut succeeded = 0u32;
         let mut still_blocked = 0u32;
         let mut dropped = 0u32;
 
-        for key in keys {
+        for &key in &self.pending_keys_scratch {
             let Some(p) = self.pending_sends.get_mut(&key) else {
                 continue;
             };
