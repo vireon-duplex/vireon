@@ -1355,12 +1355,11 @@ impl VireonDispatcher {
                     }
                     // Fan out to remote subscribers via UDP. Each
                     // remote target is a node whose local subscribers
-                    // want this topic.
+                    // want this topic. Skip nodes that are also replicas —
+                    // they receive Publish (which triggers cluster_deliver_local
+                    // including subscriber delivery), so a Fanout would
+                    // double-deliver.
                     if let Some(tx) = &self.cluster_outgoing_tx {
-                        // Origin = this node (we own the topic and are
-                        // delivering to local subscribers). The remote
-                        // nodes will use the origin back-route for
-                        // any acks.
                         let msg = InterNodeMessage::fanout(
                             self.node_id,
                             ctx.conn_idx as u32,
@@ -1369,6 +1368,9 @@ impl VireonDispatcher {
                             payload_bytes.clone(),
                         );
                         for target in remote_targets {
+                            if replicas.contains(&target) {
+                                continue;
+                            }
                             let _ = tx.send(OutgoingMsg {
                                 msg: msg.clone(),
                                 target,
@@ -2594,34 +2596,40 @@ impl VireonDispatcher {
                     // other nodes — the original Forward only sends
                     // to the owner, and cluster_deliver_local only
                     // checks local subscribers.
+                    //
+                    // Only the OWNER re-fans. Replicas receiving a
+                    // replicated Publish must NOT re-fan (the owner
+                    // already sent Fanout to all remote targets).
                     if let Some(coord) = &self.coordinator {
-                        let remote_targets =
-                            coord.collect_remote_targets(&msg.topic_or_pattern);
-                        // Skip the origin node — it already delivered
-                        // locally when it forwarded the publish to us.
-                        let fanout_targets: Vec<_> = remote_targets
-                            .into_iter()
-                            .filter(|&t| t != msg.origin_node)
-                            .collect();
-                        if !fanout_targets.is_empty() {
-                            if let Some(tx) = &self.cluster_outgoing_tx {
-                                let fanout = cluster_coordinator::InterNodeMessage::fanout(
-                                    msg.origin_node,
-                                    msg.origin_conn_idx,
-                                    msg.origin_stream_id,
-                                    msg.topic_or_pattern.clone(),
-                                    msg.payload.clone(),
-                                );
-                                for target in fanout_targets {
-                                    let _ = tx.send(OutgoingMsg {
-                                        msg: fanout.clone(),
-                                        target,
-                                    });
+                        if coord.owns_topic(&msg.topic_or_pattern) {
+                            let remote_targets =
+                                coord.collect_remote_targets(&msg.topic_or_pattern);
+                            // Skip the origin node — it already delivered
+                            // locally when it forwarded the publish to us.
+                            let fanout_targets: Vec<_> = remote_targets
+                                .into_iter()
+                                .filter(|&t| t != msg.origin_node)
+                                .collect();
+                            if !fanout_targets.is_empty() {
+                                if let Some(tx) = &self.cluster_outgoing_tx {
+                                    let fanout = cluster_coordinator::InterNodeMessage::fanout(
+                                        msg.origin_node,
+                                        msg.origin_conn_idx,
+                                        msg.origin_stream_id,
+                                        msg.topic_or_pattern.clone(),
+                                        msg.payload.clone(),
+                                    );
+                                    for target in fanout_targets {
+                                        let _ = tx.send(OutgoingMsg {
+                                            msg: fanout.clone(),
+                                            target,
+                                        });
+                                    }
+                                    tracing::trace!(
+                                        topic = %msg.topic_or_pattern,
+                                        "[cluster] forwarded publish re-fanned to remote subscribers"
+                                    );
                                 }
-                                tracing::trace!(
-                                    topic = %msg.topic_or_pattern,
-                                    "[cluster] forwarded publish re-fanned to remote subscribers"
-                                );
                             }
                         }
                     }
