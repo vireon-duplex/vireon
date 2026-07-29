@@ -70,25 +70,33 @@ use bytes::{Bytes, BytesMut};
 
 // ── Inter-worker pub/sub forwarding ────────────────────────────────
 
-/// A published message forwarded from one worker to another for
-/// cross-worker fan-out. Each worker broadcasts publishes to all other
-/// workers so their local subscribers receive the message.
+/// Messages exchanged between workers for cross-worker pub/sub.
 ///
-/// Receiving workers drain their inbox in `drain_worker_inbox` and call
-/// `cluster_deliver_local` (the same code path as inter-node delivery).
-/// Forwarded publishes are NOT re-broadcast, preventing loops.
-pub struct InterWorkerPublish {
-    /// Pre-encoded wire frame: `[topic_len:u16 BE][topic bytes][payload bytes]`.
-    ///
-    /// Worker A encodes this once on the publish path (it has to anyway,
-    /// for local subscriber fan-out) and forwards the same `Bytes` to
-    /// every other worker. Worker B clones the `Bytes` (atomic refcount
-    /// bump — zero memcpy) and enqueues it directly to its subscribers.
-    ///
-    /// The topic is re-parsed from the first 2 bytes via a zero-copy
-    /// `Bytes::slice` read for `TopicRegistry::lookup` — no `String`
-    /// allocation on the receive path.
-    pub framed: Bytes,
+/// **`Publish`** — a published frame forwarded to another worker for
+/// fan-out to that worker's local subscribers. Receiving workers call
+/// `deliver_framed_local` and do NOT re-broadcast (loop protection).
+///
+/// **`SubGained` / `SubLost`** — subscription-interest notifications.
+/// When a worker's subscriber count for a pattern transitions 0↔non-zero,
+/// it broadcasts the change so other workers can skip it during fan-out
+/// if it has no matching subscribers. This avoids sending `Publish`
+/// messages to workers that have nobody listening for the topic.
+#[derive(Clone)]
+pub enum InterWorkerMsg {
+    /// Pre-encoded wire frame for delivery to local subscribers.
+    Publish {
+        framed: Bytes,
+    },
+    /// Sender `worker_idx` now has ≥1 subscriber for `pattern`.
+    SubGained {
+        worker_idx: u16,
+        pattern: String,
+    },
+    /// Sender `worker_idx` has 0 subscribers for `pattern`.
+    SubLost {
+        worker_idx: u16,
+        pattern: String,
+    },
 }
 
 // ── FrameContext & OutgoingFrame ──────────────────────────────────
@@ -277,10 +285,10 @@ pub struct VireonDispatcher {
     /// Outboxes to all workers for pub/sub fan-out. Index = worker
     /// reactor_id. The sender at `worker_self_idx` is skipped during
     /// broadcast. Empty in single-worker mode.
-    worker_outboxes: Vec<mpsc::SyncSender<InterWorkerPublish>>,
+    worker_outboxes: Vec<mpsc::SyncSender<InterWorkerMsg>>,
     /// Inbox of forwarded publishes from other workers. Drained in
     /// [`Self::drain_worker_inbox`]. `None` in single-worker mode.
-    worker_inbox: Option<mpsc::Receiver<InterWorkerPublish>>,
+    worker_inbox: Option<mpsc::Receiver<InterWorkerMsg>>,
     /// This worker's reactor_id — used to skip self when broadcasting.
     worker_self_idx: usize,
     /// Aggregate count of cross-worker inbox-full drops. Logged at most
@@ -290,6 +298,12 @@ pub struct VireonDispatcher {
     worker_drop_count: u64,
     /// Time-based throttle for worker-inbox-full warnings.
     worker_drop_cooldown: crate::log_throttle::Cooldown,
+    /// Which **remote** workers have subscribers for which patterns.
+    /// Maps pattern → bitmap of interested worker indices (bit i = worker i).
+    /// Used to skip workers without matching subscribers during cross-worker
+    /// fan-out — avoids sending `Publish` to workers that have nobody
+    /// listening for the topic.
+    remote_pattern_interest: FxHashMap<String, u32>,
     /// ── per-frame error throttles ────────────────────────────────
     /// Persistently misbehaving clients (malformed payloads, denied
     /// topics, stuck WAL disk) can fire warn!/info! per inbound frame.
@@ -404,6 +418,7 @@ impl VireonDispatcher {
             worker_self_idx: 0,
             worker_drop_count: 0,
             worker_drop_cooldown: crate::log_throttle::Cooldown::new(WORKER_DROP_LOG_COOLDOWN),
+            remote_pattern_interest: FxHashMap::default(),
             // Per-class throttles. `every` values chosen so that under
             // a sustained ~5k frames/s/conn burst we still see ~5
             // log lines/s per category — enough to diagnose without
@@ -630,8 +645,8 @@ impl VireonDispatcher {
     pub fn set_worker_channels(
         &mut self,
         self_idx: usize,
-        inbox: mpsc::Receiver<InterWorkerPublish>,
-        outboxes: Vec<mpsc::SyncSender<InterWorkerPublish>>,
+        inbox: mpsc::Receiver<InterWorkerMsg>,
+        outboxes: Vec<mpsc::SyncSender<InterWorkerMsg>>,
     ) {
         self.worker_self_idx = self_idx;
         self.worker_inbox = Some(inbox);
@@ -1015,10 +1030,24 @@ impl VireonDispatcher {
                 }
                 // Bump per-pattern subscriber counter for quota accounting.
                 // Only reached on successful registry insertion.
-                *self
+                let entry = self
                     .pattern_sub_counts
                     .entry(pattern_str.to_string())
-                    .or_insert(0) += 1;
+                    .or_insert(0);
+                let was_zero = *entry == 0;
+                *entry += 1;
+                // Notify other workers that this worker now has interest
+                // in this pattern (0→1 transition). Skips heartbeat probes
+                // to avoid churning the inter-worker channel.
+                if was_zero
+                    && !pattern_str.starts_with("_heartbeat.")
+                    && !self.worker_outboxes.is_empty()
+                {
+                    self.broadcast_worker_msg(InterWorkerMsg::SubGained {
+                        worker_idx: self.worker_self_idx as u16,
+                        pattern: pattern_str.to_string(),
+                    });
+                }
                 // The SDK's dead-peer probe re-subscribes to
                 // `_heartbeat.probe` every ~1 s per connection. Logging
                 // it at INFO drowns real subscribe events — drop to DEBUG.
@@ -1103,6 +1132,15 @@ impl VireonDispatcher {
                     // Drop empty entries so the map stays bounded under
                     // pattern churn.
                     self.pattern_sub_counts.remove(pattern_str);
+                    // Notify other workers that this worker lost interest.
+                    if !pattern_str.starts_with("_heartbeat.")
+                        && !self.worker_outboxes.is_empty()
+                    {
+                        self.broadcast_worker_msg(InterWorkerMsg::SubLost {
+                            worker_idx: self.worker_self_idx as u16,
+                            pattern: pattern_str.to_string(),
+                        });
+                    }
                 }
             }
         }
@@ -1379,38 +1417,77 @@ impl VireonDispatcher {
             );
         }
 
-        // Cross-worker fan-out: broadcast to all other workers so their
-        // local subscribers receive this publish. `try_send` is
-        // non-blocking — a full inbox drops the publish rather than
-        // stalling the reactor thread.
+        // Cross-worker fan-out: send to other workers that have subscribers
+        // matching this topic. We skip workers with no matching patterns
+        // (tracked via SubGained/SubLost messages) to avoid wasting CPU on
+        // try_send + drain + lookup for workers that have nobody listening.
         //
         // Forward the already-encoded `bytes` (a `Bytes` handle) — worker
-        // B's clone is a refcount bump with zero memcpy. Previously this
-        // re-allocated a `String` topic + `Bytes::copy_from_slice(payload)`
-        // and worker B then re-encoded the wire frame from scratch (3×
-        // memcpy per delivered frame). At high throughput that path was
-        // the #1 CPU hotspot in multi-worker mode (~18% of total cycles).
+        // B's clone is a refcount bump with zero memcpy.
         if !self.worker_outboxes.is_empty() {
-            for (i, outbox) in self.worker_outboxes.iter().enumerate() {
-                if i == self.worker_self_idx {
-                    continue;
-                }
-                if let Err(std::sync::mpsc::TrySendError::Full(_)) =
-                    outbox.try_send(InterWorkerPublish {
-                        framed: bytes.clone(),
-                    })
-                {
-                    self.worker_drop_count = self.worker_drop_count.wrapping_add(1);
-                    if self.worker_drop_cooldown.tick() {
-                        tracing::warn!(
-                            worker = i,
-                            total_drops = self.worker_drop_count,
-                            "[pubsub] worker inbox full — dropping publishes \
-                             (raise cap in build_inter_worker_pubsub_channels)"
-                        );
+            // Compute which workers have ≥1 pattern matching this topic.
+            let target_bitmap = self.matching_worker_bitmap(topic);
+            if target_bitmap != 0 {
+                for (i, outbox) in self.worker_outboxes.iter().enumerate() {
+                    if i == self.worker_self_idx {
+                        continue;
+                    }
+                    if (target_bitmap & (1u32 << i)) == 0 {
+                        continue;
+                    }
+                    if let Err(std::sync::mpsc::TrySendError::Full(_)) =
+                        outbox.try_send(InterWorkerMsg::Publish {
+                            framed: bytes.clone(),
+                        })
+                    {
+                        self.worker_drop_count = self.worker_drop_count.wrapping_add(1);
+                        if self.worker_drop_cooldown.tick() {
+                            tracing::warn!(
+                                worker = i,
+                                total_drops = self.worker_drop_count,
+                                "[pubsub] worker inbox full — dropping publishes \
+                                 (raise cap in build_inter_worker_pubsub_channels)"
+                            );
+                        }
                     }
                 }
             }
+        }
+    }
+
+    /// Compute the bitmap of remote workers whose subscribed patterns
+    /// match `topic`. Returns 0 when no remote worker has a matching
+    /// subscriber — caller skips the fan-out entirely.
+    ///
+    /// Iterates over `remote_pattern_interest` (typically a small map,
+    /// one entry per distinct pattern across all workers) and checks
+    /// each pattern against `topic` via `TopicPattern::matches`.
+    fn matching_worker_bitmap(&self, topic: &pubsub_engine::Topic) -> u32 {
+        let mut bitmap: u32 = 0;
+        for pattern_str in self.remote_pattern_interest.keys() {
+            // Fast path: exact match (most common case — no wildcards).
+            if pattern_str == topic.as_str() {
+                bitmap |= self.remote_pattern_interest[pattern_str];
+                continue;
+            }
+            // Wildcard match.
+            if let Ok(pat) = pubsub_engine::TopicPattern::new(pattern_str) {
+                if pat.matches(topic) {
+                    bitmap |= self.remote_pattern_interest[pattern_str];
+                }
+            }
+        }
+        bitmap
+    }
+
+    /// Broadcast a non-publish inter-worker message to all other workers.
+    /// Used for SubGained/SubLost notifications. `try_send` is non-blocking.
+    fn broadcast_worker_msg(&self, msg: InterWorkerMsg) {
+        for (i, outbox) in self.worker_outboxes.iter().enumerate() {
+            if i == self.worker_self_idx {
+                continue;
+            }
+            let _ = outbox.try_send(msg.clone());
         }
     }
 
@@ -2317,8 +2394,53 @@ impl VireonDispatcher {
         let processed = batch.len();
         for msg in batch {
             match msg.kind {
-                cluster_coordinator::InterNodeKind::Publish
-                | cluster_coordinator::InterNodeKind::Fanout => {
+                cluster_coordinator::InterNodeKind::Publish => {
+                    // The owner received a forwarded publish. Fan out
+                    // to remote subscribers (nodes whose local clients
+                    // subscribed to this topic) before local delivery.
+                    // Without this, a publish forwarded from a
+                    // non-owner node never reaches subscribers on
+                    // other nodes — the original Forward only sends
+                    // to the owner, and cluster_deliver_local only
+                    // checks local subscribers.
+                    if let Some(coord) = &self.coordinator {
+                        let remote_targets =
+                            coord.collect_remote_targets(&msg.topic_or_pattern);
+                        let target_count = remote_targets.len();
+                        if target_count > 0 {
+                            if let Some(tx) = &self.cluster_outgoing_tx {
+                                let fanout = cluster_coordinator::InterNodeMessage::fanout(
+                                    msg.origin_node,
+                                    msg.origin_conn_idx,
+                                    msg.origin_stream_id,
+                                    msg.topic_or_pattern.clone(),
+                                    msg.payload.clone(),
+                                );
+                                for target in remote_targets {
+                                    let _ = tx.send(OutgoingMsg {
+                                        msg: fanout.clone(),
+                                        target,
+                                    });
+                                }
+                                tracing::trace!(
+                                    topic = %msg.topic_or_pattern,
+                                    targets = target_count,
+                                    "[cluster] forwarded publish re-fanned to remote subscribers"
+                                );
+                            }
+                        }
+                    }
+                    self.cluster_deliver_local(
+                        &msg.topic_or_pattern,
+                        &msg.payload,
+                        msg.origin_conn_idx,
+                        msg.origin_stream_id,
+                    );
+                }
+                cluster_coordinator::InterNodeKind::Fanout => {
+                    // Fanout messages are already targeted at nodes with
+                    // subscribers — deliver locally only (no re-fanout,
+                    // which would create forwarding loops).
                     self.cluster_deliver_local(
                         &msg.topic_or_pattern,
                         &msg.payload,
@@ -2473,8 +2595,8 @@ impl VireonDispatcher {
         let Some(rx) = &mut self.worker_inbox else {
             return;
         };
-        const CAP: usize = 1024;
-        let mut batch: Vec<InterWorkerPublish> = Vec::with_capacity(CAP);
+        const CAP: usize = 8192;
+        let mut batch: Vec<InterWorkerMsg> = Vec::with_capacity(CAP);
         while batch.len() < CAP {
             match rx.try_recv() {
                 Ok(msg) => batch.push(msg),
@@ -2490,7 +2612,26 @@ impl VireonDispatcher {
             "[pubsub] worker inbox drained"
         );
         for msg in batch {
-            self.deliver_framed_local(msg.framed);
+            match msg {
+                InterWorkerMsg::Publish { framed } => {
+                    self.deliver_framed_local(framed);
+                }
+                InterWorkerMsg::SubGained { worker_idx, pattern } => {
+                    let bit = 1u32 << worker_idx;
+                    *self
+                        .remote_pattern_interest
+                        .entry(pattern)
+                        .or_insert(0) |= bit;
+                }
+                InterWorkerMsg::SubLost { worker_idx, pattern } => {
+                    if let Some(bitmap) = self.remote_pattern_interest.get_mut(&pattern) {
+                        *bitmap &= !(1u32 << worker_idx);
+                        if *bitmap == 0 {
+                            self.remote_pattern_interest.remove(&pattern);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2746,6 +2887,15 @@ impl AppDispatcher for VireonDispatcher {
                     *count = count.saturating_sub(1);
                     if *count == 0 {
                         self.pattern_sub_counts.remove(pat);
+                        // Notify other workers that this worker lost interest.
+                        if !pat.starts_with("_heartbeat.")
+                            && !self.worker_outboxes.is_empty()
+                        {
+                            self.broadcast_worker_msg(InterWorkerMsg::SubLost {
+                                worker_idx: self.worker_self_idx as u16,
+                                pattern: pat.clone(),
+                            });
+                        }
                     }
                 }
             }
@@ -3126,8 +3276,8 @@ impl ApplicationLayer {
     pub fn set_worker_channels(
         &mut self,
         self_idx: usize,
-        inbox: mpsc::Receiver<InterWorkerPublish>,
-        outboxes: Vec<mpsc::SyncSender<InterWorkerPublish>>,
+        inbox: mpsc::Receiver<InterWorkerMsg>,
+        outboxes: Vec<mpsc::SyncSender<InterWorkerMsg>>,
     ) {
         self.dispatcher
             .set_worker_channels(self_idx, inbox, outboxes);

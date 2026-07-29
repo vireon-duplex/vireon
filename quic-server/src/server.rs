@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use crate::config::{ServerConfig, WorkerMode};
 use crate::error::ServerError;
-use crate::layers::InterWorkerPublish;
+use crate::layers::InterWorkerMsg;
 use crate::worker::{Worker, install_crash_handlers, install_signal_handler};
 
 /// Top-level QUIC server.
@@ -371,12 +371,14 @@ fn join_all(
 fn build_inter_worker_pubsub_channels(
     n: usize,
 ) -> Vec<(
-    std::sync::mpsc::Receiver<InterWorkerPublish>,
-    Vec<std::sync::mpsc::SyncSender<InterWorkerPublish>>,
+    std::sync::mpsc::Receiver<crate::layers::application::InterWorkerMsg>,
+    Vec<std::sync::mpsc::SyncSender<crate::layers::application::InterWorkerMsg>>,
 )> {
     let cap = 65_536;
     let channels: Vec<_> = (0..n)
-        .map(|_| std::sync::mpsc::sync_channel::<InterWorkerPublish>(cap))
+        .map(|_| {
+            std::sync::mpsc::sync_channel::<crate::layers::application::InterWorkerMsg>(cap)
+        })
         .collect();
     let senders: Vec<_> = channels.iter().map(|(s, _)| s.clone()).collect();
     channels
