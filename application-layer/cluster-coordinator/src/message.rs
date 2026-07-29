@@ -26,6 +26,7 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use session_registry::NodeId;
+use std::sync::Arc;
 
 use crate::error::ClusterError;
 
@@ -81,7 +82,9 @@ pub struct InterNodeMessage {
     pub origin_stream_id: u64,
     /// Topic (for Publish/Fanout) or pattern (for Subscribe/Unsubscribe).
     /// 1..=65535 bytes UTF-8 (caller validates encoding; wire is bytes).
-    pub topic_or_pattern: String,
+    /// `Arc<str>` so cloning an `InterNodeMessage` (e.g. fan-out to N
+    /// peers) is a refcount bump, not a heap allocation.
+    pub topic_or_pattern: Arc<str>,
     /// Message payload. Empty for Subscribe/Unsubscribe.
     pub payload: Bytes,
 }
@@ -93,7 +96,7 @@ impl InterNodeMessage {
         origin: NodeId,
         conn_idx: u32,
         stream_id: u64,
-        topic: String,
+        topic: impl Into<Arc<str>>,
         payload: Bytes,
     ) -> Self {
         Self {
@@ -101,7 +104,7 @@ impl InterNodeMessage {
             origin_node: origin,
             origin_conn_idx: conn_idx,
             origin_stream_id: stream_id,
-            topic_or_pattern: topic,
+            topic_or_pattern: topic.into(),
             payload,
         }
     }
@@ -112,7 +115,7 @@ impl InterNodeMessage {
         origin: NodeId,
         conn_idx: u32,
         stream_id: u64,
-        topic: String,
+        topic: impl Into<Arc<str>>,
         payload: Bytes,
     ) -> Self {
         Self {
@@ -120,33 +123,43 @@ impl InterNodeMessage {
             origin_node: origin,
             origin_conn_idx: conn_idx,
             origin_stream_id: stream_id,
-            topic_or_pattern: topic,
+            topic_or_pattern: topic.into(),
             payload,
         }
     }
 
     /// Construct a Subscribe message (empty payload).
     #[must_use]
-    pub fn subscribe(origin: NodeId, conn_idx: u32, stream_id: u64, pattern: String) -> Self {
+    pub fn subscribe(
+        origin: NodeId,
+        conn_idx: u32,
+        stream_id: u64,
+        pattern: impl Into<Arc<str>>,
+    ) -> Self {
         Self {
             kind: InterNodeKind::Subscribe,
             origin_node: origin,
             origin_conn_idx: conn_idx,
             origin_stream_id: stream_id,
-            topic_or_pattern: pattern,
+            topic_or_pattern: pattern.into(),
             payload: Bytes::new(),
         }
     }
 
     /// Construct an Unsubscribe message (empty payload).
     #[must_use]
-    pub fn unsubscribe(origin: NodeId, conn_idx: u32, stream_id: u64, pattern: String) -> Self {
+    pub fn unsubscribe(
+        origin: NodeId,
+        conn_idx: u32,
+        stream_id: u64,
+        pattern: impl Into<Arc<str>>,
+    ) -> Self {
         Self {
             kind: InterNodeKind::Unsubscribe,
             origin_node: origin,
             origin_conn_idx: conn_idx,
             origin_stream_id: stream_id,
-            topic_or_pattern: pattern,
+            topic_or_pattern: pattern.into(),
             payload: Bytes::new(),
         }
     }
@@ -263,6 +276,7 @@ impl InterNodeMessage {
             String::from_utf8(topic_bytes.to_vec()).map_err(|_| ClusterError::DecodeFailed {
                 reason: "topic is not valid UTF-8",
             })?;
+        let topic_or_pattern: Arc<str> = Arc::from(topic_or_pattern);
         let payload = Bytes::copy_from_slice(payload_bytes);
         Ok(Self {
             kind,
@@ -315,7 +329,7 @@ mod tests {
                 origin_node: NodeId::new(3),
                 origin_conn_idx: 9,
                 origin_stream_id: 99,
-                topic_or_pattern: "*.*".to_owned(),
+                topic_or_pattern: "*.*".to_owned().into(),
                 payload: Bytes::new(),
             };
             let bytes = m.encode().unwrap();
