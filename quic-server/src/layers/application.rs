@@ -196,6 +196,15 @@ pub struct VireonDispatcher {
     /// Avoids a `Vec::new()` allocation per publish in the group fan-out
     /// loop (handle_publish runs thousands of times/sec under load).
     group_targets_scratch: Vec<(usize, u64)>,
+    /// Reusable scratch for cross-worker inbox drain. Avoids
+    /// `Vec::with_capacity(8192)` allocation per tick — the inbox is
+    /// usually empty, and even when it's not the capacity grows once
+    /// and is reused across calls.
+    worker_inbox_scratch: Vec<InterWorkerMsg>,
+    /// Reusable scratch for cluster inbox drain. Same rationale as
+    /// `worker_inbox_scratch` — avoids `Vec::with_capacity(1024)` per
+    /// tick when the cluster inbox is usually empty.
+    cluster_inbox_scratch: Vec<InterNodeMessage>,
     /// Per-(conn_idx, QUIC-stream) response sequence counter.
     next_seq: FxHashMap<(usize, u64), Seq>,
 
@@ -387,6 +396,8 @@ impl VireonDispatcher {
             topic_catalog: TopicCatalog::new(),
             outbox: Vec::new(),
             group_targets_scratch: Vec::with_capacity(8),
+            worker_inbox_scratch: Vec::new(),
+            cluster_inbox_scratch: Vec::new(),
             next_seq: FxHashMap::default(),
             send_policy: SendPolicyTable::new(),
             egress_quic_streams: FxHashMap::default(),
@@ -2390,24 +2401,36 @@ impl VireonDispatcher {
     ///   coordinator's `RemoteSubscriberRegistry`.
     /// * `Unsubscribe` — a non-owner is dropping remote interest.
     pub fn drain_cluster_inbox(&mut self) {
-        // Drain into a local Vec first to release the borrow on
+        // Drain into a reusable scratch Vec — releases the borrow on
         // `self.cluster_incoming_rx` before we call back into
-        // `self.cluster_deliver_local` / `self.coordinator`.
+        // `self.cluster_deliver_local` / `self.coordinator`, and avoids
+        // `Vec::with_capacity(1024)` per tick (cluster inbox is usually
+        // empty outside of high-throughput forwarded-publish scenarios).
         const CLUSTER_DRAIN_CAP: usize = 1024;
-        let mut batch: Vec<InterNodeMessage> = Vec::with_capacity(CLUSTER_DRAIN_CAP);
+        self.cluster_inbox_scratch.clear();
         if let Some(rx) = &mut self.cluster_incoming_rx {
-            while batch.len() < CLUSTER_DRAIN_CAP {
+            while self.cluster_inbox_scratch.len() < CLUSTER_DRAIN_CAP {
                 match rx.try_recv() {
-                    Ok(msg) => batch.push(msg),
+                    Ok(msg) => self.cluster_inbox_scratch.push(msg),
                     Err(_) => break,
                 }
             }
         }
-        if batch.is_empty() {
+        if self.cluster_inbox_scratch.is_empty() {
             return;
         }
-        let processed = batch.len();
-        for msg in batch {
+        let processed = self.cluster_inbox_scratch.len();
+        for i in 0..processed {
+            let msg = std::mem::replace(
+                &mut self.cluster_inbox_scratch[i],
+                InterNodeMessage::publish(
+                    session_registry::NodeId::nil(),
+                    0,
+                    0,
+                    Arc::<str>::from("_"),
+                    Bytes::new(),
+                ),
+            );
             match msg.kind {
                 cluster_coordinator::InterNodeKind::Publish => {
                     // The owner received a forwarded publish. Fan out
@@ -2615,22 +2638,32 @@ impl VireonDispatcher {
             return;
         };
         const CAP: usize = 8192;
-        let mut batch: Vec<InterWorkerMsg> = Vec::with_capacity(CAP);
-        while batch.len() < CAP {
+        self.worker_inbox_scratch.clear();
+        while self.worker_inbox_scratch.len() < CAP {
             match rx.try_recv() {
-                Ok(msg) => batch.push(msg),
+                Ok(msg) => self.worker_inbox_scratch.push(msg),
                 Err(_) => break,
             }
         }
-        if batch.is_empty() {
+        if self.worker_inbox_scratch.is_empty() {
             return;
         }
+        let count = self.worker_inbox_scratch.len();
         tracing::debug!(
             worker = self.worker_self_idx,
-            count = batch.len(),
+            count,
             "[pubsub] worker inbox drained"
         );
-        for msg in batch {
+        // Process by index — `self` is borrowed mutably inside the
+        // match arms, so we can't use `for msg in batch.drain(..)` with
+        // a self-reference in the same closure.
+        for i in 0..count {
+            let msg = std::mem::replace(
+                &mut self.worker_inbox_scratch[i],
+                InterWorkerMsg::Publish {
+                    framed: Bytes::new(),
+                },
+            );
             match msg {
                 InterWorkerMsg::Publish { framed } => {
                     self.deliver_framed_local(framed);
