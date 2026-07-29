@@ -303,6 +303,45 @@ pub fn encode_into_slice(
     Ok(needed)
 }
 
+/// Writes a single frame into a raw `&mut [u8]` slice **without** computing
+/// the CRC32C trailer (writes zero instead).
+///
+/// Pair with [`FrameDecoder::skip_crc`] / [`decode_with_len_unchecked`] on the
+/// receiving side. The trailer field is still written (the wire format is
+/// unchanged) so a CRC-checking decoder sees a deterministic mismatch rather
+/// than reading uninitialized memory — but a `skip_crc` decoder ignores it.
+#[profile]
+#[inline(always)]
+pub fn encode_into_slice_skip_crc(
+    dst: &mut [u8],
+    header: FrameHeader,
+    payload: &[u8],
+) -> Result<usize, FrameError> {
+    let len = u32::try_from(payload.len()).map_err(|_| FrameError::PayloadTooLarge {
+        len: payload.len(),
+        max: u32::MAX as usize,
+    })?;
+    let needed = HEADER_SIZE + payload.len() + CRC_SIZE;
+    if dst.len() < needed {
+        return Err(FrameError::BufferTooSmall { needed, have: dst.len() });
+    }
+    // SAFETY: `dst.len() >= needed` (checked above).
+    unsafe {
+        let p = dst.as_mut_ptr();
+        core::ptr::write_unaligned(p as *mut u64, header.stream_id.get().to_be());
+        core::ptr::write_unaligned(p.add(8) as *mut u64, header.seq.get().to_be());
+        *p.add(16) = header.msg_type.as_byte();
+        *p.add(17) = header.flags.bits();
+        core::ptr::write_unaligned(p.add(18) as *mut u32, len.to_be());
+        if !payload.is_empty() {
+            core::ptr::copy_nonoverlapping(payload.as_ptr(), p.add(HEADER_SIZE), payload.len());
+        }
+        // Zero CRC — skipped by a skip_crc decoder.
+        core::ptr::write_bytes(p.add(HEADER_SIZE + payload.len()), 0, CRC_SIZE);
+    }
+    Ok(needed)
+}
+
 // ---------------------------------------------------------------------------
 // One-shot decode
 // ---------------------------------------------------------------------------
@@ -491,6 +530,11 @@ pub struct FrameDecoder {
     // tracked separately from the pool-backed encoder path.
     buf: BytesMut,
     max_payload_len: usize,
+    /// When true, skip CRC32C verification (trusts QUIC AEAD). Set via
+    /// [`skip_crc`](Self::skip_crc). Matches the encode-side
+    /// [`encode_into_slice_skip_crc`] so a `skip_crc` deployment avoids
+    /// the checksum cost on both directions.
+    skip_crc: bool,
 }
 
 /// Conservative default cap: large enough for a full HD video NAL unit or a
@@ -504,6 +548,7 @@ impl FrameDecoder {
         Self {
             buf: BytesMut::new(),
             max_payload_len: DEFAULT_MAX_PAYLOAD_LEN,
+            skip_crc: false,
         }
     }
 
@@ -513,6 +558,7 @@ impl FrameDecoder {
         Self {
             buf: BytesMut::with_capacity(capacity),
             max_payload_len: DEFAULT_MAX_PAYLOAD_LEN,
+            skip_crc: false,
         }
     }
 
@@ -523,6 +569,15 @@ impl FrameDecoder {
     #[inline(always)]
     pub fn max_payload_len(mut self, max: usize) -> Self {
         self.max_payload_len = max;
+        self
+    }
+
+    /// When true, skip CRC32C verification on decode. Use only when the
+    /// transport guarantees integrity (e.g. inside a QUIC tunnel whose own
+    /// AEAD already protects against corruption).
+    #[inline(always)]
+    pub fn skip_crc(mut self, skip: bool) -> Self {
+        self.skip_crc = skip;
         self
     }
 
@@ -616,14 +671,16 @@ impl FrameDecoder {
             return Ok(None);
         }
         let data_end = HEADER_SIZE + payload_len;
-        let expected = unsafe {
-            u32::from_be(core::ptr::read_unaligned(
-                self.buf.as_ptr().add(data_end) as *const u32
-            ))
-        };
-        let actual = crc32c::crc32c(&self.buf[..data_end]);
-        if expected != actual {
-            return Err(FrameError::CrcMismatch { expected, actual });
+        if !self.skip_crc {
+            let expected = unsafe {
+                u32::from_be(core::ptr::read_unaligned(
+                    self.buf.as_ptr().add(data_end) as *const u32
+                ))
+            };
+            let actual = crc32c::crc32c(&self.buf[..data_end]);
+            if expected != actual {
+                return Err(FrameError::CrcMismatch { expected, actual });
+            }
         }
         Ok(Some(FrameRef {
             stream_id,
@@ -690,15 +747,17 @@ impl FrameDecoder {
         }
         // Verify CRC32C over header + payload before detaching.
         let data_end = HEADER_SIZE + payload_len;
-        // SAFETY: buf.len() >= frame_end = HEADER_SIZE + payload_len + CRC_SIZE
-        let expected = unsafe {
-            u32::from_be(core::ptr::read_unaligned(
-                self.buf.as_ptr().add(data_end) as *const u32
-            ))
-        };
-        let actual = crc32c::crc32c(&self.buf[..data_end]);
-        if expected != actual {
-            return Err(FrameError::CrcMismatch { expected, actual });
+        if !self.skip_crc {
+            // SAFETY: buf.len() >= frame_end = HEADER_SIZE + payload_len + CRC_SIZE
+            let expected = unsafe {
+                u32::from_be(core::ptr::read_unaligned(
+                    self.buf.as_ptr().add(data_end) as *const u32
+                ))
+            };
+            let actual = crc32c::crc32c(&self.buf[..data_end]);
+            if expected != actual {
+                return Err(FrameError::CrcMismatch { expected, actual });
+            }
         }
 
         let frame_bytes = self.buf.split_to(frame_end).freeze();
