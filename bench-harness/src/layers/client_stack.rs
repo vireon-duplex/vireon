@@ -74,6 +74,10 @@ pub struct ClientStack {
     /// frames. Drained by `ConnState::drain_and_process` for delivery
     /// verification (missing / duplicate / out-of-order detection).
     verified_seqs: Vec<u64>,
+    /// When true, decoders skip CRC32C verification (matches the server's
+    /// `skip_crc` encode path so a `skip_crc` run avoids the checksum cost
+    /// in both directions). Set from `VIREON_BENCH_SKIP_CRC` at startup.
+    skip_crc: bool,
 }
 
 impl ClientStack {
@@ -84,11 +88,18 @@ impl ClientStack {
     /// path writes into a caller-owned buffer (`encode_frame_coalesced_into`).
     #[must_use]
     pub fn new(_coalesce_capacity: usize) -> Self {
+        // Default matches the server's skip_crc=true default so frames
+        // with zero CRC trailers aren't rejected. Set VIREON_BENCH_SKIP_CRC=0
+        // to force verification (e.g. when testing against --enforce-crc).
+        let skip_crc = std::env::var("VIREON_BENCH_SKIP_CRC")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true);
         Self {
             app: ClientApplicationLayer::new(),
             decoders: HashMap::new(),
             send_policy: SendPolicyTable::new(),
             verified_seqs: Vec::new(),
+            skip_crc,
         }
     }
 
@@ -197,7 +208,7 @@ impl ClientStack {
         let decoder = self
             .decoders
             .entry(quic_sid)
-            .or_insert_with(|| FrameDecoder::with_capacity(DECODER_CAPACITY));
+            .or_insert_with(|| FrameDecoder::with_capacity(DECODER_CAPACITY).skip_crc(self.skip_crc));
         decoder.push(data);
 
         let mut count = 0usize;
