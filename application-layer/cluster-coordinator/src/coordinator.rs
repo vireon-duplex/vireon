@@ -140,6 +140,19 @@ impl ClusterCoordinator {
         self.membership.self_id()
     }
 
+    /// Whether this node is the primary owner of `topic` in the
+    /// consistent-hash ring.
+    ///
+    /// Used to distinguish forwarded publishes (this node IS the owner)
+    /// from replicated publishes (this node is a replica backup).
+    #[must_use]
+    pub fn owns_topic(&self, topic: &str) -> bool {
+        match self.router.owner_of(topic) {
+            Some(owner) => owner == self.self_id(),
+            None => true, // empty ring → self owns by convention
+        }
+    }
+
     /// Total peer count (alive + down).
     #[must_use]
     pub fn peer_count(&self) -> usize {
