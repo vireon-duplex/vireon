@@ -45,7 +45,7 @@
 //! let mut coord = ClusterCoordinator::new(cfg).unwrap();
 //!
 //! match coord.route_publish("sensor.temp") {
-//!     cluster_coordinator::PublishDecision::Own { remote_targets } => {
+//!     cluster_coordinator::PublishDecision::Own { remote_targets, .. } => {
 //!         // Deliver to local subscribers, then fan out.
 //!     }
 //!     cluster_coordinator::PublishDecision::Forward { owner } => {

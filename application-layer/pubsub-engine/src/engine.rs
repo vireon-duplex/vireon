@@ -57,7 +57,7 @@ impl PubSubEngine {
         self.stats.record_publish();
         let mut deliveries = 0u64;
         for pattern in self.subscriptions.values() {
-            if pattern.matches(msg.topic()) {
+            if pattern.matches(msg.topic().as_str()) {
                 deliveries += 1;
                 self.stats.record_deliver();
             }
