@@ -1230,7 +1230,8 @@ impl VireonDispatcher {
                 PublishDecision::Forward { owner } => {
                     // Send the publish to the owning node via UDP.
                     // The owner will fan out to its local subscribers
-                    // + any other nodes with remote interest.
+                    // + any other nodes with remote interest (but will
+                    // skip us — we deliver locally below).
                     if let Some(tx) = &self.cluster_outgoing_tx {
                         let msg = InterNodeMessage::publish(
                             self.node_id,
@@ -1245,10 +1246,11 @@ impl VireonDispatcher {
                         conn_idx = ctx.conn_idx,
                         topic = %topic,
                         owner = %owner.raw(),
-                        "[cluster] publish forwarded to owner"
+                        "[cluster] publish forwarded to owner (also delivering locally)"
                     );
-                    // Do not deliver locally — the owner handles it.
-                    return;
+                    // Fall through to local delivery — our subscribers
+                    // get the publish immediately without waiting for
+                    // the owner's round-trip fanout.
                 }
                 PublishDecision::Own {
                     remote_targets,
@@ -2398,8 +2400,13 @@ impl VireonDispatcher {
                     if let Some(coord) = &self.coordinator {
                         let remote_targets =
                             coord.collect_remote_targets(&msg.topic_or_pattern);
-                        let target_count = remote_targets.len();
-                        if target_count > 0 {
+                        // Skip the origin node — it already delivered
+                        // locally when it forwarded the publish to us.
+                        let fanout_targets: Vec<_> = remote_targets
+                            .into_iter()
+                            .filter(|&t| t != msg.origin_node)
+                            .collect();
+                        if !fanout_targets.is_empty() {
                             if let Some(tx) = &self.cluster_outgoing_tx {
                                 let fanout = cluster_coordinator::InterNodeMessage::fanout(
                                     msg.origin_node,
@@ -2408,7 +2415,7 @@ impl VireonDispatcher {
                                     msg.topic_or_pattern.clone(),
                                     msg.payload.clone(),
                                 );
-                                for target in remote_targets {
+                                for target in fanout_targets {
                                     let _ = tx.send(OutgoingMsg {
                                         msg: fanout.clone(),
                                         target,
@@ -2416,7 +2423,6 @@ impl VireonDispatcher {
                                 }
                                 tracing::trace!(
                                     topic = %msg.topic_or_pattern,
-                                    targets = target_count,
                                     "[cluster] forwarded publish re-fanned to remote subscribers"
                                 );
                             }
