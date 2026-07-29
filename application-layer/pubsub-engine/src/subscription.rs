@@ -109,21 +109,24 @@ impl TopicPattern {
     ///   in the topic.
     /// - Non-wildcard segments must match exactly.
     /// - The number of segments must be equal.
+    ///
+    /// Zero-allocation: uses lazy `split('.')` iterators instead of
+    /// collecting into `Vec<&str>`. Called on every publish hot path.
     #[must_use]
     pub fn matches(&self, topic: &str) -> bool {
-        let pat_segments: Vec<&str> = self.pattern.split('.').collect();
-        let topic_segments: Vec<&str> = topic.split('.').collect();
-
-        if pat_segments.len() != topic_segments.len() {
-            return false;
-        }
-
-        for (pat, topic) in pat_segments.iter().zip(topic_segments.iter()) {
-            if *pat != "*" && *pat != *topic {
-                return false;
+        let mut pat = self.pattern.split('.');
+        let mut top = topic.split('.');
+        loop {
+            match (pat.next(), top.next()) {
+                (Some(p), Some(t)) => {
+                    if p != "*" && p != t {
+                        return false;
+                    }
+                }
+                (None, None) => return true,
+                _ => return false, // different segment counts
             }
         }
-        true
     }
 }
 
