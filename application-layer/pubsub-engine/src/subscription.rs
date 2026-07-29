@@ -4,7 +4,6 @@
 //! See `DESIGN.md` Part 4 (subscriptions) and Part 5 (topic patterns).
 
 use crate::error::PubSubError;
-use crate::topic::Topic;
 use std::fmt;
 
 // ── SubscriptionId ───────────────────────────────────────────────
@@ -111,9 +110,9 @@ impl TopicPattern {
     /// - Non-wildcard segments must match exactly.
     /// - The number of segments must be equal.
     #[must_use]
-    pub fn matches(&self, topic: &Topic) -> bool {
+    pub fn matches(&self, topic: &str) -> bool {
         let pat_segments: Vec<&str> = self.pattern.split('.').collect();
-        let topic_segments: Vec<&str> = topic.as_str().split('.').collect();
+        let topic_segments: Vec<&str> = topic.split('.').collect();
 
         if pat_segments.len() != topic_segments.len() {
             return false;
@@ -139,8 +138,8 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
-    fn t(s: &str) -> Topic {
-        Topic::new(s).unwrap()
+    fn t(s: &str) -> &str {
+        s
     }
 
     // ── SubscriptionId tests ─────────────────────────────────────

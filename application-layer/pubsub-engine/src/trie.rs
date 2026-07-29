@@ -20,7 +20,6 @@ use crate::config::PubSubConfig;
 use crate::error::PubSubError;
 use crate::stats::PubSubStats;
 use crate::subscription::SubscriptionId;
-use crate::topic::Topic;
 use rustc_hash::FxHashMap;
 use std::fmt;
 
@@ -154,8 +153,8 @@ impl TopicTrie {
     /// # Errors
     /// Currently never errors; returns `Ok` for consistency with the
     /// trait contract.
-    pub fn lookup(&self, topic: &Topic) -> Result<Vec<SubscriptionId>, PubSubError> {
-        let segments: Vec<&str> = topic.as_str().split('.').collect();
+    pub fn lookup(&self, topic: &str) -> Result<Vec<SubscriptionId>, PubSubError> {
+        let segments: Vec<&str> = topic.split('.').collect();
         let mut results = Vec::new();
         Self::lookup_recursive(&self.root, &segments, 0, &mut results);
 
@@ -204,8 +203,8 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
-    fn t(s: &str) -> Topic {
-        Topic::new(s).unwrap()
+    fn t(s: &str) -> &str {
+        s
     }
 
     #[test]

@@ -60,6 +60,21 @@ impl Topic {
     /// * contains a wildcard segment `*`,
     /// * contains a NUL, `/`, or `\`.
     pub fn new(name: &str) -> Result<Self, PubSubError> {
+        Self::validate(name)?;
+        Ok(Self {
+            name: name.to_owned(),
+        })
+    }
+
+    /// Validates `name` without allocating a `Topic`.
+    ///
+    /// Same rules as [`Self::new`]. Use on hot paths (e.g. per-publish)
+    /// where the validated `&str` is passed straight through and a owned
+    /// `Topic` would be immediately dropped.
+    ///
+    /// # Errors
+    /// See [`Self::new`].
+    pub fn validate(name: &str) -> Result<(), PubSubError> {
         if name.is_empty() {
             return Err(PubSubError::PublishFailed("topic name cannot be empty"));
         }
@@ -71,9 +86,6 @@ impl Topic {
                 "topic name has leading or trailing whitespace",
             ));
         }
-        // Reject only wildcard *segments* — `foo*bar` is a literal under
-        // the matcher (the `*` is a wildcard only when it is a full
-        // segment between dots). This mirror's TopicPattern's semantics.
         for seg in name.split('.') {
             if seg == "*" {
                 return Err(PubSubError::PublishFailed(
@@ -81,7 +93,6 @@ impl Topic {
                 ));
             }
         }
-        // Filesystem-safe: a valid Topic is always a valid WAL key.
         for b in name.bytes() {
             if b == 0 || b == b'/' || b == b'\\' {
                 return Err(PubSubError::PublishFailed(
@@ -89,9 +100,7 @@ impl Topic {
                 ));
             }
         }
-        Ok(Self {
-            name: name.to_owned(),
-        })
+        Ok(())
     }
 
     /// Get the topic as a `&str`. Cheap; no allocation.

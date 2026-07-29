@@ -186,6 +186,41 @@ impl InterNodeMessage {
         Ok(buf.freeze())
     }
 
+    /// Encode into a caller-supplied scratch buffer, returning a borrow
+    /// of the encoded bytes. The buffer is cleared (not shrunk) first so
+    /// its allocation is reused across calls — avoids one `BytesMut`
+    /// allocation per cluster forward on the transport hot path.
+    ///
+    /// # Errors
+    /// Same as [`encode`](Self::encode).
+    pub fn encode_into<'a>(
+        &self,
+        buf: &'a mut BytesMut,
+    ) -> Result<&'a [u8], ClusterError> {
+        let topic_bytes = self.topic_or_pattern.as_bytes();
+        let topic_len = topic_bytes.len();
+        if topic_len == 0 {
+            return Err(ClusterError::TopicEmpty);
+        }
+        if topic_len > MAX_TOPIC_LEN {
+            return Err(ClusterError::InvalidConfig {
+                reason: "topic exceeds 65535 bytes",
+            });
+        }
+        let total = self.encoded_len();
+        buf.clear();
+        buf.reserve(total);
+        buf.put_u8(self.kind as u8);
+        buf.put_u32_le(self.origin_node.raw());
+        buf.put_u32_le(self.origin_conn_idx);
+        buf.put_u64_le(self.origin_stream_id);
+        buf.put_u16_le(topic_len as u16);
+        buf.put_slice(topic_bytes);
+        buf.put_u32_le(self.payload.len() as u32);
+        buf.put_slice(&self.payload);
+        Ok(buf)
+    }
+
     /// Decode.
     ///
     /// # Errors
