@@ -336,6 +336,9 @@ fn run_transport(
     self_id: NodeId,
 ) {
     let mut recv_buf = vec![0u8; RECV_BUF_LEN];
+    // Reusable encode scratch — avoids one BytesMut allocation per
+    // cluster forward. Grows once, reused for every outgoing message.
+    let mut encode_buf = bytes::BytesMut::with_capacity(4096);
     // Coalesce sleep duration — the transport thread polls both the
     // mpsc inbox and the UDP socket; when both are idle it yields.
     let idle = std::time::Duration::from_micros(200);
@@ -346,7 +349,7 @@ fn run_transport(
         // ── Drain outgoing fan-in ──────────────────────────────────
         while let Ok(out) = outgoing_rx.try_recv() {
             did_work = true;
-            process_outgoing(&out, self_id, &peers, &socket, &incoming_txs);
+            process_outgoing(&out, self_id, &peers, &socket, &incoming_txs, &mut encode_buf);
         }
 
         // ── Drain incoming UDP datagrams ──────────────────────────
@@ -401,7 +404,7 @@ fn run_transport(
             // worker senders have dropped.
             match outgoing_rx.recv_timeout(idle) {
                 Ok(out) => {
-                    process_outgoing(&out, self_id, &peers, &socket, &incoming_txs);
+                    process_outgoing(&out, self_id, &peers, &socket, &incoming_txs, &mut encode_buf);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     // Loop and poll again.
@@ -423,6 +426,7 @@ fn process_outgoing(
     peers: &FxHashMap<NodeId, SocketAddr>,
     socket: &UdpSocket,
     incoming_txs: &[mpsc::Sender<InterNodeMessage>],
+    encode_buf: &mut bytes::BytesMut,
 ) {
     if out.target == self_id {
         // Shouldn't happen — workers only forward to non-self owners —
@@ -443,9 +447,9 @@ fn process_outgoing(
         }
         return;
     };
-    match out.msg.encode() {
+    match out.msg.encode_into(encode_buf) {
         Ok(bytes) => {
-            if let Err(e) = socket.send_to(&bytes, addr) {
+            if let Err(e) = socket.send_to(bytes, addr) {
                 if SEND_DROP.tick() {
                     tracing::warn!(
                         target = %out.target,

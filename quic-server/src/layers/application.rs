@@ -191,6 +191,10 @@ pub struct VireonDispatcher {
 
     /// Queued outgoing frames, drained by the stack after each recv.
     outbox: Vec<OutgoingFrame>,
+    /// Reusable scratch for consumer-group fan-out targets.
+    /// Avoids a `Vec::new()` allocation per publish in the group fan-out
+    /// loop (handle_publish runs thousands of times/sec under load).
+    group_targets_scratch: Vec<(usize, u64)>,
     /// Per-(conn_idx, QUIC-stream) response sequence counter.
     next_seq: FxHashMap<(usize, u64), Seq>,
 
@@ -381,6 +385,7 @@ impl VireonDispatcher {
             pubsub_registry: TopicRegistry::new(PubSubConfig::new()),
             topic_catalog: TopicCatalog::new(),
             outbox: Vec::new(),
+            group_targets_scratch: Vec::with_capacity(8),
             next_seq: FxHashMap::default(),
             send_policy: SendPolicyTable::new(),
             egress_quic_streams: FxHashMap::default(),
@@ -889,7 +894,7 @@ impl VireonDispatcher {
                     Some(t) => t,
                     None => return,
                 };
-                self.handle_publish(ctx, frame.stream_id, &topic, payload);
+                self.handle_publish(ctx, frame.stream_id, topic, payload);
             }
             Ok(Some(ParsedPayload::TopicCreate(TopicCreatePayload {
                 topic,
@@ -903,7 +908,7 @@ impl VireonDispatcher {
                     Some(t) => t,
                     None => return,
                 };
-                self.handle_topic_delete(ctx, frame.stream_id, &topic);
+                self.handle_topic_delete(ctx, frame.stream_id, topic);
             }
             Ok(Some(other)) => {
                 if self.decode_drop.tick() {
@@ -1173,7 +1178,7 @@ impl VireonDispatcher {
         &mut self,
         ctx: &FrameContext,
         stream: StreamId,
-        topic: &pubsub_engine::Topic,
+        topic: &str,
         payload: &[u8],
     ) {
         // Phase 7: check Publish against the ACL before fan-out. Skip
@@ -1181,7 +1186,7 @@ impl VireonDispatcher {
         // invisible to subscribers. The check uses the concrete topic
         // string (not the publisher's pattern, which isn't known).
         if !self
-            .check_acl(ctx.conn_idx, Action::Publish, topic.as_str())
+            .check_acl(ctx.conn_idx, Action::Publish, topic)
             .is_allow()
         {
             if self.acl_denied_drop.tick() {
@@ -1198,7 +1203,7 @@ impl VireonDispatcher {
                     crate::audit::AuditKind::AclPublishDenied,
                     crate::audit::AuditResult::Denied,
                     &actor,
-                    topic.as_str(),
+                    topic,
                 );
             }
             self.send_ack(
@@ -1207,7 +1212,7 @@ impl VireonDispatcher {
                 MessageType::Publish,
                 &[
                     b"{\"error\":\"denied\",\"action\":\"publish\",\"topic\":\"",
-                    topic.as_str().as_bytes(),
+                    topic.as_bytes(),
                     b"\"}",
                 ],
             );
@@ -1225,7 +1230,7 @@ impl VireonDispatcher {
         // locally + fan out to remote subscribers) or another node
         // (forward the publish via UDP).
         if let Some(coord) = &self.coordinator {
-            let decision = coord.route_publish(topic.as_str());
+            let decision = coord.route_publish(topic);
             match decision {
                 PublishDecision::Forward { owner } => {
                     // Send the publish to the owning node via UDP.
@@ -1237,7 +1242,7 @@ impl VireonDispatcher {
                             self.node_id,
                             ctx.conn_idx as u32,
                             ctx.quic_stream_id,
-                            topic.as_str().to_string(),
+                            topic.to_string(),
                             payload_bytes.clone(),
                         );
                         let _ = tx.send(OutgoingMsg { msg, target: owner });
@@ -1265,7 +1270,7 @@ impl VireonDispatcher {
                                 self.node_id,
                                 ctx.conn_idx as u32,
                                 ctx.quic_stream_id,
-                                topic.as_str().to_string(),
+                                topic.to_string(),
                                 payload_bytes.clone(),
                             );
                             for target in &replicas {
@@ -1293,7 +1298,7 @@ impl VireonDispatcher {
                             self.node_id,
                             ctx.conn_idx as u32,
                             ctx.quic_stream_id,
-                            topic.as_str().to_string(),
+                            topic.to_string(),
                             payload_bytes.clone(),
                         );
                         for target in remote_targets {
@@ -1325,7 +1330,7 @@ impl VireonDispatcher {
 
         // Re-encode as a Publish frame so downstream subscribers receive the
         // same wire shape the publisher used (topic_len + topic + payload).
-        let topic_str = topic.as_str();
+        let topic_str = topic;
         self.encode_scratch.clear();
         self.encode_scratch
             .extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
@@ -1338,7 +1343,7 @@ impl VireonDispatcher {
         // the message still reaches live subscribers. Subscribers that
         // later `Fetch(offset)` for this entry will see a gap; that is
         // preferable to dropping the live fan-out, which has no recovery
-        // path. The `topic.as_str()` invariant (validated at publish
+        // path. The `topic` invariant (validated at publish
         // entry) guarantees the topic is also a valid WAL key.
         //
         // `wal_offset` is lifted out so the consumer-group fan-out
@@ -1391,7 +1396,7 @@ impl VireonDispatcher {
         // load-balances across its members. The selected consumer may
         // be on the same connection as the publisher; we still deliver
         // in that case (the consumer is a different logical subscriber).
-        let mut group_targets: Vec<(usize, u64)> = Vec::new();
+        self.group_targets_scratch.clear();
         for ((t, _g), local) in &mut self.group_locals {
             if t.as_str() != topic_str || local.members.is_empty() {
                 continue;
@@ -1407,9 +1412,11 @@ impl VireonDispatcher {
             if let Some(off) = wal_offset {
                 self.consumer_offsets.ack(topic_str, m.consumer.as_str(), off);
             }
-            group_targets.push((m.conn_idx, m.quic_stream_id));
+            self.group_targets_scratch.push((m.conn_idx, m.quic_stream_id));
         }
-        for (conn_idx, quic_stream_id) in group_targets {
+        let group_len = self.group_targets_scratch.len();
+        for i in 0..group_len {
+            let (conn_idx, quic_stream_id) = self.group_targets_scratch[i];
             self.enqueue_frame(
                 conn_idx,
                 quic_stream_id,
@@ -1464,7 +1471,7 @@ impl VireonDispatcher {
     /// Iterates over `remote_pattern_interest` (typically a small map,
     /// one entry per distinct pattern across all workers) and checks
     /// each pattern against `topic` via `TopicPattern::matches`.
-    fn matching_worker_bitmap(&self, topic: &pubsub_engine::Topic) -> u32 {
+    fn matching_worker_bitmap(&self, topic: &str) -> u32 {
         let mut bitmap: u32 = 0;
         for (pattern, &mask) in self.remote_pattern_interest.iter() {
             if pattern.matches(topic) {
@@ -1489,9 +1496,17 @@ impl VireonDispatcher {
     /// invalid names so dispatch callers can early-return without
     /// enqueuing an error ack (the rejection is silent at the protocol
     /// level — only the operator sees the warning).
-    fn validate_topic_or_log(&self, ctx: &FrameContext, raw: &str) -> Option<pubsub_engine::Topic> {
-        match pubsub_engine::Topic::new(raw) {
-            Ok(t) => Some(t),
+    ///
+    /// Returns the validated `&str` (no allocation) instead of an owned
+    /// `Topic` — the publish hot path calls this thousands of times/sec
+    /// and the old `Topic::new` allocated a `String` per publish.
+    fn validate_topic_or_log<'a>(
+        &self,
+        ctx: &FrameContext,
+        raw: &'a str,
+    ) -> Option<&'a str> {
+        match pubsub_engine::Topic::validate(raw) {
+            Ok(()) => Some(raw),
             Err(e) => {
                 tracing::warn!(
                     conn_idx = ctx.conn_idx,
@@ -1605,14 +1620,14 @@ impl VireonDispatcher {
         &mut self,
         ctx: &FrameContext,
         stream: StreamId,
-        topic: &pubsub_engine::Topic,
+        topic: &str,
     ) {
         // Phase 7: TopicDelete is the most dangerous operation (it can
         // wipe subscriber state), so its ACL action is separate from
         // TopicCreate. Deny returns an error ack and skips the catalog
         // mutation.
         if !self
-            .check_acl(ctx.conn_idx, Action::TopicDelete, topic.as_str())
+            .check_acl(ctx.conn_idx, Action::TopicDelete, topic)
             .is_allow()
         {
             tracing::info!(
@@ -1626,13 +1641,13 @@ impl VireonDispatcher {
                 MessageType::TopicDelete,
                 &[
                     b"{\"error\":\"denied\",\"action\":\"topic_delete\",\"topic\":\"",
-                    topic.as_str().as_bytes(),
+                    topic.as_bytes(),
                     b"\"}",
                 ],
             );
             return;
         }
-        let existed = self.topic_catalog.delete(topic.as_str());
+        let existed = self.topic_catalog.delete(topic);
         tracing::info!(
             conn_idx = ctx.conn_idx,
             topic = %topic,
@@ -1646,7 +1661,7 @@ impl VireonDispatcher {
                 crate::audit::AuditKind::TopicDeleted,
                 crate::audit::AuditResult::Allowed,
                 &actor,
-                topic.as_str(),
+                topic,
             );
         }
         let existed_str = if existed { b"true" as &[u8] } else { b"false" };
@@ -1656,7 +1671,7 @@ impl VireonDispatcher {
             MessageType::TopicDelete,
             &[
                 b"{\"topic_deleted\":\"",
-                topic.as_str().as_bytes(),
+                topic.as_bytes(),
                 b"\",\"existed\":",
                 existed_str,
                 b"}",
@@ -2512,7 +2527,7 @@ impl VireonDispatcher {
         };
         let targets: Vec<Subscriber> = self
             .pubsub_registry
-            .lookup(&topic_ref)
+            .lookup(topic_ref.as_str())
             .into_iter()
             .collect();
 
@@ -2677,7 +2692,7 @@ impl VireonDispatcher {
 
         let targets: Vec<Subscriber> = self
             .pubsub_registry
-            .lookup(&topic_ref)
+            .lookup(topic_ref.as_str())
             .into_iter()
             .collect();
 
@@ -3738,7 +3753,7 @@ mod tests {
         // Publish to alerts.fire from a different conn (so the
         // self-skip filter doesn't apply).
         let topic = pubsub_engine::Topic::new("alerts.fire").unwrap();
-        d.handle_publish(&ctx(1, 200), StreamId::new(2), &topic, b"payload");
+        d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), b"payload");
 
         // Outbox: only the error ack, NO fan-out to subscriber.
         let out = drain_outbox_bytes(&mut d);
@@ -3760,7 +3775,7 @@ mod tests {
         let _ = d.drain_outbox();
 
         let topic = pubsub_engine::Topic::new("alerts.fire").unwrap();
-        d.handle_publish(&ctx(1, 200), StreamId::new(2), &topic, b"hi");
+        d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), b"hi");
 
         // Outbox: one Publish fan-out frame to conn 0 (the subscriber).
         let out = drain_outbox_bytes(&mut d);
@@ -3805,7 +3820,7 @@ mod tests {
         d.acl = stricter;
 
         let topic = pubsub_engine::Topic::new("admin.config").unwrap();
-        d.handle_topic_delete(&ctx(0, 100), StreamId::new(1), &topic);
+        d.handle_topic_delete(&ctx(0, 100), StreamId::new(1), topic.as_str());
 
         // Catalog still has the topic.
         assert_eq!(d.topic_catalog.len(), 1);
@@ -3979,7 +3994,7 @@ mod tests {
 
         let topic = pubsub_engine::Topic::new("sensor.temp").unwrap();
         for i in 0..5u8 {
-            d.handle_publish(&ctx(1, 200), StreamId::new(2), &topic, &[i]);
+            d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), &[i]);
         }
         // Drain the fan-out outbox so later asserts aren't muddled.
         let _ = d.drain_outbox();
@@ -3997,7 +4012,7 @@ mod tests {
         // Publish 5 entries on sensor.temp.
         let topic = pubsub_engine::Topic::new("sensor.temp").unwrap();
         for i in 0..5u8 {
-            d.handle_publish(&ctx(1, 200), StreamId::new(2), &topic, &[i]);
+            d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), &[i]);
         }
         let _ = d.drain_outbox();
 
@@ -4037,7 +4052,7 @@ mod tests {
         let mut d = VireonDispatcher::new();
 
         let topic = pubsub_engine::Topic::new("sensor.temp").unwrap();
-        d.handle_publish(&ctx(1, 200), StreamId::new(2), &topic, b"payload");
+        d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), b"payload");
         let pub_out = drain_outbox_bytes(&mut d);
         // No subscribers → no fan-out; zero frames queued by publish.
         assert!(
@@ -4071,7 +4086,7 @@ mod tests {
 
         let topic = pubsub_engine::Topic::new("sensor.temp").unwrap();
         for i in 0..20u8 {
-            d.handle_publish(&ctx(1, 200), StreamId::new(2), &topic, &[i]);
+            d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), &[i]);
         }
         let _ = d.drain_outbox();
 
@@ -4103,7 +4118,7 @@ mod tests {
         // Default policy = keep forever.
         let topic = pubsub_engine::Topic::new("sensor.temp").unwrap();
         for i in 0..10u8 {
-            d.handle_publish(&ctx(1, 200), StreamId::new(2), &topic, &[i]);
+            d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), &[i]);
         }
         let _ = d.drain_outbox();
 
@@ -4154,7 +4169,7 @@ mod tests {
         // Default: None = unlimited.
         for i in 0..100 {
             let topic = format!("topic.{i}");
-            d.handle_topic_create(&ctx(0, 100), StreamId::new(1), &topic, 1, 0);
+            d.handle_topic_create(&ctx(0, 100), StreamId::new(1), topic.as_str(), 1, 0);
         }
         let _ = d.drain_outbox();
         assert_eq!(d.topic_catalog.len(), 100);
