@@ -98,6 +98,30 @@ pub enum InterWorkerMsg {
         worker_idx: u16,
         pattern: String,
     },
+    /// Sender `worker_idx` gained a consumer-group member.
+    /// Worker 0 uses this to maintain a global member registry.
+    GroupGained {
+        worker_idx: u16,
+        topic: String,
+        group: String,
+        conn_idx: usize,
+        stream_id: u64,
+        consumer_id: String,
+    },
+    /// Sender `worker_idx` lost a consumer-group member.
+    GroupLost {
+        worker_idx: u16,
+        topic: String,
+        group: String,
+        consumer_id: String,
+    },
+    /// Deliver a framed publish to one consumer-group member.
+    /// `target = None`: worker 0 should decide and route.
+    /// `target = Some(conn_idx, stream_id)`: deliver to this specific member.
+    GroupDeliver {
+        framed: Bytes,
+        target: Option<(usize, u64)>,
+    },
 }
 
 // ── FrameContext & OutgoingFrame ──────────────────────────────────
@@ -174,6 +198,16 @@ struct GroupLocal {
     members: Vec<GroupMember>,
     /// Round-robin index advanced on each publish.
     rr_idx: usize,
+}
+
+/// A consumer-group member tracked in worker 0's global registry.
+/// Unlike `GroupMember`, this carries `worker_idx` so worker 0 knows
+/// which worker owns the connection.
+struct GlobalGroupMember {
+    worker_idx: u16,
+    conn_idx: usize,
+    stream_id: u64,
+    consumer_id: String,
 }
 
 // ── VireonDispatcher ──────────────────────────────────────────────
@@ -273,6 +307,15 @@ pub struct VireonDispatcher {
     /// strings so publish fan-out can iterate groups for a topic without
     /// constructing typed wrappers on the hot path.
     group_locals: FxHashMap<(String, String), GroupLocal>,
+    /// Global consumer-group member registry — only populated on worker 0.
+    /// Maps (topic, group) → all members across ALL workers. Used by
+    /// `do_group_delivery` for global round-robin so that each publish
+    /// is delivered to exactly one member regardless of which worker
+    /// the member's connection lives on.
+    remote_group_members: FxHashMap<(String, String), Vec<GlobalGroupMember>>,
+    /// Global round-robin counter per (topic, group). Only used by
+    /// worker 0 in `do_group_delivery`.
+    group_rr: FxHashMap<(String, String), usize>,
     /// Per-connection group memberships — used to leave all groups on
     /// disconnect. Each entry is `(topic, group_id, consumer_id)`.
     conn_group_keys: FxHashMap<usize, Vec<(String, String, ConsumerId)>>,
@@ -425,6 +468,8 @@ impl VireonDispatcher {
             wal: None,
             groups: GroupCoordinator::new(),
             group_locals: FxHashMap::default(),
+            remote_group_members: FxHashMap::default(),
+            group_rr: FxHashMap::default(),
             conn_group_keys: FxHashMap::default(),
             coordinator: None,
             node_id: session_registry::NodeId::NIL,
@@ -1408,39 +1453,47 @@ impl VireonDispatcher {
             );
         }
 
-        // P5: consumer-group fan-out — for each group on this topic,
-        // deliver to exactly one local member (round-robin) so the group
-        // load-balances across its members. The selected consumer may
-        // be on the same connection as the publisher; we still deliver
-        // in that case (the consumer is a different logical subscriber).
-        self.group_targets_scratch.clear();
-        for ((t, _g), local) in &mut self.group_locals {
-            if t.as_str() != topic_str || local.members.is_empty() {
-                continue;
+        // P5: consumer-group delivery.
+        //
+        // In single-worker mode: local round-robin via group_locals.
+        //
+        // In multi-worker mode: worker 0 does global round-robin via
+        // remote_group_members; other workers forward to worker 0 via
+        // GroupDeliver. This ensures exactly one delivery per publish
+        // regardless of which worker the group members live on.
+        if self.worker_outboxes.is_empty() {
+            // Single-worker: inline local delivery (hot path).
+            self.group_targets_scratch.clear();
+            for ((t, _g), local) in &mut self.group_locals {
+                if t.as_str() != topic_str || local.members.is_empty() {
+                    continue;
+                }
+                let idx = local.rr_idx % local.members.len();
+                local.rr_idx = local.rr_idx.wrapping_add(1);
+                let m = &local.members[idx];
+                if let Some(off) = wal_offset {
+                    self.consumer_offsets.ack(topic_str, m.consumer.as_str(), off);
+                }
+                self.group_targets_scratch.push((m.conn_idx, m.quic_stream_id));
             }
-            let idx = local.rr_idx % local.members.len();
-            local.rr_idx = local.rr_idx.wrapping_add(1);
-            let m = &local.members[idx];
-            // Auto-ack: the server has chosen this consumer for the
-            // current publish. Recording the WAL offset (if any) as
-            // the consumer's acked position means a restart will resume
-            // from this publish.next() rather than OLDEST — at-least-
-            // once delivery for the consumer.
-            if let Some(off) = wal_offset {
-                self.consumer_offsets.ack(topic_str, m.consumer.as_str(), off);
+            let group_len = self.group_targets_scratch.len();
+            for i in 0..group_len {
+                let (conn_idx, quic_stream_id) = self.group_targets_scratch[i];
+                self.enqueue_frame(
+                    conn_idx,
+                    quic_stream_id,
+                    stream,
+                    MessageType::Publish,
+                    bytes.clone(),
+                );
             }
-            self.group_targets_scratch.push((m.conn_idx, m.quic_stream_id));
-        }
-        let group_len = self.group_targets_scratch.len();
-        for i in 0..group_len {
-            let (conn_idx, quic_stream_id) = self.group_targets_scratch[i];
-            self.enqueue_frame(
-                conn_idx,
-                quic_stream_id,
-                stream,
-                MessageType::Publish,
-                bytes.clone(),
-            );
+        } else if self.worker_self_idx == 0 {
+            self.do_group_delivery(bytes.clone());
+        } else {
+            let _ = self.worker_outboxes[0].try_send(InterWorkerMsg::GroupDeliver {
+                framed: bytes.clone(),
+                target: None,
+            });
         }
 
         // Cross-worker fan-out: send to other workers that have subscribers
@@ -2039,6 +2092,39 @@ impl VireonDispatcher {
         Some((topic, group, consumer, &payload[pos..]))
     }
 
+    /// Records (or updates) a consumer-group member in worker 0's global
+    /// registry. Deduplicates by `(worker_idx, consumer_id)`: if the
+    /// member already exists, updates its `conn_idx`/`stream_id`
+    /// (handles reconnection to a new QUIC connection on the same worker).
+    fn record_global_member(
+        &mut self,
+        worker_idx: u16,
+        topic: &str,
+        group: &str,
+        conn_idx: usize,
+        stream_id: u64,
+        consumer_id: &str,
+    ) {
+        let entry = self
+            .remote_group_members
+            .entry((topic.to_string(), group.to_string()))
+            .or_default();
+        if let Some(m) = entry
+            .iter_mut()
+            .find(|m| m.consumer_id == consumer_id && m.worker_idx == worker_idx)
+        {
+            m.conn_idx = conn_idx;
+            m.stream_id = stream_id;
+        } else {
+            entry.push(GlobalGroupMember {
+                worker_idx,
+                conn_idx,
+                stream_id,
+                consumer_id: consumer_id.to_string(),
+            });
+        }
+    }
+
     /// Handles `ConsumerGroupJoin`. Parses the payload, calls the group
     /// coordinator, records the local membership, and ACKs with the
     /// generation.
@@ -2126,16 +2212,44 @@ impl VireonDispatcher {
                 members: Vec::new(),
                 rr_idx: 0,
             });
+        let should_broadcast;
         if let Some(existing) = local.members.iter_mut().find(|m| m.consumer == consumer_id) {
             // Re-join from an existing consumer: update conn_idx/stream
-            // (handles reconnection to a new QUIC connection).
+            // (handles reconnection to a new QUIC connection). Only
+            // broadcast if the connection actually changed.
+            should_broadcast =
+                existing.conn_idx != ctx.conn_idx || existing.quic_stream_id != ctx.quic_stream_id;
             existing.conn_idx = ctx.conn_idx;
             existing.quic_stream_id = ctx.quic_stream_id;
         } else {
+            should_broadcast = true;
             local.members.push(GroupMember {
                 conn_idx: ctx.conn_idx,
                 quic_stream_id: ctx.quic_stream_id,
                 consumer: consumer_id.clone(),
+            });
+        }
+        // Notify other workers (and update worker 0's local global registry).
+        // Skipped on heartbeat re-joins (same conn) to avoid flooding the
+        // inter-worker channels.
+        if should_broadcast && !self.worker_outboxes.is_empty() {
+            if self.worker_self_idx == 0 {
+                self.record_global_member(
+                    0,
+                    topic,
+                    group,
+                    ctx.conn_idx,
+                    ctx.quic_stream_id,
+                    consumer_id.as_str(),
+                );
+            }
+            self.broadcast_worker_msg(InterWorkerMsg::GroupGained {
+                worker_idx: self.worker_self_idx as u16,
+                topic: topic.to_string(),
+                group: group.to_string(),
+                conn_idx: ctx.conn_idx,
+                stream_id: ctx.quic_stream_id,
+                consumer_id: consumer_id.to_string(),
             });
         }
         let group_key = (topic.to_string(), group.to_string(), consumer_id);
@@ -2330,14 +2444,41 @@ impl VireonDispatcher {
     /// entirely so publish fan-out skips it.
     fn remove_group_member(&mut self, topic: &str, group: &str, consumer: &ConsumerId) {
         let key = (topic.to_string(), group.to_string());
+        let mut was_present = false;
         if let Some(local) = self.group_locals.get_mut(&key) {
+            let before = local.members.len();
             local
                 .members
                 .retain(|m| m.consumer.as_str() != consumer.as_str());
+            was_present = local.members.len() < before;
             if local.members.is_empty() {
                 self.group_locals.remove(&key);
             } else if local.rr_idx >= local.members.len() {
                 local.rr_idx = 0;
+            }
+        }
+        if was_present {
+            // Update worker 0's global registry
+            if self.worker_self_idx == 0 {
+                if let Some(members) = self.remote_group_members.get_mut(&key) {
+                    members.retain(|m| {
+                        !(m.consumer_id == consumer.as_str()
+                            && m.worker_idx == self.worker_self_idx as u16)
+                    });
+                    if members.is_empty() {
+                        self.remote_group_members.remove(&key);
+                        self.group_rr.remove(&key);
+                    }
+                }
+            }
+            // Notify other workers
+            if !self.worker_outboxes.is_empty() {
+                self.broadcast_worker_msg(InterWorkerMsg::GroupLost {
+                    worker_idx: self.worker_self_idx as u16,
+                    topic: topic.to_string(),
+                    group: group.to_string(),
+                    consumer_id: consumer.as_str().to_string(),
+                });
             }
         }
     }
@@ -2472,18 +2613,25 @@ impl VireonDispatcher {
                             }
                         }
                     }
-                    self.cluster_deliver_local(
+                    if let Some(bytes) = self.cluster_deliver_local(
                         &msg.topic_or_pattern,
                         &msg.payload,
                         msg.origin_conn_idx,
                         msg.origin_stream_id,
-                    );
+                    ) {
+                        // Consumer-group delivery: worker 0 only (or any
+                        // worker in single-worker mode).
+                        if self.worker_outboxes.is_empty() || self.worker_self_idx == 0 {
+                            self.do_group_delivery(bytes);
+                        }
+                    }
                 }
                 cluster_coordinator::InterNodeKind::Fanout => {
                     // Fanout messages are already targeted at nodes with
                     // subscribers — deliver locally only (no re-fanout,
-                    // which would create forwarding loops).
-                    self.cluster_deliver_local(
+                    // which would create forwarding loops). Group delivery
+                    // was already done by the owner's Publish handler.
+                    let _ = self.cluster_deliver_local(
                         &msg.topic_or_pattern,
                         &msg.payload,
                         msg.origin_conn_idx,
@@ -2533,16 +2681,19 @@ impl VireonDispatcher {
     /// subscribers. Mirrors the wire encoding used by `handle_publish`:
     /// `topic_len(u16) | topic | payload`.
     ///
+    /// Returns the framed `Bytes` on success so the caller can pass it
+    /// to `do_group_delivery` for consumer-group delivery (worker 0 only).
+    ///
     /// Inter-node delivered messages do NOT re-trigger cluster
     /// routing (that would loop): this method consults only the local
-    /// `pubsub_registry` + `group_locals`.
+    /// `pubsub_registry`.
     fn cluster_deliver_local(
         &mut self,
         topic: &str,
         payload: &[u8],
         _origin_conn_idx: u32,
         _origin_stream_id: u64,
-    ) {
+    ) -> Option<Bytes> {
         let topic_ref = match pubsub_engine::Topic::new(topic) {
             Ok(t) => t,
             Err(e) => {
@@ -2551,7 +2702,7 @@ impl VireonDispatcher {
                     error = ?e,
                     "[cluster] incoming publish has invalid topic — dropping"
                 );
-                return;
+                return None;
             }
         };
         let targets: Vec<Subscriber> = self
@@ -2604,26 +2755,9 @@ impl VireonDispatcher {
             );
         }
 
-        // Consumer-group fan-out (P5) — mirror handle_publish.
-        let mut group_targets: Vec<(usize, u64)> = Vec::new();
-        for ((t, _g), local) in &mut self.group_locals {
-            if t.as_str() != topic_str || local.members.is_empty() {
-                continue;
-            }
-            let idx = local.rr_idx % local.members.len();
-            local.rr_idx = local.rr_idx.wrapping_add(1);
-            let m = &local.members[idx];
-            group_targets.push((m.conn_idx, m.quic_stream_id));
-        }
-        for (conn_idx, quic_stream_id) in group_targets {
-            self.enqueue_frame(
-                conn_idx,
-                quic_stream_id,
-                stream,
-                MessageType::Publish,
-                bytes.clone(),
-            );
-        }
+        // Consumer-group delivery is handled by the caller via
+        // do_group_delivery (worker 0 only).
+        Some(bytes)
     }
 
     /// Drains forwarded publishes from other workers and delivers them
@@ -2687,6 +2821,175 @@ impl VireonDispatcher {
                         }
                     }
                 }
+                InterWorkerMsg::GroupGained {
+                    worker_idx,
+                    topic,
+                    group,
+                    conn_idx,
+                    stream_id,
+                    consumer_id,
+                } => {
+                    // Only worker 0 maintains the global registry.
+                    if self.worker_self_idx == 0 {
+                        self.record_global_member(
+                            worker_idx,
+                            &topic,
+                            &group,
+                            conn_idx,
+                            stream_id,
+                            &consumer_id,
+                        );
+                    }
+                }
+                InterWorkerMsg::GroupLost {
+                    worker_idx,
+                    topic,
+                    group,
+                    consumer_id,
+                } => {
+                    if self.worker_self_idx == 0 {
+                        let key = (topic, group);
+                        if let Some(members) = self.remote_group_members.get_mut(&key) {
+                            members.retain(|m| {
+                                !(m.consumer_id == consumer_id && m.worker_idx == worker_idx)
+                            });
+                            if members.is_empty() {
+                                self.remote_group_members.remove(&key);
+                                self.group_rr.remove(&key);
+                            }
+                        }
+                    }
+                }
+                InterWorkerMsg::GroupDeliver { framed, target } => match target {
+                    Some((conn_idx, stream_id)) => {
+                        // Worker 0 routed a delivery to a member on this worker.
+                        let stream = StreamId::new(0xFFFF_FFFF);
+                        self.enqueue_frame(
+                            conn_idx,
+                            stream_id,
+                            stream,
+                            MessageType::Publish,
+                            framed,
+                        );
+                    }
+                    None => {
+                        // Another worker asks us (worker 0) to do global
+                        // group delivery.
+                        self.do_group_delivery(framed);
+                    }
+                },
+            }
+        }
+    }
+
+    /// Global consumer-group delivery. Parses the topic from `framed`
+    /// bytes (`[topic_len:u16 BE][topic][payload]`), finds all groups
+    /// matching the topic, picks one member per group via round-robin,
+    /// and delivers either locally (`enqueue_frame`) or remotely
+    /// (`GroupDeliver` with a targeted `Some(conn_idx, stream_id)`).
+    ///
+    /// Two code paths:
+    /// - **Multi-worker** (`remote_group_members` populated): worker 0
+    ///   does global round-robin across all workers' members.
+    /// - **Single-worker fallback** (no `remote_group_members`): local
+    ///   round-robin via `group_locals` — same as the inline code in
+    ///   `handle_publish`'s single-worker branch.
+    fn do_group_delivery(&mut self, framed: Bytes) {
+        // Parse topic from framed bytes.
+        if framed.len() < 2 {
+            return;
+        }
+        let topic_len = u16::from_be_bytes([framed[0], framed[1]]) as usize;
+        if framed.len() < 2 + topic_len {
+            return;
+        }
+        let topic_str = match std::str::from_utf8(&framed[2..2 + topic_len]) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        // Check if we have global members for this topic (multi-worker).
+        let has_global = self
+            .remote_group_members
+            .iter()
+            .any(|((t, _), m)| t.as_str() == topic_str && !m.is_empty());
+
+        if has_global {
+            // Multi-worker: global round-robin via remote_group_members.
+            // Phase 1: read-only scan.
+            enum Target {
+                Local(usize, u64),
+                Remote(u16, usize, u64),
+            }
+            let mut decisions: Vec<Target> = Vec::new();
+            let mut rr_updates: Vec<((String, String), usize)> = Vec::new();
+
+            for (key, members) in &self.remote_group_members {
+                if key.0.as_str() != topic_str || members.is_empty() {
+                    continue;
+                }
+                let rr = self.group_rr.get(key).copied().unwrap_or(0);
+                let idx = rr % members.len();
+                rr_updates.push((key.clone(), rr.wrapping_add(1)));
+                let m = &members[idx];
+                if m.worker_idx as usize == self.worker_self_idx {
+                    decisions.push(Target::Local(m.conn_idx, m.stream_id));
+                } else {
+                    decisions.push(Target::Remote(m.worker_idx, m.conn_idx, m.stream_id));
+                }
+            }
+
+            // Phase 2: apply rr updates.
+            for (key, new_rr) in rr_updates {
+                self.group_rr.insert(key, new_rr);
+            }
+
+            // Phase 3: execute.
+            let stream = StreamId::new(0xFFFF_FFFF);
+            for decision in decisions {
+                match decision {
+                    Target::Local(conn_idx, stream_id) => {
+                        self.enqueue_frame(
+                            conn_idx,
+                            stream_id,
+                            stream,
+                            MessageType::Publish,
+                            framed.clone(),
+                        );
+                    }
+                    Target::Remote(worker_idx, conn_idx, stream_id) => {
+                        if let Some(outbox) = self.worker_outboxes.get(worker_idx as usize) {
+                            let _ = outbox.try_send(InterWorkerMsg::GroupDeliver {
+                                framed: framed.clone(),
+                                target: Some((conn_idx, stream_id)),
+                            });
+                        }
+                    }
+                }
+            }
+        } else {
+            // Single-worker fallback: local round-robin via group_locals.
+            self.group_targets_scratch.clear();
+            for ((t, _g), local) in &mut self.group_locals {
+                if t.as_str() != topic_str || local.members.is_empty() {
+                    continue;
+                }
+                let idx = local.rr_idx % local.members.len();
+                local.rr_idx = local.rr_idx.wrapping_add(1);
+                let m = &local.members[idx];
+                self.group_targets_scratch.push((m.conn_idx, m.quic_stream_id));
+            }
+            let stream = StreamId::new(0xFFFF_FFFF);
+            let group_len = self.group_targets_scratch.len();
+            for i in 0..group_len {
+                let (conn_idx, stream_id) = self.group_targets_scratch[i];
+                self.enqueue_frame(
+                    conn_idx,
+                    stream_id,
+                    stream,
+                    MessageType::Publish,
+                    framed.clone(),
+                );
             }
         }
     }
@@ -2702,8 +3005,9 @@ impl VireonDispatcher {
     /// slicing for the registry lookup, avoiding the `String` allocation
     /// the previous `cluster_deliver_local` path incurred.
     ///
-    /// Same semantics as `cluster_deliver_local` for the regular fan-out
-    /// AND consumer-group round-robin.
+    /// Same semantics as `cluster_deliver_local` for regular fan-out.
+    /// Consumer-group delivery is NOT handled here — it goes through
+    /// the `GroupDeliver` inter-worker path to worker 0.
     fn deliver_framed_local(&mut self, framed: Bytes) {
         // Zero-copy topic parse: first 2 bytes = topic_len BE, then topic.
         if framed.len() < 2 {
@@ -2748,26 +3052,8 @@ impl VireonDispatcher {
             );
         }
 
-        // Consumer-group fan-out (P5) — same logic as `cluster_deliver_local`.
-        let mut group_targets: Vec<(usize, u64)> = Vec::new();
-        for ((t, _g), local) in &mut self.group_locals {
-            if t.as_str() != topic_str || local.members.is_empty() {
-                continue;
-            }
-            let idx = local.rr_idx % local.members.len();
-            local.rr_idx = local.rr_idx.wrapping_add(1);
-            let m = &local.members[idx];
-            group_targets.push((m.conn_idx, m.quic_stream_id));
-        }
-        for (conn_idx, quic_stream_id) in group_targets {
-            self.enqueue_frame(
-                conn_idx,
-                quic_stream_id,
-                stream,
-                MessageType::Publish,
-                framed.clone(),
-            );
-        }
+        // Consumer-group delivery is handled exclusively via the
+        // GroupDeliver path (see handle_publish → do_group_delivery).
     }
 
     /// Apply the configured WAL retention policy to every tracked
