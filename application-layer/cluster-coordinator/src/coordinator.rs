@@ -205,7 +205,7 @@ impl ClusterCoordinator {
 
     /// Collect the distinct alive nodes with subscribers matching
     /// `topic`. Excludes self.
-    fn collect_remote_targets(&self, topic: &str) -> Vec<NodeId> {
+    pub fn collect_remote_targets(&self, topic: &str) -> Vec<NodeId> {
         let hits = self.remote_subs.lookup(topic);
         let mut seen: FxHashSet<NodeId> = FxHashSet::default();
         let mut out: Vec<NodeId> = Vec::with_capacity(hits.len());

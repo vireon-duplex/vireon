@@ -39,8 +39,8 @@ impl Worker {
         num_workers: u32,
         inbox_rx: mpsc::Receiver<ForwardedPacket>,
         outboxes: Vec<mpsc::SyncSender<ForwardedPacket>>,
-        worker_inbox: Option<mpsc::Receiver<crate::layers::InterWorkerPublish>>,
-        worker_outboxes: Vec<mpsc::SyncSender<crate::layers::InterWorkerPublish>>,
+        worker_inbox: Option<mpsc::Receiver<crate::layers::InterWorkerMsg>>,
+        worker_outboxes: Vec<mpsc::SyncSender<crate::layers::InterWorkerMsg>>,
         cluster_handle: Option<ClusterWorkerHandle>,
         shutdown_requested: Arc<AtomicBool>,
     ) -> Result<Self, ServerError> {
@@ -186,8 +186,8 @@ impl Worker {
         num_workers: u32,
         inbox_rx: mpsc::Receiver<ForwardedPacket>,
         outboxes: Vec<mpsc::SyncSender<ForwardedPacket>>,
-        worker_inbox: Option<mpsc::Receiver<crate::layers::InterWorkerPublish>>,
-        worker_outboxes: Vec<mpsc::SyncSender<crate::layers::InterWorkerPublish>>,
+        worker_inbox: Option<mpsc::Receiver<crate::layers::InterWorkerMsg>>,
+        worker_outboxes: Vec<mpsc::SyncSender<crate::layers::InterWorkerMsg>>,
         cluster_handle: Option<ClusterWorkerHandle>,
         shutdown_requested: Arc<AtomicBool>,
     ) -> Result<

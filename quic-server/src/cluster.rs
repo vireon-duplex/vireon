@@ -261,6 +261,38 @@ pub fn launch_cluster(
     socket
         .set_nonblocking(true)
         .map_err(|e| format!("cluster UDP non-blocking: {e}"))?;
+
+    // Match the main QUIC socket buffer sizes so burst-heavy cluster
+    // forwarding (e.g. ClientPool 20K-frame bursts) doesn't overflow
+    // the kernel default (~208 KiB) and silently drop datagrams.
+    use std::os::unix::io::AsRawFd;
+    const CLUSTER_BUF_SIZE: libc::c_int = 16 * 1024 * 1024;
+    let fd = socket.as_raw_fd();
+    let optlen = std::mem::size_of_val(&CLUSTER_BUF_SIZE) as libc::socklen_t;
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &CLUSTER_BUF_SIZE as *const _ as *const libc::c_void,
+            optlen,
+        )
+    };
+    if rc != 0 {
+        tracing::warn!(errno = %rc, "cluster UDP SO_RCVBUF failed (using kernel default)");
+    }
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &CLUSTER_BUF_SIZE as *const _ as *const libc::c_void,
+            optlen,
+        )
+    };
+    if rc != 0 {
+        tracing::warn!(errno = %rc, "cluster UDP SO_SNDBUF failed (using kernel default)");
+    }
     tracing::info!(
         bind_addr = %cfg.bind_addr,
         peers = cfg.peer_addrs.len(),
