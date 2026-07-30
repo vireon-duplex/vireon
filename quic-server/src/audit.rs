@@ -158,6 +158,9 @@ impl AuditLog {
                 "audit log: bad magic",
             ));
         }
+        // SAFETY: `data[4..8]` is exactly 4 bytes by Rust slice indexing
+        // semantics, so try_into::<[u8; 4]>() cannot return Err.
+        #[allow(clippy::unwrap_used)]
         let version = u32::from_be_bytes(data[4..8].try_into().unwrap());
         if version != FORMAT_VERSION {
             return Err(std::io::Error::new(

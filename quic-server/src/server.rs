@@ -63,7 +63,8 @@ impl QuicServer {
         let (dummy_tx, dummy_rx) = std::sync::mpsc::sync_channel::<quic_engine::ForwardedPacket>(1);
 
         // P6: launch cluster transport if configured.
-        let cluster_handle = self.launch_cluster_transport(1)?.and_then(|mut h| h.pop());
+        let (cluster_handles, cluster_join) = self.launch_cluster_transport(1)?;
+        let cluster_handle = cluster_handles.and_then(|mut h| h.pop());
 
         let worker = Worker::create(
             &self.config,
@@ -113,7 +114,15 @@ impl QuicServer {
         }
 
         tracing::info!("starting single-worker server (core 0)");
-        worker.run()
+        let result = worker.run();
+
+        // Join the cluster transport thread for a clean shutdown.
+        if let Some(join) = cluster_join {
+            if join.join().is_err() {
+                tracing::warn!("cluster transport thread panicked during shutdown");
+            }
+        }
+        result
     }
 
     // ── Multi Worker (thread-per-core) ─────────────────────────────
@@ -127,9 +136,8 @@ impl QuicServer {
 
         // P6: launch cluster transport if configured. Returns one
         // ClusterWorkerHandle per worker (in core_id order).
-        let mut cluster_handles = self
-            .launch_cluster_transport(num_workers)?
-            .map(std::collections::VecDeque::from);
+        let (cluster_handles_opt, cluster_join) = self.launch_cluster_transport(num_workers)?;
+        let mut cluster_handles = cluster_handles_opt.map(std::collections::VecDeque::from);
 
         // Build the inter-worker forwarding mesh. Each worker gets one
         // inbox receiver + the shared sender vector. The mesh provides a
@@ -223,8 +231,12 @@ impl QuicServer {
         // (single-worker with ghosts needs steering to avoid routing
         // packets to dead sockets).
         if num_live > 1 || ghost_offset > 0 {
+            let Some(&primary_fd) = socket_fds.first() else {
+                tracing::error!("no worker sockets available — skipping eBPF attach");
+                return join_all(handles, &shutdown_requested);
+            };
             match kernel_nic::attach_quic_reuseport_steering(
-                socket_fds[0],
+                primary_fd,
                 num_live as u32,
                 ghost_offset,
             ) {
@@ -255,7 +267,16 @@ impl QuicServer {
         install_signal_handler(shutdown_requested.clone())?;
         install_crash_handlers();
 
-        join_all(handles, &shutdown_requested)
+        let result = join_all(handles, &shutdown_requested);
+
+        // Join the cluster transport thread for a clean shutdown.
+        if let Some(join) = cluster_join {
+            if join.join().is_err() {
+                tracing::warn!("cluster transport thread panicked during shutdown");
+            }
+        }
+
+        result
     }
 
     // ── Distributed (stub) ─────────────────────────────────────────
@@ -300,9 +321,15 @@ impl QuicServer {
     fn launch_cluster_transport(
         &self,
         num_workers: usize,
-    ) -> Result<Option<Vec<crate::cluster::ClusterWorkerHandle>>, ServerError> {
+    ) -> Result<
+        (
+            Option<Vec<crate::cluster::ClusterWorkerHandle>>,
+            Option<thread::JoinHandle<()>>,
+        ),
+        ServerError,
+    > {
         let Some(cfg) = self.config.cluster.as_ref() else {
-            return Ok(None);
+            return Ok((None, None));
         };
         tracing::info!(
             self_id = cfg.cluster_cfg.self_id.raw(),
@@ -310,12 +337,9 @@ impl QuicServer {
             workers = num_workers,
             "starting cluster transport"
         );
-        let (handles, _join) = crate::cluster::launch_cluster(cfg, num_workers)
+        let (handles, join) = crate::cluster::launch_cluster(cfg, num_workers)
             .map_err(|e| ServerError::Config(format!("cluster transport: {e}")))?;
-        // NOTE: `_join` is intentionally dropped here — the transport
-        // thread exits naturally when all worker senders drop. A future
-        // enhancement could join it at shutdown for a clean exit.
-        Ok(Some(handles))
+        Ok((Some(handles), Some(join)))
     }
 }
 
@@ -374,7 +398,7 @@ fn build_inter_worker_pubsub_channels(
     std::sync::mpsc::Receiver<crate::layers::application::InterWorkerMsg>,
     Vec<std::sync::mpsc::SyncSender<crate::layers::application::InterWorkerMsg>>,
 )> {
-    let cap = 65_536;
+    let cap = 262_144;
     let channels: Vec<_> = (0..n)
         .map(|_| {
             std::sync::mpsc::sync_channel::<crate::layers::application::InterWorkerMsg>(cap)

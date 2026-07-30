@@ -50,6 +50,12 @@ pub enum InterNodeKind {
     Subscribe = 0x03,
     /// Non-owner → owner: "stop sending fanouts for this pattern".
     Unsubscribe = 0x04,
+    /// "I'm alive" — broadcast every `heartbeat_interval` so peers can
+    /// detect failures. `origin_node` = the heartbeating node.
+    Heartbeat = 0x05,
+    /// Gossip: "node X is dead" — converges on removal. `origin_node`
+    /// = the node being declared down (not the reporter).
+    NodeDown = 0x06,
 }
 
 impl InterNodeKind {
@@ -62,6 +68,8 @@ impl InterNodeKind {
             0x02 => Some(Self::Fanout),
             0x03 => Some(Self::Subscribe),
             0x04 => Some(Self::Unsubscribe),
+            0x05 => Some(Self::Heartbeat),
+            0x06 => Some(Self::NodeDown),
             _ => None,
         }
     }
@@ -160,6 +168,37 @@ impl InterNodeMessage {
             origin_conn_idx: conn_idx,
             origin_stream_id: stream_id,
             topic_or_pattern: pattern.into(),
+            payload: Bytes::new(),
+        }
+    }
+
+    /// Construct a Heartbeat message. Broadcast periodically by each
+    /// node so peers can detect failures. The topic field carries a
+    /// fixed marker (`_heartbeat.cluster`) — it satisfies the non-empty
+    /// topic constraint without carrying real subscription state.
+    #[must_use]
+    pub fn heartbeat(origin: NodeId) -> Self {
+        Self {
+            kind: InterNodeKind::Heartbeat,
+            origin_node: origin,
+            origin_conn_idx: 0,
+            origin_stream_id: 0,
+            topic_or_pattern: Arc::from("_heartbeat.cluster"),
+            payload: Bytes::new(),
+        }
+    }
+
+    /// Construct a NodeDown gossip message. `dead_node` is the node
+    /// being declared down — receivers should mark it down so ownership
+    /// shifts to the next node on the ring.
+    #[must_use]
+    pub fn node_down(reporter: NodeId, dead_node: NodeId) -> Self {
+        Self {
+            kind: InterNodeKind::NodeDown,
+            origin_node: dead_node,
+            origin_conn_idx: reporter.raw(),
+            origin_stream_id: 0,
+            topic_or_pattern: Arc::from("_nodedown.gossip"),
             payload: Bytes::new(),
         }
     }
@@ -448,12 +487,40 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_round_trip() {
+        let m = InterNodeMessage::heartbeat(NodeId::new(7));
+        let bytes = m.encode().unwrap();
+        let back = InterNodeMessage::decode(&bytes).unwrap();
+        assert_eq!(m, back);
+        assert_eq!(back.kind, InterNodeKind::Heartbeat);
+        assert_eq!(back.origin_node, NodeId::new(7));
+        assert!(back.payload.is_empty());
+    }
+
+    #[test]
+    fn node_down_round_trip() {
+        let reporter = NodeId::new(1);
+        let dead = NodeId::new(3);
+        let m = InterNodeMessage::node_down(reporter, dead);
+        let bytes = m.encode().unwrap();
+        let back = InterNodeMessage::decode(&bytes).unwrap();
+        assert_eq!(m, back);
+        assert_eq!(back.kind, InterNodeKind::NodeDown);
+        // origin_node carries the dead node's id.
+        assert_eq!(back.origin_node, dead);
+        // origin_conn_idx carries the reporter's id.
+        assert_eq!(back.origin_conn_idx, reporter.raw());
+    }
+
+    #[test]
     fn kind_from_u8_round_trips() {
         for k in [
             InterNodeKind::Publish,
             InterNodeKind::Fanout,
             InterNodeKind::Subscribe,
             InterNodeKind::Unsubscribe,
+            InterNodeKind::Heartbeat,
+            InterNodeKind::NodeDown,
         ] {
             assert_eq!(InterNodeKind::from_u8(k as u8), Some(k));
         }

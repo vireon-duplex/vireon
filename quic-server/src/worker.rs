@@ -116,6 +116,7 @@ impl Worker {
             config.wal_root.as_deref(),
             config.wal_retention,
             config.wal_sync,
+            config.wal_segment_max_bytes,
             config.max_topics,
             config.max_subscribers_per_topic,
             cluster,

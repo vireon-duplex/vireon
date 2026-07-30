@@ -116,9 +116,10 @@ impl ServerMetrics {
     /// calls for the same topic only take a read-lock + atomic bump.
     #[inline]
     pub fn record_topic_publish(&self, topic: &str, payload_len: u64) {
-        // Fast path: read-lock + atomic bump.
+        // Fast path: read-lock + atomic bump.  Recover from lock
+        // poisoning (a panicked worker) rather than crashing the server.
         {
-            let map = self.topic_counters.read().unwrap();
+            let map = self.topic_counters.read().unwrap_or_else(|e| e.into_inner());
             if let Some(m) = map.get(topic) {
                 m.publishes.fetch_add(1, Ordering::Relaxed);
                 m.bytes_recv.fetch_add(payload_len, Ordering::Relaxed);
@@ -128,7 +129,10 @@ impl ServerMetrics {
         // Slow path: first-seen topic — insert under write-lock, then
         // bump. Another worker may have inserted concurrently; the
         // or_insert_with guard handles that.
-        let mut map = self.topic_counters.write().unwrap();
+        let mut map = self
+            .topic_counters
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let m = map
             .entry(topic.into())
             .or_insert_with(|| Arc::new(TopicMetrics::new()));
@@ -140,13 +144,19 @@ impl ServerMetrics {
     #[inline]
     pub fn record_topic_delivery(&self, topic: &str) {
         {
-            let map = self.topic_counters.read().unwrap();
+            let map = self
+                .topic_counters
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(m) = map.get(topic) {
                 m.deliveries.fetch_add(1, Ordering::Relaxed);
                 return;
             }
         }
-        let mut map = self.topic_counters.write().unwrap();
+        let mut map = self
+            .topic_counters
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let m = map
             .entry(topic.into())
             .or_insert_with(|| Arc::new(TopicMetrics::new()));
