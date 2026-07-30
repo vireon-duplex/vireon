@@ -170,6 +170,9 @@ pub struct ServerConf {
     /// fsync policy for the WAL. See `[wal_sync]` section in
     /// `vireon.conf.example`. `None` = default (group-commit 100 ms).
     pub wal_sync: Option<WalSyncConf>,
+    /// Per-segment size cap in bytes. A segment is rolled to a fresh
+    /// file once it exceeds this size. Defaults to 1 GiB.
+    pub wal_segment_max_bytes: Option<u64>,
 
     // ── Limits ──
     pub max_topics: Option<usize>,
@@ -241,6 +244,11 @@ pub struct ClusterConf {
     /// Virtual nodes per physical node on the consistent-hash ring.
     /// Default 150 (Dynamo standard). Clamped to `[1, 1024]`.
     pub vnodes: Option<u32>,
+    /// Heartbeat broadcast interval in milliseconds. Default 1000.
+    pub heartbeat_interval_ms: Option<u64>,
+    /// Heartbeat timeout in milliseconds — peers with no heartbeat
+    /// within this window are declared down. Default 5000.
+    pub heartbeat_timeout_ms: Option<u64>,
 }
 
 /// `[buffer_pool]` — per-worker buffer allocation pool tuning.
@@ -270,6 +278,12 @@ pub struct BackpressureConf {
     /// Hard backpressure percentage (0–100). Above this, the shard
     /// rejects new connections.
     pub hard_pct: Option<u8>,
+    /// High-watermark on total buffered `pending_sends` bytes. When
+    /// exceeded, new `Publish` frames are rejected with a
+    /// `backpressure` error ack — protecting the server from OOM when
+    /// subscribers can't drain fast enough. `0` (default) uses the
+    /// built-in 512 MiB threshold; set explicitly to disable.
+    pub publish_high_watermark_bytes: Option<HumanBytes>,
 }
 
 /// `[reactor]` — per-tick processing budget for the io_uring reactor.
@@ -485,6 +499,14 @@ pub struct LayerTuning {
     pub scheduler_max_streams_per_tick: u32,
     pub scheduler_max_bytes_per_tick: usize,
     pub scheduler_starvation_threshold_us: u64,
+    // ── Publisher backpressure ──
+    /// High-watermark on total `pending_sends` bytes (across all
+    /// subscriber streams). When exceeded, new `Publish` frames are
+    /// rejected with a `backpressure` error ack instead of being
+    /// accepted — this protects the server from OOM when subscribers
+    /// can't drain fast enough. 0 disables the check (accept
+    /// everything; eviction is the last line of defense).
+    pub publish_backpressure_high_watermark_bytes: usize,
 }
 
 impl Default for LayerTuning {
@@ -528,6 +550,9 @@ impl Default for LayerTuning {
             scheduler_max_streams_per_tick: 64,
             scheduler_max_bytes_per_tick: 65_536,
             scheduler_starvation_threshold_us: 10_000,
+            // 512 MiB ≈ 50% of PENDING_BYTE_CAP (1 GiB). Leaves headroom
+            // for the eviction path to act as the last line of defense.
+            publish_backpressure_high_watermark_bytes: 512 * 1024 * 1024,
         }
     }
 }

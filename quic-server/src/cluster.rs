@@ -170,6 +170,10 @@ pub struct ClusterOpts {
     /// `None` = `ClusterConfig::DEFAULT_VNODES` (150). Clamped to
     /// `[1, 1024]` by `ClusterMembership::new`.
     pub vnodes: Option<u32>,
+    /// Heartbeat broadcast interval in milliseconds. `None` = 1000.
+    pub heartbeat_interval_ms: Option<u64>,
+    /// Heartbeat timeout in milliseconds. `None` = 5000.
+    pub heartbeat_timeout_ms: Option<u64>,
 }
 
 /// Returns an error if `self_id` is nil, the peer list is empty, the
@@ -219,6 +223,12 @@ pub fn build_cluster_transport_config(
     if let Some(v) = opts.vnodes {
         cluster_cfg = cluster_cfg.with_vnodes(v);
     }
+    if let Some(ms) = opts.heartbeat_interval_ms {
+        cluster_cfg.heartbeat_interval_ms = ms.max(1);
+    }
+    if let Some(ms) = opts.heartbeat_timeout_ms {
+        cluster_cfg.heartbeat_timeout_ms = ms.max(cluster_cfg.heartbeat_interval_ms + 1);
+    }
     Ok(ClusterTransportConfig {
         cluster_cfg,
         bind_addr,
@@ -266,7 +276,7 @@ pub fn launch_cluster(
     // forwarding (e.g. ClientPool 20K-frame bursts) doesn't overflow
     // the kernel default (~208 KiB) and silently drop datagrams.
     use std::os::unix::io::AsRawFd;
-    const CLUSTER_BUF_SIZE: libc::c_int = 16 * 1024 * 1024;
+    const CLUSTER_BUF_SIZE: libc::c_int = 32 * 1024 * 1024;
     let fd = socket.as_raw_fd();
     let optlen = std::mem::size_of_val(&CLUSTER_BUF_SIZE) as libc::socklen_t;
     let rc = unsafe {
@@ -293,6 +303,12 @@ pub fn launch_cluster(
     if rc != 0 {
         tracing::warn!(errno = %rc, "cluster UDP SO_SNDBUF failed (using kernel default)");
     }
+
+    // Register the cluster socket fd for crash-safe cleanup. Without
+    // this, a SIGSEGV / second-SIGINT exit leaves the kernel holding
+    // the socket bound to the cluster port, blocking restarts.
+    crate::socket_registry::REGISTRY.register(fd);
+
     tracing::info!(
         bind_addr = %cfg.bind_addr,
         peers = cfg.peer_addrs.len(),

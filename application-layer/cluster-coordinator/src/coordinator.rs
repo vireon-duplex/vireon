@@ -20,10 +20,12 @@
 //! scraped from a separate metrics-poller thread).
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use rustc_hash::FxHashSet;
 use session_registry::NodeId;
 
+use crate::failure::FailureDetector;
 use crate::membership::{ClusterMembership, DEFAULT_VNODES};
 use crate::router::TopicRouter;
 use crate::subscriber::{RemoteSubscriber, RemoteSubscriberRegistry};
@@ -98,6 +100,13 @@ pub struct ClusterCoordinator {
     remote_subs: RemoteSubscriberRegistry,
     stats: ClusterStats,
     replication_factor: u8,
+    /// Heartbeat-based failure detector for auto-recovery.
+    failure: FailureDetector,
+    /// Heartbeat broadcast interval.
+    heartbeat_interval: Duration,
+    /// Heartbeat timeout — peers with no heartbeat within this window
+    /// are declared down by `tick_health`.
+    heartbeat_timeout: Duration,
 }
 
 impl ClusterCoordinator {
@@ -120,10 +129,15 @@ impl ClusterCoordinator {
             cfg.vnodes
         };
         let replication_factor = cfg.replication_factor.max(1);
+        let heartbeat_interval = Duration::from_millis(cfg.heartbeat_interval_ms.max(1));
+        let heartbeat_timeout = Duration::from_millis(cfg.heartbeat_timeout_ms.max(1));
         let membership = ClusterMembership::new(cfg)?;
         let mut router = TopicRouter::new(vnodes);
-        for n in alive_nodes {
-            router.add_node(n);
+        let mut failure = FailureDetector::new();
+        let now = Instant::now();
+        for n in &alive_nodes {
+            router.add_node(*n);
+            failure.seed_alive(*n, now);
         }
         Ok(Self {
             membership,
@@ -131,6 +145,9 @@ impl ClusterCoordinator {
             remote_subs: RemoteSubscriberRegistry::new(),
             stats: ClusterStats::default(),
             replication_factor,
+            failure,
+            heartbeat_interval,
+            heartbeat_timeout,
         })
     }
 
@@ -263,10 +280,71 @@ impl ClusterCoordinator {
             self.stats.nodes_marked_down.fetch_add(1, Ordering::Relaxed);
             self.router.remove_node(node);
         }
+        self.failure.forget(node);
         // `remote_subs_removed` stat tracks explicit unsubscribe, not
         // implicit removal via node-down. The return value is the
         // authoritative count.
         self.remote_subs.remove_node(node)
+    }
+
+    /// Record a heartbeat received from `node`. Called when an
+    /// `InterNodeKind::Heartbeat` message arrives via the cluster mesh.
+    pub fn record_heartbeat(&mut self, node: NodeId) {
+        self.failure.record_heartbeat(node, Instant::now());
+    }
+
+    /// Drive the failure detector. Returns the IDs of nodes that have
+    /// not heartbeated within `heartbeat_timeout` and were just marked
+    /// down. The caller should broadcast `NodeDown` gossip for each
+    /// returned node so the rest of the cluster converges.
+    ///
+    /// Call this from the reactor tick loop (typically once per
+    /// `heartbeat_interval`).
+    #[must_use]
+    pub fn tick_health(&mut self) -> Vec<NodeId> {
+        let now = Instant::now();
+        let expired = self
+            .failure
+            .check_expired(now, self.heartbeat_timeout);
+        for &n in &expired {
+            let dropped = self.mark_node_down(n);
+            if dropped > 0 {
+                tracing::info!(
+                    node = n.raw(),
+                    dropped_subs = dropped,
+                    "[cluster] node {} marked down (heartbeat timeout), dropped {} remote subs",
+                    n.raw(),
+                    dropped
+                );
+            } else {
+                tracing::info!(
+                    node = n.raw(),
+                    "[cluster] node {} marked down (heartbeat timeout)",
+                    n.raw()
+                );
+            }
+        }
+        expired
+    }
+
+    /// Whether it's time to send the next heartbeat broadcast.
+    /// The caller compares the returned interval against the elapsed
+    /// time since the last heartbeat send.
+    #[must_use]
+    pub fn heartbeat_interval(&self) -> Duration {
+        self.heartbeat_interval
+    }
+
+    /// Whether this node should heart-beat at all (only in cluster mode).
+    #[must_use]
+    pub fn is_cluster_enabled(&self) -> bool {
+        self.membership.peer_count() > 1
+    }
+
+    /// Configure heartbeat timing. Defaults are 1s interval / 5s timeout.
+    pub fn set_heartbeat_timing(&mut self, interval: Duration, timeout: Duration) {
+        self.heartbeat_interval = interval;
+        self.heartbeat_timeout = timeout;
     }
 
     /// Snapshot of cluster stats.

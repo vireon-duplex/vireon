@@ -55,6 +55,7 @@ pub mod file_store;
 pub mod memory;
 pub mod offset;
 pub mod retention;
+pub mod segment;
 pub mod store;
 
 // ── Re-exports ────────────────────────────────────────────────────

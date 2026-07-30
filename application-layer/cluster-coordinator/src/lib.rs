@@ -56,6 +56,7 @@
 
 pub mod coordinator;
 pub mod error;
+pub mod failure;
 pub mod membership;
 pub mod message;
 pub mod router;
@@ -65,6 +66,7 @@ pub mod subscriber;
 
 pub use coordinator::{ClusterCoordinator, ClusterStats, ClusterStatsSnapshot, PublishDecision};
 pub use error::ClusterError;
+pub use failure::FailureDetector;
 pub use membership::{ClusterConfig, ClusterMembership, DEFAULT_VNODES};
 pub use message::{InterNodeKind, InterNodeMessage, MAX_TOPIC_LEN};
 pub use router::{MAX_VNODES, MIN_VNODES, TopicRouter};
