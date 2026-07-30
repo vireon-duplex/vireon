@@ -90,6 +90,11 @@ pub struct ServerConfig {
     /// 100 ms while keeping throughput high. Configured via the
     /// `[wal_sync]` section in `vireon.conf`.
     pub wal_sync: wal_store::SyncPolicy,
+    /// Per-segment size cap in bytes. A segment is rolled to a fresh
+    /// file once it exceeds this size, so retention truncation can drop
+    /// old data in O(1) (delete whole files) instead of O(n) (rewrite
+    /// surviving entries). Defaults to 1 GiB.
+    pub wal_segment_max_bytes: u64,
     /// Cap on total topics in the catalog. `None` = unlimited.
     pub max_topics: Option<usize>,
     /// Cap on subscribers per distinct subscription pattern.
@@ -326,6 +331,15 @@ impl ServerConfig {
             None => wal_store::SyncPolicy::default(),
         };
 
+        // Segment size cap: controls how large each WAL segment file can
+        // grow before it is rolled. Smaller → faster truncation, more
+        // file descriptors; larger → fewer files, but truncation of old
+        // data rewrites more. Defaults to 1 GiB.
+        let wal_segment_max_bytes = conf
+            .wal_segment_max_bytes
+            .filter(|&b| b > 0)
+            .unwrap_or(wal_store::file_store::DEFAULT_SEGMENT_MAX_BYTES);
+
         // ── Quotas ──────────────────────────────────────────────────
         let max_topics_raw = cli.max_topics.or(conf.max_topics).unwrap_or(0);
         let max_subscribers_raw = cli
@@ -363,6 +377,14 @@ impl ServerConfig {
         let cluster_peers = cli_peers.or(conf_peers);
         let cluster_replication_factor = cli_rf.or(conf_rf);
         let cluster_vnodes = conf_vnodes;
+        let cluster_heartbeat_interval = conf
+            .cluster
+            .as_ref()
+            .and_then(|c| c.heartbeat_interval_ms);
+        let cluster_heartbeat_timeout = conf
+            .cluster
+            .as_ref()
+            .and_then(|c| c.heartbeat_timeout_ms);
 
         let cluster = match (cluster_node_id, cluster_peers.as_deref()) {
             (Some(id), Some(peers_str)) => {
@@ -372,6 +394,8 @@ impl ServerConfig {
                 let opts = crate::cluster::ClusterOpts {
                     replication_factor: cluster_replication_factor,
                     vnodes: cluster_vnodes,
+                    heartbeat_interval_ms: cluster_heartbeat_interval,
+                    heartbeat_timeout_ms: cluster_heartbeat_timeout,
                 };
                 let cfg = crate::cluster::build_cluster_transport_config(
                     self_id,
@@ -424,6 +448,7 @@ impl ServerConfig {
             wal_root,
             wal_retention,
             wal_sync,
+            wal_segment_max_bytes,
             max_topics,
             max_subscribers_per_topic,
             cluster,
@@ -545,6 +570,9 @@ fn resolve_tuning(conf: &ServerConf) -> LayerTuning {
         if let Some(v) = bp.connection_capacity { t.connection_capacity = v; }
         if let Some(v) = bp.soft_pct { t.soft_bp_pct = v; }
         if let Some(v) = bp.hard_pct { t.hard_bp_pct = v; }
+        if let Some(v) = bp.publish_high_watermark_bytes {
+            t.publish_backpressure_high_watermark_bytes = v.0 as usize;
+        }
     }
 
     // ── Reactor tick budget ──

@@ -38,6 +38,14 @@ pub struct ClusterConfig {
     /// consistent hashing on the topic so the same topic always
     /// replicates to the same nodes.
     pub replication_factor: u8,
+    /// Heartbeat broadcast interval in milliseconds. Default 1000.
+    /// The coordinator sends one heartbeat per interval to every alive
+    /// peer so they can detect failures.
+    pub heartbeat_interval_ms: u64,
+    /// Heartbeat timeout in milliseconds. Default 5000. Peers with no
+    /// heartbeat within this window are declared down and removed from
+    /// the topic ring.
+    pub heartbeat_timeout_ms: u64,
 }
 
 impl ClusterConfig {
@@ -49,6 +57,8 @@ impl ClusterConfig {
             peers,
             vnodes: DEFAULT_VNODES,
             replication_factor: 1,
+            heartbeat_interval_ms: 1000,
+            heartbeat_timeout_ms: 5000,
         }
     }
 
@@ -64,6 +74,14 @@ impl ClusterConfig {
     #[must_use]
     pub fn with_vnodes(mut self, vnodes: u32) -> Self {
         self.vnodes = vnodes.max(1);
+        self
+    }
+
+    /// Builder: set heartbeat timing.
+    #[must_use]
+    pub fn with_heartbeat(mut self, interval_ms: u64, timeout_ms: u64) -> Self {
+        self.heartbeat_interval_ms = interval_ms.max(1);
+        self.heartbeat_timeout_ms = timeout_ms.max(interval_ms + 1);
         self
     }
 }

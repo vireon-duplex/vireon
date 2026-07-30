@@ -108,17 +108,27 @@ impl RetentionPolicy {
         }
 
         // Phase 2: byte-based truncation. After age truncation, size
-        // may still exceed `max_bytes` — keep truncating oldest until
-        // under cap or empty.
+        // may still exceed `max_bytes`. Walk forward accumulating the
+        // cutoff offset, then issue a **single** `truncate` call —
+        // with segment-based stores this drops whole segment files in
+        // O(1) rather than rewriting per entry.
         if let Some(cap) = self.max_bytes {
             // After age truncation, the read range may be stale.
             scan.clear();
             let _ = store.read_range(topic, store.oldest(topic), store.head(topic), &mut scan)?;
             let mut total: u64 = scan.iter().map(WalEntry::wire_len).map(|n| n as u64).sum();
-            while total > cap && !scan.is_empty() {
-                let front = scan.remove(0);
-                total = total.saturating_sub(front.wire_len() as u64);
-                removed += store.truncate(topic, front.offset.next())?;
+            if total > cap && !scan.is_empty() {
+                let mut cutoff = Offset::NONE;
+                for e in &scan {
+                    if total <= cap {
+                        break;
+                    }
+                    total = total.saturating_sub(e.wire_len() as u64);
+                    cutoff = e.offset.next();
+                }
+                if cutoff != Offset::NONE {
+                    removed += store.truncate(topic, cutoff)?;
+                }
             }
         }
 

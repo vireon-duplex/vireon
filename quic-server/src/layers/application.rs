@@ -212,6 +212,43 @@ struct GlobalGroupMember {
 
 // ── VireonDispatcher ──────────────────────────────────────────────
 
+/// Per-connection metrics. Single-threaded (owned by one worker's
+/// dispatcher), so plain `u64` — no atomics needed. Logged at close
+/// time for observability; a future enhancement can aggregate them into
+/// the shared [`ServerMetrics`] for the `/metrics` endpoint.
+#[derive(Debug, Default, Clone)]
+pub struct ConnMetrics {
+    /// Publish frames received from this connection.
+    pub publishes_in: u64,
+    /// Delivery frames sent to this connection.
+    pub deliveries_out: u64,
+    /// Bytes received via publish payloads.
+    pub bytes_in: u64,
+    /// Bytes sent via delivery payloads.
+    pub bytes_out: u64,
+    /// Publishes rejected (ACL, quota, backpressure).
+    pub publishes_rejected: u64,
+}
+
+impl ConnMetrics {
+    /// Record an incoming publish of `payload_len` bytes.
+    pub fn record_publish_in(&mut self, payload_len: usize) {
+        self.publishes_in += 1;
+        self.bytes_in += payload_len as u64;
+    }
+
+    /// Record an outgoing delivery of `payload_len` bytes.
+    pub fn record_delivery_out(&mut self, payload_len: usize) {
+        self.deliveries_out += 1;
+        self.bytes_out += payload_len as u64;
+    }
+
+    /// Record a rejected publish.
+    pub fn record_reject(&mut self) {
+        self.publishes_rejected += 1;
+    }
+}
+
 /// Production dispatcher that routes frames by [`MessageType`] to the
 /// appropriate application-layer module(s).
 ///
@@ -239,6 +276,9 @@ pub struct VireonDispatcher {
     /// `worker_inbox_scratch` — avoids `Vec::with_capacity(1024)` per
     /// tick when the cluster inbox is usually empty.
     cluster_inbox_scratch: Vec<InterNodeMessage>,
+    /// Per-connection metrics (`conn_idx → ConnMetrics`). Single-threaded
+    /// per worker. Removed on [`Self::on_close_conn`]. Logged at close.
+    conn_metrics: FxHashMap<usize, ConnMetrics>,
     /// Per-(conn_idx, QUIC-stream) response sequence counter.
     next_seq: FxHashMap<(usize, u64), Seq>,
 
@@ -348,6 +388,13 @@ pub struct VireonDispatcher {
     worker_inbox: Option<mpsc::Receiver<InterWorkerMsg>>,
     /// This worker's reactor_id — used to skip self when broadcasting.
     worker_self_idx: usize,
+    /// Last time a cluster heartbeat was broadcast. Worker 0 is the
+    /// designated heart-beater; other workers skip the send to avoid
+    /// N×redundant datagrams.
+    last_heartbeat_send: Option<std::time::Instant>,
+    /// Last time `tick_health` ran the failure detector. Throttled to
+    /// `heartbeat_interval` to avoid scanning on every reactor tick.
+    last_health_check: Option<std::time::Instant>,
     /// Aggregate count of cross-worker inbox-full drops. Logged at most
     /// once every `WORKER_DROP_LOG_COOLDOWN` via [`worker_drop_cooldown`]
     /// — a sustained burst otherwise produces hundreds of identical WARN
@@ -445,6 +492,7 @@ impl VireonDispatcher {
             group_targets_scratch: Vec::with_capacity(8),
             worker_inbox_scratch: Vec::new(),
             cluster_inbox_scratch: Vec::new(),
+            conn_metrics: FxHashMap::default(),
             next_seq: FxHashMap::default(),
             send_policy: SendPolicyTable::new(),
             egress_quic_streams: FxHashMap::default(),
@@ -482,6 +530,8 @@ impl VireonDispatcher {
             worker_outboxes: Vec::new(),
             worker_inbox: None,
             worker_self_idx: 0,
+            last_heartbeat_send: None,
+            last_health_check: None,
             worker_drop_count: 0,
             worker_drop_cooldown: crate::log_throttle::Cooldown::new(WORKER_DROP_LOG_COOLDOWN),
             remote_pattern_interest: FxHashMap::default(),
@@ -577,6 +627,14 @@ impl VireonDispatcher {
         msg_type: MessageType,
         payload: Bytes,
     ) {
+        // Record per-connection delivery metrics for publish deliveries.
+        if msg_type == MessageType::Publish {
+            let plen = payload.len();
+            self.conn_metrics
+                .entry(conn_idx)
+                .or_default()
+                .record_delivery_out(plen);
+        }
         let seq = self
             .next_seq
             .entry((conn_idx, quic_stream_id))
@@ -640,6 +698,21 @@ impl VireonDispatcher {
     ) {
         self.consumer_offsets = offsets;
         self.offsets_path = Some(path);
+    }
+
+    /// Persists consumer offsets to disk immediately. Called from the
+    /// shutdown path (`VireonStack` entering `Draining`) so the last
+    /// batch of acks isn't lost between periodic sweeps.
+    pub fn save_offsets(&self) {
+        if let Some(path) = self.offsets_path.as_ref() {
+            if let Err(e) = self.consumer_offsets.save_to(path) {
+                tracing::warn!(
+                    path = ?path,
+                    error = %e,
+                    "[shutdown] consumer-offsets snapshot failed — previous snapshot retained"
+                );
+            }
+        }
     }
 
     /// Attaches an audit log. Once set, security-relevant events are
@@ -1251,6 +1324,7 @@ impl VireonDispatcher {
             .check_acl(ctx.conn_idx, Action::Publish, topic)
             .is_allow()
         {
+            self.conn_metrics.entry(ctx.conn_idx).or_default().record_reject();
             if self.acl_denied_drop.tick() {
                 tracing::info!(
                     conn_idx = ctx.conn_idx,
@@ -1280,6 +1354,12 @@ impl VireonDispatcher {
             );
             return;
         }
+
+        // Record per-connection publish-in metric.
+        self.conn_metrics
+            .entry(ctx.conn_idx)
+            .or_default()
+            .record_publish_in(payload.len());
 
         // Copy payload once — the &[u8] points into the io_uring buffer
         // pool which gets recycled after this function returns. All
@@ -1496,11 +1576,13 @@ impl VireonDispatcher {
             }
         } else if self.worker_self_idx == 0 {
             self.do_group_delivery(bytes.clone());
-        } else {
-            let _ = self.worker_outboxes[0].try_send(InterWorkerMsg::GroupDeliver {
+        } else if let Some(outbox) = self.worker_outboxes.first() {
+            let _ = outbox.try_send(InterWorkerMsg::GroupDeliver {
                 framed: bytes.clone(),
                 target: None,
             });
+        } else {
+            tracing::error!("worker_outboxes empty in group-deliver path — skipping");
         }
 
         // Cross-worker fan-out: send to other workers that have subscribers
@@ -2692,9 +2774,87 @@ impl VireonDispatcher {
                         );
                     }
                 }
+                cluster_coordinator::InterNodeKind::Heartbeat => {
+                    if let Some(coord) = &mut self.coordinator {
+                        coord.record_heartbeat(msg.origin_node);
+                    }
+                }
+                cluster_coordinator::InterNodeKind::NodeDown => {
+                    // Gossip: mark the dead node (origin_node = dead node)
+                    // down so ownership shifts to the next node on the
+                    // ring. Convergence: once enough nodes agree, the
+                    // dead node is fully removed from routing tables.
+                    if let Some(coord) = &mut self.coordinator {
+                        let dropped = coord.mark_node_down(msg.origin_node);
+                        tracing::info!(
+                            dead_node = msg.origin_node.raw(),
+                            dropped_subs = dropped,
+                            "[cluster] node-down gossip received, marked dead"
+                        );
+                    }
+                }
             }
         }
         tracing::trace!(processed, "[cluster] inbox drained");
+    }
+
+    /// Drives the cluster heartbeat + failure-detection cycle.
+    ///
+    /// Called from [`ApplicationLayer::on_batch_tick`] (which fires on
+    /// every reactor tick). To avoid redundant work:
+    ///
+    /// * **Heartbeat send** runs at most once per `heartbeat_interval`.
+    ///   Only **worker 0** sends (or the sole worker in single-worker
+    ///   mode) so N workers don't emit N× redundant datagrams.
+    /// * **Health check** (`tick_health`) also runs at most once per
+    ///   `heartbeat_interval` — scans the failure detector and marks
+    ///   down any peer that hasn't heartbeated within `heartbeat_timeout`.
+    ///   For each newly-dead node, a `NodeDown` gossip is broadcast so
+    ///   the rest of the cluster converges on removal.
+    pub fn tick_cluster_health(&mut self) {
+        let now = std::time::Instant::now();
+        let Some(coord) = &mut self.coordinator else {
+            return; // single-node mode
+        };
+        let interval = coord.heartbeat_interval();
+        let due = self.last_health_check.map_or(true, |t| now.duration_since(t) >= interval);
+        if !due {
+            return;
+        }
+        self.last_health_check = Some(now);
+
+        // Worker 0 (or sole worker) broadcasts heartbeats to all peers.
+        let is_heartbeater = self.worker_outboxes.is_empty() || self.worker_self_idx == 0;
+        if is_heartbeater {
+            if let Some(tx) = &self.cluster_outgoing_tx {
+                let hb = cluster_coordinator::InterNodeMessage::heartbeat(self.node_id);
+                let peers = coord.membership().alive_nodes();
+                for peer in peers {
+                    if peer != self.node_id {
+                        let _ = tx.send(OutgoingMsg { msg: hb.clone(), target: peer });
+                    }
+                }
+            }
+            self.last_heartbeat_send = Some(now);
+        }
+
+        // Check for expired nodes.
+        let expired = coord.tick_health();
+        if !expired.is_empty() {
+            // Broadcast NodeDown gossip for each expired node.
+            if let Some(tx) = &self.cluster_outgoing_tx {
+                for &dead in &expired {
+                    let gossip =
+                        cluster_coordinator::InterNodeMessage::node_down(self.node_id, dead);
+                    let peers = coord.membership().alive_nodes();
+                    for peer in peers {
+                        if peer != self.node_id {
+                            let _ = tx.send(OutgoingMsg { msg: gossip.clone(), target: peer });
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Delivers an inter-node Publish/Fanout payload to local
@@ -2791,7 +2951,7 @@ impl VireonDispatcher {
         let Some(rx) = &mut self.worker_inbox else {
             return;
         };
-        const CAP: usize = 8192;
+        const CAP: usize = 32_768;
         self.worker_inbox_scratch.clear();
         while self.worker_inbox_scratch.len() < CAP {
             match rx.try_recv() {
@@ -3266,6 +3426,22 @@ impl AppDispatcher for VireonDispatcher {
         }
         let principal = self.principals.remove(&conn_idx);
 
+        // Log + drop per-connection metrics on close.
+        if let Some(m) = self.conn_metrics.remove(&conn_idx) {
+            if m.publishes_in > 0 || m.deliveries_out > 0 || m.publishes_rejected > 0 {
+                tracing::info!(
+                    conn_idx,
+                    session_id = ?session_id,
+                    publishes_in = m.publishes_in,
+                    deliveries_out = m.deliveries_out,
+                    bytes_in = m.bytes_in,
+                    bytes_out = m.bytes_out,
+                    rejected = m.publishes_rejected,
+                    "[metrics] connection lifetime counters"
+                );
+            }
+        }
+
         // P5: leave all consumer groups the disconnected connection
         // was a member of.
         if let Some(keys) = self.conn_group_keys.remove(&conn_idx) {
@@ -3504,6 +3680,7 @@ impl ApplicationLayer {
         self.dispatcher.drain_cluster_inbox();
         self.dispatcher.drain_worker_inbox();
         self.dispatcher.maybe_run_wal_retention();
+        self.dispatcher.tick_cluster_health();
     }
 
     /// Drains queued outgoing frames produced by the dispatcher.
@@ -3550,6 +3727,45 @@ impl ApplicationLayer {
             open_streams = released,
             reason = reason.unwrap_or("none"),
             "session destroyed"
+        );
+    }
+
+    /// Rejects a publish because the server's subscriber-side send
+    /// backlog (`pending_sends`) has exceeded the backpressure
+    /// high-watermark. Enqueues a `backpressure` error ack on the
+    /// publisher's own stream and records the reject in per-connection
+    /// metrics. Non-fatal — the publisher may retry or drop per its
+    /// own policy.
+    ///
+    /// Called by the stack's frame-dispatch path before the publish
+    /// reaches fan-out, so no subscribers are touched.
+    pub fn reject_publish_backpressure(
+        &mut self,
+        conn_idx: usize,
+        quic_stream_id: u64,
+        logical_stream: StreamId,
+        topic: &str,
+    ) {
+        self.dispatcher
+            .conn_metrics
+            .entry(conn_idx)
+            .or_default()
+            .record_reject();
+        let ctx = FrameContext {
+            // Session id is unused by enqueue_frame; a fresh id is fine.
+            session_id: SessionId::new(),
+            conn_idx,
+            quic_stream_id,
+        };
+        self.dispatcher.send_ack(
+            &ctx,
+            logical_stream,
+            MessageType::Publish,
+            &[
+                b"{\"error\":\"backpressure\",\"action\":\"publish\",\"topic\":\"",
+                topic.as_bytes(),
+                b"\"}",
+            ],
         );
     }
 
@@ -3603,6 +3819,12 @@ impl ApplicationLayer {
         path: std::path::PathBuf,
     ) {
         self.dispatcher.set_consumer_offsets(offsets, path);
+    }
+
+    /// Delegates to [`VireonDispatcher::save_offsets`]. Called from
+    /// the shutdown path to flush the latest acks before drain.
+    pub fn save_offsets(&self) {
+        self.dispatcher.save_offsets();
     }
 
     /// Delegates to [`VireonDispatcher::set_audit_log`].

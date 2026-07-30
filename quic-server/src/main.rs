@@ -1,5 +1,9 @@
 //! Vireon QUIC Server — production-grade QUIC server on io_uring + quiche.
 
+// Warn on .unwrap() / .expect() in production code. Test modules
+// (#[cfg(test)]) are exempt — assertions there should panic on failure.
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
+
 mod acl_loader;
 mod audit;
 mod cli;
