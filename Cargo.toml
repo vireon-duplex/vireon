@@ -50,7 +50,7 @@ debug = "line-tables-only"
 strip = false
 
 [workspace]
-members = ["io-layer/io","runtime-layer/buffer-pool", "runtime-layer/timer-wheel","message-layer/frame", "runtime-layer/send-queue", "runtime-layer/task-queue", "runtime-layer/cqe-processor", "kernel-layer/kernel-nic", "runtime-layer/connection-shard", "transport-layer/quic-engine", "runtime-layer/reactor", "stream-layer/stream-manager", "stream-layer/stream-scheduler", "stream-layer/delivery-policy", "stream-layer/send-policy", "session-layer/session-manager", "session-layer/session-registry", "session-layer/session-router", "session-layer/session-migration-manager", "session-layer/session-replication-service", "application-layer/auth-framework", "application-layer/observability-sdk", "application-layer/resource-quotas", "application-layer/pubsub-engine", "application-layer/wal-store", "application-layer/consumer-groups", "application-layer/cluster-coordinator", "application-layer/topic-acl", "application-layer/observability-exporters", "quic-server", "quic-client", "bench-harness", "profiler/macro", "profiler/runtime"]
+members = ["io-layer/io","runtime-layer/buffer-pool", "runtime-layer/timer-wheel","message-layer/frame", "runtime-layer/send-queue", "runtime-layer/task-queue", "runtime-layer/cqe-processor", "kernel-layer/kernel-nic", "runtime-layer/connection-shard", "transport-layer/quic-engine", "runtime-layer/reactor", "stream-layer/stream-manager", "stream-layer/stream-scheduler", "stream-layer/delivery-policy", "stream-layer/send-policy", "session-layer/session-manager", "session-layer/session-registry", "session-layer/session-router", "session-layer/session-migration-manager", "session-layer/session-replication-service", "application-layer/auth-framework", "application-layer/observability-sdk", "application-layer/resource-quotas", "application-layer/pubsub-engine", "application-layer/wal-store", "application-layer/consumer-groups", "application-layer/cluster-coordinator", "application-layer/topic-acl", "quic-server", "quic-client", "bench-harness", "profiler/macro", "profiler/runtime"]
 resolver = "2"
 exclude = ["stream-layer/delivery-policy/fuzz"]
 
@@ -102,7 +102,6 @@ tracing-subscriber = { workspace = true }
 pubsub-engine          = { path = "application-layer/pubsub-engine" }
 topic-acl              = { path = "application-layer/topic-acl" }
 auth-framework         = { path = "application-layer/auth-framework" }
-observability-exporters = { path = "application-layer/observability-exporters" }
 
 # Signal handling for graceful shutdown.
 ctrlc = "3.4"
