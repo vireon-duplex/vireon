@@ -313,6 +313,13 @@ congestion = "cubic"
 # Larger = faster ramp-up on new connections.
 initial_cwnd_packets = 100
 
+# Connection migration (RFC 9000 §9). When true (default), clients can
+# change their 4-tuple (WiFi switch, NAT rebinding) without dropping
+# the QUIC connection — packets are routed by DCID. quiche validates
+# the new path with PATH_CHALLENGE/PATH_RESPONSE internally.
+# Set to false to reject path changes (e.g. for benchmark isolation).
+# migration = true
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  Buffer Pool
