@@ -139,6 +139,7 @@ impl Cooldown {
     }
 
     /// Reset the cooldown so the next tick logs immediately.
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.last = None;
     }

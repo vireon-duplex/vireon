@@ -42,6 +42,7 @@ const GENESIS_HASH: [u8; HASH_LEN] = [0u8; HASH_LEN];
 /// Event kind recorded in the audit log.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub enum AuditKind {
     /// ACL denied a publish.
     AclPublishDenied = 1,
@@ -80,6 +81,7 @@ impl AuditKind {
 /// Result of the audited action.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub enum AuditResult {
     Allowed = 0,
     Denied = 1,
@@ -179,10 +181,9 @@ impl AuditLog {
             }
             let mut cursor = pos;
             cursor += 8; // ts_ns
-            let kind = data[cursor];
-            cursor += 1;
-            let result = data[cursor];
-            cursor += 1;
+            // Skip kind(1) + result(1) — verified via hash chain, not
+            // individually consumed during resume.
+            cursor += 2;
 
             let actor_len = u16::from_be_bytes([data[cursor], data[cursor + 1]]) as usize;
             cursor += 2;
@@ -295,6 +296,7 @@ impl AuditLog {
 
     /// Number of entries written since the log was opened.
     #[must_use]
+    #[allow(dead_code)]
     pub const fn entry_count(&self) -> u64 {
         self.entry_count
     }

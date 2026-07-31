@@ -119,6 +119,10 @@ pub struct ExtensionFlags {
     /// connection. quiche handles PATH_CHALLENGE/PATH_RESPONSE
     /// validation internally. On by default (standard QUIC feature).
     pub migration: bool,
+    /// TLS 1.3 session resumption via NEW_SESSION_TICKET. When enabled,
+    /// the server issues session tickets that the client can use for
+    /// 0-RTT reconnection (RFC 8938). On by default.
+    pub session_resumption: bool,
     /// draft-ietf-quic-bbrv2-congestion-control (only meaningful
     /// when `congestion = Bbr2`).
     pub bbr2: bool,
@@ -137,6 +141,7 @@ impl ExtensionFlags {
             ack_frequency: true,
             multipath: false,
             migration: true,
+            session_resumption: true,
             bbr2: false,
             grease_bit: true,
         }
