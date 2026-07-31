@@ -114,6 +114,11 @@ pub struct ExtensionFlags {
     pub ack_frequency: bool,
     /// RFC 9464 Simple Multipath QUIC.
     pub multipath: bool,
+    /// RFC 9000 §9 Connection Migration — lets a client change its
+    /// 4-tuple (WiFi switch, NAT rebinding) without dropping the
+    /// connection. quiche handles PATH_CHALLENGE/PATH_RESPONSE
+    /// validation internally. On by default (standard QUIC feature).
+    pub migration: bool,
     /// draft-ietf-quic-bbrv2-congestion-control (only meaningful
     /// when `congestion = Bbr2`).
     pub bbr2: bool,
@@ -123,14 +128,15 @@ pub struct ExtensionFlags {
 }
 
 impl ExtensionFlags {
-    /// Production default: DATAGRAM + ACK Frequency + Grease Bit on,
-    /// Multipath / BBRv2 off (still draft).
+    /// Production default: DATAGRAM + ACK Frequency + Migration + Grease
+    /// Bit on, Multipath / BBRv2 off (still draft).
     #[must_use]
     pub const fn production() -> Self {
         Self {
             datagram: true,
             ack_frequency: true,
             multipath: false,
+            migration: true,
             bbr2: false,
             grease_bit: true,
         }
@@ -410,6 +416,7 @@ mod tests {
         assert!(f.datagram);
         assert!(f.ack_frequency);
         assert!(f.grease_bit);
+        assert!(f.migration); // standard QUIC feature, on by default
         assert!(!f.multipath); // still draft
         assert!(!f.bbr2); // still draft
     }

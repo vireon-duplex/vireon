@@ -228,6 +228,12 @@ impl ServerConfig {
             if let Some(v) = q.congestion_str() {
                 quic_config.congestion = parse_congestion(v);
             }
+            // Connection migration toggle. Defaults to true (standard
+            // QUIC feature) via `ExtensionFlags::production()`; set
+            // explicitly to `false` to disable.
+            if let Some(v) = q.migration {
+                quic_config.extensions.migration = v;
+            }
         }
 
         // ── CRC resolution ──────────────────────────────────────────

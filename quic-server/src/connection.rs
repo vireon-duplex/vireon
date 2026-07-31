@@ -80,6 +80,16 @@ impl ConnectionRegistry {
         }
     }
 
+    /// Updates the peer address for a connection. Called when the QUIC
+    /// engine reports a `PeerAddressChanged` event (connection migration
+    /// / NAT rebinding) so that idle-timeout checks, logging, and
+    /// eviction all see the current remote address.
+    pub fn update_peer_addr(&mut self, conn_idx: usize, addr: SocketAddr) {
+        if let Some(cs) = self.map.get_mut(&conn_idx) {
+            cs.peer_addr = addr;
+        }
+    }
+
     /// Iterates over all `(conn_idx, &ConnState)` pairs — used by the
     /// eviction pass to collect victim metadata.
     pub fn iter(&self) -> impl Iterator<Item = (&usize, &ConnState)> {
