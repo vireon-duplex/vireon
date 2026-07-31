@@ -63,6 +63,12 @@ pub struct Cli {
     #[arg(short, long)]
     pub verbose: bool,
 
+    /// Log output format: `text` (default) or `json` (structured).
+    /// JSON format is compatible with journald, Loki, Fluentd, and
+    /// other log aggregators that parse JSON on stdin.
+    #[arg(long)]
+    pub log_format: Option<LogFormatArg>,
+
     /// Echo mode — echo every received frame back on the same stream.
     /// Used for load-testing (RR / pipeline benchmark modes).
     #[arg(long)]
@@ -161,6 +167,14 @@ pub struct Cli {
     #[arg(long)]
     pub cluster_peers: Option<String>,
 
+    /// Replication factor for cluster durability. When >1, each
+    /// publish is forwarded to N-1 replica nodes (chosen by
+    /// consistent hashing on the topic) in addition to the primary
+    /// owner. Replicas append to their local WAL. Default 1 (no
+    /// replication). Requires --cluster-node-id and --cluster-peers.
+    #[arg(long)]
+    pub cluster_replication_factor: Option<u8>,
+
     /// Optional HTTP port for the Prometheus `/metrics` endpoint. When
     /// set, the server exposes counters (connections, publishes,
     /// deliveries, errors, bytes) in Prometheus text format. A scrape
@@ -178,6 +192,14 @@ pub struct Cli {
     /// same IP are unaffected.
     #[arg(long)]
     pub max_handshakes_per_ip_per_sec: Option<u32>,
+
+    /// Path template for the tamper-evident audit log. When set, the
+    /// server records security-relevant events (ACL denies, quota
+    /// rejections, topic create/delete) to a SHA-256 hash-chained
+    /// append-only file. `{worker}` is replaced with the worker ID.
+    /// Example: `--audit-log /var/log/vireon/audit.{worker}.vaud`
+    #[arg(long)]
+    pub audit_log: Option<String>,
 }
 
 /// CLI worker-mode selector.
@@ -208,4 +230,13 @@ pub enum PresetArg {
     /// Bulk-transfer max throughput.
     #[value(name = "max-throughput")]
     MaxThroughput,
+}
+
+/// CLI log-format selector.
+#[derive(Clone, Debug, clap::ValueEnum)]
+pub enum LogFormatArg {
+    /// Human-readable plain text (default).
+    Text,
+    /// JSON structured logging for log aggregators.
+    Json,
 }

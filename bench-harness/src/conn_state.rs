@@ -189,14 +189,47 @@ fn flush_conn(conn: &mut quiche::Connection, send_buf: &mut [u8], fd: RawFd) -> 
     syscalls
 }
 
+/// How many unique-bench_seq frames to batch-encode per encode cycle in
+/// the group/broadcast publishers. Each frame gets a distinct bench_seq
+/// so the SeqVerifier reports zero duplicates, while the batch amortises
+/// per-frame overhead (deadline checks, loop iterations).
+const PUB_BATCH: usize = 8;
+
+/// After `encode_frame_coalesced_into` writes `batch` copies of the same
+/// payload into `encode_buf`, this function patches each copy's
+/// `bench_seq` field with a unique incrementing value so the SeqVerifier
+/// reports zero duplicates.
+///
+/// Each wire frame is `HEADER_SIZE + payload_len + CRC_SIZE` bytes, laid
+/// out contiguously in `encode_buf`. The `bench_seq` lives at offset
+/// `HEADER_SIZE + seq_offset` within each frame.
+fn patch_bench_seq_batch(
+    encode_buf: &mut Vec<u8>,
+    payload_len: usize,
+    seq_offset: usize,
+    pub_seq: &mut u64,
+) {
+    let frame_wire = frame::codec::HEADER_SIZE + payload_len + frame::codec::CRC_SIZE;
+    let seq_start = frame::codec::HEADER_SIZE + seq_offset;
+    let total = encode_buf.len();
+    let count = total / frame_wire;
+    for i in 0..count {
+        let off = i * frame_wire + seq_start;
+        if off + BENCH_SEQ_BYTES <= total {
+            encode_buf[off..off + BENCH_SEQ_BYTES].copy_from_slice(&pub_seq.to_be_bytes());
+            *pub_seq += 1;
+        }
+    }
+}
+
 /// Builds a Publish payload for `topic`:
-/// `topic_len:u16 BE | topic | bench_seq:u64 placeholder | 4 KiB data`.
+/// `topic_len:u16 BE | topic | bench_seq:u64 placeholder | data_size bytes`.
 /// The publisher patches the 8 `bench_seq` bytes (at offset `2 +
 /// topic.len()`) with a unique per-frame counter before each encode call.
 /// Mirrors the wire format the server's `handle_publish` parses.
-fn build_publish_payload(topic: &str) -> Vec<u8> {
+fn build_publish_payload(topic: &str, data_size: usize) -> Vec<u8> {
     let topic_b = topic.as_bytes();
-    let data = vec![0xE8u8; 4096];
+    let data = vec![0xE8u8; data_size];
     let mut v = Vec::with_capacity(2 + topic_b.len() + data.len());
     v.extend_from_slice(&(topic_b.len() as u16).to_be_bytes());
     v.extend_from_slice(topic_b);
@@ -415,12 +448,12 @@ impl ConnState {
         let (publish_payload, bench_seq_offset, group_join_payload, broadcast_subscribe_payload) =
             match mode {
                 BenchMode::Group => {
-                    let p = build_publish_payload(GROUP_TOPIC);
+                    let p = build_publish_payload(GROUP_TOPIC, 32_768);
                     let off = 2 + GROUP_TOPIC.len();
                     (p, off, build_group_join_payload(global_idx), Vec::new())
                 }
                 BenchMode::Broadcast => {
-                    let p = build_publish_payload(BROADCAST_TOPIC);
+                    let p = build_publish_payload(BROADCAST_TOPIC, 16_384);
                     let off = 2 + BROADCAST_TOPIC.len();
                     (p, off, Vec::new(), build_subscribe_payload(BROADCAST_TOPIC))
                 }
@@ -1002,21 +1035,23 @@ impl ConnState {
                 return;
             }
             if !cursor.encoded {
-                // Patch bench_seq into the payload template (inline to
-                // avoid borrowing all of self while cursor holds &mut self.ms).
-                let off = self.bench_seq_offset;
-                if off + BENCH_SEQ_BYTES <= self.publish_payload.len() {
-                    self.publish_payload[off..off + BENCH_SEQ_BYTES]
-                        .copy_from_slice(&self.pub_seq.to_be_bytes());
-                }
-                self.pub_seq += 1;
+                // Encode `batch` copies of the SAME payload (1 copy_from_slice)
+                // then patch each frame's bench_seq in-place. This eliminates
+                // per-frame Bytes allocation and send_policy overhead.
+                let batch = coalesce.max(1) * PUB_BATCH;
                 self.stack.encode_frame_coalesced_into(
                     &mut self.encode_buf,
                     0,
                     MessageType::Publish,
                     FrameFlags::NONE,
                     &self.publish_payload,
-                    coalesce,
+                    batch,
+                );
+                patch_bench_seq_batch(
+                    &mut self.encode_buf,
+                    self.publish_payload.len(),
+                    self.bench_seq_offset,
+                    &mut self.pub_seq,
                 );
                 cursor.send_off = 0;
                 cursor.encoded = true;
@@ -1146,21 +1181,20 @@ impl ConnState {
                 return;
             }
             if !cursor.encoded {
-                // Patch bench_seq into the payload template (inline to
-                // avoid borrowing all of self while cursor holds &mut self.ms).
-                let off = self.bench_seq_offset;
-                if off + BENCH_SEQ_BYTES <= self.publish_payload.len() {
-                    self.publish_payload[off..off + BENCH_SEQ_BYTES]
-                        .copy_from_slice(&self.pub_seq.to_be_bytes());
-                }
-                self.pub_seq += 1;
+                let batch = coalesce.max(1) * PUB_BATCH;
                 self.stack.encode_frame_coalesced_into(
                     &mut self.encode_buf,
                     0,
                     MessageType::Publish,
                     FrameFlags::NONE,
                     &self.publish_payload,
-                    coalesce,
+                    batch,
+                );
+                patch_bench_seq_batch(
+                    &mut self.encode_buf,
+                    self.publish_payload.len(),
+                    self.bench_seq_offset,
+                    &mut self.pub_seq,
                 );
                 cursor.send_off = 0;
                 cursor.encoded = true;

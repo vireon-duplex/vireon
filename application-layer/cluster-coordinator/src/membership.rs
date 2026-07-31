@@ -32,6 +32,20 @@ pub struct ClusterConfig {
     /// Virtual nodes per physical node on the topic ring. Default is
     /// [`DEFAULT_VNODES`]. Clamped to `[1, 1024]` by [`ClusterMembership::new`].
     pub vnodes: u32,
+    /// Number of nodes (including owner) that should hold a replica
+    /// of each publish for durability. `1` = no replication (owner
+    /// only). `3` = owner + 2 replicas. Replicas are chosen via
+    /// consistent hashing on the topic so the same topic always
+    /// replicates to the same nodes.
+    pub replication_factor: u8,
+    /// Heartbeat broadcast interval in milliseconds. Default 1000.
+    /// The coordinator sends one heartbeat per interval to every alive
+    /// peer so they can detect failures.
+    pub heartbeat_interval_ms: u64,
+    /// Heartbeat timeout in milliseconds. Default 5000. Peers with no
+    /// heartbeat within this window are declared down and removed from
+    /// the topic ring.
+    pub heartbeat_timeout_ms: u64,
 }
 
 impl ClusterConfig {
@@ -42,7 +56,33 @@ impl ClusterConfig {
             self_id,
             peers,
             vnodes: DEFAULT_VNODES,
+            replication_factor: 1,
+            heartbeat_interval_ms: 1000,
+            heartbeat_timeout_ms: 5000,
         }
+    }
+
+    /// Builder: set the replication factor.
+    #[must_use]
+    pub fn with_replication_factor(mut self, rf: u8) -> Self {
+        self.replication_factor = rf.max(1);
+        self
+    }
+
+    /// Builder: set the virtual-node count for the consistent-hash ring.
+    /// `ClusterMembership::new` clamps to `[1, 1024]`.
+    #[must_use]
+    pub fn with_vnodes(mut self, vnodes: u32) -> Self {
+        self.vnodes = vnodes.max(1);
+        self
+    }
+
+    /// Builder: set heartbeat timing.
+    #[must_use]
+    pub fn with_heartbeat(mut self, interval_ms: u64, timeout_ms: u64) -> Self {
+        self.heartbeat_interval_ms = interval_ms.max(1);
+        self.heartbeat_timeout_ms = timeout_ms.max(interval_ms + 1);
+        self
     }
 }
 

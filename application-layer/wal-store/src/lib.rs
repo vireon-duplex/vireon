@@ -55,6 +55,7 @@ pub mod file_store;
 pub mod memory;
 pub mod offset;
 pub mod retention;
+pub mod segment;
 pub mod store;
 
 // ── Re-exports ────────────────────────────────────────────────────
@@ -62,7 +63,7 @@ pub mod store;
 pub use consumer::ConsumerOffsets;
 pub use entry::{WalEntry, WalRecord};
 pub use error::WalError;
-pub use file_store::FileStore;
+pub use file_store::{FileStore, SyncPolicy};
 pub use memory::MemoryStore;
 pub use offset::Offset;
 pub use retention::{RetentionPolicy, RetentionStats};

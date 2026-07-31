@@ -20,7 +20,6 @@ use crate::config::PubSubConfig;
 use crate::error::PubSubError;
 use crate::stats::PubSubStats;
 use crate::subscription::SubscriptionId;
-use crate::topic::Topic;
 use rustc_hash::FxHashMap;
 use std::fmt;
 
@@ -154,10 +153,9 @@ impl TopicTrie {
     /// # Errors
     /// Currently never errors; returns `Ok` for consistency with the
     /// trait contract.
-    pub fn lookup(&self, topic: &Topic) -> Result<Vec<SubscriptionId>, PubSubError> {
-        let segments: Vec<&str> = topic.as_str().split('.').collect();
+    pub fn lookup(&self, topic: &str) -> Result<Vec<SubscriptionId>, PubSubError> {
         let mut results = Vec::new();
-        Self::lookup_recursive(&self.root, &segments, 0, &mut results);
+        Self::lookup_recursive(&self.root, topic, &mut results);
 
         // Deduplicate (a topic may match multiple wildcard patterns).
         results.sort_unstable_by_key(|s| s.raw());
@@ -165,28 +163,34 @@ impl TopicTrie {
         Ok(results)
     }
 
+    /// Recursive lookup using lazy `&str` slicing — zero allocation
+    /// for segment parsing (the previous version allocated a
+    /// `Vec<&str>` on every publish).
     fn lookup_recursive(
         node: &TrieNode,
-        segments: &[&str],
-        depth: usize,
+        topic_rest: &str,
         out: &mut Vec<SubscriptionId>,
     ) {
-        if depth == segments.len() {
-            // We've consumed all topic segments — collect subs at this node.
+        if topic_rest.is_empty() {
+            // All segments consumed — collect subs at this node.
             out.extend_from_slice(&node.subs);
             return;
         }
 
-        let seg = segments[depth];
+        // Find current segment (up to next '.') and remaining topic.
+        let (seg, rest) = match topic_rest.find('.') {
+            Some(pos) => (&topic_rest[..pos], &topic_rest[pos + 1..]),
+            None => (topic_rest, ""), // last segment
+        };
 
         // Exact match child.
         if let Some(child) = node.children.get(seg) {
-            Self::lookup_recursive(child, segments, depth + 1, out);
+            Self::lookup_recursive(child, rest, out);
         }
 
         // Wildcard `*` child.
         if let Some(child) = node.children.get("*") {
-            Self::lookup_recursive(child, segments, depth + 1, out);
+            Self::lookup_recursive(child, rest, out);
         }
     }
 
@@ -204,8 +208,8 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
-    fn t(s: &str) -> Topic {
-        Topic::new(s).unwrap()
+    fn t(s: &str) -> &str {
+        s
     }
 
     #[test]

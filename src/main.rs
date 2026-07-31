@@ -1,17 +1,14 @@
 //! `vireon` — runtime entry point.
 //!
 //! Phase 9 capstone binary. Wires together the application-layer
-//! crates built across phases 1–8 into a single runnable demo:
+//! crates built across phases 1–7 into a single runnable demo:
 //!
 //! 1. Initializes `tracing`.
 //! 2. Builds a [`PubSubEngine`], subscribes to a few patterns, and
 //!    publishes a small stream of demo messages.
 //! 3. Builds an [`AclTable`] via [`AclTableBuilder`] and runs a few
 //!    authorization checks (allow / explicit-deny / no-match).
-//! 4. Builds a [`PrometheusRegistry`] with a [`ClosureCollector`]
-//!    that exposes the engine's atomics, then prints the scrape to
-//!    stdout — the canonical `/metrics` simulation.
-//! 5. Idles until Ctrl-C, then exits cleanly.
+//! 4. Idles until Ctrl-C, then exits cleanly.
 //!
 //! The binary prints results, so `print_stdout` is allowed at the
 //! crate root. All other workspace deny lints still apply.
@@ -27,10 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use auth_framework::PrincipalId;
-use observability_exporters::{
-    ClosureCollector, Metric, PrometheusRegistry, Sample, encode_prometheus,
-};
-use pubsub_engine::{PubSubConfig, PubSubEngine, PubSubMessage, StatsSnapshot, TopicPattern};
+use pubsub_engine::{PubSubConfig, PubSubEngine, PubSubMessage, TopicPattern};
 use topic_acl::{AclTableBuilder, Action, ActionSet};
 
 fn main() -> Result<()> {
@@ -42,9 +36,8 @@ fn main() -> Result<()> {
 
     print_banner();
 
-    let engine = run_pubsub_demo();
+    run_pubsub_demo();
     run_acl_demo();
-    let _text = run_metrics_demo(&engine);
 
     wait_for_ctrlc();
     print_shutdown();
@@ -167,94 +160,11 @@ fn run_acl_demo() {
     }
 }
 
-// ── Metrics scrape demo ───────────────────────────────────────────
-
-fn run_metrics_demo(engine: &PubSubEngine) -> String {
-    println!("\n[3] Prometheus export — scrape output");
-
-    // Take a one-shot snapshot of the engine stats and freeze it in
-    // the closure's environment. A production collector would capture
-    // an `Arc<PubSubStats>` and call `.snapshot()` inside the closure
-    // so that later scrapes see fresh values.
-    let snap = engine.snapshot();
-    let mut registry = PrometheusRegistry::new();
-    registry.register(ClosureCollector::new("pubsub", move || {
-        pubsub_metrics(snap)
-    }));
-    println!("  registry has {} collector(s)", registry.collector_count());
-
-    let text = registry.scrape_text();
-    println!("{}", "-".repeat(60));
-    print!("{text}");
-    println!("{}", "-".repeat(60));
-    let _ = encode_prometheus(&[]); // exercise the empty path; always ""
-    text
-}
-
-fn pubsub_metrics(s: StatsSnapshot) -> Vec<Metric> {
-    // The constructors validate names; both are constants so this
-    // branch never errors in practice. If it did, we'd return an empty
-    // Vec rather than panic.
-    let counter = Metric::counter(
-        "vireon_pubsub_messages_published_total",
-        "Total messages published.",
-        vec![Sample::unlabeled(s.messages_published as f64)],
-    );
-    let delivered = Metric::counter(
-        "vireon_pubsub_messages_delivered_total",
-        "Total messages delivered.",
-        vec![Sample::unlabeled(s.messages_delivered as f64)],
-    );
-    let active = Metric::gauge(
-        "vireon_pubsub_subscriptions_active",
-        "Currently-active subscriptions.",
-        vec![Sample::unlabeled(s.subscriptions_active as f64)],
-    );
-    let mut out = Vec::new();
-    if let Ok(m) = counter {
-        out.push(m);
-    }
-    if let Ok(m) = delivered {
-        out.push(m);
-    }
-    if let Ok(m) = active {
-        out.push(m);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use topic_acl::AclDecision;
-
-    #[test]
-    fn pubsub_metrics_returns_three_families() {
-        let snap = StatsSnapshot {
-            messages_published: 10,
-            messages_delivered: 8,
-            delivery_failures: 0,
-            subscriptions_active: 3,
-            subscriptions_created: 4,
-        };
-        let m = pubsub_metrics(snap);
-        assert_eq!(m.len(), 3);
-        assert_eq!(m[0].name, "vireon_pubsub_messages_published_total");
-        assert_eq!(m[0].samples[0].value, 10.0);
-        assert_eq!(m[1].samples[0].value, 8.0);
-        assert_eq!(m[2].samples[0].value, 3.0);
-    }
-
-    #[test]
-    fn pubsub_metrics_handles_default_snapshot() {
-        let m = pubsub_metrics(StatsSnapshot::default());
-        assert_eq!(m.len(), 3);
-        for fam in &m {
-            assert_eq!(fam.samples.len(), 1);
-            assert_eq!(fam.samples[0].value, 0.0);
-        }
-    }
 
     #[test]
     fn acl_demo_table_has_three_rules() {

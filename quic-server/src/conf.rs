@@ -158,11 +158,21 @@ pub struct ServerConf {
     pub verbose: Option<bool>,
     pub profile_output: Option<String>,
 
+    // ── Logging ──
+    /// `"text"` (default) or `"json"` (structured logging).
+    pub log_format: Option<String>,
+
     // ── WAL ──
     pub wal_root: Option<String>,
     pub wal_retention_secs: Option<u64>,
     pub wal_max_bytes: Option<u64>,
     pub wal_sweep_interval_secs: Option<u64>,
+    /// fsync policy for the WAL. See `[wal_sync]` section in
+    /// `vireon.conf.example`. `None` = default (group-commit 100 ms).
+    pub wal_sync: Option<WalSyncConf>,
+    /// Per-segment size cap in bytes. A segment is rolled to a fresh
+    /// file once it exceeds this size. Defaults to 1 GiB.
+    pub wal_segment_max_bytes: Option<u64>,
 
     // ── Limits ──
     pub max_topics: Option<usize>,
@@ -175,11 +185,14 @@ pub struct ServerConf {
     pub metrics_port: Option<u16>,
 
     // ── Cluster ──
-    pub cluster_node_id: Option<u32>,
-    pub cluster_peers: Option<String>,
+    pub cluster: Option<ClusterConf>,
 
     // ── ACL ──
     pub acl_rules_path: Option<String>,
+
+    // ── Audit ──
+    /// Path template for the audit log (e.g. `"/var/log/vireon/audit.{worker}.vaud"`).
+    pub audit_log: Option<String>,
 
     // ── QUIC engine overrides ──
     pub quic: Option<QuicConf>,
@@ -210,6 +223,37 @@ pub struct QuicConf {
     pub handshake_timeout: Option<HumanDuration>,
     pub congestion: Option<String>,
     pub initial_cwnd_packets: Option<u32>,
+    /// RFC 9000 §9 Connection Migration — lets a client change its
+    /// 4-tuple (WiFi switch, NAT rebinding) without dropping the
+    /// connection. On by default. Set to `false` to reject path
+    /// changes (mostly useful for benchmark isolation).
+    pub migration: Option<bool>,
+}
+
+/// `[cluster]` — multi-node cluster configuration (P6).
+///
+/// When `node_id` is `Some` and `peers` is non-empty, the server joins
+/// a cluster and routes publishes via consistent hashing. Both fields
+/// must be set together; setting only one is a config error.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct ClusterConf {
+    /// Self node ID. Must be >0 and appear in `peers`.
+    pub node_id: Option<u32>,
+    /// Peer list string: `"id=host:port,id=host:port,..."`.
+    /// All nodes (including self) must be listed.
+    pub peers: Option<String>,
+    /// Number of nodes (including owner) that should hold a replica of
+    /// each publish. `1` = no replication (default).
+    pub replication_factor: Option<u8>,
+    /// Virtual nodes per physical node on the consistent-hash ring.
+    /// Default 150 (Dynamo standard). Clamped to `[1, 1024]`.
+    pub vnodes: Option<u32>,
+    /// Heartbeat broadcast interval in milliseconds. Default 1000.
+    pub heartbeat_interval_ms: Option<u64>,
+    /// Heartbeat timeout in milliseconds — peers with no heartbeat
+    /// within this window are declared down. Default 5000.
+    pub heartbeat_timeout_ms: Option<u64>,
 }
 
 /// `[buffer_pool]` — per-worker buffer allocation pool tuning.
@@ -239,6 +283,12 @@ pub struct BackpressureConf {
     /// Hard backpressure percentage (0–100). Above this, the shard
     /// rejects new connections.
     pub hard_pct: Option<u8>,
+    /// High-watermark on total buffered `pending_sends` bytes. When
+    /// exceeded, new `Publish` frames are rejected with a
+    /// `backpressure` error ack — protecting the server from OOM when
+    /// subscribers can't drain fast enough. `0` (default) uses the
+    /// built-in 512 MiB threshold; set explicitly to disable.
+    pub publish_high_watermark_bytes: Option<HumanBytes>,
 }
 
 /// `[reactor]` — per-tick processing budget for the io_uring reactor.
@@ -354,6 +404,19 @@ pub struct StreamSchedulerConf {
     pub starvation_threshold_us: Option<u64>,
 }
 
+/// fsync policy for the WAL.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct WalSyncConf {
+    /// Strategy: `"never"` | `"every_flush"` | `"group_commit"`.
+    /// Default `group_commit` (when the section is present but the
+    /// field is omitted).
+    pub mode: String,
+    /// Used only by `group_commit`: max milliseconds between fsyncs.
+    /// Default 100 ms.
+    pub group_commit_ms: Option<u64>,
+}
+
 impl ServerConf {
     /// Load and parse a TOML config file.
     ///
@@ -441,6 +504,14 @@ pub struct LayerTuning {
     pub scheduler_max_streams_per_tick: u32,
     pub scheduler_max_bytes_per_tick: usize,
     pub scheduler_starvation_threshold_us: u64,
+    // ── Publisher backpressure ──
+    /// High-watermark on total `pending_sends` bytes (across all
+    /// subscriber streams). When exceeded, new `Publish` frames are
+    /// rejected with a `backpressure` error ack instead of being
+    /// accepted — this protects the server from OOM when subscribers
+    /// can't drain fast enough. 0 disables the check (accept
+    /// everything; eviction is the last line of defense).
+    pub publish_backpressure_high_watermark_bytes: usize,
 }
 
 impl Default for LayerTuning {
@@ -484,6 +555,9 @@ impl Default for LayerTuning {
             scheduler_max_streams_per_tick: 64,
             scheduler_max_bytes_per_tick: 65_536,
             scheduler_starvation_threshold_us: 10_000,
+            // 512 MiB ≈ 50% of PENDING_BYTE_CAP (1 GiB). Leaves headroom
+            // for the eviction path to act as the last line of defense.
+            publish_backpressure_high_watermark_bytes: 512 * 1024 * 1024,
         }
     }
 }

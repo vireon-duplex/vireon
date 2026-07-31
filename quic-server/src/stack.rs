@@ -120,12 +120,21 @@ pub struct VireonStack {
     flush_direct: Vec<OutgoingFrame>,
     /// Pre-allocated scratch for flush_outbox policy-ready path (avoids per-tick Vec alloc).
     flush_policy: Vec<OutgoingFrame>,
+    /// Pre-allocated scratch for drain_pending_sends keys (avoids per-tick Vec alloc).
+    pending_keys_scratch: Vec<(usize, u64)>,
 
     // ── Observability ────────────────────────────────────────────
     /// Tick counter — used to throttle periodic stats logging.
     tick_count: u64,
     /// Throttle for memory-pressure warnings (logs at most every 5 s).
     pressure_throttle: PressureThrottle,
+    /// Cached cgroup pressure level — re-read at most every 1 s.
+    /// `cgroup_pressure_level()` reads `/proc/self/status` (or cgroup
+    /// files) on every call, which profiler runs showed burning ~7% of
+    /// CPU in multi-worker mode because it ran every batch tick. RSS
+    /// doesn't move at sub-second timescales, so a 1 s TTL is safe.
+    cgroup_pressure_cache: buffer_pool::PressureLevel,
+    cgroup_pressure_last_check: Option<Instant>,
     /// ── per-frame error throttles ────────────────────────────────
     /// Encode failures on persistently malformed outgoing frames and
     /// retry-queue evictions under sustained backpressure can both fire
@@ -143,6 +152,12 @@ pub struct VireonStack {
     // ── Benchmark mode ───────────────────────────────────────────
     /// When true, echo every received frame back on the same stream.
     echo: bool,
+    /// When true, skip CRC32C on outgoing frames (writes zero trailer).
+    /// Mirrors the engine's decode-side `skip_crc` so a `skip_crc`
+    /// deployment avoids the checksum cost on both directions. Profiler
+    /// runs showed encode-side CRC burning ~9% of CPU in broadcast mode
+    /// (3× fan-out per publish).
+    skip_crc: bool,
 
     // ── Per-stream pending-send buffer ───────────────────────────
     /// Per-`(conn_idx, quic_stream_id)` buffered bytes from partial
@@ -156,6 +171,21 @@ pub struct VireonStack {
     /// Frames dropped after exhausting `PENDING_MAX_ATTEMPTS` or hitting
     /// a cap. Surfaced in the periodic `[distribution]` log.
     pending_drops: u64,
+    /// Total bytes of in-flight frames lost when a subscriber connection
+    /// was torn down mid-delivery (partial writes still buffered in
+    /// `pending_sends`). A non-zero value means subscribers missed the
+    /// tail of at least one message — surfaced in the periodic
+    /// `[distribution]` log and on connection close.
+    pending_gap_bytes: u64,
+
+    // ── Publisher backpressure ──────────────────────────────────
+    /// High-watermark on `pending_bytes`. When exceeded, new `Publish`
+    /// frames are rejected with a `backpressure` error ack before
+    /// fan-out — this protects the server from OOM when subscribers
+    /// can't drain. `0` disables the check.
+    publish_bp_high_watermark: usize,
+    /// Publishes rejected due to backpressure since startup.
+    publishes_backpressured: u64,
 
     // ── Rate-limiter metric sync ────────────────────────────────
     /// Last engine handshake-rejection count observed by the metrics
@@ -164,6 +194,16 @@ pub struct VireonStack {
     /// `ServerMetrics::rate_limit_rejections_total` so the Prometheus
     /// counter reflects engine state without coupling the two crates.
     last_rl_rejections: u64,
+
+    // ── Connection migration ───────────────────────────────────────
+    /// Total peer-address changes (NAT rebinding, WiFi switch) since
+    /// startup. Surfaced in the periodic `[distribution]` log and as
+    /// the `vireon_migrations_total` Prometheus counter. Connections
+    /// survive because QUIC routes by DCID, not 4-tuple.
+    migrations_total: u64,
+    /// Throttle for migration log lines — a flapping NAT can emit many
+    /// `PeerAddressChanged` events per second, so collapse to ≤1/s.
+    migration_log_throttle: crate::log_throttle::RateCounter,
 
     // ── Graceful shutdown ────────────────────────────────────────
     /// Set by the signal handler to request graceful shutdown.
@@ -234,12 +274,15 @@ impl VireonStack {
         acl_table: Option<topic_acl::AclTable>,
         wal_root: Option<&std::path::Path>,
         wal_retention: Option<wal_store::RetentionPolicy>,
+        wal_sync: wal_store::SyncPolicy,
+        wal_segment_max_bytes: u64,
         max_topics: Option<usize>,
         max_subscribers_per_topic: Option<usize>,
         cluster: Option<(&cluster_coordinator::ClusterConfig, ClusterWorkerHandle)>,
-        worker_inbox: Option<std::sync::mpsc::Receiver<crate::layers::InterWorkerPublish>>,
-        worker_outboxes: Vec<std::sync::mpsc::SyncSender<crate::layers::InterWorkerPublish>>,
+        worker_inbox: Option<std::sync::mpsc::Receiver<crate::layers::InterWorkerMsg>>,
+        worker_outboxes: Vec<std::sync::mpsc::SyncSender<crate::layers::InterWorkerMsg>>,
         shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
+        audit_log_template: Option<&str>,
         tuning: &crate::conf::LayerTuning,
     ) -> Result<Self, ServerError> {
         let mut application = ApplicationLayer::new(tuning)?;
@@ -260,13 +303,30 @@ impl VireonStack {
             // so concurrent reactors don't fight over the same files.
             // Cross-worker WAL sharing is a P5/P6 concern.
             let worker_dir = root.join(format!("worker_{reactor_id}"));
-            match wal_store::FileStore::open(&worker_dir) {
+            match wal_store::FileStore::open_full(&worker_dir, wal_sync, wal_segment_max_bytes) {
                 Ok(store) => application.set_wal(store),
                 Err(e) => {
                     return Err(ServerError::EngineInit(format!(
                         "wal_store open `{}`: {e:?}",
                         worker_dir.display()
                     )));
+                }
+            }
+            // Load consumer offsets from `<worker_dir>/offsets.dat`.
+            // Missing file = fresh start (no ack history).
+            let offsets_path = worker_dir.join("offsets.dat");
+            match wal_store::ConsumerOffsets::load_from(&offsets_path) {
+                Ok(loaded) => application.set_consumer_offsets(loaded, offsets_path),
+                Err(e) => {
+                    tracing::warn!(
+                        path = ?offsets_path,
+                        error = %e,
+                        "[wal] failed to load consumer offsets — starting fresh"
+                    );
+                    application.set_consumer_offsets(
+                        wal_store::ConsumerOffsets::new(),
+                        offsets_path,
+                    );
                 }
             }
         }
@@ -276,6 +336,27 @@ impl VireonStack {
         if let Some(inbox) = worker_inbox {
             application.set_worker_channels(reactor_id as usize, inbox, worker_outboxes);
         }
+        if let Some(template) = audit_log_template {
+            let path_str = template.replace("{worker}", &reactor_id.to_string());
+            let path = std::path::Path::new(&path_str);
+            match crate::audit::AuditLog::open(path) {
+                Ok(log) => {
+                    tracing::info!(
+                        path = %path.display(),
+                        "[audit] opened per-worker audit log"
+                    );
+                    application.set_audit_log(log);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "[audit] failed to open — audit logging disabled for this worker"
+                    );
+                }
+            }
+        }
+        let skip_crc = engine.config.skip_crc;
         Ok(Self {
             application,
             runtime: RuntimeLayer::new(reactor_id, tuning)?,
@@ -287,8 +368,11 @@ impl VireonStack {
             evict_scratch: Vec::with_capacity(32),
             flush_direct: Vec::new(),
             flush_policy: Vec::new(),
+            pending_keys_scratch: Vec::with_capacity(16),
             tick_count: 0,
             pressure_throttle: PressureThrottle::new(),
+            cgroup_pressure_cache: buffer_pool::PressureLevel::Low,
+            cgroup_pressure_last_check: None,
             encode_fail_throttle: crate::log_throttle::RateCounter::new(256),
             pending_evict_throttle: crate::log_throttle::RateCounter::new(128),
             eviction_cooldown: None,
@@ -300,10 +384,18 @@ impl VireonStack {
                 min_survivors: tuning.eviction_min_survivors,
             },
             echo,
+            skip_crc,
             pending_sends: FxHashMap::with_capacity_and_hasher(64, Default::default()),
             pending_bytes: 0,
             pending_drops: 0,
+            pending_gap_bytes: 0,
+            publish_bp_high_watermark: tuning.publish_backpressure_high_watermark_bytes,
+            publishes_backpressured: 0,
             last_rl_rejections: 0,
+            migrations_total: 0,
+            // Log at most every 16th event during a NAT flap to keep
+            // the log readable while still surfacing the problem.
+            migration_log_throttle: crate::log_throttle::RateCounter::new(16),
             shutdown_requested,
             reactor_stop: None,
             shutdown_state: ShutdownState::Running,
@@ -353,6 +445,13 @@ impl VireonStack {
                 } => {
                     self.on_stream_finished(conn_idx, stream_id);
                 }
+                QuicEvent::PeerAddressChanged {
+                    conn_idx,
+                    from,
+                    to,
+                } => {
+                    self.on_peer_address_changed(conn_idx, from, to);
+                }
             }
         }
 
@@ -391,6 +490,11 @@ impl VireonStack {
             );
             if let Some(m) = &self.metrics {
                 m.inc(&m.deliveries_total);
+                if out.header.msg_type == MessageType::Publish {
+                    if let Some(topic) = crate::metrics::extract_topic_from_publish(&out.payload) {
+                        m.record_topic_delivery(topic);
+                    }
+                }
             }
         }
         self.flush_direct = direct;
@@ -407,6 +511,11 @@ impl VireonStack {
             );
             if let Some(m) = &self.metrics {
                 m.inc(&m.deliveries_total);
+                if out.header.msg_type == MessageType::Publish {
+                    if let Some(topic) = crate::metrics::extract_topic_from_publish(&out.payload) {
+                        m.record_topic_delivery(topic);
+                    }
+                }
             }
         }
         self.flush_policy = policy;
@@ -480,6 +589,23 @@ impl VireonStack {
         // [application → session → stream] Top-down teardown.
         self.application.on_close(conn_idx, cs.session_id, reason);
 
+        // [pending-sends gap marker] Reclaim any buffered frame tails
+        // for this connection's subscriber streams. The teardown above
+        // already discarded the send-policy state; this reclaims the
+        // transport-layer partial-write buffer. A non-zero gap means at
+        // least one stream missed the tail of an in-flight message.
+        let (gap_entries, gap_bytes) = self.drop_pending_for_connection(conn_idx);
+        if gap_bytes > 0 {
+            tracing::warn!(
+                conn_idx,
+                gap_streams = gap_entries,
+                gap_bytes,
+                total_gap_bytes = self.pending_gap_bytes,
+                "[pending] connection closed with in-flight bytes buffered — subscriber streams lost the tail \
+                 of {gap_bytes} byte(s) across {gap_entries} stream(s)"
+            );
+        }
+
         // [runtime-layer] Cancel timer + destroy connection.
         self.runtime.on_close(conn_idx, cs.conn_id);
 
@@ -489,6 +615,8 @@ impl VireonStack {
             session_id = ?cs.session_id,
             %peer_addr,
             reason = reason.unwrap_or("none"),
+            gap_entries,
+            gap_bytes,
             "session destroyed"
         );
     }
@@ -519,6 +647,9 @@ impl VireonStack {
             m.add(&m.bytes_recv_total, payload.len() as u64);
             if header.msg_type == MessageType::Publish {
                 m.inc(&m.publishes_total);
+                if let Some(topic) = crate::metrics::extract_topic_from_publish(&payload[..]) {
+                    m.record_topic_publish(topic, payload.len() as u64);
+                }
             }
         }
 
@@ -538,6 +669,29 @@ impl VireonStack {
         // performance from application-layer overhead.
         if self.echo {
             self.encode_and_send(conn_idx, quic_stream_id, header, &payload[..]);
+            return;
+        }
+
+        // [publisher backpressure] If subscriber-side `pending_sends`
+        // backlog exceeds the high-watermark, reject new publishes
+        // before fan-out. This gives the publisher immediate feedback
+        // (a `backpressure` error ack) instead of letting the server
+        // drift toward the hard eviction path, which corrupts streams.
+        // The topic is parsed from the publish payload so the ack can
+        // name it; if parsing fails we still reject with a generic msg.
+        if header.msg_type == MessageType::Publish
+            && self.publish_bp_high_watermark > 0
+            && self.pending_bytes >= self.publish_bp_high_watermark
+        {
+            self.publishes_backpressured = self.publishes_backpressured.saturating_add(1);
+            let topic = crate::metrics::extract_topic_from_publish(&payload[..])
+                .map(|t| t.to_string())
+                .unwrap_or_default();
+            self.application
+                .reject_publish_backpressure(conn_idx, quic_stream_id, header.stream_id, &topic);
+            if let Some(m) = &self.metrics {
+                m.inc(&m.publishes_total);
+            }
             return;
         }
 
@@ -597,7 +751,11 @@ impl VireonStack {
         // `wire_size` bytes on success. On error we `clear()` so no
         // uninitialized memory persists beyond this call.
         unsafe { self.send_scratch.set_len(wire_size) };
-        let n = match codec::encode_into_slice(&mut self.send_scratch, header, payload) {
+        let n = match if self.skip_crc {
+            codec::encode_into_slice_skip_crc(&mut self.send_scratch, header, payload)
+        } else {
+            codec::encode_into_slice(&mut self.send_scratch, header, payload)
+        } {
             Ok(n) => n,
             Err(e) => {
                 self.send_scratch.clear();
@@ -666,6 +824,27 @@ impl VireonStack {
 
     fn on_stream_finished(&mut self, conn_idx: usize, stream_id: u64) {
         tracing::trace!(conn_idx, stream_id, "QUIC stream FIN");
+    }
+
+    /// Handles a connection-migration / NAT-rebinding event from the
+    /// QUIC engine. The connection is still alive — quiche already
+    /// validated the new path with PATH_CHALLENGE/PATH_RESPONSE. We
+    /// only need to sync the upper-layer address book and count it.
+    fn on_peer_address_changed(&mut self, conn_idx: usize, from: SocketAddr, to: SocketAddr) {
+        self.connections.update_peer_addr(conn_idx, to);
+        self.migrations_total = self.migrations_total.saturating_add(1);
+        if let Some(m) = &self.metrics {
+            m.migrations_total.fetch_add(1, Ordering::Relaxed);
+        }
+        if self.migration_log_throttle.tick() {
+            tracing::info!(
+                conn_idx,
+                %from,
+                %to,
+                total = self.migrations_total,
+                "[migration] peer address changed (connection survived — QUIC routes by DCID)",
+            );
+        }
     }
 
     // ── Per-stream pending-send buffer ───────────────────────────
@@ -776,12 +955,13 @@ impl VireonStack {
         }
         // Snapshot keys to release the borrow on `pending_sends` before
         // we call `engine.send_stream` (which takes &mut self).
-        let keys: Vec<(usize, u64)> = self.pending_sends.keys().copied().collect();
+        self.pending_keys_scratch.clear();
+        self.pending_keys_scratch.extend(self.pending_sends.keys().copied());
         let mut succeeded = 0u32;
         let mut still_blocked = 0u32;
         let mut dropped = 0u32;
 
-        for key in keys {
+        for &key in &self.pending_keys_scratch {
             let Some(p) = self.pending_sends.get_mut(&key) else {
                 continue;
             };
@@ -799,13 +979,17 @@ impl VireonStack {
                         // Partial write — buffer the tail, reset attempts.
                         let tail = buf.split_off(written);
                         self.pending_bytes += tail.len();
-                        let p = self
-                            .pending_sends
-                            .get_mut(&key)
-                            .expect("just get_mut'd above");
-                        p.data = tail;
-                        p.blocked_attempts = 0;
-                        still_blocked += 1;
+                        if let Some(p) = self.pending_sends.get_mut(&key) {
+                            p.data = tail;
+                            p.blocked_attempts = 0;
+                            still_blocked += 1;
+                        } else {
+                            tracing::warn!(
+                                conn_idx = key.0,
+                                quic_stream_id = key.1,
+                                "[pending] entry vanished during partial-write restore"
+                            );
+                        }
                     } else {
                         // Full send — drop the entry.
                         self.pending_sends.remove(&key);
@@ -816,18 +1000,22 @@ impl VireonStack {
                     // Restore the buffer; bump attempts.
                     self.pending_bytes -= prev_len;
                     self.pending_bytes += buf.len(); // same length, but be explicit
-                    let p = self
-                        .pending_sends
-                        .get_mut(&key)
-                        .expect("just get_mut'd above");
-                    p.data = buf;
-                    p.blocked_attempts = p.blocked_attempts.saturating_add(1);
-                    if p.blocked_attempts >= PENDING_MAX_ATTEMPTS {
-                        self.pending_bytes -= p.data.len();
-                        self.pending_sends.remove(&key);
-                        dropped += 1;
+                    if let Some(p) = self.pending_sends.get_mut(&key) {
+                        p.data = buf;
+                        p.blocked_attempts = p.blocked_attempts.saturating_add(1);
+                        if p.blocked_attempts >= PENDING_MAX_ATTEMPTS {
+                            self.pending_bytes -= p.data.len();
+                            self.pending_sends.remove(&key);
+                            dropped += 1;
+                        } else {
+                            still_blocked += 1;
+                        }
                     } else {
-                        still_blocked += 1;
+                        tracing::warn!(
+                            conn_idx = key.0,
+                            quic_stream_id = key.1,
+                            "[pending] entry vanished during flow-blocked restore"
+                        );
                     }
                 }
                 Err(e) => {
@@ -857,6 +1045,41 @@ impl VireonStack {
                 "pending sends drain"
             );
         }
+    }
+
+    /// Drops every `pending_sends` entry belonging to `conn_idx` and
+    /// returns `(entries_dropped, bytes_dropped)`. Called from
+    /// [`Self::on_connection_closed`] so the teardown is observable —
+    /// a non-zero return means at least one subscriber-side stream lost
+    /// the buffered tail of an in-flight frame when the connection went
+    /// down.
+    ///
+    /// This is the "gap marker" path for v1: rather than silently
+    /// leaking the buffered bytes (which would only be reclaimed when
+    /// the next eviction pass happened to pick them, or never), we
+    /// eagerly reclaim the memory and surface the loss in the
+    /// `[distribution]` stats + the connection-close log line.
+    fn drop_pending_for_connection(&mut self, conn_idx: usize) -> (usize, u64) {
+        if self.pending_sends.is_empty() {
+            return (0, 0);
+        }
+        let mut entries = 0usize;
+        let mut bytes = 0u64;
+        // Collect keys first so we don't mutate while iterating.
+        self.pending_keys_scratch.clear();
+        self.pending_keys_scratch
+            .extend(self.pending_sends.keys().filter(|(c, _)| *c == conn_idx).copied());
+        for key in self.pending_keys_scratch.drain(..) {
+            if let Some(p) = self.pending_sends.remove(&key) {
+                entries += 1;
+                bytes += p.data.len() as u64;
+                self.pending_bytes = self.pending_bytes.saturating_sub(p.data.len());
+            }
+        }
+        if bytes > 0 {
+            self.pending_gap_bytes = self.pending_gap_bytes.saturating_add(bytes);
+        }
+        (entries, bytes)
     }
 
     // ── Idle-timeout reaping ──────────────────────────────────────
@@ -1027,6 +1250,9 @@ impl IoHandler for VireonStack {
             let pending_len = self.pending_sends.len();
             let pending_bytes = self.pending_bytes;
             let pending_drops = self.pending_drops;
+            let pending_gap_bytes = self.pending_gap_bytes;
+            let publishes_backpressured = self.publishes_backpressured;
+            let migrations_total = self.migrations_total;
             if let Some(mesh) = self.engine.forward_mesh() {
                 tracing::info!(
                     reactor_id,
@@ -1039,6 +1265,9 @@ impl IoHandler for VireonStack {
                     pending_streams = pending_len,
                     pending_bytes,
                     pending_drops,
+                    pending_gap_bytes,
+                    publishes_backpressured,
+                    migrations_total,
                     "[distribution] worker stats"
                 );
             } else {
@@ -1050,6 +1279,9 @@ impl IoHandler for VireonStack {
                     pending_streams = pending_len,
                     pending_bytes,
                     pending_drops,
+                    pending_gap_bytes,
+                    publishes_backpressured,
+                    migrations_total,
                     "[distribution] worker stats (single-worker mode)"
                 );
             }
@@ -1062,7 +1294,16 @@ impl IoHandler for VireonStack {
         // Take the higher (more urgent) of the two — a cgroup OOM kills
         // the process regardless of how healthy the pool thinks it is.
         let pool_pressure = self.engine.pressure_level();
-        let cgroup_pressure = buffer_pool::maintenance::cgroup::cgroup_pressure_level();
+        // Throttle the cgroup read to once per second — see field comment.
+        let cgroup_pressure = match self.cgroup_pressure_last_check {
+            Some(t) if t.elapsed() < Duration::from_secs(1) => self.cgroup_pressure_cache,
+            _ => {
+                let level = buffer_pool::maintenance::cgroup::cgroup_pressure_level();
+                self.cgroup_pressure_cache = level;
+                self.cgroup_pressure_last_check = Some(Instant::now());
+                level
+            }
+        };
         let pressure = pool_pressure.max(cgroup_pressure);
 
         if pressure >= buffer_pool::PressureLevel::High && self.pressure_throttle.tick() {
@@ -1113,6 +1354,9 @@ impl IoHandler for VireonStack {
             && matches!(self.shutdown_state, ShutdownState::Running)
         {
             let active = self.engine.active_connections();
+            // Flush consumer offsets before closing connections so the
+            // last batch of acks isn't lost between periodic sweeps.
+            self.application.save_offsets();
             self.engine.begin_shutdown();
             self.shutdown_state = ShutdownState::Draining {
                 deadline: Instant::now() + DRAIN_TIMEOUT,

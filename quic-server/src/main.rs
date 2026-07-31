@@ -1,6 +1,11 @@
 //! Vireon QUIC Server — production-grade QUIC server on io_uring + quiche.
 
+// Warn on .unwrap() / .expect() in production code. Test modules
+// (#[cfg(test)]) are exempt — assertions there should panic on failure.
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
+
 mod acl_loader;
+mod audit;
 mod cli;
 mod cluster;
 mod conf;
@@ -74,15 +79,23 @@ fn main() -> Result<(), ServerError> {
 }
 
 fn init_tracing(cli: &Cli) {
+    use crate::cli::LogFormatArg;
     let filter = if cli.verbose {
         "quic_server=debug,quic_engine=debug,io=debug,quiche=trace,warn"
     } else {
         "quic_server=info,quic_engine=info,warn"
     };
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .try_init();
+    let result = match cli.log_format {
+        Some(LogFormatArg::Json) => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .json()
+            .try_init(),
+        _ => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .try_init(),
+    };
+    let _ = result;
 }
 
 fn print_banner(config: &ServerConfig) {

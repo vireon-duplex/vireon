@@ -26,6 +26,7 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use session_registry::NodeId;
+use std::sync::Arc;
 
 use crate::error::ClusterError;
 
@@ -49,6 +50,12 @@ pub enum InterNodeKind {
     Subscribe = 0x03,
     /// Non-owner → owner: "stop sending fanouts for this pattern".
     Unsubscribe = 0x04,
+    /// "I'm alive" — broadcast every `heartbeat_interval` so peers can
+    /// detect failures. `origin_node` = the heartbeating node.
+    Heartbeat = 0x05,
+    /// Gossip: "node X is dead" — converges on removal. `origin_node`
+    /// = the node being declared down (not the reporter).
+    NodeDown = 0x06,
 }
 
 impl InterNodeKind {
@@ -61,6 +68,8 @@ impl InterNodeKind {
             0x02 => Some(Self::Fanout),
             0x03 => Some(Self::Subscribe),
             0x04 => Some(Self::Unsubscribe),
+            0x05 => Some(Self::Heartbeat),
+            0x06 => Some(Self::NodeDown),
             _ => None,
         }
     }
@@ -81,7 +90,9 @@ pub struct InterNodeMessage {
     pub origin_stream_id: u64,
     /// Topic (for Publish/Fanout) or pattern (for Subscribe/Unsubscribe).
     /// 1..=65535 bytes UTF-8 (caller validates encoding; wire is bytes).
-    pub topic_or_pattern: String,
+    /// `Arc<str>` so cloning an `InterNodeMessage` (e.g. fan-out to N
+    /// peers) is a refcount bump, not a heap allocation.
+    pub topic_or_pattern: Arc<str>,
     /// Message payload. Empty for Subscribe/Unsubscribe.
     pub payload: Bytes,
 }
@@ -93,7 +104,7 @@ impl InterNodeMessage {
         origin: NodeId,
         conn_idx: u32,
         stream_id: u64,
-        topic: String,
+        topic: impl Into<Arc<str>>,
         payload: Bytes,
     ) -> Self {
         Self {
@@ -101,7 +112,7 @@ impl InterNodeMessage {
             origin_node: origin,
             origin_conn_idx: conn_idx,
             origin_stream_id: stream_id,
-            topic_or_pattern: topic,
+            topic_or_pattern: topic.into(),
             payload,
         }
     }
@@ -112,7 +123,7 @@ impl InterNodeMessage {
         origin: NodeId,
         conn_idx: u32,
         stream_id: u64,
-        topic: String,
+        topic: impl Into<Arc<str>>,
         payload: Bytes,
     ) -> Self {
         Self {
@@ -120,33 +131,74 @@ impl InterNodeMessage {
             origin_node: origin,
             origin_conn_idx: conn_idx,
             origin_stream_id: stream_id,
-            topic_or_pattern: topic,
+            topic_or_pattern: topic.into(),
             payload,
         }
     }
 
     /// Construct a Subscribe message (empty payload).
     #[must_use]
-    pub fn subscribe(origin: NodeId, conn_idx: u32, stream_id: u64, pattern: String) -> Self {
+    pub fn subscribe(
+        origin: NodeId,
+        conn_idx: u32,
+        stream_id: u64,
+        pattern: impl Into<Arc<str>>,
+    ) -> Self {
         Self {
             kind: InterNodeKind::Subscribe,
             origin_node: origin,
             origin_conn_idx: conn_idx,
             origin_stream_id: stream_id,
-            topic_or_pattern: pattern,
+            topic_or_pattern: pattern.into(),
             payload: Bytes::new(),
         }
     }
 
     /// Construct an Unsubscribe message (empty payload).
     #[must_use]
-    pub fn unsubscribe(origin: NodeId, conn_idx: u32, stream_id: u64, pattern: String) -> Self {
+    pub fn unsubscribe(
+        origin: NodeId,
+        conn_idx: u32,
+        stream_id: u64,
+        pattern: impl Into<Arc<str>>,
+    ) -> Self {
         Self {
             kind: InterNodeKind::Unsubscribe,
             origin_node: origin,
             origin_conn_idx: conn_idx,
             origin_stream_id: stream_id,
-            topic_or_pattern: pattern,
+            topic_or_pattern: pattern.into(),
+            payload: Bytes::new(),
+        }
+    }
+
+    /// Construct a Heartbeat message. Broadcast periodically by each
+    /// node so peers can detect failures. The topic field carries a
+    /// fixed marker (`_heartbeat.cluster`) — it satisfies the non-empty
+    /// topic constraint without carrying real subscription state.
+    #[must_use]
+    pub fn heartbeat(origin: NodeId) -> Self {
+        Self {
+            kind: InterNodeKind::Heartbeat,
+            origin_node: origin,
+            origin_conn_idx: 0,
+            origin_stream_id: 0,
+            topic_or_pattern: Arc::from("_heartbeat.cluster"),
+            payload: Bytes::new(),
+        }
+    }
+
+    /// Construct a NodeDown gossip message. `dead_node` is the node
+    /// being declared down — receivers should mark it down so ownership
+    /// shifts to the next node on the ring.
+    #[must_use]
+    pub fn node_down(reporter: NodeId, dead_node: NodeId) -> Self {
+        Self {
+            kind: InterNodeKind::NodeDown,
+            origin_node: dead_node,
+            origin_conn_idx: reporter.raw(),
+            origin_stream_id: 0,
+            topic_or_pattern: Arc::from("_nodedown.gossip"),
             payload: Bytes::new(),
         }
     }
@@ -184,6 +236,41 @@ impl InterNodeMessage {
         buf.put_u32_le(self.payload.len() as u32);
         buf.put_slice(&self.payload);
         Ok(buf.freeze())
+    }
+
+    /// Encode into a caller-supplied scratch buffer, returning a borrow
+    /// of the encoded bytes. The buffer is cleared (not shrunk) first so
+    /// its allocation is reused across calls — avoids one `BytesMut`
+    /// allocation per cluster forward on the transport hot path.
+    ///
+    /// # Errors
+    /// Same as [`encode`](Self::encode).
+    pub fn encode_into<'a>(
+        &self,
+        buf: &'a mut BytesMut,
+    ) -> Result<&'a [u8], ClusterError> {
+        let topic_bytes = self.topic_or_pattern.as_bytes();
+        let topic_len = topic_bytes.len();
+        if topic_len == 0 {
+            return Err(ClusterError::TopicEmpty);
+        }
+        if topic_len > MAX_TOPIC_LEN {
+            return Err(ClusterError::InvalidConfig {
+                reason: "topic exceeds 65535 bytes",
+            });
+        }
+        let total = self.encoded_len();
+        buf.clear();
+        buf.reserve(total);
+        buf.put_u8(self.kind as u8);
+        buf.put_u32_le(self.origin_node.raw());
+        buf.put_u32_le(self.origin_conn_idx);
+        buf.put_u64_le(self.origin_stream_id);
+        buf.put_u16_le(topic_len as u16);
+        buf.put_slice(topic_bytes);
+        buf.put_u32_le(self.payload.len() as u32);
+        buf.put_slice(&self.payload);
+        Ok(buf)
     }
 
     /// Decode.
@@ -228,6 +315,7 @@ impl InterNodeMessage {
             String::from_utf8(topic_bytes.to_vec()).map_err(|_| ClusterError::DecodeFailed {
                 reason: "topic is not valid UTF-8",
             })?;
+        let topic_or_pattern: Arc<str> = Arc::from(topic_or_pattern);
         let payload = Bytes::copy_from_slice(payload_bytes);
         Ok(Self {
             kind,
@@ -280,7 +368,7 @@ mod tests {
                 origin_node: NodeId::new(3),
                 origin_conn_idx: 9,
                 origin_stream_id: 99,
-                topic_or_pattern: "*.*".to_owned(),
+                topic_or_pattern: "*.*".to_owned().into(),
                 payload: Bytes::new(),
             };
             let bytes = m.encode().unwrap();
@@ -399,12 +487,40 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_round_trip() {
+        let m = InterNodeMessage::heartbeat(NodeId::new(7));
+        let bytes = m.encode().unwrap();
+        let back = InterNodeMessage::decode(&bytes).unwrap();
+        assert_eq!(m, back);
+        assert_eq!(back.kind, InterNodeKind::Heartbeat);
+        assert_eq!(back.origin_node, NodeId::new(7));
+        assert!(back.payload.is_empty());
+    }
+
+    #[test]
+    fn node_down_round_trip() {
+        let reporter = NodeId::new(1);
+        let dead = NodeId::new(3);
+        let m = InterNodeMessage::node_down(reporter, dead);
+        let bytes = m.encode().unwrap();
+        let back = InterNodeMessage::decode(&bytes).unwrap();
+        assert_eq!(m, back);
+        assert_eq!(back.kind, InterNodeKind::NodeDown);
+        // origin_node carries the dead node's id.
+        assert_eq!(back.origin_node, dead);
+        // origin_conn_idx carries the reporter's id.
+        assert_eq!(back.origin_conn_idx, reporter.raw());
+    }
+
+    #[test]
     fn kind_from_u8_round_trips() {
         for k in [
             InterNodeKind::Publish,
             InterNodeKind::Fanout,
             InterNodeKind::Subscribe,
             InterNodeKind::Unsubscribe,
+            InterNodeKind::Heartbeat,
+            InterNodeKind::NodeDown,
         ] {
             assert_eq!(InterNodeKind::from_u8(k as u8), Some(k));
         }

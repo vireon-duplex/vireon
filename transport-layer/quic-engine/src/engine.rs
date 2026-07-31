@@ -88,6 +88,20 @@ pub enum QuicEvent {
         /// Error description from quiche, if any.
         reason: Option<String>,
     },
+    /// A connection's peer address changed — connection migration or
+    /// NAT rebinding. The engine found the connection by DCID (so the
+    /// conn_idx is stable), but the source address differs from the
+    /// previously seen one. quiche handles path validation internally;
+    /// this event lets upper layers sync their address tracking and
+    /// log the migration for observability.
+    PeerAddressChanged {
+        /// Slab index of the connection.
+        conn_idx: usize,
+        /// Previous remote address.
+        from: SocketAddr,
+        /// New remote address.
+        to: SocketAddr,
+    },
     /// A decoded frame was received on a stream.
     FrameReceived {
         /// Slab index of the connection.
@@ -473,6 +487,19 @@ impl QuicEngine {
         let Some(Some(entry)) = self.connections.get_mut(idx) else {
             return;
         };
+
+        // Detect connection migration / NAT rebinding: the packet
+        // arrived from a different source address than we last saw for
+        // this connection. quiche handles path validation internally
+        // (PATH_CHALLENGE/PATH_RESPONSE) using the RecvInfo below; this
+        // event lets upper layers sync their address tracking.
+        if entry.peer_addr != peer {
+            events.push(QuicEvent::PeerAddressChanged {
+                conn_idx: idx,
+                from: entry.peer_addr,
+                to: peer,
+            });
+        }
 
         // Update peer address (connection migration).
         entry.peer_addr = peer;
