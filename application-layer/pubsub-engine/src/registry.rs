@@ -22,7 +22,6 @@
 use crate::config::PubSubConfig;
 use crate::error::PubSubError;
 use crate::subscription::SubscriptionId;
-use crate::topic::Topic;
 use crate::trie::TopicTrie;
 use rustc_hash::FxHashMap;
 use std::fmt;
@@ -164,7 +163,7 @@ impl TopicRegistry {
     /// receive a delivery. The caller is responsible for any fan-out
     /// filtering (e.g. suppressing echo to the origin connection).
     #[must_use]
-    pub fn lookup(&self, topic: &Topic) -> Vec<Subscriber> {
+    pub fn lookup(&self, topic: &str) -> Vec<Subscriber> {
         match self.trie.lookup(topic) {
             Ok(ids) => ids
                 .iter()
@@ -318,8 +317,8 @@ mod tests {
         }
     }
 
-    fn t(s: &str) -> Topic {
-        Topic::new(s).unwrap()
+    fn t(s: &str) -> &str {
+        s
     }
 
     #[test]

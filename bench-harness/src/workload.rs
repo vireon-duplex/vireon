@@ -111,22 +111,22 @@ pub const BENCH_SEQ_BYTES: usize = 8;
 /// `bench_seq`. Use `--coalesce N` for raw-throughput runs without
 /// verification.
 pub fn build_group() -> anyhow::Result<Workload> {
-    Ok(build_publish_workload(GROUP_TOPIC, 1))
+    Ok(build_publish_workload(GROUP_TOPIC, 1, 32_768))
 }
 
 /// Builds the 1-entry workload used for `--mode broadcast`. Same
 /// structure as `build_group` but targets `BROADCAST_TOPIC`. Coalesce
 /// is 1 for per-message seq verification.
 pub fn build_broadcast() -> anyhow::Result<Workload> {
-    Ok(build_publish_workload(BROADCAST_TOPIC, 1))
+    Ok(build_publish_workload(BROADCAST_TOPIC, 1, 16_384))
 }
 
 /// Shared builder for group/broadcast: one Publish entry to `topic`
 /// with `coalesce` copies per stream_send.
-fn build_publish_workload(topic: &str, coalesce: usize) -> Workload {
+fn build_publish_workload(topic: &str, coalesce: usize, data_size: usize) -> Workload {
     let topic_b = topic.as_bytes();
-    // data = bench_seq(8) + padding to fill ~4 KiB
-    let data_payload = vec![0xE8u8; 4096];
+    // data = bench_seq(8) + padding to fill ~16 KiB
+    let data_payload = vec![0xE8u8; data_size];
     let mut payload = Vec::with_capacity(2 + topic_b.len() + data_payload.len());
     payload.extend_from_slice(&(topic_b.len() as u16).to_be_bytes());
     payload.extend_from_slice(topic_b);

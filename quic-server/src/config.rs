@@ -6,8 +6,27 @@ use std::time::Duration;
 
 use quic_engine::{QuicConfig, QuicPreset};
 
-use crate::cli::{Cli, PresetArg, WorkerModeArg};
+use crate::cli::{Cli, LogFormatArg, PresetArg, WorkerModeArg};
 use crate::conf::{LayerTuning, ServerConf};
+
+/// Log output format — resolved from CLI or config file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum LogFormat {
+    /// Human-readable plain text (default).
+    #[default]
+    Text,
+    /// JSON structured logging for log aggregators.
+    Json,
+}
+
+impl From<LogFormatArg> for LogFormat {
+    fn from(arg: LogFormatArg) -> Self {
+        match arg {
+            LogFormatArg::Text => Self::Text,
+            LogFormatArg::Json => Self::Json,
+        }
+    }
+}
 
 /// Worker mode — resolved from CLI or config file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,6 +85,16 @@ pub struct ServerConfig {
     /// forever (default). Configured via `--wal-retention-secs` and
     /// `--wal-max-bytes`.
     pub wal_retention: Option<wal_store::RetentionPolicy>,
+    /// When to call `sync_data` on appended WAL bytes. Defaults to
+    /// group-commit 100 ms — bounds worst-case power-loss data loss to
+    /// 100 ms while keeping throughput high. Configured via the
+    /// `[wal_sync]` section in `vireon.conf`.
+    pub wal_sync: wal_store::SyncPolicy,
+    /// Per-segment size cap in bytes. A segment is rolled to a fresh
+    /// file once it exceeds this size, so retention truncation can drop
+    /// old data in O(1) (delete whole files) instead of O(n) (rewrite
+    /// surviving entries). Defaults to 1 GiB.
+    pub wal_segment_max_bytes: u64,
     /// Cap on total topics in the catalog. `None` = unlimited.
     pub max_topics: Option<usize>,
     /// Cap on subscribers per distinct subscription pattern.
@@ -86,6 +115,13 @@ pub struct ServerConfig {
     /// metrics are disabled; `Some(Arc<...>)` when the endpoint is
     /// active.
     pub metrics: Option<Arc<crate::metrics::ServerMetrics>>,
+
+    /// Log output format: plain text (default) or JSON (structured).
+    pub log_format: LogFormat,
+
+    /// Optional audit log path template. `{worker}` is substituted with
+    /// the worker ID at startup. `None` = audit logging disabled.
+    pub audit_log: Option<String>,
 
     /// Resolved layer-tuning knobs (buffer pool, backpressure, reactor
     /// budget, send batching, eviction, session/stream limits, task
@@ -192,6 +228,12 @@ impl ServerConfig {
             if let Some(v) = q.congestion_str() {
                 quic_config.congestion = parse_congestion(v);
             }
+            // Connection migration toggle. Defaults to true (standard
+            // QUIC feature) via `ExtensionFlags::production()`; set
+            // explicitly to `false` to disable.
+            if let Some(v) = q.migration {
+                quic_config.extensions.migration = v;
+            }
         }
 
         // ── CRC resolution ──────────────────────────────────────────
@@ -233,11 +275,26 @@ impl ServerConfig {
         // ── Echo / verbose (CLI-only flags; conf has them too for parity) ──
         let echo = cli.echo || conf.echo.unwrap_or(false);
 
+        // ── Log format ─────────────────────────────────────────────
+        let log_format = cli.log_format.clone().map(LogFormat::from).or_else(|| {
+            conf.log_format.as_deref().map(|s| match s.to_ascii_lowercase().as_str() {
+                "json" => LogFormat::Json,
+                _ => LogFormat::Text,
+            })
+        }).unwrap_or_default();
+
         // ── ACL ─────────────────────────────────────────────────────
         let acl_rules_path = cli
             .acl_rules_path
             .clone()
             .or(conf.acl_rules_path.clone())
+            .filter(|s| !s.is_empty());
+
+        // ── Audit log ──────────────────────────────────────────────
+        let audit_log = cli
+            .audit_log
+            .clone()
+            .or(conf.audit_log.clone())
             .filter(|s| !s.is_empty());
         let acl_table = match acl_rules_path.as_deref() {
             Some(path) => Some(
@@ -258,6 +315,37 @@ impl ServerConfig {
         let wal_max_bytes = cli.wal_max_bytes.or(conf.wal_max_bytes).unwrap_or(0);
         let wal_retention = build_wal_retention(wal_retention_secs, wal_max_bytes);
 
+        // fsync policy: how the WAL calls sync_data after a flush.
+        let wal_sync = match conf.wal_sync.as_ref() {
+            Some(s) => match s.mode.as_str() {
+                "never" => wal_store::SyncPolicy::Never,
+                "every_flush" | "every-flush" | "everyflush" => {
+                    wal_store::SyncPolicy::EveryFlush
+                }
+                "group_commit" | "group-commit" | "groupcommit" => {
+                    let ms = s.group_commit_ms.unwrap_or(100).max(1);
+                    wal_store::SyncPolicy::GroupCommit(std::time::Duration::from_millis(ms))
+                }
+                other => {
+                    tracing::warn!(
+                        value = other,
+                        "[config] unknown wal_sync mode, falling back to group_commit 100ms"
+                    );
+                    wal_store::SyncPolicy::default()
+                }
+            },
+            None => wal_store::SyncPolicy::default(),
+        };
+
+        // Segment size cap: controls how large each WAL segment file can
+        // grow before it is rolled. Smaller → faster truncation, more
+        // file descriptors; larger → fewer files, but truncation of old
+        // data rewrites more. Defaults to 1 GiB.
+        let wal_segment_max_bytes = conf
+            .wal_segment_max_bytes
+            .filter(|&b| b > 0)
+            .unwrap_or(wal_store::file_store::DEFAULT_SEGMENT_MAX_BYTES);
+
         // ── Quotas ──────────────────────────────────────────────────
         let max_topics_raw = cli.max_topics.or(conf.max_topics).unwrap_or(0);
         let max_subscribers_raw = cli
@@ -268,34 +356,69 @@ impl ServerConfig {
         let max_subscribers_per_topic = (max_subscribers_raw > 0).then_some(max_subscribers_raw);
 
         // ── Cluster (P6) ────────────────────────────────────────────
-        // 0 = not set (single-node mode). Filter so Some(0) doesn't
-        // trigger the cluster-peers requirement.
-        let cluster_node_id = cli
-            .cluster_node_id
-            .or(conf.cluster_node_id)
-            .filter(|&id| id != 0);
-        let cluster_peers = cli
+        // CLI flags take precedence over the [cluster] section. Both
+        // `node_id` and `peers` must be set together (CLI × CLI, CLI ×
+        // conf, or conf × conf — any combination is allowed).
+        //
+        // 0 / "" = not set (single-node mode). Filter so Some(0) /
+        // Some("") don't trigger the cluster-peers requirement.
+        let cli_node = cli.cluster_node_id.filter(|&id| id != 0);
+        let cli_peers = cli
             .cluster_peers
             .clone()
-            .or(conf.cluster_peers.clone())
             .filter(|s| !s.is_empty());
+        let cli_rf = cli.cluster_replication_factor;
+
+        let (conf_node, conf_peers, conf_rf, conf_vnodes) = match &conf.cluster {
+            Some(c) => (
+                c.node_id.filter(|&id| id != 0),
+                c.peers.clone().filter(|s| !s.is_empty()),
+                c.replication_factor,
+                c.vnodes,
+            ),
+            None => (None, None, None, None),
+        };
+
+        let cluster_node_id = cli_node.or(conf_node);
+        let cluster_peers = cli_peers.or(conf_peers);
+        let cluster_replication_factor = cli_rf.or(conf_rf);
+        let cluster_vnodes = conf_vnodes;
+        let cluster_heartbeat_interval = conf
+            .cluster
+            .as_ref()
+            .and_then(|c| c.heartbeat_interval_ms);
+        let cluster_heartbeat_timeout = conf
+            .cluster
+            .as_ref()
+            .and_then(|c| c.heartbeat_timeout_ms);
+
         let cluster = match (cluster_node_id, cluster_peers.as_deref()) {
             (Some(id), Some(peers_str)) => {
                 let self_id = session_registry::NodeId::new(id);
                 let peers = crate::cluster::parse_cluster_peers(peers_str)
                     .map_err(|e| anyhow::anyhow!("cluster-peers: {e}"))?;
-                let cfg = crate::cluster::build_cluster_transport_config(self_id, &peers)
-                    .map_err(|e| anyhow::anyhow!("cluster-peers: {e}"))?;
+                let opts = crate::cluster::ClusterOpts {
+                    replication_factor: cluster_replication_factor,
+                    vnodes: cluster_vnodes,
+                    heartbeat_interval_ms: cluster_heartbeat_interval,
+                    heartbeat_timeout_ms: cluster_heartbeat_timeout,
+                };
+                let cfg = crate::cluster::build_cluster_transport_config(
+                    self_id,
+                    &peers,
+                    opts,
+                )
+                .map_err(|e| anyhow::anyhow!("cluster-peers: {e}"))?;
                 Some(cfg)
             }
             (Some(_), None) => {
                 return Err(anyhow::anyhow!(
-                    "cluster-node-id requires cluster-peers (set via CLI or config file)"
+                    "cluster-node-id requires cluster-peers (set via CLI or [cluster] section)"
                 ));
             }
             (None, Some(_)) => {
                 return Err(anyhow::anyhow!(
-                    "cluster-peers requires cluster-node-id (set via CLI or config file)"
+                    "cluster-peers requires cluster-node-id (set via CLI or [cluster] section)"
                 ));
             }
             (None, None) => None,
@@ -330,11 +453,15 @@ impl ServerConfig {
             acl_table,
             wal_root,
             wal_retention,
+            wal_sync,
+            wal_segment_max_bytes,
             max_topics,
             max_subscribers_per_topic,
             cluster,
             metrics_port,
             metrics,
+            log_format,
+            audit_log,
             tuning,
         })
     }
@@ -449,6 +576,9 @@ fn resolve_tuning(conf: &ServerConf) -> LayerTuning {
         if let Some(v) = bp.connection_capacity { t.connection_capacity = v; }
         if let Some(v) = bp.soft_pct { t.soft_bp_pct = v; }
         if let Some(v) = bp.hard_pct { t.hard_bp_pct = v; }
+        if let Some(v) = bp.publish_high_watermark_bytes {
+            t.publish_backpressure_high_watermark_bytes = v.0 as usize;
+        }
     }
 
     // ── Reactor tick budget ──

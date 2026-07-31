@@ -29,6 +29,7 @@
 use rustc_hash::FxHashMap;
 use std::net::SocketAddr;
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use auth_framework::authenticator::AuthenticationPipeline;
@@ -70,25 +71,57 @@ use bytes::{Bytes, BytesMut};
 
 // ── Inter-worker pub/sub forwarding ────────────────────────────────
 
-/// A published message forwarded from one worker to another for
-/// cross-worker fan-out. Each worker broadcasts publishes to all other
-/// workers so their local subscribers receive the message.
+/// Messages exchanged between workers for cross-worker pub/sub.
 ///
-/// Receiving workers drain their inbox in `drain_worker_inbox` and call
-/// `cluster_deliver_local` (the same code path as inter-node delivery).
-/// Forwarded publishes are NOT re-broadcast, preventing loops.
-pub struct InterWorkerPublish {
-    /// Pre-encoded wire frame: `[topic_len:u16 BE][topic bytes][payload bytes]`.
-    ///
-    /// Worker A encodes this once on the publish path (it has to anyway,
-    /// for local subscriber fan-out) and forwards the same `Bytes` to
-    /// every other worker. Worker B clones the `Bytes` (atomic refcount
-    /// bump — zero memcpy) and enqueues it directly to its subscribers.
-    ///
-    /// The topic is re-parsed from the first 2 bytes via a zero-copy
-    /// `Bytes::slice` read for `TopicRegistry::lookup` — no `String`
-    /// allocation on the receive path.
-    pub framed: Bytes,
+/// **`Publish`** — a published frame forwarded to another worker for
+/// fan-out to that worker's local subscribers. Receiving workers call
+/// `deliver_framed_local` and do NOT re-broadcast (loop protection).
+///
+/// **`SubGained` / `SubLost`** — subscription-interest notifications.
+/// When a worker's subscriber count for a pattern transitions 0↔non-zero,
+/// it broadcasts the change so other workers can skip it during fan-out
+/// if it has no matching subscribers. This avoids sending `Publish`
+/// messages to workers that have nobody listening for the topic.
+#[derive(Clone)]
+pub enum InterWorkerMsg {
+    /// Pre-encoded wire frame for delivery to local subscribers.
+    Publish {
+        framed: Bytes,
+    },
+    /// Sender `worker_idx` now has ≥1 subscriber for `pattern`.
+    SubGained {
+        worker_idx: u16,
+        pattern: String,
+    },
+    /// Sender `worker_idx` has 0 subscribers for `pattern`.
+    SubLost {
+        worker_idx: u16,
+        pattern: String,
+    },
+    /// Sender `worker_idx` gained a consumer-group member.
+    /// Worker 0 uses this to maintain a global member registry.
+    GroupGained {
+        worker_idx: u16,
+        topic: String,
+        group: String,
+        conn_idx: usize,
+        stream_id: u64,
+        consumer_id: String,
+    },
+    /// Sender `worker_idx` lost a consumer-group member.
+    GroupLost {
+        worker_idx: u16,
+        topic: String,
+        group: String,
+        consumer_id: String,
+    },
+    /// Deliver a framed publish to one consumer-group member.
+    /// `target = None`: worker 0 should decide and route.
+    /// `target = Some(conn_idx, stream_id)`: deliver to this specific member.
+    GroupDeliver {
+        framed: Bytes,
+        target: Option<(usize, u64)>,
+    },
 }
 
 // ── FrameContext & OutgoingFrame ──────────────────────────────────
@@ -167,7 +200,54 @@ struct GroupLocal {
     rr_idx: usize,
 }
 
+/// A consumer-group member tracked in worker 0's global registry.
+/// Unlike `GroupMember`, this carries `worker_idx` so worker 0 knows
+/// which worker owns the connection.
+struct GlobalGroupMember {
+    worker_idx: u16,
+    conn_idx: usize,
+    stream_id: u64,
+    consumer_id: String,
+}
+
 // ── VireonDispatcher ──────────────────────────────────────────────
+
+/// Per-connection metrics. Single-threaded (owned by one worker's
+/// dispatcher), so plain `u64` — no atomics needed. Logged at close
+/// time for observability; a future enhancement can aggregate them into
+/// the shared [`ServerMetrics`] for the `/metrics` endpoint.
+#[derive(Debug, Default, Clone)]
+pub struct ConnMetrics {
+    /// Publish frames received from this connection.
+    pub publishes_in: u64,
+    /// Delivery frames sent to this connection.
+    pub deliveries_out: u64,
+    /// Bytes received via publish payloads.
+    pub bytes_in: u64,
+    /// Bytes sent via delivery payloads.
+    pub bytes_out: u64,
+    /// Publishes rejected (ACL, quota, backpressure).
+    pub publishes_rejected: u64,
+}
+
+impl ConnMetrics {
+    /// Record an incoming publish of `payload_len` bytes.
+    pub fn record_publish_in(&mut self, payload_len: usize) {
+        self.publishes_in += 1;
+        self.bytes_in += payload_len as u64;
+    }
+
+    /// Record an outgoing delivery of `payload_len` bytes.
+    pub fn record_delivery_out(&mut self, payload_len: usize) {
+        self.deliveries_out += 1;
+        self.bytes_out += payload_len as u64;
+    }
+
+    /// Record a rejected publish.
+    pub fn record_reject(&mut self) {
+        self.publishes_rejected += 1;
+    }
+}
 
 /// Production dispatcher that routes frames by [`MessageType`] to the
 /// appropriate application-layer module(s).
@@ -183,6 +263,22 @@ pub struct VireonDispatcher {
 
     /// Queued outgoing frames, drained by the stack after each recv.
     outbox: Vec<OutgoingFrame>,
+    /// Reusable scratch for consumer-group fan-out targets.
+    /// Avoids a `Vec::new()` allocation per publish in the group fan-out
+    /// loop (handle_publish runs thousands of times/sec under load).
+    group_targets_scratch: Vec<(usize, u64)>,
+    /// Reusable scratch for cross-worker inbox drain. Avoids
+    /// `Vec::with_capacity(8192)` allocation per tick — the inbox is
+    /// usually empty, and even when it's not the capacity grows once
+    /// and is reused across calls.
+    worker_inbox_scratch: Vec<InterWorkerMsg>,
+    /// Reusable scratch for cluster inbox drain. Same rationale as
+    /// `worker_inbox_scratch` — avoids `Vec::with_capacity(1024)` per
+    /// tick when the cluster inbox is usually empty.
+    cluster_inbox_scratch: Vec<InterNodeMessage>,
+    /// Per-connection metrics (`conn_idx → ConnMetrics`). Single-threaded
+    /// per worker. Removed on [`Self::on_close_conn`]. Logged at close.
+    conn_metrics: FxHashMap<usize, ConnMetrics>,
     /// Per-(conn_idx, QUIC-stream) response sequence counter.
     next_seq: FxHashMap<(usize, u64), Seq>,
 
@@ -232,6 +328,14 @@ pub struct VireonDispatcher {
     /// matches Vireon's thread-per-core design. Cross-worker sharing
     /// is a P5/P6 concern.
     wal: Option<wal_store::FileStore>,
+    /// Where consumer-offsets snapshots are persisted. `None` when no
+    /// WAL is configured (consumer positions are then ephemeral).
+    /// Lives next to the WAL: `<wal_root>/worker_<id>/offsets.dat`.
+    offsets_path: Option<std::path::PathBuf>,
+    /// Per-(topic, consumer_id) ack tracking. Auto-updated when the
+    /// server delivers to a group member so that on restart the
+    /// consumer resumes from `last_acked.next()` rather than `OLDEST`.
+    consumer_offsets: wal_store::ConsumerOffsets,
 
     /// [application-layer] Consumer-group coordinator — tracks group
     /// membership, generations, and partition assignment for load-
@@ -243,6 +347,15 @@ pub struct VireonDispatcher {
     /// strings so publish fan-out can iterate groups for a topic without
     /// constructing typed wrappers on the hot path.
     group_locals: FxHashMap<(String, String), GroupLocal>,
+    /// Global consumer-group member registry — only populated on worker 0.
+    /// Maps (topic, group) → all members across ALL workers. Used by
+    /// `do_group_delivery` for global round-robin so that each publish
+    /// is delivered to exactly one member regardless of which worker
+    /// the member's connection lives on.
+    remote_group_members: FxHashMap<(String, String), Vec<GlobalGroupMember>>,
+    /// Global round-robin counter per (topic, group). Only used by
+    /// worker 0 in `do_group_delivery`.
+    group_rr: FxHashMap<(String, String), usize>,
     /// Per-connection group memberships — used to leave all groups on
     /// disconnect. Each entry is `(topic, group_id, consumer_id)`.
     conn_group_keys: FxHashMap<usize, Vec<(String, String, ConsumerId)>>,
@@ -269,12 +382,19 @@ pub struct VireonDispatcher {
     /// Outboxes to all workers for pub/sub fan-out. Index = worker
     /// reactor_id. The sender at `worker_self_idx` is skipped during
     /// broadcast. Empty in single-worker mode.
-    worker_outboxes: Vec<mpsc::SyncSender<InterWorkerPublish>>,
+    worker_outboxes: Vec<mpsc::SyncSender<InterWorkerMsg>>,
     /// Inbox of forwarded publishes from other workers. Drained in
     /// [`Self::drain_worker_inbox`]. `None` in single-worker mode.
-    worker_inbox: Option<mpsc::Receiver<InterWorkerPublish>>,
+    worker_inbox: Option<mpsc::Receiver<InterWorkerMsg>>,
     /// This worker's reactor_id — used to skip self when broadcasting.
     worker_self_idx: usize,
+    /// Last time a cluster heartbeat was broadcast. Worker 0 is the
+    /// designated heart-beater; other workers skip the send to avoid
+    /// N×redundant datagrams.
+    last_heartbeat_send: Option<std::time::Instant>,
+    /// Last time `tick_health` ran the failure detector. Throttled to
+    /// `heartbeat_interval` to avoid scanning on every reactor tick.
+    last_health_check: Option<std::time::Instant>,
     /// Aggregate count of cross-worker inbox-full drops. Logged at most
     /// once every `WORKER_DROP_LOG_COOLDOWN` via [`worker_drop_cooldown`]
     /// — a sustained burst otherwise produces hundreds of identical WARN
@@ -282,6 +402,16 @@ pub struct VireonDispatcher {
     worker_drop_count: u64,
     /// Time-based throttle for worker-inbox-full warnings.
     worker_drop_cooldown: crate::log_throttle::Cooldown,
+    /// Which **remote** workers have subscribers for which patterns.
+    /// Maps pattern → bitmap of interested worker indices (bit i = worker i).
+    /// Used to skip workers without matching subscribers during cross-worker
+    /// fan-out — avoids sending `Publish` to workers that have nobody
+    /// listening for the topic.
+    remote_pattern_interest: FxHashMap<pubsub_engine::TopicPattern, u32>,
+    /// Cache: topic → worker bitmap for cross-worker fan-out. Avoids
+    /// iterating `remote_pattern_interest` + calling `TopicPattern::matches`
+    /// on every publish. Invalidated (cleared) on SubGained/SubLost.
+    topic_worker_bitmap_cache: FxHashMap<String, u32>,
     /// ── per-frame error throttles ────────────────────────────────
     /// Persistently misbehaving clients (malformed payloads, denied
     /// topics, stuck WAL disk) can fire warn!/info! per inbound frame.
@@ -330,6 +460,14 @@ pub struct VireonDispatcher {
     // Eliminates per-publish Vec allocation in the fan-out path.
     // clear() + split().freeze() produces a Bytes without allocating.
     encode_scratch: BytesMut,
+    /// Reusable scratch buffer for JSON ACK responses. Same clear +
+    /// split().freeze() pattern as `encode_scratch` — zero allocation
+    /// per ACK after warmup.
+    ack_scratch: BytesMut,
+    /// Optional tamper-evident audit log. Records security-relevant
+    /// events (ACL denies, quota rejections, topic lifecycle). `None`
+    /// when `--audit-log` is not configured.
+    audit_log: Option<crate::audit::AuditLog>,
 }
 
 /// Minimum gap between cross-worker drop warning logs.
@@ -351,6 +489,10 @@ impl VireonDispatcher {
             pubsub_registry: TopicRegistry::new(PubSubConfig::new()),
             topic_catalog: TopicCatalog::new(),
             outbox: Vec::new(),
+            group_targets_scratch: Vec::with_capacity(8),
+            worker_inbox_scratch: Vec::new(),
+            cluster_inbox_scratch: Vec::new(),
+            conn_metrics: FxHashMap::default(),
             next_seq: FxHashMap::default(),
             send_policy: SendPolicyTable::new(),
             egress_quic_streams: FxHashMap::default(),
@@ -378,6 +520,8 @@ impl VireonDispatcher {
             wal: None,
             groups: GroupCoordinator::new(),
             group_locals: FxHashMap::default(),
+            remote_group_members: FxHashMap::default(),
+            group_rr: FxHashMap::default(),
             conn_group_keys: FxHashMap::default(),
             coordinator: None,
             node_id: session_registry::NodeId::NIL,
@@ -386,8 +530,12 @@ impl VireonDispatcher {
             worker_outboxes: Vec::new(),
             worker_inbox: None,
             worker_self_idx: 0,
+            last_heartbeat_send: None,
+            last_health_check: None,
             worker_drop_count: 0,
             worker_drop_cooldown: crate::log_throttle::Cooldown::new(WORKER_DROP_LOG_COOLDOWN),
+            remote_pattern_interest: FxHashMap::default(),
+            topic_worker_bitmap_cache: FxHashMap::default(),
             // Per-class throttles. `every` values chosen so that under
             // a sustained ~5k frames/s/conn burst we still see ~5
             // log lines/s per category — enough to diagnose without
@@ -404,12 +552,16 @@ impl VireonDispatcher {
             wal_retention: wal_store::RetentionPolicy::keep_forever(),
             wal_retention_last_run: None,
             wal_sweep_interval: Duration::from_secs(60),
+            offsets_path: None,
+            consumer_offsets: wal_store::ConsumerOffsets::new(),
             max_topics: None,
             max_subscribers_per_topic: None,
             pattern_sub_counts: FxHashMap::default(),
             quota_topic_rejects: 0,
             quota_subscriber_rejects: 0,
             encode_scratch: BytesMut::new(),
+            ack_scratch: BytesMut::new(),
+            audit_log: None,
         }
     }
 
@@ -438,6 +590,33 @@ impl VireonDispatcher {
         );
     }
 
+    /// Assembles a JSON ACK from literal + dynamic parts into the
+    /// reusable `ack_scratch` buffer and returns it as `Bytes`.
+    ///
+    /// The `split().freeze()` pattern reuses the buffer's capacity —
+    /// zero allocation per ACK after warmup (unlike `format!` which
+    /// allocates a new String every call).
+    fn ack_parts(&mut self, parts: &[&[u8]]) -> Bytes {
+        self.ack_scratch.clear();
+        for p in parts {
+            self.ack_scratch.extend_from_slice(p);
+        }
+        self.ack_scratch.split().freeze()
+    }
+
+    /// Convenience: enqueues a JSON ACK built from `parts` as the
+    /// response payload for `msg_type`.
+    fn send_ack(
+        &mut self,
+        ctx: &FrameContext,
+        logical_stream: StreamId,
+        msg_type: MessageType,
+        parts: &[&[u8]],
+    ) {
+        let payload = self.ack_parts(parts);
+        self.enqueue_response(ctx, logical_stream, msg_type, payload);
+    }
+
     /// Enqueues a frame targeting an explicit connection + QUIC stream.
     /// Used for both same-connection responses and cross-connection delivery.
     fn enqueue_frame(
@@ -448,6 +627,14 @@ impl VireonDispatcher {
         msg_type: MessageType,
         payload: Bytes,
     ) {
+        // Record per-connection delivery metrics for publish deliveries.
+        if msg_type == MessageType::Publish {
+            let plen = payload.len();
+            self.conn_metrics
+                .entry(conn_idx)
+                .or_default()
+                .record_delivery_out(plen);
+        }
         let seq = self
             .next_seq
             .entry((conn_idx, quic_stream_id))
@@ -499,6 +686,39 @@ impl VireonDispatcher {
     #[allow(dead_code)]
     pub fn set_wal(&mut self, wal: wal_store::FileStore) {
         self.wal = Some(wal);
+    }
+
+    /// Sets the loaded consumer-offsets map + the on-disk path the
+    /// periodic sweeper should write snapshots to. Called once during
+    /// startup after [`Self::set_wal`].
+    pub fn set_consumer_offsets(
+        &mut self,
+        offsets: wal_store::ConsumerOffsets,
+        path: std::path::PathBuf,
+    ) {
+        self.consumer_offsets = offsets;
+        self.offsets_path = Some(path);
+    }
+
+    /// Persists consumer offsets to disk immediately. Called from the
+    /// shutdown path (`VireonStack` entering `Draining`) so the last
+    /// batch of acks isn't lost between periodic sweeps.
+    pub fn save_offsets(&self) {
+        if let Some(path) = self.offsets_path.as_ref() {
+            if let Err(e) = self.consumer_offsets.save_to(path) {
+                tracing::warn!(
+                    path = ?path,
+                    error = %e,
+                    "[shutdown] consumer-offsets snapshot failed — previous snapshot retained"
+                );
+            }
+        }
+    }
+
+    /// Attaches an audit log. Once set, security-relevant events are
+    /// hash-chained to the log.
+    pub fn set_audit_log(&mut self, log: crate::audit::AuditLog) {
+        self.audit_log = Some(log);
     }
 
     /// Sets the retention policy applied to the WAL by the periodic
@@ -565,8 +785,8 @@ impl VireonDispatcher {
     pub fn set_worker_channels(
         &mut self,
         self_idx: usize,
-        inbox: mpsc::Receiver<InterWorkerPublish>,
-        outboxes: Vec<mpsc::SyncSender<InterWorkerPublish>>,
+        inbox: mpsc::Receiver<InterWorkerMsg>,
+        outboxes: Vec<mpsc::SyncSender<InterWorkerMsg>>,
     ) {
         self.worker_self_idx = self_idx;
         self.worker_inbox = Some(inbox);
@@ -809,7 +1029,7 @@ impl VireonDispatcher {
                     Some(t) => t,
                     None => return,
                 };
-                self.handle_publish(ctx, frame.stream_id, &topic, payload);
+                self.handle_publish(ctx, frame.stream_id, topic, payload);
             }
             Ok(Some(ParsedPayload::TopicCreate(TopicCreatePayload {
                 topic,
@@ -823,7 +1043,7 @@ impl VireonDispatcher {
                     Some(t) => t,
                     None => return,
                 };
-                self.handle_topic_delete(ctx, frame.stream_id, &topic);
+                self.handle_topic_delete(ctx, frame.stream_id, topic);
             }
             Ok(Some(other)) => {
                 if self.decode_drop.tick() {
@@ -880,10 +1100,16 @@ impl VireonDispatcher {
                     "[acl] subscribe denied (logging every 256th)"
                 );
             }
-            let ack = format!(
-                "{{\"error\":\"denied\",\"action\":\"subscribe\",\"pattern\":\"{pattern_str}\"}}"
+            self.send_ack(
+                ctx,
+                stream,
+                MessageType::Subscribe,
+                &[
+                    b"{\"error\":\"denied\",\"action\":\"subscribe\",\"pattern\":\"",
+                    pattern_str.as_bytes(),
+                    b"\"}",
+                ],
             );
-            self.enqueue_response(ctx, stream, MessageType::Subscribe, Bytes::from(ack));
             return;
         }
         match TopicPattern::new(pattern_str) {
@@ -912,14 +1138,19 @@ impl VireonDispatcher {
                                 "[quota] subscribe rejected — max_subscribers_per_topic reached"
                             );
                         }
-                        let ack = format!(
-                            "{{\"error\":\"quota_exceeded\",\"limit\":\"max_subscribers_per_topic\",\"cap\":{cap},\"pattern\":\"{pattern_str}\"}}"
-                        );
-                        self.enqueue_response(
+                        let mut cap_buf = itoa::Buffer::new();
+                        let cap_s = cap_buf.format(cap);
+                        self.send_ack(
                             ctx,
                             stream,
                             MessageType::Subscribe,
-                            Bytes::from(ack),
+                            &[
+                                b"{\"error\":\"quota_exceeded\",\"limit\":\"max_subscribers_per_topic\",\"cap\":",
+                                cap_s.as_bytes(),
+                                b",\"pattern\":\"",
+                                pattern_str.as_bytes(),
+                                b"\"}",
+                            ],
                         );
                         return;
                     }
@@ -939,10 +1170,24 @@ impl VireonDispatcher {
                 }
                 // Bump per-pattern subscriber counter for quota accounting.
                 // Only reached on successful registry insertion.
-                *self
+                let entry = self
                     .pattern_sub_counts
                     .entry(pattern_str.to_string())
-                    .or_insert(0) += 1;
+                    .or_insert(0);
+                let was_zero = *entry == 0;
+                *entry += 1;
+                // Notify other workers that this worker now has interest
+                // in this pattern (0→1 transition). Skips heartbeat probes
+                // to avoid churning the inter-worker channel.
+                if was_zero
+                    && !pattern_str.starts_with("_heartbeat.")
+                    && !self.worker_outboxes.is_empty()
+                {
+                    self.broadcast_worker_msg(InterWorkerMsg::SubGained {
+                        worker_idx: self.worker_self_idx as u16,
+                        pattern: pattern_str.to_string(),
+                    });
+                }
                 // The SDK's dead-peer probe re-subscribes to
                 // `_heartbeat.probe` every ~1 s per connection. Logging
                 // it at INFO drowns real subscribe events — drop to DEBUG.
@@ -990,8 +1235,12 @@ impl VireonDispatcher {
                     }
                 }
 
-                let ack = format!("{{\"subscribed\":\"{pattern_str}\"}}");
-                self.enqueue_response(ctx, stream, MessageType::Subscribe, Bytes::from(ack));
+                self.send_ack(
+                    ctx,
+                    stream,
+                    MessageType::Subscribe,
+                    &[b"{\"subscribed\":\"", pattern_str.as_bytes(), b"\"}"],
+                );
             }
             Err(e) => {
                 if self.invalid_pattern_drop.tick() {
@@ -1023,6 +1272,15 @@ impl VireonDispatcher {
                     // Drop empty entries so the map stays bounded under
                     // pattern churn.
                     self.pattern_sub_counts.remove(pattern_str);
+                    // Notify other workers that this worker lost interest.
+                    if !pattern_str.starts_with("_heartbeat.")
+                        && !self.worker_outboxes.is_empty()
+                    {
+                        self.broadcast_worker_msg(InterWorkerMsg::SubLost {
+                            worker_idx: self.worker_self_idx as u16,
+                            pattern: pattern_str.to_string(),
+                        });
+                    }
                 }
             }
         }
@@ -1033,8 +1291,20 @@ impl VireonDispatcher {
             active = self.pubsub_registry.len(),
             "[pubsub] unsubscribe"
         );
-        let ack = format!("{{\"unsubscribed\":\"{pattern_str}\",\"removed\":{removed}}}");
-        self.enqueue_response(ctx, stream, MessageType::Unsubscribe, Bytes::from(ack));
+        let mut rbuf = itoa::Buffer::new();
+        let r = rbuf.format(removed);
+        self.send_ack(
+            ctx,
+            stream,
+            MessageType::Unsubscribe,
+            &[
+                b"{\"unsubscribed\":\"",
+                pattern_str.as_bytes(),
+                b"\",\"removed\":",
+                r.as_bytes(),
+                b"}",
+            ],
+        );
     }
 
     /// Fans a published payload out to every subscriber whose pattern matches
@@ -1043,7 +1313,7 @@ impl VireonDispatcher {
         &mut self,
         ctx: &FrameContext,
         stream: StreamId,
-        topic: &pubsub_engine::Topic,
+        topic: &str,
         payload: &[u8],
     ) {
         // Phase 7: check Publish against the ACL before fan-out. Skip
@@ -1051,9 +1321,10 @@ impl VireonDispatcher {
         // invisible to subscribers. The check uses the concrete topic
         // string (not the publisher's pattern, which isn't known).
         if !self
-            .check_acl(ctx.conn_idx, Action::Publish, topic.as_str())
+            .check_acl(ctx.conn_idx, Action::Publish, topic)
             .is_allow()
         {
+            self.conn_metrics.entry(ctx.conn_idx).or_default().record_reject();
             if self.acl_denied_drop.tick() {
                 tracing::info!(
                     conn_idx = ctx.conn_idx,
@@ -1062,11 +1333,33 @@ impl VireonDispatcher {
                     "[acl] publish denied (logging every 256th)"
                 );
             }
-            let ack =
-                format!("{{\"error\":\"denied\",\"action\":\"publish\",\"topic\":\"{topic}\"}}");
-            self.enqueue_response(ctx, stream, MessageType::Publish, Bytes::from(ack));
+            if let Some(log) = &mut self.audit_log {
+                let actor = format!("conn:{}", ctx.conn_idx);
+                let _ = log.record(
+                    crate::audit::AuditKind::AclPublishDenied,
+                    crate::audit::AuditResult::Denied,
+                    &actor,
+                    topic,
+                );
+            }
+            self.send_ack(
+                ctx,
+                stream,
+                MessageType::Publish,
+                &[
+                    b"{\"error\":\"denied\",\"action\":\"publish\",\"topic\":\"",
+                    topic.as_bytes(),
+                    b"\"}",
+                ],
+            );
             return;
         }
+
+        // Record per-connection publish-in metric.
+        self.conn_metrics
+            .entry(ctx.conn_idx)
+            .or_default()
+            .record_publish_in(payload.len());
 
         // Copy payload once — the &[u8] points into the io_uring buffer
         // pool which gets recycled after this function returns. All
@@ -1079,18 +1372,24 @@ impl VireonDispatcher {
         // locally + fan out to remote subscribers) or another node
         // (forward the publish via UDP).
         if let Some(coord) = &self.coordinator {
-            let decision = coord.route_publish(topic.as_str());
+            let decision = coord.route_publish(topic);
+            // Hoist ONE Arc<str> allocation for the topic — every
+            // InterNodeMessage we construct below (publish/fanout) and
+            // every msg.clone() in the fan-out loops reuses this via
+            // refcount bump instead of deep-allocating Strings.
+            let topic_arc: Arc<str> = Arc::from(topic);
             match decision {
                 PublishDecision::Forward { owner } => {
                     // Send the publish to the owning node via UDP.
                     // The owner will fan out to its local subscribers
-                    // + any other nodes with remote interest.
+                    // + any other nodes with remote interest (but will
+                    // skip us — we deliver locally below).
                     if let Some(tx) = &self.cluster_outgoing_tx {
                         let msg = InterNodeMessage::publish(
                             self.node_id,
                             ctx.conn_idx as u32,
                             ctx.quic_stream_id,
-                            topic.as_str().to_string(),
+                            topic_arc.clone(),
                             payload_bytes.clone(),
                         );
                         let _ = tx.send(OutgoingMsg { msg, target: owner });
@@ -1099,28 +1398,59 @@ impl VireonDispatcher {
                         conn_idx = ctx.conn_idx,
                         topic = %topic,
                         owner = %owner.raw(),
-                        "[cluster] publish forwarded to owner"
+                        "[cluster] publish forwarded to owner (also delivering locally)"
                     );
-                    // Do not deliver locally — the owner handles it.
-                    return;
+                    // Fall through to local delivery — our subscribers
+                    // get the publish immediately without waiting for
+                    // the owner's round-trip fanout.
                 }
-                PublishDecision::Own { remote_targets } => {
+                PublishDecision::Own {
+                    remote_targets,
+                    replicas,
+                } => {
+                    // Replication: forward the publish to replica
+                    // nodes for durability. Fire-and-forget — the
+                    // replicas append to their own WAL asynchronously.
+                    if !replicas.is_empty() {
+                        if let Some(tx) = &self.cluster_outgoing_tx {
+                            let msg = InterNodeMessage::publish(
+                                self.node_id,
+                                ctx.conn_idx as u32,
+                                ctx.quic_stream_id,
+                                topic_arc.clone(),
+                                payload_bytes.clone(),
+                            );
+                            for target in &replicas {
+                                let _ = tx.send(OutgoingMsg {
+                                    msg: msg.clone(),
+                                    target: *target,
+                                });
+                            }
+                            tracing::trace!(
+                                topic = %topic,
+                                replicas = replicas.len(),
+                                "[cluster] publish replicated to backup nodes"
+                            );
+                        }
+                    }
                     // Fan out to remote subscribers via UDP. Each
                     // remote target is a node whose local subscribers
-                    // want this topic.
+                    // want this topic. Skip nodes that are also replicas —
+                    // they receive Publish (which triggers cluster_deliver_local
+                    // including subscriber delivery), so a Fanout would
+                    // double-deliver.
                     if let Some(tx) = &self.cluster_outgoing_tx {
-                        // Origin = this node (we own the topic and are
-                        // delivering to local subscribers). The remote
-                        // nodes will use the origin back-route for
-                        // any acks.
                         let msg = InterNodeMessage::fanout(
                             self.node_id,
                             ctx.conn_idx as u32,
                             ctx.quic_stream_id,
-                            topic.as_str().to_string(),
+                            topic_arc.clone(),
                             payload_bytes.clone(),
                         );
                         for target in remote_targets {
+                            if replicas.contains(&target) {
+                                continue;
+                            }
                             let _ = tx.send(OutgoingMsg {
                                 msg: msg.clone(),
                                 target,
@@ -1149,7 +1479,7 @@ impl VireonDispatcher {
 
         // Re-encode as a Publish frame so downstream subscribers receive the
         // same wire shape the publisher used (topic_len + topic + payload).
-        let topic_str = topic.as_str();
+        let topic_str = topic;
         self.encode_scratch.clear();
         self.encode_scratch
             .extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
@@ -1162,8 +1492,13 @@ impl VireonDispatcher {
         // the message still reaches live subscribers. Subscribers that
         // later `Fetch(offset)` for this entry will see a gap; that is
         // preferable to dropping the live fan-out, which has no recovery
-        // path. The `topic.as_str()` invariant (validated at publish
+        // path. The `topic` invariant (validated at publish
         // entry) guarantees the topic is also a valid WAL key.
+        //
+        // `wal_offset` is lifted out so the consumer-group fan-out
+        // below can auto-ack the chosen member at the right offset
+        // (without it, restart would replay from OLDEST).
+        let mut wal_offset: Option<wal_store::Offset> = None;
         if let Some(wal) = &mut self.wal {
             let now_ns = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1178,6 +1513,7 @@ impl VireonDispatcher {
                         offset = offset.get(),
                         "[wal] appended"
                     );
+                    wal_offset = Some(offset);
                 }
                 Err(e) => {
                     if self.wal_fail_drop.tick() {
@@ -1204,63 +1540,121 @@ impl VireonDispatcher {
             );
         }
 
-        // P5: consumer-group fan-out — for each group on this topic,
-        // deliver to exactly one local member (round-robin) so the group
-        // load-balances across its members. The selected consumer may
-        // be on the same connection as the publisher; we still deliver
-        // in that case (the consumer is a different logical subscriber).
-        let mut group_targets: Vec<(usize, u64)> = Vec::new();
-        for ((t, _g), local) in &mut self.group_locals {
-            if t.as_str() != topic_str || local.members.is_empty() {
-                continue;
-            }
-            let idx = local.rr_idx % local.members.len();
-            local.rr_idx = local.rr_idx.wrapping_add(1);
-            let m = &local.members[idx];
-            group_targets.push((m.conn_idx, m.quic_stream_id));
-        }
-        for (conn_idx, quic_stream_id) in group_targets {
-            self.enqueue_frame(
-                conn_idx,
-                quic_stream_id,
-                stream,
-                MessageType::Publish,
-                bytes.clone(),
-            );
-        }
-
-        // Cross-worker fan-out: broadcast to all other workers so their
-        // local subscribers receive this publish. `try_send` is
-        // non-blocking — a full inbox drops the publish rather than
-        // stalling the reactor thread.
+        // P5: consumer-group delivery.
         //
-        // Forward the already-encoded `bytes` (a `Bytes` handle) — worker
-        // B's clone is a refcount bump with zero memcpy. Previously this
-        // re-allocated a `String` topic + `Bytes::copy_from_slice(payload)`
-        // and worker B then re-encoded the wire frame from scratch (3×
-        // memcpy per delivered frame). At high throughput that path was
-        // the #1 CPU hotspot in multi-worker mode (~18% of total cycles).
-        if !self.worker_outboxes.is_empty() {
-            for (i, outbox) in self.worker_outboxes.iter().enumerate() {
-                if i == self.worker_self_idx {
+        // In single-worker mode: local round-robin via group_locals.
+        //
+        // In multi-worker mode: worker 0 does global round-robin via
+        // remote_group_members; other workers forward to worker 0 via
+        // GroupDeliver. This ensures exactly one delivery per publish
+        // regardless of which worker the group members live on.
+        if self.worker_outboxes.is_empty() {
+            // Single-worker: inline local delivery (hot path).
+            self.group_targets_scratch.clear();
+            for ((t, _g), local) in &mut self.group_locals {
+                if t.as_str() != topic_str || local.members.is_empty() {
                     continue;
                 }
-                if let Err(std::sync::mpsc::TrySendError::Full(_)) =
-                    outbox.try_send(InterWorkerPublish {
-                        framed: bytes.clone(),
-                    })
-                {
-                    self.worker_drop_count = self.worker_drop_count.wrapping_add(1);
-                    if self.worker_drop_cooldown.tick() {
-                        tracing::warn!(
-                            worker = i,
-                            total_drops = self.worker_drop_count,
-                            "[pubsub] worker inbox full — dropping publishes \
-                             (raise cap in build_inter_worker_pubsub_channels)"
-                        );
+                let idx = local.rr_idx % local.members.len();
+                local.rr_idx = local.rr_idx.wrapping_add(1);
+                let m = &local.members[idx];
+                if let Some(off) = wal_offset {
+                    self.consumer_offsets.ack(topic_str, m.consumer.as_str(), off);
+                }
+                self.group_targets_scratch.push((m.conn_idx, m.quic_stream_id));
+            }
+            let group_len = self.group_targets_scratch.len();
+            for i in 0..group_len {
+                let (conn_idx, quic_stream_id) = self.group_targets_scratch[i];
+                self.enqueue_frame(
+                    conn_idx,
+                    quic_stream_id,
+                    stream,
+                    MessageType::Publish,
+                    bytes.clone(),
+                );
+            }
+        } else if self.worker_self_idx == 0 {
+            self.do_group_delivery(bytes.clone());
+        } else if let Some(outbox) = self.worker_outboxes.first() {
+            let _ = outbox.try_send(InterWorkerMsg::GroupDeliver {
+                framed: bytes.clone(),
+                target: None,
+            });
+        } else {
+            tracing::error!("worker_outboxes empty in group-deliver path — skipping");
+        }
+
+        // Cross-worker fan-out: send to other workers that have subscribers
+        // matching this topic. We skip workers with no matching patterns
+        // (tracked via SubGained/SubLost messages) to avoid wasting CPU on
+        // try_send + drain + lookup for workers that have nobody listening.
+        //
+        // Forward the already-encoded `bytes` (a `Bytes` handle) — worker
+        // B's clone is a refcount bump with zero memcpy.
+        if !self.worker_outboxes.is_empty() {
+            // Compute which workers have ≥1 pattern matching this topic.
+            let target_bitmap = self.matching_worker_bitmap(topic);
+            if target_bitmap != 0 {
+                for (i, outbox) in self.worker_outboxes.iter().enumerate() {
+                    if i == self.worker_self_idx {
+                        continue;
+                    }
+                    if (target_bitmap & (1u32 << i)) == 0 {
+                        continue;
+                    }
+                    if let Err(std::sync::mpsc::TrySendError::Full(_)) =
+                        outbox.try_send(InterWorkerMsg::Publish {
+                            framed: bytes.clone(),
+                        })
+                    {
+                        self.worker_drop_count = self.worker_drop_count.wrapping_add(1);
+                        if self.worker_drop_cooldown.tick() {
+                            tracing::warn!(
+                                worker = i,
+                                total_drops = self.worker_drop_count,
+                                "[pubsub] worker inbox full — dropping publishes \
+                                 (raise cap in build_inter_worker_pubsub_channels)"
+                            );
+                        }
                     }
                 }
             }
+        }
+    }
+
+    /// Compute the bitmap of remote workers whose subscribed patterns
+    /// match `topic`. Returns 0 when no remote worker has a matching
+    /// subscriber — caller skips the fan-out entirely.
+    ///
+    /// Iterates over `remote_pattern_interest` (typically a small map,
+    /// one entry per distinct pattern across all workers) and checks
+    /// each pattern against `topic` via `TopicPattern::matches`.
+    fn matching_worker_bitmap(&mut self, topic: &str) -> u32 {
+        // Fast path: cache hit (common case — publishes go to a small
+        // number of distinct topics, so the hit rate is very high).
+        if let Some(&bm) = self.topic_worker_bitmap_cache.get(topic) {
+            return bm;
+        }
+        // Cache miss: compute by iterating remote_pattern_interest.
+        let mut bitmap: u32 = 0;
+        for (pattern, &mask) in self.remote_pattern_interest.iter() {
+            if pattern.matches(topic) {
+                bitmap |= mask;
+            }
+        }
+        self.topic_worker_bitmap_cache.insert(topic.to_string(), bitmap);
+        bitmap
+    }
+
+    /// Broadcast a non-publish inter-worker message to all other workers.
+    /// Used for SubGained/SubLost notifications. `try_send` is non-blocking.
+    fn broadcast_worker_msg(&self, msg: InterWorkerMsg) {
+        for (i, outbox) in self.worker_outboxes.iter().enumerate() {
+            if i == self.worker_self_idx {
+                continue;
+            }
+            let _ = outbox.try_send(msg.clone());
         }
     }
 
@@ -1268,9 +1662,17 @@ impl VireonDispatcher {
     /// invalid names so dispatch callers can early-return without
     /// enqueuing an error ack (the rejection is silent at the protocol
     /// level — only the operator sees the warning).
-    fn validate_topic_or_log(&self, ctx: &FrameContext, raw: &str) -> Option<pubsub_engine::Topic> {
-        match pubsub_engine::Topic::new(raw) {
-            Ok(t) => Some(t),
+    ///
+    /// Returns the validated `&str` (no allocation) instead of an owned
+    /// `Topic` — the publish hot path calls this thousands of times/sec
+    /// and the old `Topic::new` allocated a `String` per publish.
+    fn validate_topic_or_log<'a>(
+        &self,
+        ctx: &FrameContext,
+        raw: &'a str,
+    ) -> Option<&'a str> {
+        match pubsub_engine::Topic::validate(raw) {
+            Ok(()) => Some(raw),
             Err(e) => {
                 tracing::warn!(
                     conn_idx = ctx.conn_idx,
@@ -1305,10 +1707,16 @@ impl VireonDispatcher {
                 topic = %topic,
                 "[acl] topic_create denied"
             );
-            let ack = format!(
-                "{{\"error\":\"denied\",\"action\":\"topic_create\",\"topic\":\"{topic}\"}}"
+            self.send_ack(
+                ctx,
+                stream,
+                MessageType::TopicCreate,
+                &[
+                    b"{\"error\":\"denied\",\"action\":\"topic_create\",\"topic\":\"",
+                    topic.as_bytes(),
+                    b"\"}",
+                ],
             );
-            self.enqueue_response(ctx, stream, MessageType::TopicCreate, Bytes::from(ack));
             return;
         }
         // Resource quota: max-topics. Skip the check when the topic is
@@ -1326,10 +1734,20 @@ impl VireonDispatcher {
                     rejects = self.quota_topic_rejects,
                     "[quota] topic_create rejected — max_topics reached"
                 );
-                let ack = format!(
-                    "{{\"error\":\"quota_exceeded\",\"limit\":\"max_topics\",\"cap\":{cap},\"topic\":\"{topic}\"}}"
+                let mut cap_buf = itoa::Buffer::new();
+                let cap_s = cap_buf.format(cap);
+                self.send_ack(
+                    ctx,
+                    stream,
+                    MessageType::TopicCreate,
+                    &[
+                        b"{\"error\":\"quota_exceeded\",\"limit\":\"max_topics\",\"cap\":",
+                        cap_s.as_bytes(),
+                        b",\"topic\":\"",
+                        topic.as_bytes(),
+                        b"\"}",
+                    ],
                 );
-                self.enqueue_response(ctx, stream, MessageType::TopicCreate, Bytes::from(ack));
                 return;
             }
         }
@@ -1346,8 +1764,21 @@ impl VireonDispatcher {
             total_topics = self.topic_catalog.len(),
             "[pubsub] TopicCreate"
         );
-        let ack = format!("{{\"topic_created\":\"{topic}\"}}");
-        self.enqueue_response(ctx, stream, MessageType::TopicCreate, Bytes::from(ack));
+        if let Some(log) = &mut self.audit_log {
+            let actor = format!("conn:{}", ctx.conn_idx);
+            let _ = log.record(
+                crate::audit::AuditKind::TopicCreated,
+                crate::audit::AuditResult::Allowed,
+                &actor,
+                topic,
+            );
+        }
+        self.send_ack(
+            ctx,
+            stream,
+            MessageType::TopicCreate,
+            &[b"{\"topic_created\":\"", topic.as_bytes(), b"\"}"],
+        );
     }
 
     /// Removes a topic from the catalog.
@@ -1355,14 +1786,14 @@ impl VireonDispatcher {
         &mut self,
         ctx: &FrameContext,
         stream: StreamId,
-        topic: &pubsub_engine::Topic,
+        topic: &str,
     ) {
         // Phase 7: TopicDelete is the most dangerous operation (it can
         // wipe subscriber state), so its ACL action is separate from
         // TopicCreate. Deny returns an error ack and skips the catalog
         // mutation.
         if !self
-            .check_acl(ctx.conn_idx, Action::TopicDelete, topic.as_str())
+            .check_acl(ctx.conn_idx, Action::TopicDelete, topic)
             .is_allow()
         {
             tracing::info!(
@@ -1370,13 +1801,19 @@ impl VireonDispatcher {
                 topic = %topic,
                 "[acl] topic_delete denied"
             );
-            let ack = format!(
-                "{{\"error\":\"denied\",\"action\":\"topic_delete\",\"topic\":\"{topic}\"}}"
+            self.send_ack(
+                ctx,
+                stream,
+                MessageType::TopicDelete,
+                &[
+                    b"{\"error\":\"denied\",\"action\":\"topic_delete\",\"topic\":\"",
+                    topic.as_bytes(),
+                    b"\"}",
+                ],
             );
-            self.enqueue_response(ctx, stream, MessageType::TopicDelete, Bytes::from(ack));
             return;
         }
-        let existed = self.topic_catalog.delete(topic.as_str());
+        let existed = self.topic_catalog.delete(topic);
         tracing::info!(
             conn_idx = ctx.conn_idx,
             topic = %topic,
@@ -1384,8 +1821,28 @@ impl VireonDispatcher {
             total_topics = self.topic_catalog.len(),
             "[pubsub] TopicDelete"
         );
-        let ack = format!("{{\"topic_deleted\":\"{topic}\",\"existed\":{existed}}}");
-        self.enqueue_response(ctx, stream, MessageType::TopicDelete, Bytes::from(ack));
+        if let Some(log) = &mut self.audit_log {
+            let actor = format!("conn:{}", ctx.conn_idx);
+            let _ = log.record(
+                crate::audit::AuditKind::TopicDeleted,
+                crate::audit::AuditResult::Allowed,
+                &actor,
+                topic,
+            );
+        }
+        let existed_str = if existed { b"true" as &[u8] } else { b"false" };
+        self.send_ack(
+            ctx,
+            stream,
+            MessageType::TopicDelete,
+            &[
+                b"{\"topic_deleted\":\"",
+                topic.as_bytes(),
+                b"\",\"existed\":",
+                existed_str,
+                b"}",
+            ],
+        );
     }
 
     /// Processes a `Handshake` frame: extract the claimed
@@ -1464,12 +1921,13 @@ impl VireonDispatcher {
                     version = ?hs.version,
                     "[auth] handshake ok — principal bound to connection"
                 );
-                let ack = format!("{{\"ok\":true,\"principal\":{}}}", resolved.raw());
-                self.enqueue_response(
+                let mut pbuf = itoa::Buffer::new();
+                let p = pbuf.format(resolved.raw());
+                self.send_ack(
                     ctx,
                     frame.stream_id,
                     MessageType::Handshake,
-                    Bytes::from(ack),
+                    &[b"{\"ok\":true,\"principal\":", p.as_bytes(), b"}"],
                 );
             }
             Err(e) => {
@@ -1561,12 +2019,15 @@ impl VireonDispatcher {
                 error = ?e,
                 "[wal] fetch on invalid topic name"
             );
-            let ack = format!("{{\"error\":\"invalid_topic\",\"topic\":\"{topic_str}\"}}");
-            self.enqueue_response(
+            self.send_ack(
                 ctx,
                 frame.stream_id,
                 MessageType::FetchReply,
-                Bytes::from(ack),
+                &[
+                    b"{\"error\":\"invalid_topic\",\"topic\":\"",
+                    topic_str.as_bytes(),
+                    b"\"}",
+                ],
             );
             return;
         }
@@ -1581,13 +2042,15 @@ impl VireonDispatcher {
                 topic = topic_str,
                 "[acl] fetch denied"
             );
-            let ack =
-                format!("{{\"error\":\"denied\",\"action\":\"fetch\",\"topic\":\"{topic_str}\"}}");
-            self.enqueue_response(
+            self.send_ack(
                 ctx,
                 frame.stream_id,
                 MessageType::FetchReply,
-                Bytes::from(ack),
+                &[
+                    b"{\"error\":\"denied\",\"action\":\"fetch\",\"topic\":\"",
+                    topic_str.as_bytes(),
+                    b"\"}",
+                ],
             );
             return;
         }
@@ -1639,12 +2102,15 @@ impl VireonDispatcher {
                     error = ?e,
                     "[wal] read_range failed"
                 );
-                let ack = format!("{{\"error\":\"read_failed\",\"topic\":\"{topic_str}\"}}");
-                self.enqueue_response(
+                self.send_ack(
                     ctx,
                     frame.stream_id,
                     MessageType::FetchReply,
-                    Bytes::from(ack),
+                    &[
+                        b"{\"error\":\"read_failed\",\"topic\":\"",
+                        topic_str.as_bytes(),
+                        b"\"}",
+                    ],
                 );
                 return;
             }
@@ -1720,6 +2186,39 @@ impl VireonDispatcher {
         let consumer = std::str::from_utf8(&payload[pos..pos + clen]).ok()?;
         pos += clen;
         Some((topic, group, consumer, &payload[pos..]))
+    }
+
+    /// Records (or updates) a consumer-group member in worker 0's global
+    /// registry. Deduplicates by `(worker_idx, consumer_id)`: if the
+    /// member already exists, updates its `conn_idx`/`stream_id`
+    /// (handles reconnection to a new QUIC connection on the same worker).
+    fn record_global_member(
+        &mut self,
+        worker_idx: u16,
+        topic: &str,
+        group: &str,
+        conn_idx: usize,
+        stream_id: u64,
+        consumer_id: &str,
+    ) {
+        let entry = self
+            .remote_group_members
+            .entry((topic.to_string(), group.to_string()))
+            .or_default();
+        if let Some(m) = entry
+            .iter_mut()
+            .find(|m| m.consumer_id == consumer_id && m.worker_idx == worker_idx)
+        {
+            m.conn_idx = conn_idx;
+            m.stream_id = stream_id;
+        } else {
+            entry.push(GlobalGroupMember {
+                worker_idx,
+                conn_idx,
+                stream_id,
+                consumer_id: consumer_id.to_string(),
+            });
+        }
     }
 
     /// Handles `ConsumerGroupJoin`. Parses the payload, calls the group
@@ -1809,16 +2308,44 @@ impl VireonDispatcher {
                 members: Vec::new(),
                 rr_idx: 0,
             });
+        let should_broadcast;
         if let Some(existing) = local.members.iter_mut().find(|m| m.consumer == consumer_id) {
             // Re-join from an existing consumer: update conn_idx/stream
-            // (handles reconnection to a new QUIC connection).
+            // (handles reconnection to a new QUIC connection). Only
+            // broadcast if the connection actually changed.
+            should_broadcast =
+                existing.conn_idx != ctx.conn_idx || existing.quic_stream_id != ctx.quic_stream_id;
             existing.conn_idx = ctx.conn_idx;
             existing.quic_stream_id = ctx.quic_stream_id;
         } else {
+            should_broadcast = true;
             local.members.push(GroupMember {
                 conn_idx: ctx.conn_idx,
                 quic_stream_id: ctx.quic_stream_id,
                 consumer: consumer_id.clone(),
+            });
+        }
+        // Notify other workers (and update worker 0's local global registry).
+        // Skipped on heartbeat re-joins (same conn) to avoid flooding the
+        // inter-worker channels.
+        if should_broadcast && !self.worker_outboxes.is_empty() {
+            if self.worker_self_idx == 0 {
+                self.record_global_member(
+                    0,
+                    topic,
+                    group,
+                    ctx.conn_idx,
+                    ctx.quic_stream_id,
+                    consumer_id.as_str(),
+                );
+            }
+            self.broadcast_worker_msg(InterWorkerMsg::GroupGained {
+                worker_idx: self.worker_self_idx as u16,
+                topic: topic.to_string(),
+                group: group.to_string(),
+                conn_idx: ctx.conn_idx,
+                stream_id: ctx.quic_stream_id,
+                consumer_id: consumer_id.to_string(),
             });
         }
         let group_key = (topic.to_string(), group.to_string(), consumer_id);
@@ -1833,12 +2360,21 @@ impl VireonDispatcher {
             generation = generation,
             "[groups] join"
         );
-        let ack = format!(r#"{{"joined":"{topic}","group":"{group}","generation":{generation}}}"#);
-        self.enqueue_response(
+        let mut gbuf = itoa::Buffer::new();
+        let g = gbuf.format(generation);
+        self.send_ack(
             ctx,
             frame.stream_id,
             MessageType::ConsumerGroupJoin,
-            Bytes::from(ack),
+            &[
+                b"{\"joined\":\"",
+                topic.as_bytes(),
+                b"\",\"group\":\"",
+                group.as_bytes(),
+                b"\",\"generation\":",
+                g.as_bytes(),
+                b"}",
+            ],
         );
     }
 
@@ -1892,12 +2428,17 @@ impl VireonDispatcher {
             group = group,
             "[groups] leave"
         );
-        let ack = format!(r#"{{"left":"{topic}","group":"{group}"}}"#);
-        self.enqueue_response(
+        self.send_ack(
             ctx,
             frame.stream_id,
             MessageType::ConsumerGroupLeave,
-            Bytes::from(ack),
+            &[
+                b"{\"left\":\"",
+                topic.as_bytes(),
+                b"\",\"group\":\"",
+                group.as_bytes(),
+                b"\"}",
+            ],
         );
     }
 
@@ -1958,14 +2499,21 @@ impl VireonDispatcher {
             .heartbeat(topic, &group_id, &consumer_id, generation, now_ns)
         {
             Ok(cur_gen) => {
-                let ack = format!(
-                    r#"{{"heartbeat":"{topic}","group":"{group}","generation":{cur_gen}}}"#
-                );
-                self.enqueue_response(
+                let mut gbuf = itoa::Buffer::new();
+                let g = gbuf.format(cur_gen);
+                self.send_ack(
                     ctx,
                     frame.stream_id,
                     MessageType::ConsumerGroupHeartbeat,
-                    Bytes::from(ack),
+                    &[
+                        b"{\"heartbeat\":\"",
+                        topic.as_bytes(),
+                        b"\",\"group\":\"",
+                        group.as_bytes(),
+                        b"\",\"generation\":",
+                        g.as_bytes(),
+                        b"}",
+                    ],
                 );
             }
             Err(e) => {
@@ -1977,12 +2525,11 @@ impl VireonDispatcher {
                         "[groups] heartbeat failed (logging every 64th)"
                     );
                 }
-                let ack = r#"{"error":"heartbeat_failed"}"#.to_string();
                 self.enqueue_response(
                     ctx,
                     frame.stream_id,
                     MessageType::ConsumerGroupHeartbeat,
-                    Bytes::from(ack),
+                    Bytes::from_static(br#"{"error":"heartbeat_failed"}"#),
                 );
             }
         }
@@ -1993,14 +2540,41 @@ impl VireonDispatcher {
     /// entirely so publish fan-out skips it.
     fn remove_group_member(&mut self, topic: &str, group: &str, consumer: &ConsumerId) {
         let key = (topic.to_string(), group.to_string());
+        let mut was_present = false;
         if let Some(local) = self.group_locals.get_mut(&key) {
+            let before = local.members.len();
             local
                 .members
                 .retain(|m| m.consumer.as_str() != consumer.as_str());
+            was_present = local.members.len() < before;
             if local.members.is_empty() {
                 self.group_locals.remove(&key);
             } else if local.rr_idx >= local.members.len() {
                 local.rr_idx = 0;
+            }
+        }
+        if was_present {
+            // Update worker 0's global registry
+            if self.worker_self_idx == 0 {
+                if let Some(members) = self.remote_group_members.get_mut(&key) {
+                    members.retain(|m| {
+                        !(m.consumer_id == consumer.as_str()
+                            && m.worker_idx == self.worker_self_idx as u16)
+                    });
+                    if members.is_empty() {
+                        self.remote_group_members.remove(&key);
+                        self.group_rr.remove(&key);
+                    }
+                }
+            }
+            // Notify other workers
+            if !self.worker_outboxes.is_empty() {
+                self.broadcast_worker_msg(InterWorkerMsg::GroupLost {
+                    worker_idx: self.worker_self_idx as u16,
+                    topic: topic.to_string(),
+                    group: group.to_string(),
+                    consumer_id: consumer.as_str().to_string(),
+                });
             }
         }
     }
@@ -2064,28 +2638,102 @@ impl VireonDispatcher {
     ///   coordinator's `RemoteSubscriberRegistry`.
     /// * `Unsubscribe` — a non-owner is dropping remote interest.
     pub fn drain_cluster_inbox(&mut self) {
-        // Drain into a local Vec first to release the borrow on
+        // Drain into a reusable scratch Vec — releases the borrow on
         // `self.cluster_incoming_rx` before we call back into
-        // `self.cluster_deliver_local` / `self.coordinator`.
+        // `self.cluster_deliver_local` / `self.coordinator`, and avoids
+        // `Vec::with_capacity(1024)` per tick (cluster inbox is usually
+        // empty outside of high-throughput forwarded-publish scenarios).
         const CLUSTER_DRAIN_CAP: usize = 1024;
-        let mut batch: Vec<InterNodeMessage> = Vec::with_capacity(CLUSTER_DRAIN_CAP);
+        self.cluster_inbox_scratch.clear();
         if let Some(rx) = &mut self.cluster_incoming_rx {
-            while batch.len() < CLUSTER_DRAIN_CAP {
+            while self.cluster_inbox_scratch.len() < CLUSTER_DRAIN_CAP {
                 match rx.try_recv() {
-                    Ok(msg) => batch.push(msg),
+                    Ok(msg) => self.cluster_inbox_scratch.push(msg),
                     Err(_) => break,
                 }
             }
         }
-        if batch.is_empty() {
+        if self.cluster_inbox_scratch.is_empty() {
             return;
         }
-        let processed = batch.len();
-        for msg in batch {
+        let processed = self.cluster_inbox_scratch.len();
+        for i in 0..processed {
+            let msg = std::mem::replace(
+                &mut self.cluster_inbox_scratch[i],
+                InterNodeMessage::publish(
+                    session_registry::NodeId::nil(),
+                    0,
+                    0,
+                    Arc::<str>::from("_"),
+                    Bytes::new(),
+                ),
+            );
             match msg.kind {
-                cluster_coordinator::InterNodeKind::Publish
-                | cluster_coordinator::InterNodeKind::Fanout => {
-                    self.cluster_deliver_local(
+                cluster_coordinator::InterNodeKind::Publish => {
+                    // The owner received a forwarded publish. Fan out
+                    // to remote subscribers (nodes whose local clients
+                    // subscribed to this topic) before local delivery.
+                    // Without this, a publish forwarded from a
+                    // non-owner node never reaches subscribers on
+                    // other nodes — the original Forward only sends
+                    // to the owner, and cluster_deliver_local only
+                    // checks local subscribers.
+                    //
+                    // Only the OWNER re-fans. Replicas receiving a
+                    // replicated Publish must NOT re-fan (the owner
+                    // already sent Fanout to all remote targets).
+                    if let Some(coord) = &self.coordinator {
+                        if coord.owns_topic(&msg.topic_or_pattern) {
+                            let remote_targets =
+                                coord.collect_remote_targets(&msg.topic_or_pattern);
+                            // Skip the origin node — it already delivered
+                            // locally when it forwarded the publish to us.
+                            let fanout_targets: Vec<_> = remote_targets
+                                .into_iter()
+                                .filter(|&t| t != msg.origin_node)
+                                .collect();
+                            if !fanout_targets.is_empty() {
+                                if let Some(tx) = &self.cluster_outgoing_tx {
+                                    let fanout = cluster_coordinator::InterNodeMessage::fanout(
+                                        msg.origin_node,
+                                        msg.origin_conn_idx,
+                                        msg.origin_stream_id,
+                                        msg.topic_or_pattern.clone(),
+                                        msg.payload.clone(),
+                                    );
+                                    for target in fanout_targets {
+                                        let _ = tx.send(OutgoingMsg {
+                                            msg: fanout.clone(),
+                                            target,
+                                        });
+                                    }
+                                    tracing::trace!(
+                                        topic = %msg.topic_or_pattern,
+                                        "[cluster] forwarded publish re-fanned to remote subscribers"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if let Some(bytes) = self.cluster_deliver_local(
+                        &msg.topic_or_pattern,
+                        &msg.payload,
+                        msg.origin_conn_idx,
+                        msg.origin_stream_id,
+                    ) {
+                        // Consumer-group delivery: worker 0 only (or any
+                        // worker in single-worker mode).
+                        if self.worker_outboxes.is_empty() || self.worker_self_idx == 0 {
+                            self.do_group_delivery(bytes);
+                        }
+                    }
+                }
+                cluster_coordinator::InterNodeKind::Fanout => {
+                    // Fanout messages are already targeted at nodes with
+                    // subscribers — deliver locally only (no re-fanout,
+                    // which would create forwarding loops). Group delivery
+                    // was already done by the owner's Publish handler.
+                    let _ = self.cluster_deliver_local(
                         &msg.topic_or_pattern,
                         &msg.payload,
                         msg.origin_conn_idx,
@@ -2126,25 +2774,106 @@ impl VireonDispatcher {
                         );
                     }
                 }
+                cluster_coordinator::InterNodeKind::Heartbeat => {
+                    if let Some(coord) = &mut self.coordinator {
+                        coord.record_heartbeat(msg.origin_node);
+                    }
+                }
+                cluster_coordinator::InterNodeKind::NodeDown => {
+                    // Gossip: mark the dead node (origin_node = dead node)
+                    // down so ownership shifts to the next node on the
+                    // ring. Convergence: once enough nodes agree, the
+                    // dead node is fully removed from routing tables.
+                    if let Some(coord) = &mut self.coordinator {
+                        let dropped = coord.mark_node_down(msg.origin_node);
+                        tracing::info!(
+                            dead_node = msg.origin_node.raw(),
+                            dropped_subs = dropped,
+                            "[cluster] node-down gossip received, marked dead"
+                        );
+                    }
+                }
             }
         }
         tracing::trace!(processed, "[cluster] inbox drained");
+    }
+
+    /// Drives the cluster heartbeat + failure-detection cycle.
+    ///
+    /// Called from [`ApplicationLayer::on_batch_tick`] (which fires on
+    /// every reactor tick). To avoid redundant work:
+    ///
+    /// * **Heartbeat send** runs at most once per `heartbeat_interval`.
+    ///   Only **worker 0** sends (or the sole worker in single-worker
+    ///   mode) so N workers don't emit N× redundant datagrams.
+    /// * **Health check** (`tick_health`) also runs at most once per
+    ///   `heartbeat_interval` — scans the failure detector and marks
+    ///   down any peer that hasn't heartbeated within `heartbeat_timeout`.
+    ///   For each newly-dead node, a `NodeDown` gossip is broadcast so
+    ///   the rest of the cluster converges on removal.
+    pub fn tick_cluster_health(&mut self) {
+        let now = std::time::Instant::now();
+        let Some(coord) = &mut self.coordinator else {
+            return; // single-node mode
+        };
+        let interval = coord.heartbeat_interval();
+        let due = self.last_health_check.map_or(true, |t| now.duration_since(t) >= interval);
+        if !due {
+            return;
+        }
+        self.last_health_check = Some(now);
+
+        // Worker 0 (or sole worker) broadcasts heartbeats to all peers.
+        let is_heartbeater = self.worker_outboxes.is_empty() || self.worker_self_idx == 0;
+        if is_heartbeater {
+            if let Some(tx) = &self.cluster_outgoing_tx {
+                let hb = cluster_coordinator::InterNodeMessage::heartbeat(self.node_id);
+                let peers = coord.membership().alive_nodes();
+                for peer in peers {
+                    if peer != self.node_id {
+                        let _ = tx.send(OutgoingMsg { msg: hb.clone(), target: peer });
+                    }
+                }
+            }
+            self.last_heartbeat_send = Some(now);
+        }
+
+        // Check for expired nodes.
+        let expired = coord.tick_health();
+        if !expired.is_empty() {
+            // Broadcast NodeDown gossip for each expired node.
+            if let Some(tx) = &self.cluster_outgoing_tx {
+                for &dead in &expired {
+                    let gossip =
+                        cluster_coordinator::InterNodeMessage::node_down(self.node_id, dead);
+                    let peers = coord.membership().alive_nodes();
+                    for peer in peers {
+                        if peer != self.node_id {
+                            let _ = tx.send(OutgoingMsg { msg: gossip.clone(), target: peer });
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Delivers an inter-node Publish/Fanout payload to local
     /// subscribers. Mirrors the wire encoding used by `handle_publish`:
     /// `topic_len(u16) | topic | payload`.
     ///
+    /// Returns the framed `Bytes` on success so the caller can pass it
+    /// to `do_group_delivery` for consumer-group delivery (worker 0 only).
+    ///
     /// Inter-node delivered messages do NOT re-trigger cluster
     /// routing (that would loop): this method consults only the local
-    /// `pubsub_registry` + `group_locals`.
+    /// `pubsub_registry`.
     fn cluster_deliver_local(
         &mut self,
         topic: &str,
         payload: &[u8],
         _origin_conn_idx: u32,
         _origin_stream_id: u64,
-    ) {
+    ) -> Option<Bytes> {
         let topic_ref = match pubsub_engine::Topic::new(topic) {
             Ok(t) => t,
             Err(e) => {
@@ -2153,12 +2882,12 @@ impl VireonDispatcher {
                     error = ?e,
                     "[cluster] incoming publish has invalid topic — dropping"
                 );
-                return;
+                return None;
             }
         };
         let targets: Vec<Subscriber> = self
             .pubsub_registry
-            .lookup(&topic_ref)
+            .lookup(topic_ref.as_str())
             .into_iter()
             .collect();
 
@@ -2171,6 +2900,25 @@ impl VireonDispatcher {
         self.encode_scratch.extend_from_slice(topic_str.as_bytes());
         self.encode_scratch.extend_from_slice(payload);
         let bytes = self.encode_scratch.split().freeze();
+
+        // WAL append: when a publish arrives via the cluster (either
+        // forwarded to the owner or replicated to a backup), persist
+        // it locally. This gives the cluster durable storage without
+        // requiring a separate replication transport.
+        if let Some(wal) = &mut self.wal {
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            let record = wal_store::WalRecord::new(now_ns, bytes.clone());
+            if let Err(e) = wal.append(topic_str, record) {
+                tracing::warn!(
+                    topic = topic_str,
+                    error = ?e,
+                    "[cluster] WAL append failed for incoming publish"
+                );
+            }
+        }
 
         // Use a synthetic logical stream for inter-node-delivered
         // publishes — they aren't bound to a particular subscriber's
@@ -2187,26 +2935,9 @@ impl VireonDispatcher {
             );
         }
 
-        // Consumer-group fan-out (P5) — mirror handle_publish.
-        let mut group_targets: Vec<(usize, u64)> = Vec::new();
-        for ((t, _g), local) in &mut self.group_locals {
-            if t.as_str() != topic_str || local.members.is_empty() {
-                continue;
-            }
-            let idx = local.rr_idx % local.members.len();
-            local.rr_idx = local.rr_idx.wrapping_add(1);
-            let m = &local.members[idx];
-            group_targets.push((m.conn_idx, m.quic_stream_id));
-        }
-        for (conn_idx, quic_stream_id) in group_targets {
-            self.enqueue_frame(
-                conn_idx,
-                quic_stream_id,
-                stream,
-                MessageType::Publish,
-                bytes.clone(),
-            );
-        }
+        // Consumer-group delivery is handled by the caller via
+        // do_group_delivery (worker 0 only).
+        Some(bytes)
     }
 
     /// Drains forwarded publishes from other workers and delivers them
@@ -2220,24 +2951,228 @@ impl VireonDispatcher {
         let Some(rx) = &mut self.worker_inbox else {
             return;
         };
-        const CAP: usize = 1024;
-        let mut batch: Vec<InterWorkerPublish> = Vec::with_capacity(CAP);
-        while batch.len() < CAP {
+        const CAP: usize = 32_768;
+        self.worker_inbox_scratch.clear();
+        while self.worker_inbox_scratch.len() < CAP {
             match rx.try_recv() {
-                Ok(msg) => batch.push(msg),
+                Ok(msg) => self.worker_inbox_scratch.push(msg),
                 Err(_) => break,
             }
         }
-        if batch.is_empty() {
+        if self.worker_inbox_scratch.is_empty() {
             return;
         }
+        let count = self.worker_inbox_scratch.len();
         tracing::debug!(
             worker = self.worker_self_idx,
-            count = batch.len(),
+            count,
             "[pubsub] worker inbox drained"
         );
-        for msg in batch {
-            self.deliver_framed_local(msg.framed);
+        // Process by index — `self` is borrowed mutably inside the
+        // match arms, so we can't use `for msg in batch.drain(..)` with
+        // a self-reference in the same closure.
+        for i in 0..count {
+            let msg = std::mem::replace(
+                &mut self.worker_inbox_scratch[i],
+                InterWorkerMsg::Publish {
+                    framed: Bytes::new(),
+                },
+            );
+            match msg {
+                InterWorkerMsg::Publish { framed } => {
+                    self.deliver_framed_local(framed);
+                }
+                InterWorkerMsg::SubGained { worker_idx, pattern } => {
+                    if let Ok(pat) = pubsub_engine::TopicPattern::new(&pattern) {
+                        let bit = 1u32 << worker_idx;
+                        *self
+                            .remote_pattern_interest
+                            .entry(pat)
+                            .or_insert(0) |= bit;
+                    }
+                    self.topic_worker_bitmap_cache.clear();
+                }
+                InterWorkerMsg::SubLost { worker_idx, pattern } => {
+                    if let Ok(pat) = pubsub_engine::TopicPattern::new(&pattern) {
+                        if let Some(bitmap) = self.remote_pattern_interest.get_mut(&pat) {
+                            *bitmap &= !(1u32 << worker_idx);
+                            if *bitmap == 0 {
+                                self.remote_pattern_interest.remove(&pat);
+                            }
+                        }
+                    }
+                    self.topic_worker_bitmap_cache.clear();
+                }
+                InterWorkerMsg::GroupGained {
+                    worker_idx,
+                    topic,
+                    group,
+                    conn_idx,
+                    stream_id,
+                    consumer_id,
+                } => {
+                    // Only worker 0 maintains the global registry.
+                    if self.worker_self_idx == 0 {
+                        self.record_global_member(
+                            worker_idx,
+                            &topic,
+                            &group,
+                            conn_idx,
+                            stream_id,
+                            &consumer_id,
+                        );
+                    }
+                }
+                InterWorkerMsg::GroupLost {
+                    worker_idx,
+                    topic,
+                    group,
+                    consumer_id,
+                } => {
+                    if self.worker_self_idx == 0 {
+                        let key = (topic, group);
+                        if let Some(members) = self.remote_group_members.get_mut(&key) {
+                            members.retain(|m| {
+                                !(m.consumer_id == consumer_id && m.worker_idx == worker_idx)
+                            });
+                            if members.is_empty() {
+                                self.remote_group_members.remove(&key);
+                                self.group_rr.remove(&key);
+                            }
+                        }
+                    }
+                }
+                InterWorkerMsg::GroupDeliver { framed, target } => match target {
+                    Some((conn_idx, stream_id)) => {
+                        // Worker 0 routed a delivery to a member on this worker.
+                        let stream = StreamId::new(0xFFFF_FFFF);
+                        self.enqueue_frame(
+                            conn_idx,
+                            stream_id,
+                            stream,
+                            MessageType::Publish,
+                            framed,
+                        );
+                    }
+                    None => {
+                        // Another worker asks us (worker 0) to do global
+                        // group delivery.
+                        self.do_group_delivery(framed);
+                    }
+                },
+            }
+        }
+    }
+
+    /// Global consumer-group delivery. Parses the topic from `framed`
+    /// bytes (`[topic_len:u16 BE][topic][payload]`), finds all groups
+    /// matching the topic, picks one member per group via round-robin,
+    /// and delivers either locally (`enqueue_frame`) or remotely
+    /// (`GroupDeliver` with a targeted `Some(conn_idx, stream_id)`).
+    ///
+    /// Two code paths:
+    /// - **Multi-worker** (`remote_group_members` populated): worker 0
+    ///   does global round-robin across all workers' members.
+    /// - **Single-worker fallback** (no `remote_group_members`): local
+    ///   round-robin via `group_locals` — same as the inline code in
+    ///   `handle_publish`'s single-worker branch.
+    fn do_group_delivery(&mut self, framed: Bytes) {
+        // Parse topic from framed bytes.
+        if framed.len() < 2 {
+            return;
+        }
+        let topic_len = u16::from_be_bytes([framed[0], framed[1]]) as usize;
+        if framed.len() < 2 + topic_len {
+            return;
+        }
+        let topic_str = match std::str::from_utf8(&framed[2..2 + topic_len]) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        // Check if we have global members for this topic (multi-worker).
+        let has_global = self
+            .remote_group_members
+            .iter()
+            .any(|((t, _), m)| t.as_str() == topic_str && !m.is_empty());
+
+        if has_global {
+            // Multi-worker: global round-robin via remote_group_members.
+            // Phase 1: read-only scan.
+            enum Target {
+                Local(usize, u64),
+                Remote(u16, usize, u64),
+            }
+            let mut decisions: Vec<Target> = Vec::new();
+            let mut rr_updates: Vec<((String, String), usize)> = Vec::new();
+
+            for (key, members) in &self.remote_group_members {
+                if key.0.as_str() != topic_str || members.is_empty() {
+                    continue;
+                }
+                let rr = self.group_rr.get(key).copied().unwrap_or(0);
+                let idx = rr % members.len();
+                rr_updates.push((key.clone(), rr.wrapping_add(1)));
+                let m = &members[idx];
+                if m.worker_idx as usize == self.worker_self_idx {
+                    decisions.push(Target::Local(m.conn_idx, m.stream_id));
+                } else {
+                    decisions.push(Target::Remote(m.worker_idx, m.conn_idx, m.stream_id));
+                }
+            }
+
+            // Phase 2: apply rr updates.
+            for (key, new_rr) in rr_updates {
+                self.group_rr.insert(key, new_rr);
+            }
+
+            // Phase 3: execute.
+            let stream = StreamId::new(0xFFFF_FFFF);
+            for decision in decisions {
+                match decision {
+                    Target::Local(conn_idx, stream_id) => {
+                        self.enqueue_frame(
+                            conn_idx,
+                            stream_id,
+                            stream,
+                            MessageType::Publish,
+                            framed.clone(),
+                        );
+                    }
+                    Target::Remote(worker_idx, conn_idx, stream_id) => {
+                        if let Some(outbox) = self.worker_outboxes.get(worker_idx as usize) {
+                            let _ = outbox.try_send(InterWorkerMsg::GroupDeliver {
+                                framed: framed.clone(),
+                                target: Some((conn_idx, stream_id)),
+                            });
+                        }
+                    }
+                }
+            }
+        } else {
+            // Single-worker fallback: local round-robin via group_locals.
+            self.group_targets_scratch.clear();
+            for ((t, _g), local) in &mut self.group_locals {
+                if t.as_str() != topic_str || local.members.is_empty() {
+                    continue;
+                }
+                let idx = local.rr_idx % local.members.len();
+                local.rr_idx = local.rr_idx.wrapping_add(1);
+                let m = &local.members[idx];
+                self.group_targets_scratch.push((m.conn_idx, m.quic_stream_id));
+            }
+            let stream = StreamId::new(0xFFFF_FFFF);
+            let group_len = self.group_targets_scratch.len();
+            for i in 0..group_len {
+                let (conn_idx, stream_id) = self.group_targets_scratch[i];
+                self.enqueue_frame(
+                    conn_idx,
+                    stream_id,
+                    stream,
+                    MessageType::Publish,
+                    framed.clone(),
+                );
+            }
         }
     }
 
@@ -2252,8 +3187,9 @@ impl VireonDispatcher {
     /// slicing for the registry lookup, avoiding the `String` allocation
     /// the previous `cluster_deliver_local` path incurred.
     ///
-    /// Same semantics as `cluster_deliver_local` for the regular fan-out
-    /// AND consumer-group round-robin.
+    /// Same semantics as `cluster_deliver_local` for regular fan-out.
+    /// Consumer-group delivery is NOT handled here — it goes through
+    /// the `GroupDeliver` inter-worker path to worker 0.
     fn deliver_framed_local(&mut self, framed: Bytes) {
         // Zero-copy topic parse: first 2 bytes = topic_len BE, then topic.
         if framed.len() < 2 {
@@ -2281,7 +3217,7 @@ impl VireonDispatcher {
 
         let targets: Vec<Subscriber> = self
             .pubsub_registry
-            .lookup(&topic_ref)
+            .lookup(topic_ref.as_str())
             .into_iter()
             .collect();
 
@@ -2298,26 +3234,8 @@ impl VireonDispatcher {
             );
         }
 
-        // Consumer-group fan-out (P5) — same logic as `cluster_deliver_local`.
-        let mut group_targets: Vec<(usize, u64)> = Vec::new();
-        for ((t, _g), local) in &mut self.group_locals {
-            if t.as_str() != topic_str || local.members.is_empty() {
-                continue;
-            }
-            let idx = local.rr_idx % local.members.len();
-            local.rr_idx = local.rr_idx.wrapping_add(1);
-            let m = &local.members[idx];
-            group_targets.push((m.conn_idx, m.quic_stream_id));
-        }
-        for (conn_idx, quic_stream_id) in group_targets {
-            self.enqueue_frame(
-                conn_idx,
-                quic_stream_id,
-                stream,
-                MessageType::Publish,
-                framed.clone(),
-            );
-        }
+        // Consumer-group delivery is handled exclusively via the
+        // GroupDeliver path (see handle_publish → do_group_delivery).
     }
 
     /// Apply the configured WAL retention policy to every tracked
@@ -2329,13 +3247,12 @@ impl VireonDispatcher {
     /// [`wal_store::RetentionPolicy::apply`], and aggregates the
     /// removed-entry count for a single summary log line.
     fn maybe_run_wal_retention(&mut self) {
-        // Fast path: no WAL, no policy, or interval not yet elapsed.
-        if self.wal.is_none() {
+        // Fast path: no WAL — nothing to sweep, nothing to persist.
+        if self.wal.is_none() && self.offsets_path.is_none() {
             return;
         }
-        if self.wal_retention.max_bytes.is_none() && self.wal_retention.max_age_ns.is_none() {
-            return;
-        }
+        // Throttle interval applies to BOTH retention and offset-snapshot
+        // so the disk walk happens at most once per `wal_sweep_interval`.
         let now = Instant::now();
         let due = self.wal_retention_last_run.map_or(true, |t| {
             now.duration_since(t) >= self.wal_sweep_interval
@@ -2345,43 +3262,58 @@ impl VireonDispatcher {
         }
         self.wal_retention_last_run = Some(now);
 
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-
-        // Borrow-checker dance: split the wal mutably from the policy
-        // copy so `apply` can take &mut store + &policy by value.
-        let policy = self.wal_retention;
-        let Some(wal) = self.wal.as_mut() else {
-            return;
-        };
-        let topics = wal.topic_names();
-        if topics.is_empty() {
-            return;
-        }
-        let mut total_removed: usize = 0;
-        let mut errored: u64 = 0;
-        for topic in &topics {
-            match policy.apply::<wal_store::FileStore>(wal, topic, now_ns) {
-                Ok(stats) => total_removed = total_removed.saturating_add(stats.removed),
-                Err(_) => errored = errored.saturating_add(1),
+        // Run the retention walk only if a policy is configured. The
+        // common case (keep-forever) skips the directory walk entirely.
+        let has_policy = self.wal_retention.max_bytes.is_some()
+            || self.wal_retention.max_age_ns.is_some();
+        if has_policy {
+            if let Some(wal) = self.wal.as_mut() {
+                let now_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                let policy = self.wal_retention;
+                let topics = wal.topic_names();
+                if !topics.is_empty() {
+                    let mut total_removed: usize = 0;
+                    let mut errored: u64 = 0;
+                    for topic in &topics {
+                        match policy.apply::<wal_store::FileStore>(wal, topic, now_ns) {
+                            Ok(stats) => total_removed = total_removed.saturating_add(stats.removed),
+                            Err(_) => errored = errored.saturating_add(1),
+                        }
+                    }
+                    if total_removed > 0 || errored > 0 {
+                        tracing::info!(
+                            topics = topics.len(),
+                            removed = total_removed,
+                            errored,
+                            retained_bytes = wal.retained_bytes(),
+                            "[wal] retention sweep"
+                        );
+                    } else {
+                        tracing::debug!(
+                            topics = topics.len(),
+                            retained_bytes = wal.retained_bytes(),
+                            "[wal] retention sweep (no removals)"
+                        );
+                    }
+                }
             }
         }
-        if total_removed > 0 || errored > 0 {
-            tracing::info!(
-                topics = topics.len(),
-                removed = total_removed,
-                errored,
-                retained_bytes = wal.retained_bytes(),
-                "[wal] retention sweep"
-            );
-        } else {
-            tracing::debug!(
-                topics = topics.len(),
-                retained_bytes = wal.retained_bytes(),
-                "[wal] retention sweep (no removals)"
-            );
+
+        // Persist consumer offsets alongside the retention sweep. A
+        // failure here only risks at-least-once (replay restarts from
+        // the previous snapshot), so we warn-and-continue rather than
+        // surfacing an error that would abort the tick.
+        if let Some(path) = self.offsets_path.as_ref() {
+            if let Err(e) = self.consumer_offsets.save_to(path) {
+                tracing::warn!(
+                    path = ?path,
+                    error = %e,
+                    "[wal] consumer-offsets snapshot failed — previous snapshot retained"
+                );
+            }
         }
     }
 }
@@ -2479,11 +3411,36 @@ impl AppDispatcher for VireonDispatcher {
                     *count = count.saturating_sub(1);
                     if *count == 0 {
                         self.pattern_sub_counts.remove(pat);
+                        // Notify other workers that this worker lost interest.
+                        if !pat.starts_with("_heartbeat.")
+                            && !self.worker_outboxes.is_empty()
+                        {
+                            self.broadcast_worker_msg(InterWorkerMsg::SubLost {
+                                worker_idx: self.worker_self_idx as u16,
+                                pattern: pat.clone(),
+                            });
+                        }
                     }
                 }
             }
         }
         let principal = self.principals.remove(&conn_idx);
+
+        // Log + drop per-connection metrics on close.
+        if let Some(m) = self.conn_metrics.remove(&conn_idx) {
+            if m.publishes_in > 0 || m.deliveries_out > 0 || m.publishes_rejected > 0 {
+                tracing::info!(
+                    conn_idx,
+                    session_id = ?session_id,
+                    publishes_in = m.publishes_in,
+                    deliveries_out = m.deliveries_out,
+                    bytes_in = m.bytes_in,
+                    bytes_out = m.bytes_out,
+                    rejected = m.publishes_rejected,
+                    "[metrics] connection lifetime counters"
+                );
+            }
+        }
 
         // P5: leave all consumer groups the disconnected connection
         // was a member of.
@@ -2723,6 +3680,7 @@ impl ApplicationLayer {
         self.dispatcher.drain_cluster_inbox();
         self.dispatcher.drain_worker_inbox();
         self.dispatcher.maybe_run_wal_retention();
+        self.dispatcher.tick_cluster_health();
     }
 
     /// Drains queued outgoing frames produced by the dispatcher.
@@ -2772,6 +3730,45 @@ impl ApplicationLayer {
         );
     }
 
+    /// Rejects a publish because the server's subscriber-side send
+    /// backlog (`pending_sends`) has exceeded the backpressure
+    /// high-watermark. Enqueues a `backpressure` error ack on the
+    /// publisher's own stream and records the reject in per-connection
+    /// metrics. Non-fatal — the publisher may retry or drop per its
+    /// own policy.
+    ///
+    /// Called by the stack's frame-dispatch path before the publish
+    /// reaches fan-out, so no subscribers are touched.
+    pub fn reject_publish_backpressure(
+        &mut self,
+        conn_idx: usize,
+        quic_stream_id: u64,
+        logical_stream: StreamId,
+        topic: &str,
+    ) {
+        self.dispatcher
+            .conn_metrics
+            .entry(conn_idx)
+            .or_default()
+            .record_reject();
+        let ctx = FrameContext {
+            // Session id is unused by enqueue_frame; a fresh id is fine.
+            session_id: SessionId::new(),
+            conn_idx,
+            quic_stream_id,
+        };
+        self.dispatcher.send_ack(
+            &ctx,
+            logical_stream,
+            MessageType::Publish,
+            &[
+                b"{\"error\":\"backpressure\",\"action\":\"publish\",\"topic\":\"",
+                topic.as_bytes(),
+                b"\"}",
+            ],
+        );
+    }
+
     // ── Introspection ──────────────────────────────────────────────
 
     /// Returns the session table occupancy.
@@ -2813,6 +3810,28 @@ impl ApplicationLayer {
         self.dispatcher.set_wal_retention(policy);
     }
 
+    /// Delegates to [`VireonDispatcher::set_consumer_offsets`]. Loads
+    /// the persisted consumer-offsets map + records the path the
+    /// periodic sweeper should write snapshots to.
+    pub fn set_consumer_offsets(
+        &mut self,
+        offsets: wal_store::ConsumerOffsets,
+        path: std::path::PathBuf,
+    ) {
+        self.dispatcher.set_consumer_offsets(offsets, path);
+    }
+
+    /// Delegates to [`VireonDispatcher::save_offsets`]. Called from
+    /// the shutdown path to flush the latest acks before drain.
+    pub fn save_offsets(&self) {
+        self.dispatcher.save_offsets();
+    }
+
+    /// Delegates to [`VireonDispatcher::set_audit_log`].
+    pub fn set_audit_log(&mut self, log: crate::audit::AuditLog) {
+        self.dispatcher.set_audit_log(log);
+    }
+
     /// Delegates to [`VireonDispatcher::set_max_topics`].
     pub fn set_max_topics(&mut self, max: Option<usize>) {
         self.dispatcher.set_max_topics(max);
@@ -2843,8 +3862,8 @@ impl ApplicationLayer {
     pub fn set_worker_channels(
         &mut self,
         self_idx: usize,
-        inbox: mpsc::Receiver<InterWorkerPublish>,
-        outboxes: Vec<mpsc::SyncSender<InterWorkerPublish>>,
+        inbox: mpsc::Receiver<InterWorkerMsg>,
+        outboxes: Vec<mpsc::SyncSender<InterWorkerMsg>>,
     ) {
         self.dispatcher
             .set_worker_channels(self_idx, inbox, outboxes);
@@ -3303,7 +4322,7 @@ mod tests {
         // Publish to alerts.fire from a different conn (so the
         // self-skip filter doesn't apply).
         let topic = pubsub_engine::Topic::new("alerts.fire").unwrap();
-        d.handle_publish(&ctx(1, 200), StreamId::new(2), &topic, b"payload");
+        d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), b"payload");
 
         // Outbox: only the error ack, NO fan-out to subscriber.
         let out = drain_outbox_bytes(&mut d);
@@ -3325,7 +4344,7 @@ mod tests {
         let _ = d.drain_outbox();
 
         let topic = pubsub_engine::Topic::new("alerts.fire").unwrap();
-        d.handle_publish(&ctx(1, 200), StreamId::new(2), &topic, b"hi");
+        d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), b"hi");
 
         // Outbox: one Publish fan-out frame to conn 0 (the subscriber).
         let out = drain_outbox_bytes(&mut d);
@@ -3370,7 +4389,7 @@ mod tests {
         d.acl = stricter;
 
         let topic = pubsub_engine::Topic::new("admin.config").unwrap();
-        d.handle_topic_delete(&ctx(0, 100), StreamId::new(1), &topic);
+        d.handle_topic_delete(&ctx(0, 100), StreamId::new(1), topic.as_str());
 
         // Catalog still has the topic.
         assert_eq!(d.topic_catalog.len(), 1);
@@ -3544,7 +4563,7 @@ mod tests {
 
         let topic = pubsub_engine::Topic::new("sensor.temp").unwrap();
         for i in 0..5u8 {
-            d.handle_publish(&ctx(1, 200), StreamId::new(2), &topic, &[i]);
+            d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), &[i]);
         }
         // Drain the fan-out outbox so later asserts aren't muddled.
         let _ = d.drain_outbox();
@@ -3562,7 +4581,7 @@ mod tests {
         // Publish 5 entries on sensor.temp.
         let topic = pubsub_engine::Topic::new("sensor.temp").unwrap();
         for i in 0..5u8 {
-            d.handle_publish(&ctx(1, 200), StreamId::new(2), &topic, &[i]);
+            d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), &[i]);
         }
         let _ = d.drain_outbox();
 
@@ -3602,7 +4621,7 @@ mod tests {
         let mut d = VireonDispatcher::new();
 
         let topic = pubsub_engine::Topic::new("sensor.temp").unwrap();
-        d.handle_publish(&ctx(1, 200), StreamId::new(2), &topic, b"payload");
+        d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), b"payload");
         let pub_out = drain_outbox_bytes(&mut d);
         // No subscribers → no fan-out; zero frames queued by publish.
         assert!(
@@ -3636,7 +4655,7 @@ mod tests {
 
         let topic = pubsub_engine::Topic::new("sensor.temp").unwrap();
         for i in 0..20u8 {
-            d.handle_publish(&ctx(1, 200), StreamId::new(2), &topic, &[i]);
+            d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), &[i]);
         }
         let _ = d.drain_outbox();
 
@@ -3668,7 +4687,7 @@ mod tests {
         // Default policy = keep forever.
         let topic = pubsub_engine::Topic::new("sensor.temp").unwrap();
         for i in 0..10u8 {
-            d.handle_publish(&ctx(1, 200), StreamId::new(2), &topic, &[i]);
+            d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), &[i]);
         }
         let _ = d.drain_outbox();
 
@@ -3719,7 +4738,7 @@ mod tests {
         // Default: None = unlimited.
         for i in 0..100 {
             let topic = format!("topic.{i}");
-            d.handle_topic_create(&ctx(0, 100), StreamId::new(1), &topic, 1, 0);
+            d.handle_topic_create(&ctx(0, 100), StreamId::new(1), topic.as_str(), 1, 0);
         }
         let _ = d.drain_outbox();
         assert_eq!(d.topic_catalog.len(), 100);

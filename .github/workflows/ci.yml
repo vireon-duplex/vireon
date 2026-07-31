@@ -53,6 +53,47 @@ jobs:
     - name: Run tests
       run: cargo test --verbose --workspace
 
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@v3
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Install cargo-tarpaulin
+      run: cargo install cargo-tarpaulin
+
+    - name: Generate coverage report
+      run: cargo tarpaulin --workspace --timeout 120 --out xml --out html -- --workspace
+      continue-on-error: true
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v4
+      if: env.CODECOV_TOKEN != ''
+      with:
+        files: cobertura.xml
+        fail_ci_if_error: false
+      env:
+        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+    - name: Upload coverage artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-report
+        path: |
+          cobertura.xml
+          tarpaulin-report.html
+
   build:
     name: Build Release
     runs-on: ubuntu-latest

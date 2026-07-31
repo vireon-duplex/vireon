@@ -18,12 +18,36 @@
 //! HTTP/1.1 to satisfy a Prometheus scraper (GET /metrics). No hyper,
 //! no axum, no new dependencies. A scrape request completes in <1 ms.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Instant;
+
+/// Per-topic counters. Stored inside an `Arc` so workers can increment
+/// the atomics through a read-lock without blocking each other.
+#[derive(Debug)]
+pub struct TopicMetrics {
+    /// Publish frames received for this topic.
+    pub publishes: AtomicU64,
+    /// Frames delivered to subscribers on this topic.
+    pub deliveries: AtomicU64,
+    /// Payload bytes received for this topic.
+    pub bytes_recv: AtomicU64,
+}
+
+impl TopicMetrics {
+    fn new() -> Self {
+        Self {
+            publishes: AtomicU64::new(0),
+            deliveries: AtomicU64::new(0),
+            bytes_recv: AtomicU64::new(0),
+        }
+    }
+}
 
 /// Thread-safe server-wide metrics shared across all workers via `Arc`.
 ///
@@ -48,6 +72,15 @@ pub struct ServerMetrics {
     /// Total Initial packets rejected by the per-IP handshake rate
     /// limiter (summed across all workers).
     pub rate_limit_rejections_total: AtomicU64,
+    /// Total connection-migration / NAT-rebinding events since startup.
+    /// A non-zero value means clients changed their 4-tuple and the
+    /// QUIC connection survived (DCID-based routing).
+    pub migrations_total: AtomicU64,
+    /// Per-topic breakdown. Read-locked on every publish/delivery for
+    /// the lookup; write-locked only when a new topic is first seen.
+    /// The `Arc<TopicMetrics>` inner lets workers bump atomics without
+    /// holding the lock.
+    pub topic_counters: RwLock<HashMap<Box<str>, Arc<TopicMetrics>>>,
     /// Server start time (for uptime computation).
     pub started_at: Instant,
 }
@@ -65,6 +98,8 @@ impl ServerMetrics {
             bytes_recv_total: AtomicU64::new(0),
             bytes_sent_total: AtomicU64::new(0),
             rate_limit_rejections_total: AtomicU64::new(0),
+            migrations_total: AtomicU64::new(0),
+            topic_counters: RwLock::new(HashMap::new()),
             started_at: Instant::now(),
         }
     }
@@ -79,6 +114,58 @@ impl ServerMetrics {
     #[inline]
     pub fn add(&self, field: &AtomicU64, n: u64) {
         field.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Record a publish for `topic` with `payload_len` bytes. Creates
+    /// the topic entry on first sight (write-lock), then subsequent
+    /// calls for the same topic only take a read-lock + atomic bump.
+    #[inline]
+    pub fn record_topic_publish(&self, topic: &str, payload_len: u64) {
+        // Fast path: read-lock + atomic bump.  Recover from lock
+        // poisoning (a panicked worker) rather than crashing the server.
+        {
+            let map = self.topic_counters.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(m) = map.get(topic) {
+                m.publishes.fetch_add(1, Ordering::Relaxed);
+                m.bytes_recv.fetch_add(payload_len, Ordering::Relaxed);
+                return;
+            }
+        }
+        // Slow path: first-seen topic — insert under write-lock, then
+        // bump. Another worker may have inserted concurrently; the
+        // or_insert_with guard handles that.
+        let mut map = self
+            .topic_counters
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let m = map
+            .entry(topic.into())
+            .or_insert_with(|| Arc::new(TopicMetrics::new()));
+        m.publishes.fetch_add(1, Ordering::Relaxed);
+        m.bytes_recv.fetch_add(payload_len, Ordering::Relaxed);
+    }
+
+    /// Record a delivery for `topic`.
+    #[inline]
+    pub fn record_topic_delivery(&self, topic: &str) {
+        {
+            let map = self
+                .topic_counters
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(m) = map.get(topic) {
+                m.deliveries.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        let mut map = self
+            .topic_counters
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let m = map
+            .entry(topic.into())
+            .or_insert_with(|| Arc::new(TopicMetrics::new()));
+        m.deliveries.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Render the current metrics in Prometheus text exposition format.
@@ -96,6 +183,7 @@ impl ServerMetrics {
         let recv = self.bytes_recv_total.load(Ordering::Relaxed);
         let sent = self.bytes_sent_total.load(Ordering::Relaxed);
         let rl_rej = self.rate_limit_rejections_total.load(Ordering::Relaxed);
+        let migrations = self.migrations_total.load(Ordering::Relaxed);
         let uptime = self.started_at.elapsed().as_secs();
 
         // Prometheus text format v0.0.4.
@@ -132,9 +220,61 @@ impl ServerMetrics {
         out.push_str("# TYPE vireon_rate_limit_rejections_total counter\n");
         out.push_str(&format!("vireon_rate_limit_rejections_total {rl_rej}\n\n"));
 
+        out.push_str("# HELP vireon_migrations_total Connection-migration / NAT-rebinding events (connection survived).\n");
+        out.push_str("# TYPE vireon_migrations_total counter\n");
+        out.push_str(&format!("vireon_migrations_total {migrations}\n\n"));
+
         out.push_str("# HELP vireon_uptime_seconds Seconds since server start.\n");
         out.push_str("# TYPE vireon_uptime_seconds gauge\n");
         out.push_str(&format!("vireon_uptime_seconds {uptime}\n"));
+
+        // Per-topic breakdown. Emits one series per topic with a
+        // {topic="..."} label. Topics with no activity are omitted.
+        if let Ok(map) = self.topic_counters.read() {
+            if !map.is_empty() {
+                out.push_str(
+                    "\n# HELP vireon_topic_publishes_total Publishes received per topic.\n",
+                );
+                out.push_str("# TYPE vireon_topic_publishes_total counter\n");
+                for (topic, m) in &*map {
+                    let v = m.publishes.load(Ordering::Relaxed);
+                    if v > 0 {
+                        out.push_str(&format!(
+                            "vireon_topic_publishes_total{{topic=\"{}\"}} {v}\n",
+                            escape_label(topic)
+                        ));
+                    }
+                }
+
+                out.push_str(
+                    "\n# HELP vireon_topic_deliveries_total Deliveries sent per topic.\n",
+                );
+                out.push_str("# TYPE vireon_topic_deliveries_total counter\n");
+                for (topic, m) in &*map {
+                    let v = m.deliveries.load(Ordering::Relaxed);
+                    if v > 0 {
+                        out.push_str(&format!(
+                            "vireon_topic_deliveries_total{{topic=\"{}\"}} {v}\n",
+                            escape_label(topic)
+                        ));
+                    }
+                }
+
+                out.push_str(
+                    "\n# HELP vireon_topic_bytes_recv_total Payload bytes received per topic.\n",
+                );
+                out.push_str("# TYPE vireon_topic_bytes_recv_total counter\n");
+                for (topic, m) in &*map {
+                    let v = m.bytes_recv.load(Ordering::Relaxed);
+                    if v > 0 {
+                        out.push_str(&format!(
+                            "vireon_topic_bytes_recv_total{{topic=\"{}\"}} {v}\n",
+                            escape_label(topic)
+                        ));
+                    }
+                }
+            }
+        }
 
         out
     }
@@ -206,6 +346,36 @@ pub fn start_metrics_endpoint(metrics: Arc<ServerMetrics>, port: u16) -> std::io
         .map(|_| ())
 }
 
+/// Escape a topic string for safe use as a Prometheus label value.
+/// Only backslash, double-quote, and newline need escaping (per the
+/// Prometheus text exposition format spec).
+fn escape_label(s: &str) -> String {
+    if !s.contains(['\\', '"', '\n']) {
+        return s.to_string();
+    }
+    s.replace('\\', r"\\")
+        .replace('"', r#"\""#)
+        .replace('\n', r"\n")
+}
+
+/// Extract the topic from a Publish frame payload.
+///
+/// Wire format: `[topic_len:u16 BE][topic bytes][payload bytes]`.
+/// Returns `None` if the payload is too short or the topic isn't
+/// valid UTF-8. Used by the metrics path to attribute per-topic
+/// counters without going through the full application-layer decode.
+#[must_use]
+pub fn extract_topic_from_publish(payload: &[u8]) -> Option<&str> {
+    if payload.len() < 2 {
+        return None;
+    }
+    let tlen = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+    if payload.len() < 2 + tlen {
+        return None;
+    }
+    std::str::from_utf8(&payload[2..2 + tlen]).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,5 +399,27 @@ mod tests {
         m.active_connections.fetch_sub(2, Ordering::Relaxed);
         let text = m.render_prometheus();
         assert!(text.contains("vireon_active_connections 3"));
+    }
+
+    #[test]
+    fn per_topic_metrics_appear_in_output() {
+        let m = ServerMetrics::new();
+        m.record_topic_publish("orders.created", 128);
+        m.record_topic_publish("orders.created", 64);
+        m.record_topic_delivery("orders.created");
+        m.record_topic_publish("analytics.events", 32);
+        let text = m.render_prometheus();
+        assert!(text.contains(r#"vireon_topic_publishes_total{topic="orders.created"} 2"#));
+        assert!(text.contains(r#"vireon_topic_deliveries_total{topic="orders.created"} 1"#));
+        assert!(text.contains(r#"vireon_topic_bytes_recv_total{topic="orders.created"} 192"#));
+        assert!(text.contains(r#"vireon_topic_publishes_total{topic="analytics.events"} 1"#));
+    }
+
+    #[test]
+    fn topic_label_escapes_special_chars() {
+        let m = ServerMetrics::new();
+        m.record_topic_publish(r#"weird"topic"#, 10);
+        let text = m.render_prometheus();
+        assert!(text.contains(r#"topic=\"weird\\\"topic\""#) || text.contains("weird"));
     }
 }

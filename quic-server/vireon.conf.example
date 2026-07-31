@@ -116,6 +116,11 @@ sqpoll = false
 # Bypasses the application layer entirely.
 echo = false
 
+# Log output format: "text" (default) or "json" (structured).
+# JSON is compatible with journald, Loki, Fluentd, and other log
+# aggregators that parse JSON on stdin.
+log_format = "text"
+
 
 # ─────────────────────────────────────────────────────────────────────
 #  Write-Ahead Log (WAL)
@@ -143,6 +148,28 @@ wal_max_bytes = 0
 # Lower = more frequent cleanup, higher CPU. Higher = lazier cleanup.
 #   60 = default (once per minute).
 wal_sweep_interval_secs = 60
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  WAL fsync policy
+# ─────────────────────────────────────────────────────────────────────
+
+# When the WAL calls sync_data on appended bytes. Controls the
+# durability/throughput trade-off after every successful publish.
+#
+# - never       : flush() only — page cache holds the bytes. Survives
+#                 process crash, lost on power failure. Fastest.
+# - every_flush : sync_data() after every flush. Maximum durability,
+#                 one syscall per publish. Slowest.
+# - group_commit: sync_data() if more than `group_commit_ms` has
+#                 elapsed since the last sync. Bounds worst-case
+#                 power-loss data loss to the interval while keeping
+#                 throughput high. Recommended for production.
+#
+# Default (when the section is omitted): group_commit 100 ms.
+[wal_sync]
+mode = "group_commit"
+group_commit_ms = 100
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -187,17 +214,37 @@ metrics_port = 0
 
 # ─────────────────────────────────────────────────────────────────────
 #  Cluster (P6 — multi-node)
+#
+#  All cluster settings live under the [cluster] section. When both
+#  `node_id` and `peers` are set, the server joins a multi-node cluster
+#  and routes publishes to topic owners via UDP inter-node transport.
+#  CLI flags (--cluster-node-id, --cluster-peers, etc.) override these.
 # ─────────────────────────────────────────────────────────────────────
+[cluster]
 
-# Self node ID in a multi-node cluster.
-# Must be >0 and appear in cluster_peers.
-#   0 = single-node mode (all topics owned locally).
-cluster_node_id = 0
+# Self node ID in the cluster.
+#   0 = single-node mode (default — all topics owned locally).
+# Must be >0 and appear in `peers` below when cluster mode is on.
+node_id = 0
 
 # Cluster peer list: "id=host:port,id=host:port,..."
 # Every node (including self) must be listed.
 # Example: "1=10.0.0.1:4433,2=10.0.0.2:4433,3=10.0.0.3:4433"
-cluster_peers = ""
+peers = ""
+
+# Replication factor for cluster durability.
+# When >1, each publish is forwarded to N-1 replica nodes (chosen by
+# consistent hashing on the topic) in addition to the primary owner.
+# Replicas append to their local WAL.
+#   1 = no replication (default).
+# Must be ≤ number of peers.
+replication_factor = 1
+
+# Virtual nodes per physical node on the consistent-hash ring.
+# Higher = more even topic distribution, larger ring bookkeeping.
+# The Dynamo paper recommends 150; clamped to [1, 1024] at startup.
+# Leave commented out to keep the default.
+# vnodes = 150
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -209,6 +256,13 @@ cluster_peers = ""
 # default permissive allow("*.*", None, ALL) table.
 # Empty ("") = permissive default (single-tenant mode).
 acl_rules_path = ""
+
+# Path template for the tamper-evident audit log. When set, the
+# server records security-relevant events (ACL denies, quota
+# rejections, topic create/delete) to a SHA-256 hash-chained file.
+# {worker} is replaced with the worker ID.
+# Empty ("") = audit logging disabled (default).
+audit_log = ""
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -258,6 +312,13 @@ congestion = "cubic"
 # Initial congestion window in packets (RFC 9002 §7.2).
 # Larger = faster ramp-up on new connections.
 initial_cwnd_packets = 100
+
+# Connection migration (RFC 9000 §9). When true (default), clients can
+# change their 4-tuple (WiFi switch, NAT rebinding) without dropping
+# the QUIC connection — packets are routed by DCID. quiche validates
+# the new path with PATH_CHALLENGE/PATH_RESPONSE internally.
+# Set to false to reject path changes (e.g. for benchmark isolation).
+# migration = true
 
 
 # ═══════════════════════════════════════════════════════════════════
