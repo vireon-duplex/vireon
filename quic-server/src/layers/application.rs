@@ -431,7 +431,7 @@ pub struct VireonDispatcher {
     /// Active retention policy. Defaults to `keep_forever`; mutated
     /// via [`Self::set_wal_retention`]. The sweep is applied to every
     /// tracked topic when [`Self::wal_retention_last_run`] is older
-    /// than [`WAL_RETENTION_SWEEP_INTERVAL`].
+    /// than `wal_sweep_interval`.
     wal_retention: wal_store::RetentionPolicy,
     /// Last time the retention sweep ran ( Instant::now()-based,
     /// throttled by `wal_sweep_interval` to amortise directory walks).
@@ -473,13 +473,6 @@ pub struct VireonDispatcher {
 /// Minimum gap between cross-worker drop warning logs.
 const WORKER_DROP_LOG_COOLDOWN: Duration = Duration::from_secs(5);
 
-/// Minimum gap between WAL retention sweeps. The sweep walks every
-/// tracked topic and may issue a truncation (which copies surviving
-/// entries through a tempfile). 60 s keeps the cost negligible even
-/// on slow disks — retention is a coarse-grained lever, not a per-tick
-/// concern. Sweeps additionally bail early when the policy is
-/// `keep_forever` (no work to do).
-const WAL_RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 impl VireonDispatcher {
     /// Creates a new dispatcher with default-configured modules.
@@ -3242,7 +3235,7 @@ impl VireonDispatcher {
     /// topic if the sweep interval has elapsed. Cheap no-op when WAL
     /// is unconfigured or the policy is `keep_forever`.
     ///
-    /// Throttled to one sweep per [`WAL_RETENTION_SWEEP_INTERVAL`]
+    /// Throttled to one sweep per `wal_sweep_interval`
     /// (60 s). The sweep walks every topic known to the store, calls
     /// [`wal_store::RetentionPolicy::apply`], and aggregates the
     /// removed-entry count for a single summary log line.

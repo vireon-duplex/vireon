@@ -24,6 +24,7 @@ use crate::replica::ReplicaId;
 #[derive(Clone, Debug)]
 struct GossipEntry {
     payload: Vec<u8>,
+    #[allow(dead_code)]
     broadcast_ns: u64,
     /// Peers that have acknowledged this message.
     acked_by: Vec<ReplicaId>,
