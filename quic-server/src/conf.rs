@@ -223,6 +223,11 @@ pub struct QuicConf {
     pub handshake_timeout: Option<HumanDuration>,
     pub congestion: Option<String>,
     pub initial_cwnd_packets: Option<u32>,
+    /// RFC 9000 §9 Connection Migration — lets a client change its
+    /// 4-tuple (WiFi switch, NAT rebinding) without dropping the
+    /// connection. On by default. Set to `false` to reject path
+    /// changes (mostly useful for benchmark isolation).
+    pub migration: Option<bool>,
 }
 
 /// `[cluster]` — multi-node cluster configuration (P6).

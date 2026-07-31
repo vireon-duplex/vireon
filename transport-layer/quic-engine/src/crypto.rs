@@ -75,8 +75,12 @@ pub fn build_quiche_config(
         config.enable_dgram(true, 64, 64);
     }
 
-    // Disable active migration unless explicitly enabled.
-    config.set_disable_active_migration(!quic_cfg.extensions.multipath);
+    // Connection migration (RFC 9000 §9). When enabled, quiche accepts
+    // path changes (WiFi switch, NAT rebinding) and validates the new
+    // path with PATH_CHALLENGE/PATH_RESPONSE internally. This is
+    // distinct from multipath (RFC 9464), which uses multiple paths
+    // concurrently.
+    config.set_disable_active_migration(!quic_cfg.extensions.migration);
 
     // Pacing helps reduce burstiness on high-throughput links.
     config.enable_pacing(true);

@@ -72,6 +72,10 @@ pub struct ServerMetrics {
     /// Total Initial packets rejected by the per-IP handshake rate
     /// limiter (summed across all workers).
     pub rate_limit_rejections_total: AtomicU64,
+    /// Total connection-migration / NAT-rebinding events since startup.
+    /// A non-zero value means clients changed their 4-tuple and the
+    /// QUIC connection survived (DCID-based routing).
+    pub migrations_total: AtomicU64,
     /// Per-topic breakdown. Read-locked on every publish/delivery for
     /// the lookup; write-locked only when a new topic is first seen.
     /// The `Arc<TopicMetrics>` inner lets workers bump atomics without
@@ -94,6 +98,7 @@ impl ServerMetrics {
             bytes_recv_total: AtomicU64::new(0),
             bytes_sent_total: AtomicU64::new(0),
             rate_limit_rejections_total: AtomicU64::new(0),
+            migrations_total: AtomicU64::new(0),
             topic_counters: RwLock::new(HashMap::new()),
             started_at: Instant::now(),
         }
@@ -178,6 +183,7 @@ impl ServerMetrics {
         let recv = self.bytes_recv_total.load(Ordering::Relaxed);
         let sent = self.bytes_sent_total.load(Ordering::Relaxed);
         let rl_rej = self.rate_limit_rejections_total.load(Ordering::Relaxed);
+        let migrations = self.migrations_total.load(Ordering::Relaxed);
         let uptime = self.started_at.elapsed().as_secs();
 
         // Prometheus text format v0.0.4.
@@ -213,6 +219,10 @@ impl ServerMetrics {
         out.push_str("# HELP vireon_rate_limit_rejections_total Initial packets rejected by the per-IP handshake rate limiter.\n");
         out.push_str("# TYPE vireon_rate_limit_rejections_total counter\n");
         out.push_str(&format!("vireon_rate_limit_rejections_total {rl_rej}\n\n"));
+
+        out.push_str("# HELP vireon_migrations_total Connection-migration / NAT-rebinding events (connection survived).\n");
+        out.push_str("# TYPE vireon_migrations_total counter\n");
+        out.push_str(&format!("vireon_migrations_total {migrations}\n\n"));
 
         out.push_str("# HELP vireon_uptime_seconds Seconds since server start.\n");
         out.push_str("# TYPE vireon_uptime_seconds gauge\n");

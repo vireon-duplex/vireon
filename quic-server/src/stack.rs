@@ -195,6 +195,16 @@ pub struct VireonStack {
     /// counter reflects engine state without coupling the two crates.
     last_rl_rejections: u64,
 
+    // ── Connection migration ───────────────────────────────────────
+    /// Total peer-address changes (NAT rebinding, WiFi switch) since
+    /// startup. Surfaced in the periodic `[distribution]` log and as
+    /// the `vireon_migrations_total` Prometheus counter. Connections
+    /// survive because QUIC routes by DCID, not 4-tuple.
+    migrations_total: u64,
+    /// Throttle for migration log lines — a flapping NAT can emit many
+    /// `PeerAddressChanged` events per second, so collapse to ≤1/s.
+    migration_log_throttle: crate::log_throttle::RateCounter,
+
     // ── Graceful shutdown ────────────────────────────────────────
     /// Set by the signal handler to request graceful shutdown.
     shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
@@ -382,6 +392,10 @@ impl VireonStack {
             publish_bp_high_watermark: tuning.publish_backpressure_high_watermark_bytes,
             publishes_backpressured: 0,
             last_rl_rejections: 0,
+            migrations_total: 0,
+            // Log at most every 16th event during a NAT flap to keep
+            // the log readable while still surfacing the problem.
+            migration_log_throttle: crate::log_throttle::RateCounter::new(16),
             shutdown_requested,
             reactor_stop: None,
             shutdown_state: ShutdownState::Running,
@@ -430,6 +444,13 @@ impl VireonStack {
                     stream_id,
                 } => {
                     self.on_stream_finished(conn_idx, stream_id);
+                }
+                QuicEvent::PeerAddressChanged {
+                    conn_idx,
+                    from,
+                    to,
+                } => {
+                    self.on_peer_address_changed(conn_idx, from, to);
                 }
             }
         }
@@ -803,6 +824,27 @@ impl VireonStack {
 
     fn on_stream_finished(&mut self, conn_idx: usize, stream_id: u64) {
         tracing::trace!(conn_idx, stream_id, "QUIC stream FIN");
+    }
+
+    /// Handles a connection-migration / NAT-rebinding event from the
+    /// QUIC engine. The connection is still alive — quiche already
+    /// validated the new path with PATH_CHALLENGE/PATH_RESPONSE. We
+    /// only need to sync the upper-layer address book and count it.
+    fn on_peer_address_changed(&mut self, conn_idx: usize, from: SocketAddr, to: SocketAddr) {
+        self.connections.update_peer_addr(conn_idx, to);
+        self.migrations_total = self.migrations_total.saturating_add(1);
+        if let Some(m) = &self.metrics {
+            m.migrations_total.fetch_add(1, Ordering::Relaxed);
+        }
+        if self.migration_log_throttle.tick() {
+            tracing::info!(
+                conn_idx,
+                %from,
+                %to,
+                total = self.migrations_total,
+                "[migration] peer address changed (connection survived — QUIC routes by DCID)",
+            );
+        }
     }
 
     // ── Per-stream pending-send buffer ───────────────────────────
@@ -1210,6 +1252,7 @@ impl IoHandler for VireonStack {
             let pending_drops = self.pending_drops;
             let pending_gap_bytes = self.pending_gap_bytes;
             let publishes_backpressured = self.publishes_backpressured;
+            let migrations_total = self.migrations_total;
             if let Some(mesh) = self.engine.forward_mesh() {
                 tracing::info!(
                     reactor_id,
@@ -1224,6 +1267,7 @@ impl IoHandler for VireonStack {
                     pending_drops,
                     pending_gap_bytes,
                     publishes_backpressured,
+                    migrations_total,
                     "[distribution] worker stats"
                 );
             } else {
@@ -1237,6 +1281,7 @@ impl IoHandler for VireonStack {
                     pending_drops,
                     pending_gap_bytes,
                     publishes_backpressured,
+                    migrations_total,
                     "[distribution] worker stats (single-worker mode)"
                 );
             }
