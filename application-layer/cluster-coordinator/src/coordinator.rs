@@ -20,10 +20,12 @@
 //! scraped from a separate metrics-poller thread).
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use rustc_hash::FxHashSet;
 use session_registry::NodeId;
 
+use crate::failure::FailureDetector;
 use crate::membership::{ClusterMembership, DEFAULT_VNODES};
 use crate::router::TopicRouter;
 use crate::subscriber::{RemoteSubscriber, RemoteSubscriberRegistry};
@@ -34,14 +36,21 @@ use crate::{ClusterConfig, ClusterError};
 pub enum PublishDecision {
     /// Self owns the topic. `remote_targets` lists every alive node
     /// that has at least one matching remote subscription for the
-    /// topic. The caller should:
+    /// topic. `replicas` lists the additional nodes (beyond self)
+    /// that should receive a replicated copy for durability. The
+    /// caller should:
     /// 1. Deliver to local subscribers via the existing
     ///    `pubsub_engine::TopicRegistry`.
     /// 2. For each node in `remote_targets`, send an
     ///    `InterNodeMessage::Fanout`.
+    /// 3. For each node in `replicas`, send an
+    ///    `InterNodeMessage::Publish` (replication copy).
     Own {
         /// Distinct alive nodes (no self) needing fanout.
         remote_targets: Vec<NodeId>,
+        /// Distinct alive nodes (no self) needing a replication copy.
+        /// Empty when `replication_factor <= 1`.
+        replicas: Vec<NodeId>,
     },
     /// Another node owns the topic. The caller should send an
     /// `InterNodeMessage::Publish` to `owner`.
@@ -90,6 +99,14 @@ pub struct ClusterCoordinator {
     router: TopicRouter,
     remote_subs: RemoteSubscriberRegistry,
     stats: ClusterStats,
+    replication_factor: u8,
+    /// Heartbeat-based failure detector for auto-recovery.
+    failure: FailureDetector,
+    /// Heartbeat broadcast interval.
+    heartbeat_interval: Duration,
+    /// Heartbeat timeout — peers with no heartbeat within this window
+    /// are declared down by `tick_health`.
+    heartbeat_timeout: Duration,
 }
 
 impl ClusterCoordinator {
@@ -111,16 +128,26 @@ impl ClusterCoordinator {
         } else {
             cfg.vnodes
         };
+        let replication_factor = cfg.replication_factor.max(1);
+        let heartbeat_interval = Duration::from_millis(cfg.heartbeat_interval_ms.max(1));
+        let heartbeat_timeout = Duration::from_millis(cfg.heartbeat_timeout_ms.max(1));
         let membership = ClusterMembership::new(cfg)?;
         let mut router = TopicRouter::new(vnodes);
-        for n in alive_nodes {
-            router.add_node(n);
+        let mut failure = FailureDetector::new();
+        let now = Instant::now();
+        for n in &alive_nodes {
+            router.add_node(*n);
+            failure.seed_alive(*n, now);
         }
         Ok(Self {
             membership,
             router,
             remote_subs: RemoteSubscriberRegistry::new(),
             stats: ClusterStats::default(),
+            replication_factor,
+            failure,
+            heartbeat_interval,
+            heartbeat_timeout,
         })
     }
 
@@ -128,6 +155,19 @@ impl ClusterCoordinator {
     #[must_use]
     pub fn self_id(&self) -> NodeId {
         self.membership.self_id()
+    }
+
+    /// Whether this node is the primary owner of `topic` in the
+    /// consistent-hash ring.
+    ///
+    /// Used to distinguish forwarded publishes (this node IS the owner)
+    /// from replicated publishes (this node is a replica backup).
+    #[must_use]
+    pub fn owns_topic(&self, topic: &str) -> bool {
+        match self.router.owner_of(topic) {
+            Some(owner) => owner == self.self_id(),
+            None => true, // empty ring → self owns by convention
+        }
     }
 
     /// Total peer count (alive + down).
@@ -153,7 +193,11 @@ impl ClusterCoordinator {
                     .publishes_routed_local
                     .fetch_add(1, Ordering::Relaxed);
                 let remote_targets = self.collect_remote_targets(topic);
-                PublishDecision::Own { remote_targets }
+                let replicas = self.collect_replicas(topic);
+                PublishDecision::Own {
+                    remote_targets,
+                    replicas,
+                }
             }
             Some(owner) => {
                 self.stats
@@ -169,14 +213,29 @@ impl ClusterCoordinator {
                     .fetch_add(1, Ordering::Relaxed);
                 PublishDecision::Own {
                     remote_targets: Vec::new(),
+                    replicas: Vec::new(),
                 }
             }
         }
     }
 
+    /// Collect replica node IDs for `topic` based on the configured
+    /// `replication_factor`. Excludes self (the primary owner).
+    fn collect_replicas(&self, topic: &str) -> Vec<NodeId> {
+        if self.replication_factor <= 1 {
+            return Vec::new();
+        }
+        let n = usize::from(self.replication_factor);
+        self.router
+            .replicas_of(topic, n)
+            .into_iter()
+            .filter(|&node| node != self.self_id())
+            .collect()
+    }
+
     /// Collect the distinct alive nodes with subscribers matching
     /// `topic`. Excludes self.
-    fn collect_remote_targets(&self, topic: &str) -> Vec<NodeId> {
+    pub fn collect_remote_targets(&self, topic: &str) -> Vec<NodeId> {
         let hits = self.remote_subs.lookup(topic);
         let mut seen: FxHashSet<NodeId> = FxHashSet::default();
         let mut out: Vec<NodeId> = Vec::with_capacity(hits.len());
@@ -221,10 +280,71 @@ impl ClusterCoordinator {
             self.stats.nodes_marked_down.fetch_add(1, Ordering::Relaxed);
             self.router.remove_node(node);
         }
+        self.failure.forget(node);
         // `remote_subs_removed` stat tracks explicit unsubscribe, not
         // implicit removal via node-down. The return value is the
         // authoritative count.
         self.remote_subs.remove_node(node)
+    }
+
+    /// Record a heartbeat received from `node`. Called when an
+    /// `InterNodeKind::Heartbeat` message arrives via the cluster mesh.
+    pub fn record_heartbeat(&mut self, node: NodeId) {
+        self.failure.record_heartbeat(node, Instant::now());
+    }
+
+    /// Drive the failure detector. Returns the IDs of nodes that have
+    /// not heartbeated within `heartbeat_timeout` and were just marked
+    /// down. The caller should broadcast `NodeDown` gossip for each
+    /// returned node so the rest of the cluster converges.
+    ///
+    /// Call this from the reactor tick loop (typically once per
+    /// `heartbeat_interval`).
+    #[must_use]
+    pub fn tick_health(&mut self) -> Vec<NodeId> {
+        let now = Instant::now();
+        let expired = self
+            .failure
+            .check_expired(now, self.heartbeat_timeout);
+        for &n in &expired {
+            let dropped = self.mark_node_down(n);
+            if dropped > 0 {
+                tracing::info!(
+                    node = n.raw(),
+                    dropped_subs = dropped,
+                    "[cluster] node {} marked down (heartbeat timeout), dropped {} remote subs",
+                    n.raw(),
+                    dropped
+                );
+            } else {
+                tracing::info!(
+                    node = n.raw(),
+                    "[cluster] node {} marked down (heartbeat timeout)",
+                    n.raw()
+                );
+            }
+        }
+        expired
+    }
+
+    /// Whether it's time to send the next heartbeat broadcast.
+    /// The caller compares the returned interval against the elapsed
+    /// time since the last heartbeat send.
+    #[must_use]
+    pub fn heartbeat_interval(&self) -> Duration {
+        self.heartbeat_interval
+    }
+
+    /// Whether this node should heart-beat at all (only in cluster mode).
+    #[must_use]
+    pub fn is_cluster_enabled(&self) -> bool {
+        self.membership.peer_count() > 1
+    }
+
+    /// Configure heartbeat timing. Defaults are 1s interval / 5s timeout.
+    pub fn set_heartbeat_timing(&mut self, interval: Duration, timeout: Duration) {
+        self.heartbeat_interval = interval;
+        self.heartbeat_timeout = timeout;
     }
 
     /// Snapshot of cluster stats.
@@ -293,7 +413,7 @@ mod tests {
     impl PublishDecisionExt for PublishDecision {
         fn remote_targets(&self) -> &[NodeId] {
             match self {
-                PublishDecision::Own { remote_targets } => remote_targets,
+                PublishDecision::Own { remote_targets, .. } => remote_targets,
                 PublishDecision::Forward { .. } => &[],
             }
         }

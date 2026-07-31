@@ -157,11 +157,31 @@ pub fn parse_cluster_peers(s: &str) -> Result<Vec<(NodeId, SocketAddr)>, String>
 /// later concern.
 ///
 /// # Errors
+/// Optional cluster overrides applied on top of defaults during
+/// [`build_cluster_transport_config`]. All fields optional — `Default`
+/// gives the standard behavior (replication factor 1, default vnode
+/// count from `ClusterConfig::new`).
+#[derive(Default, Clone, Debug)]
+pub struct ClusterOpts {
+    /// Number of nodes (including owner) that should hold a replica of
+    /// each publish. `None` = `1` (no replication).
+    pub replication_factor: Option<u8>,
+    /// Virtual nodes per physical node on the consistent-hash ring.
+    /// `None` = `ClusterConfig::DEFAULT_VNODES` (150). Clamped to
+    /// `[1, 1024]` by `ClusterMembership::new`.
+    pub vnodes: Option<u32>,
+    /// Heartbeat broadcast interval in milliseconds. `None` = 1000.
+    pub heartbeat_interval_ms: Option<u64>,
+    /// Heartbeat timeout in milliseconds. `None` = 5000.
+    pub heartbeat_timeout_ms: Option<u64>,
+}
+
 /// Returns an error if `self_id` is nil, the peer list is empty, the
 /// peer list does not contain `self_id`, or there are duplicate ids.
 pub fn build_cluster_transport_config(
     self_id: NodeId,
     peers: &[(NodeId, SocketAddr)],
+    opts: ClusterOpts,
 ) -> Result<ClusterTransportConfig, String> {
     if self_id.is_nil() {
         return Err("cluster self_id is nil".into());
@@ -198,7 +218,17 @@ pub fn build_cluster_transport_config(
             self_id.raw()
         )
     })?;
-    let cluster_cfg = ClusterConfig::new(self_id, peer_infos);
+    let mut cluster_cfg = ClusterConfig::new(self_id, peer_infos);
+    cluster_cfg.replication_factor = opts.replication_factor.unwrap_or(1).max(1);
+    if let Some(v) = opts.vnodes {
+        cluster_cfg = cluster_cfg.with_vnodes(v);
+    }
+    if let Some(ms) = opts.heartbeat_interval_ms {
+        cluster_cfg.heartbeat_interval_ms = ms.max(1);
+    }
+    if let Some(ms) = opts.heartbeat_timeout_ms {
+        cluster_cfg.heartbeat_timeout_ms = ms.max(cluster_cfg.heartbeat_interval_ms + 1);
+    }
     Ok(ClusterTransportConfig {
         cluster_cfg,
         bind_addr,
@@ -241,6 +271,44 @@ pub fn launch_cluster(
     socket
         .set_nonblocking(true)
         .map_err(|e| format!("cluster UDP non-blocking: {e}"))?;
+
+    // Match the main QUIC socket buffer sizes so burst-heavy cluster
+    // forwarding (e.g. ClientPool 20K-frame bursts) doesn't overflow
+    // the kernel default (~208 KiB) and silently drop datagrams.
+    use std::os::unix::io::AsRawFd;
+    const CLUSTER_BUF_SIZE: libc::c_int = 32 * 1024 * 1024;
+    let fd = socket.as_raw_fd();
+    let optlen = std::mem::size_of_val(&CLUSTER_BUF_SIZE) as libc::socklen_t;
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &CLUSTER_BUF_SIZE as *const _ as *const libc::c_void,
+            optlen,
+        )
+    };
+    if rc != 0 {
+        tracing::warn!(errno = %rc, "cluster UDP SO_RCVBUF failed (using kernel default)");
+    }
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &CLUSTER_BUF_SIZE as *const _ as *const libc::c_void,
+            optlen,
+        )
+    };
+    if rc != 0 {
+        tracing::warn!(errno = %rc, "cluster UDP SO_SNDBUF failed (using kernel default)");
+    }
+
+    // Register the cluster socket fd for crash-safe cleanup. Without
+    // this, a SIGSEGV / second-SIGINT exit leaves the kernel holding
+    // the socket bound to the cluster port, blocking restarts.
+    crate::socket_registry::REGISTRY.register(fd);
+
     tracing::info!(
         bind_addr = %cfg.bind_addr,
         peers = cfg.peer_addrs.len(),
@@ -284,6 +352,9 @@ fn run_transport(
     self_id: NodeId,
 ) {
     let mut recv_buf = vec![0u8; RECV_BUF_LEN];
+    // Reusable encode scratch — avoids one BytesMut allocation per
+    // cluster forward. Grows once, reused for every outgoing message.
+    let mut encode_buf = bytes::BytesMut::with_capacity(4096);
     // Coalesce sleep duration — the transport thread polls both the
     // mpsc inbox and the UDP socket; when both are idle it yields.
     let idle = std::time::Duration::from_micros(200);
@@ -294,7 +365,7 @@ fn run_transport(
         // ── Drain outgoing fan-in ──────────────────────────────────
         while let Ok(out) = outgoing_rx.try_recv() {
             did_work = true;
-            process_outgoing(&out, self_id, &peers, &socket, &incoming_txs);
+            process_outgoing(&out, self_id, &peers, &socket, &incoming_txs, &mut encode_buf);
         }
 
         // ── Drain incoming UDP datagrams ──────────────────────────
@@ -349,7 +420,7 @@ fn run_transport(
             // worker senders have dropped.
             match outgoing_rx.recv_timeout(idle) {
                 Ok(out) => {
-                    process_outgoing(&out, self_id, &peers, &socket, &incoming_txs);
+                    process_outgoing(&out, self_id, &peers, &socket, &incoming_txs, &mut encode_buf);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     // Loop and poll again.
@@ -371,6 +442,7 @@ fn process_outgoing(
     peers: &FxHashMap<NodeId, SocketAddr>,
     socket: &UdpSocket,
     incoming_txs: &[mpsc::Sender<InterNodeMessage>],
+    encode_buf: &mut bytes::BytesMut,
 ) {
     if out.target == self_id {
         // Shouldn't happen — workers only forward to non-self owners —
@@ -391,9 +463,9 @@ fn process_outgoing(
         }
         return;
     };
-    match out.msg.encode() {
+    match out.msg.encode_into(encode_buf) {
         Ok(bytes) => {
-            if let Err(e) = socket.send_to(&bytes, addr) {
+            if let Err(e) = socket.send_to(bytes, addr) {
                 if SEND_DROP.tick() {
                     tracing::warn!(
                         target = %out.target,
@@ -471,7 +543,7 @@ mod tests {
             (NodeId::new(1), "127.0.0.1:4001".parse().unwrap()),
             (NodeId::new(2), "127.0.0.1:4002".parse().unwrap()),
         ];
-        let cfg = build_cluster_transport_config(NodeId::new(2), &peers).unwrap();
+        let cfg = build_cluster_transport_config(NodeId::new(2), &peers, ClusterOpts::default()).unwrap();
         assert_eq!(cfg.bind_addr, peers[1].1);
         assert_eq!(cfg.cluster_cfg.self_id, NodeId::new(2));
         assert_eq!(cfg.cluster_cfg.peers.len(), 2);
@@ -484,7 +556,7 @@ mod tests {
             (NodeId::new(1), "127.0.0.1:4001".parse().unwrap()),
             (NodeId::new(2), "127.0.0.1:4002".parse().unwrap()),
         ];
-        let cfg = build_cluster_transport_config(NodeId::new(1), &peers).unwrap();
+        let cfg = build_cluster_transport_config(NodeId::new(1), &peers, ClusterOpts::default()).unwrap();
         for p in &cfg.cluster_cfg.peers {
             assert_eq!(p.state, NodeState::Alive);
         }
@@ -493,7 +565,7 @@ mod tests {
     #[test]
     fn build_config_rejects_nil_self() {
         let peers = vec![(NodeId::new(1), "127.0.0.1:4001".parse().unwrap())];
-        assert!(build_cluster_transport_config(NodeId::NIL, &peers).is_err());
+        assert!(build_cluster_transport_config(NodeId::NIL, &peers, ClusterOpts::default()).is_err());
     }
 
     #[test]
@@ -502,7 +574,7 @@ mod tests {
             (NodeId::new(1), "127.0.0.1:4001".parse().unwrap()),
             (NodeId::new(2), "127.0.0.1:4002".parse().unwrap()),
         ];
-        assert!(build_cluster_transport_config(NodeId::new(99), &peers).is_err());
+        assert!(build_cluster_transport_config(NodeId::new(99), &peers, ClusterOpts::default()).is_err());
     }
 
     #[test]
@@ -511,13 +583,13 @@ mod tests {
             (NodeId::new(1), "127.0.0.1:4001".parse().unwrap()),
             (NodeId::new(1), "127.0.0.1:4099".parse().unwrap()),
         ];
-        assert!(build_cluster_transport_config(NodeId::new(1), &peers).is_err());
+        assert!(build_cluster_transport_config(NodeId::new(1), &peers, ClusterOpts::default()).is_err());
     }
 
     #[test]
     fn build_config_rejects_empty_peers() {
         let peers = vec![];
-        assert!(build_cluster_transport_config(NodeId::new(1), &peers).is_err());
+        assert!(build_cluster_transport_config(NodeId::new(1), &peers, ClusterOpts::default()).is_err());
     }
 
     #[test]
@@ -526,7 +598,7 @@ mod tests {
             (NodeId::new(1), "127.0.0.1:4001".parse().unwrap()),
             (NodeId::new(2), "127.0.0.1:4002".parse().unwrap()),
         ];
-        let cfg = build_cluster_transport_config(NodeId::new(1), &peers).unwrap();
+        let cfg = build_cluster_transport_config(NodeId::new(1), &peers, ClusterOpts::default()).unwrap();
         let c1 = worker_coordinator(&cfg.cluster_cfg).unwrap();
         let c2 = worker_coordinator(&cfg.cluster_cfg).unwrap();
         // Two independent copies — both see the same self id.
@@ -539,7 +611,7 @@ mod tests {
             (NodeId::new(1), "127.0.0.1:4101".parse().unwrap()),
             (NodeId::new(2), "127.0.0.1:4102".parse().unwrap()),
         ];
-        let cfg = build_cluster_transport_config(NodeId::new(1), &peers).unwrap();
+        let cfg = build_cluster_transport_config(NodeId::new(1), &peers, ClusterOpts::default()).unwrap();
         let (handles, join) = launch_cluster(&cfg, 3).unwrap();
         assert_eq!(handles.len(), 3);
         // Drop all handles → outgoing_tx senders all drop → transport
@@ -559,15 +631,15 @@ mod tests {
             (NodeId::new(1), "127.0.0.1:4201".parse().unwrap()),
             (NodeId::new(2), "127.0.0.1:4202".parse().unwrap()),
         ];
-        let cfg1 = build_cluster_transport_config(NodeId::new(1), &peers).unwrap();
-        let cfg2 = build_cluster_transport_config(NodeId::new(2), &peers).unwrap();
+        let cfg1 = build_cluster_transport_config(NodeId::new(1), &peers, ClusterOpts::default()).unwrap();
+        let cfg2 = build_cluster_transport_config(NodeId::new(2), &peers, ClusterOpts::default()).unwrap();
         let (mut h1, _j1) = launch_cluster(&cfg1, 1).unwrap();
         let (mut h2, _j2) = launch_cluster(&cfg2, 1).unwrap();
         let h1rx = h1.remove(0);
         let h2rx = h2.remove(0);
 
         // Node 1 sends a Subscribe to node 2.
-        let msg = InterNodeMessage::subscribe(NodeId::new(1), 42, 100, "sensor.*".into());
+        let msg = InterNodeMessage::subscribe(NodeId::new(1), 42, 100, "sensor.*");
         h1rx.outgoing_tx
             .send(OutgoingMsg {
                 msg: msg.clone(),

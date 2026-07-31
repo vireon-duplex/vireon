@@ -15,9 +15,14 @@
 //!        └─ VireonDispatcher  (Phase 3 send-policy + Phase 7 ACL)
 //! ```
 
+// Warn on .unwrap() / .expect() in production code.
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod acl_loader;
+pub mod audit;
 pub mod cluster;
 pub mod conf;
 pub mod error;
 pub mod layers;
 pub mod log_throttle;
+pub mod socket_registry;

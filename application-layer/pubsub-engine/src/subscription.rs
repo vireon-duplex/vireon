@@ -4,7 +4,6 @@
 //! See `DESIGN.md` Part 4 (subscriptions) and Part 5 (topic patterns).
 
 use crate::error::PubSubError;
-use crate::topic::Topic;
 use std::fmt;
 
 // ── SubscriptionId ───────────────────────────────────────────────
@@ -110,21 +109,24 @@ impl TopicPattern {
     ///   in the topic.
     /// - Non-wildcard segments must match exactly.
     /// - The number of segments must be equal.
+    ///
+    /// Zero-allocation: uses lazy `split('.')` iterators instead of
+    /// collecting into `Vec<&str>`. Called on every publish hot path.
     #[must_use]
-    pub fn matches(&self, topic: &Topic) -> bool {
-        let pat_segments: Vec<&str> = self.pattern.split('.').collect();
-        let topic_segments: Vec<&str> = topic.as_str().split('.').collect();
-
-        if pat_segments.len() != topic_segments.len() {
-            return false;
-        }
-
-        for (pat, topic) in pat_segments.iter().zip(topic_segments.iter()) {
-            if *pat != "*" && *pat != *topic {
-                return false;
+    pub fn matches(&self, topic: &str) -> bool {
+        let mut pat = self.pattern.split('.');
+        let mut top = topic.split('.');
+        loop {
+            match (pat.next(), top.next()) {
+                (Some(p), Some(t)) => {
+                    if p != "*" && p != t {
+                        return false;
+                    }
+                }
+                (None, None) => return true,
+                _ => return false, // different segment counts
             }
         }
-        true
     }
 }
 
@@ -139,8 +141,8 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
-    fn t(s: &str) -> Topic {
-        Topic::new(s).unwrap()
+    fn t(s: &str) -> &str {
+        s
     }
 
     // ── SubscriptionId tests ─────────────────────────────────────
