@@ -228,6 +228,10 @@ pub struct QuicConf {
     /// connection. On by default. Set to `false` to reject path
     /// changes (mostly useful for benchmark isolation).
     pub migration: Option<bool>,
+    /// TLS 1.3 session resumption via NEW_SESSION_TICKET (RFC 8938).
+    /// On by default. Set to `false` to force full handshake on every
+    /// connection (useful for benchmark isolation).
+    pub session_resumption: Option<bool>,
 }
 
 /// `[cluster]` — multi-node cluster configuration (P6).

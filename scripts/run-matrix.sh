@@ -467,6 +467,76 @@ run_migration_case() {
 run_migration_case "true"  "migration-on"
 run_migration_case "false" "migration-off"
 
+# ── SDK-driven migration (actual Client::migrate() call) ─────────
+# The smoke cases above verify config parsing + metric presence.
+# This case verifies vireon_migrations_total actually INCREMENTS
+# when the SDK triggers a real connection migration via Client::migrate().
+echo
+echo "▶ [6/4b] SDK migration (s19 — actual UDP rebind via Client::migrate)"
+
+run_sdk_migration() {
+    local sport; sport=$(free_port_clean)
+    local mport; mport=$(free_port_clean)
+    local conf="$CONF_DIR/migration-$RUN_ID-sdk.conf"
+    write_migration_conf "$conf" "true" "$mport"
+
+    local log="$CONF_DIR/migration-$RUN_ID-sdk.log"
+    $SRV --config "$conf" --port "$sport" > "$log" 2>&1 &
+    local pid=$!
+    if ! wait_ready "$sport"; then
+        printf "  %-22s %s\n" "sdk-migration" "FAIL(server didn't bind $sport)"
+        RESULTS+=("migration|sdk|FAIL(server)")
+        stop_pid "$pid" 2>/dev/null
+        return
+    fi
+    if ! wait_metrics_ready "$mport"; then
+        printf "  %-22s %s\n" "sdk-migration" "FAIL(/metrics on $mport)"
+        RESULTS+=("migration|sdk|FAIL(metrics)")
+        stop_pid "$pid"
+        return
+    fi
+
+    local mig_before
+    mig_before=$(metric_value "$mport" vireon_migrations_total)
+    mig_before=${mig_before:-0}
+
+    local slog="$CONF_DIR/migration-$RUN_ID-sdk.workload.log"
+    local start=$(date +%s.%N)
+    VIREON_ADDR="127.0.0.1:$sport" VIREON_CERT="$CERT" \
+        timeout 90 cargo run -p vireon-sdk --release --example s19_connection_migration \
+        > "$slog" 2>&1
+    local rc=$?
+    local end=$(date +%s.%N)
+    local elapsed=$(awk "BEGIN{printf \"%.1f\", $end-$start}")
+
+    local mig_after verified
+    mig_after=$(metric_value "$mport" vireon_migrations_total)
+    mig_after=${mig_after:-0}
+    verified=$(grep -cE 'MIGRATION VERIFIED' "$slog" 2>/dev/null || echo 0)
+
+    stop_pid "$pid"
+
+    if [ "$rc" -ne 0 ]; then
+        printf "  %-22s FAIL(rc=$rc) %ss\n" "sdk-migration" "$elapsed"
+        RESULTS+=("migration|sdk|FAIL(example rc)")
+        return
+    fi
+
+    local delta=$((mig_after - mig_before))
+    if [ "$delta" -gt 0 ] && [ "${verified:-0}" -ge 1 ]; then
+        printf "  %-22s PASS %ss | migrations %d->%d (+%d) | VERIFIED\n" \
+            "sdk-migration" "$elapsed" "$mig_before" "$mig_after" "$delta"
+        RESULTS+=("migration|sdk|PASS")
+    else
+        printf "  %-22s FAIL %ss | migrations %d->%d (+%d) | verified=%s\n" \
+            "sdk-migration" "$elapsed" "$mig_before" "$mig_after" "$delta" "${verified:-0}"
+        RESULTS+=("migration|sdk|FAIL(no increment)")
+    fi
+    sleep 1
+}
+
+run_sdk_migration
+
 # Summary
 echo
 echo "═══════════════════════════════════════════════════════════════"
