@@ -654,6 +654,18 @@ fn resolve_tuning(conf: &ServerConf) -> LayerTuning {
         if let Some(v) = ss.starvation_threshold_us { t.scheduler_starvation_threshold_us = v; }
     }
 
+    // ── Adaptive delivery ──
+    if let Some(d) = &conf.delivery {
+        if let Some(v) = d.logtail_threshold { t.delivery_logtail_threshold = v; }
+        if let Some(v) = d.force_strategy.as_deref() {
+            t.delivery_force_strategy = match v.trim().to_ascii_lowercase().as_str() {
+                "batch" | "batchpush" | "push" => crate::conf::DeliveryMode::ForceBatch,
+                "logtail" | "log" | "tail" => crate::conf::DeliveryMode::ForceLogTail,
+                _ => crate::conf::DeliveryMode::Auto,
+            };
+        }
+    }
+
     t
 }
 

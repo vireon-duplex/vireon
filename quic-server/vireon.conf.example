@@ -541,3 +541,29 @@ max_bytes_per_tick = "64KiB"
 # Starvation threshold in microseconds. A stream waiting longer
 # than this is prioritized on the next tick.
 starvation_threshold_us = 10000
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Adaptive Delivery Strategy
+#
+#  Controls when the server switches from BatchPush (encode once,
+#  clone per subscriber) to LogTail (append WAL, send NotifyOffset,
+#  subscriber auto-fetches) based on subscriber count.
+#
+#  Requires WAL to be enabled (--wal-root) for LogTail.
+# ═══════════════════════════════════════════════════════════════════
+[delivery]
+
+# Subscriber count above which LogTail is used instead of BatchPush.
+# When a topic has ≥ this many subscribers (local + remote nodes),
+# the server appends the payload to WAL and sends a lightweight
+# NotifyOffset (~16 bytes) instead of the full payload. Subscribers
+# auto-fetch the payload via the Fetch protocol.
+# Default: 256. Set high (e.g. 999999) to force BatchPush always.
+logtail_threshold = 256
+
+# Force a strategy regardless of subscriber count:
+#   "auto"      — select based on logtail_threshold (default)
+#   "batch"     — always BatchPush
+#   "logtail"   — always LogTail (requires WAL)
+# force_strategy = "auto"

@@ -25,10 +25,42 @@
 //!        ├─ outbox: Vec<OutgoingFrame>
 //!        └─ next_seq: per-QUIC-stream response seq
 //! ```
+//!
+//! ## Adaptive Delivery Strategy
+//!
+//! The dispatcher selects a fan-out algorithm per-publish based on subscriber
+//! count, configurable via `[delivery]` in the TOML config:
+//!
+//! ```text
+//! Transport path (automatic, based on subscriber location):
+//!
+//!   ┌─────────────────┬──────────────────────────────────┐
+//!   │ Subscriber loc  │ Transport                        │
+//!   ├─────────────────┼──────────────────────────────────┤
+//!   │ Same worker     │ Direct enqueue_frame             │
+//!   │ Other worker    │ InterWorkerMsg via mpsc channel  │
+//!   │ Other node      │ InterNodeMessage via UDP mesh    │
+//!   └─────────────────┴──────────────────────────────────┘
+//!
+//! Fan-out strategy (adaptive, based on total subscriber count):
+//!
+//!   fan-out < logtail_threshold  →  BatchPush (encode once, clone per sub)
+//!   fan-out ≥ logtail_threshold  →  LogTail (WAL append + NotifyOffset)
+//! ```
+//!
+//! **BatchPush** encodes the payload once into `Bytes`, then each subscriber
+//! gets a `.clone()` (Arc refcount bump — zero-copy). Optimal for small
+//! fan-out where latency matters.
+//!
+//! **LogTail** appends to WAL, then sends a ~16-byte `NotifyOffset` frame per
+//! subscriber. The subscriber auto-fetches the full payload via `Fetch`.
+//! Reduces per-publish send-queue memory from `N × payload_size` to
+//! `N × 16 bytes` — optimal for high fan-out (hundreds+ subscribers).
 
 use arrayvec::ArrayVec;
 use rustc_hash::FxHashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -72,6 +104,68 @@ use bytes::{Bytes, BytesMut};
 
 // ── Inter-worker pub/sub forwarding ────────────────────────────────
 
+/// Delivery algorithm selected per-publish based on fan-out count.
+///
+/// **BatchPush** — encode once, clone `Bytes` (Arc refcount bump) per
+/// subscriber, enqueue directly. Optimal for small fan-out.
+///
+/// **LogTail** — append to WAL, send lightweight `NotifyOffset` (~16 bytes)
+/// per subscriber; the subscriber auto-fetches the full payload via
+/// `Fetch`. Reduces per-publish memory from `N × payload_size` to
+/// `N × 16` bytes in send queues — optimal for large fan-out (hundreds+).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FanoutStrategy {
+    BatchPush,
+    LogTail,
+}
+
+/// Resolved adaptive-delivery configuration. Controls when the server
+/// switches from BatchPush to LogTail based on subscriber count.
+#[derive(Debug, Clone)]
+pub struct DeliveryConfig {
+    /// Subscriber count above which LogTail is used. Default 256.
+    pub logtail_threshold: usize,
+    /// Force a strategy regardless of subscriber count.
+    pub force_strategy: crate::conf::DeliveryMode,
+}
+
+impl Default for DeliveryConfig {
+    fn default() -> Self {
+        Self {
+            logtail_threshold: 256,
+            force_strategy: crate::conf::DeliveryMode::Auto,
+        }
+    }
+}
+
+impl DeliveryConfig {
+    /// Selects the strategy for a publish given the total fan-out count
+    /// and whether WAL is available.
+    #[must_use]
+    pub fn select(&self, total_fanout: usize, wal_available: bool) -> FanoutStrategy {
+        match self.force_strategy {
+            crate::conf::DeliveryMode::ForceBatch => FanoutStrategy::BatchPush,
+            crate::conf::DeliveryMode::ForceLogTail => {
+                if wal_available {
+                    FanoutStrategy::LogTail
+                } else {
+                    tracing::warn!(
+                        "[delivery] force_strategy=logtail but WAL is disabled — falling back to BatchPush"
+                    );
+                    FanoutStrategy::BatchPush
+                }
+            }
+            crate::conf::DeliveryMode::Auto => {
+                if wal_available && total_fanout >= self.logtail_threshold {
+                    FanoutStrategy::LogTail
+                } else {
+                    FanoutStrategy::BatchPush
+                }
+            }
+        }
+    }
+}
+
 /// Messages exchanged between workers for cross-worker pub/sub.
 ///
 /// **`Publish`** — a published frame forwarded to another worker for
@@ -86,8 +180,11 @@ use bytes::{Bytes, BytesMut};
 #[derive(Clone)]
 pub enum InterWorkerMsg {
     /// Pre-encoded wire frame for delivery to local subscribers.
+    /// `msg_type` distinguishes Publish (full payload) from NotifyOffset
+    /// (LogTail — WAL offset pointer).
     Publish {
         framed: Bytes,
+        msg_type: MessageType,
     },
     /// Sender `worker_idx` now has ≥1 subscriber for `pattern`.
     SubGained {
@@ -122,6 +219,7 @@ pub enum InterWorkerMsg {
     GroupDeliver {
         framed: Bytes,
         target: Option<(usize, u64)>,
+        msg_type: MessageType,
     },
 }
 
@@ -400,6 +498,19 @@ pub struct VireonDispatcher {
     /// Last time `tick_health` ran the failure detector. Throttled to
     /// `heartbeat_interval` to avoid scanning on every reactor tick.
     last_health_check: Option<std::time::Instant>,
+    /// Backpressure signal from the Stack's `pending_sends` queue. Set by
+    /// the Stack before `on_batch_tick` so `drain_worker_inbox` can stop
+    /// accepting cross-worker publishes when subscriber QUIC streams are
+    /// flow-controlled. Without this, multi-worker fan-out fills
+    /// `pending_sends` to the 1 GiB byte cap, triggering eviction and
+    /// silent frame drops (manifests as 0.3–0.5× fanout in broadcast benches).
+    pending_sends_high: bool,
+    /// Shared pressure flags — one per worker. This worker sets its own
+    /// flag when `pending_sends_high` is true; reads others' flags to
+    /// decide whether to forward cross-worker publishes or backpressure
+    /// the publisher instead. Enables cross-worker backpressure without
+    /// polling channel depth (which `SyncSender` doesn't expose).
+    worker_pressure_flags: Vec<Arc<AtomicBool>>,
     /// Aggregate count of cross-worker inbox-full drops. Logged at most
     /// once every `WORKER_DROP_LOG_COOLDOWN` via [`worker_drop_cooldown`]
     /// — a sustained burst otherwise produces hundreds of identical WARN
@@ -469,6 +580,18 @@ pub struct VireonDispatcher {
     /// split().freeze() pattern as `encode_scratch` — zero allocation
     /// per ACK after warmup.
     ack_scratch: BytesMut,
+    /// Reusable scratch for encoding LogTail `NotifyOffset` frames.
+    /// Same clear + split().freeze() pattern — zero allocation after warmup.
+    notify_scratch: BytesMut,
+
+    // ── Adaptive delivery ──────────────────────────────────────────
+    /// Resolved delivery-strategy configuration (thresholds + force mode).
+    delivery_config: DeliveryConfig,
+    /// Cumulative count of publishes routed via BatchPush.
+    batch_push_count: u64,
+    /// Cumulative count of publishes routed via LogTail.
+    logtail_count: u64,
+
     /// Optional tamper-evident audit log. Records security-relevant
     /// events (ACL denies, quota rejections, topic lifecycle). `None`
     /// when `--audit-log` is not configured.
@@ -531,6 +654,8 @@ impl VireonDispatcher {
             worker_self_idx: 0,
             last_heartbeat_send: None,
             last_health_check: None,
+            pending_sends_high: false,
+            worker_pressure_flags: Vec::new(),
             worker_drop_count: 0,
             worker_drop_cooldown: crate::log_throttle::Cooldown::new(WORKER_DROP_LOG_COOLDOWN),
             remote_pattern_interest: FxHashMap::default(),
@@ -560,6 +685,10 @@ impl VireonDispatcher {
             quota_subscriber_rejects: 0,
             encode_scratch: BytesMut::new(),
             ack_scratch: BytesMut::new(),
+            notify_scratch: BytesMut::new(),
+            delivery_config: DeliveryConfig::default(),
+            batch_push_count: 0,
+            logtail_count: 0,
             audit_log: None,
         }
     }
@@ -568,6 +697,13 @@ impl VireonDispatcher {
     #[must_use]
     pub fn with_wal_sweep_interval(mut self, interval: Duration) -> Self {
         self.wal_sweep_interval = interval;
+        self
+    }
+
+    /// Sets the adaptive-delivery configuration (thresholds + force mode).
+    #[must_use]
+    pub fn with_delivery_config(mut self, cfg: DeliveryConfig) -> Self {
+        self.delivery_config = cfg;
         self
     }
 
@@ -790,6 +926,11 @@ impl VireonDispatcher {
         self.worker_self_idx = self_idx;
         self.worker_inbox = Some(inbox);
         self.worker_outboxes = outboxes;
+        // Initialize one shared pressure flag per worker. Each worker sets
+        // its own flag when its pending_sends is high; other workers read
+        // it to apply publisher-side backpressure before forwarding.
+        let n = self.worker_outboxes.len();
+        self.worker_pressure_flags = (0..n).map(|_| Arc::new(AtomicBool::new(false))).collect();
     }
 
     /// Evaluates `(conn_idx's principal, action, topic_or_pattern)` against
@@ -1370,6 +1511,7 @@ impl VireonDispatcher {
         // to decide whether this publish belongs to us (deliver
         // locally + fan out to remote subscribers) or another node
         // (forward the publish via UDP).
+        let mut remote_node_count: usize = 0;
         if let Some(coord) = &self.coordinator {
             let decision = coord.route_publish(topic);
             // Hoist ONE Arc<str> allocation for the topic — every
@@ -1438,6 +1580,10 @@ impl VireonDispatcher {
                     // they receive Publish (which triggers cluster_deliver_local
                     // including subscriber delivery), so a Fanout would
                     // double-deliver.
+                    remote_node_count = remote_targets
+                        .iter()
+                        .filter(|t| !replicas.contains(t))
+                        .count();
                     if let Some(tx) = &self.cluster_outgoing_tx {
                         let msg = InterNodeMessage::fanout(
                             self.node_id,
@@ -1530,6 +1676,48 @@ impl VireonDispatcher {
             }
         }
 
+        // ── Adaptive delivery strategy selection ──────────────────────
+        // BatchPush (default): forward the full payload to each subscriber.
+        // LogTail (high fan-out): send a lightweight NotifyOffset; subscribers
+        // auto-fetch the payload from WAL. This reduces per-publish memory
+        // from N × payload_size to N × ~16 bytes in subscriber send queues.
+        //
+        // LogTail requires a single WAL: the NotifyOffset carries a WAL offset
+        // that the subscriber's Fetch reads back. In multi-worker mode each
+        // worker has its own WAL instance, so a NotifyOffset generated by
+        // worker W is meaningless to a subscriber whose Fetch lands on worker
+        // V. We therefore treat WAL as unavailable for strategy selection when
+        // more than one worker is active.
+        let total_fanout = self.targets_scratch.len() + remote_node_count;
+        let wal_usable = self.wal.is_some() && self.worker_outboxes.is_empty();
+        let strategy = self.delivery_config.select(total_fanout, wal_usable);
+        let (fanout_bytes, fanout_msg_type) = match strategy {
+            FanoutStrategy::BatchPush => {
+                self.batch_push_count = self.batch_push_count.wrapping_add(1);
+                (bytes.clone(), MessageType::Publish)
+            }
+            FanoutStrategy::LogTail => {
+                self.logtail_count = self.logtail_count.wrapping_add(1);
+                // Encode NotifyOffset: topic_len(u16) | topic | offset(u64).
+                let offset = wal_offset.unwrap_or_else(|| wal_store::Offset::new(0));
+                self.notify_scratch.clear();
+                self.notify_scratch
+                    .extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
+                self.notify_scratch.extend_from_slice(topic_str.as_bytes());
+                self.notify_scratch.extend_from_slice(&offset.get().to_be_bytes());
+                (self.notify_scratch.split().freeze(), MessageType::NotifyOffset)
+            }
+        };
+
+        tracing::debug!(
+            conn_idx = ctx.conn_idx,
+            topic = %topic,
+            strategy = ?strategy,
+            local_subs = self.targets_scratch.len(),
+            remote_nodes = remote_node_count,
+            "[delivery] publish routed"
+        );
+
         let target_count = self.targets_scratch.len();
         for i in 0..target_count {
             let (conn_idx, quic_stream_id) = {
@@ -1540,8 +1728,8 @@ impl VireonDispatcher {
                 conn_idx,
                 quic_stream_id,
                 stream,
-                MessageType::Publish,
-                bytes.clone(),
+                fanout_msg_type,
+                fanout_bytes.clone(),
             );
         }
 
@@ -1575,16 +1763,17 @@ impl VireonDispatcher {
                     conn_idx,
                     quic_stream_id,
                     stream,
-                    MessageType::Publish,
-                    bytes.clone(),
+                    fanout_msg_type,
+                    fanout_bytes.clone(),
                 );
             }
         } else if self.worker_self_idx == 0 {
-            self.do_group_delivery(bytes.clone());
+            self.do_group_delivery(fanout_bytes.clone(), fanout_msg_type);
         } else if let Some(outbox) = self.worker_outboxes.first() {
             let _ = outbox.try_send(InterWorkerMsg::GroupDeliver {
-                framed: bytes.clone(),
+                framed: fanout_bytes.clone(),
                 target: None,
+                msg_type: fanout_msg_type,
             });
         } else {
             tracing::error!("worker_outboxes empty in group-deliver path — skipping");
@@ -1610,7 +1799,8 @@ impl VireonDispatcher {
                     }
                     if let Err(std::sync::mpsc::TrySendError::Full(_)) =
                         outbox.try_send(InterWorkerMsg::Publish {
-                            framed: bytes.clone(),
+                            framed: fanout_bytes.clone(),
+                            msg_type: fanout_msg_type,
                         })
                     {
                         self.worker_drop_count = self.worker_drop_count.wrapping_add(1);
@@ -2729,7 +2919,7 @@ impl VireonDispatcher {
                         // Consumer-group delivery: worker 0 only (or any
                         // worker in single-worker mode).
                         if self.worker_outboxes.is_empty() || self.worker_self_idx == 0 {
-                            self.do_group_delivery(bytes);
+                            self.do_group_delivery(bytes, MessageType::Publish);
                         }
                     }
                 }
@@ -2956,6 +3146,15 @@ impl VireonDispatcher {
         let Some(rx) = &mut self.worker_inbox else {
             return;
         };
+        // Backpressure gate: when subscriber QUIC streams are flow-controlled
+        // and pending_sends is above the high-watermark, stop draining the
+        // cross-worker inbox. This lets `drain_pending_sends` catch up
+        // instead of flooding pending_sends to the 1 GiB eviction cap.
+        // The sender-side `try_send` will see a full channel and drop,
+        // providing backpressure to the publishing worker.
+        if self.pending_sends_high {
+            return;
+        }
         const CAP: usize = 32_768;
         self.worker_inbox_scratch.clear();
         while self.worker_inbox_scratch.len() < CAP {
@@ -2981,11 +3180,12 @@ impl VireonDispatcher {
                 &mut self.worker_inbox_scratch[i],
                 InterWorkerMsg::Publish {
                     framed: Bytes::new(),
+                    msg_type: MessageType::Publish,
                 },
             );
             match msg {
-                InterWorkerMsg::Publish { framed } => {
-                    self.deliver_framed_local(framed);
+                InterWorkerMsg::Publish { framed, msg_type } => {
+                    self.deliver_framed_local(framed, msg_type);
                 }
                 InterWorkerMsg::SubGained { worker_idx, pattern } => {
                     if let Ok(pat) = pubsub_engine::TopicPattern::new(&pattern) {
@@ -3047,7 +3247,7 @@ impl VireonDispatcher {
                         }
                     }
                 }
-                InterWorkerMsg::GroupDeliver { framed, target } => match target {
+                InterWorkerMsg::GroupDeliver { framed, target, msg_type } => match target {
                     Some((conn_idx, stream_id)) => {
                         // Worker 0 routed a delivery to a member on this worker.
                         let stream = StreamId::new(0xFFFF_FFFF);
@@ -3055,14 +3255,14 @@ impl VireonDispatcher {
                             conn_idx,
                             stream_id,
                             stream,
-                            MessageType::Publish,
+                            msg_type,
                             framed,
                         );
                     }
                     None => {
                         // Another worker asks us (worker 0) to do global
                         // group delivery.
-                        self.do_group_delivery(framed);
+                        self.do_group_delivery(framed, msg_type);
                     }
                 },
             }
@@ -3081,7 +3281,7 @@ impl VireonDispatcher {
     /// - **Single-worker fallback** (no `remote_group_members`): local
     ///   round-robin via `group_locals` — same as the inline code in
     ///   `handle_publish`'s single-worker branch.
-    fn do_group_delivery(&mut self, framed: Bytes) {
+    fn do_group_delivery(&mut self, framed: Bytes, msg_type: MessageType) {
         // Parse topic from framed bytes.
         if framed.len() < 2 {
             return;
@@ -3140,7 +3340,7 @@ impl VireonDispatcher {
                             conn_idx,
                             stream_id,
                             stream,
-                            MessageType::Publish,
+                            msg_type,
                             framed.clone(),
                         );
                     }
@@ -3149,6 +3349,7 @@ impl VireonDispatcher {
                             let _ = outbox.try_send(InterWorkerMsg::GroupDeliver {
                                 framed: framed.clone(),
                                 target: Some((conn_idx, stream_id)),
+                                msg_type,
                             });
                         }
                     }
@@ -3174,7 +3375,7 @@ impl VireonDispatcher {
                     conn_idx,
                     stream_id,
                     stream,
-                    MessageType::Publish,
+                    msg_type,
                     framed.clone(),
                 );
             }
@@ -3195,7 +3396,7 @@ impl VireonDispatcher {
     /// Same semantics as `cluster_deliver_local` for regular fan-out.
     /// Consumer-group delivery is NOT handled here — it goes through
     /// the `GroupDeliver` inter-worker path to worker 0.
-    fn deliver_framed_local(&mut self, framed: Bytes) {
+    fn deliver_framed_local(&mut self, framed: Bytes, msg_type: MessageType) {
         // Zero-copy topic parse: first 2 bytes = topic_len BE, then topic.
         if framed.len() < 2 {
             return;
@@ -3234,7 +3435,7 @@ impl VireonDispatcher {
                 target.conn_idx,
                 target.quic_stream_id,
                 stream,
-                MessageType::Publish,
+                msg_type,
                 framed.clone(),
             );
         }
@@ -3572,7 +3773,11 @@ impl ApplicationLayer {
             session: SessionLayer::new(t)?,
             platform,
             dispatcher: VireonDispatcher::new()
-                .with_wal_sweep_interval(t.wal_sweep_interval),
+                .with_wal_sweep_interval(t.wal_sweep_interval)
+                .with_delivery_config(DeliveryConfig {
+                    logtail_threshold: t.delivery_logtail_threshold,
+                    force_strategy: t.delivery_force_strategy,
+                }),
             metric_frames_rx,
             metric_connections,
             default_tenant,
@@ -3674,6 +3879,33 @@ impl ApplicationLayer {
                 .quotas
                 .enforce_bandwidth(self.default_tenant, frame.payload.len() as u64);
         }
+    }
+
+    /// Set the pending-sends backpressure signal from the Stack. Called
+    /// before `on_batch_tick` so cross-worker inbox draining can be gated
+    /// when subscriber streams are flow-controlled. Also publishes this
+    /// worker's pressure state to the shared flag so other workers can
+    /// backpressure their publishers before forwarding.
+    pub fn set_pending_pressure(&mut self, high: bool) {
+        self.dispatcher.pending_sends_high = high;
+        if let Some(flag) = self.dispatcher.worker_pressure_flags.get(
+            self.dispatcher.worker_self_idx,
+        ) {
+            flag.store(high, Ordering::Relaxed);
+        }
+    }
+
+    /// Returns true if any *other* worker has reported pending-sends
+    /// pressure. Checked by the Stack before accepting a Publish so the
+    /// publisher gets a backpressure ack instead of silently dropping at
+    /// the cross-worker `try_send` boundary.
+    pub fn any_remote_worker_pressured(&self) -> bool {
+        let self_idx = self.dispatcher.worker_self_idx;
+        self.dispatcher
+            .worker_pressure_flags
+            .iter()
+            .enumerate()
+            .any(|(i, f)| i != self_idx && f.load(Ordering::Relaxed))
     }
 
     /// Drives the stream scheduler once per recv batch.

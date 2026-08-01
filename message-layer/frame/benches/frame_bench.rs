@@ -292,6 +292,55 @@ fn realistic_payload(mt: MessageType) -> Vec<u8> {
             v.extend_from_slice(payload);
             v
         }
+        MessageType::ConsumerGroupJoin => {
+            let topic = b"metrics.cpu.host.0";
+            let group = b"zone1-alerts";
+            let consumer = b"consumer-1";
+            let mut v = Vec::with_capacity(2 + topic.len() + 2 + group.len() + 2 + consumer.len() + 4);
+            v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            v.extend_from_slice(topic);
+            v.extend_from_slice(&(group.len() as u16).to_be_bytes());
+            v.extend_from_slice(group);
+            v.extend_from_slice(&(consumer.len() as u16).to_be_bytes());
+            v.extend_from_slice(consumer);
+            v.extend_from_slice(&4u32.to_be_bytes());
+            v
+        }
+        MessageType::ConsumerGroupLeave => {
+            let topic = b"metrics.cpu.host.0";
+            let group = b"zone1-alerts";
+            let consumer = b"consumer-1";
+            let mut v = Vec::with_capacity(2 + topic.len() + 2 + group.len() + 2 + consumer.len());
+            v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            v.extend_from_slice(topic);
+            v.extend_from_slice(&(group.len() as u16).to_be_bytes());
+            v.extend_from_slice(group);
+            v.extend_from_slice(&(consumer.len() as u16).to_be_bytes());
+            v.extend_from_slice(consumer);
+            v
+        }
+        MessageType::ConsumerGroupHeartbeat => {
+            let topic = b"metrics.cpu.host.0";
+            let group = b"zone1-alerts";
+            let consumer = b"consumer-1";
+            let mut v = Vec::with_capacity(2 + topic.len() + 2 + group.len() + 2 + consumer.len() + 4);
+            v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            v.extend_from_slice(topic);
+            v.extend_from_slice(&(group.len() as u16).to_be_bytes());
+            v.extend_from_slice(group);
+            v.extend_from_slice(&(consumer.len() as u16).to_be_bytes());
+            v.extend_from_slice(consumer);
+            v.extend_from_slice(&1u32.to_be_bytes());
+            v
+        }
+        MessageType::NotifyOffset => {
+            let topic = b"metrics.cpu.host.0";
+            let mut v = Vec::with_capacity(2 + topic.len() + 8);
+            v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            v.extend_from_slice(topic);
+            v.extend_from_slice(&42u64.to_be_bytes());
+            v
+        }
     }
 }
 
@@ -329,6 +378,10 @@ fn type_name(mt: MessageType) -> &'static str {
         MessageType::TopicDelete => "TopicDelete",
         MessageType::Fetch => "Fetch",
         MessageType::FetchReply => "FetchReply",
+        MessageType::ConsumerGroupJoin => "ConsumerGroupJoin",
+        MessageType::ConsumerGroupLeave => "ConsumerGroupLeave",
+        MessageType::ConsumerGroupHeartbeat => "ConsumerGroupHeartbeat",
+        MessageType::NotifyOffset => "NotifyOffset",
     }
 }
 
