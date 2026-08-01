@@ -339,23 +339,40 @@ impl ClientStack {
     /// Encodes Fetch requests into `dst`. Each Fetch asks the server to
     /// replay one WAL entry starting at `offset` for the given topic.
     /// The server caps the reply at `FETCH_MAX_COUNT` entries.
+    ///
+    /// All fetches are enqueued into the send-policy and drained in a single
+    /// pass — calling `encode_frame_coalesced_into` per fetch would clear
+    /// `dst` each time (its internal `dst.clear()`), losing all but the last.
     pub fn encode_fetches_into(&mut self, dst: &mut Vec<u8>, fetches: &[(Vec<u8>, u64)]) {
-        dst.clear();
+        let stream_id = StreamId::new(0);
+        // 1. Enqueue all fetch frames into the send-policy.
         for (topic_bytes, offset) in fetches {
-            // Build Fetch payload: topic_len(u16) | topic | from_offset(u64) | max_count(u32).
             let mut payload = Vec::with_capacity(2 + topic_bytes.len() + 8 + 4);
             payload.extend_from_slice(&(topic_bytes.len() as u16).to_be_bytes());
             payload.extend_from_slice(topic_bytes);
             payload.extend_from_slice(&offset.to_be_bytes());
             payload.extend_from_slice(&1u32.to_be_bytes()); // max_count = 1
-            self.encode_frame_coalesced_into(
-                dst,
-                0,
+            let header = self.app.prepare_frame(0, MessageType::Fetch, FrameFlags::NONE);
+            let fp = FramePayload::new(
                 MessageType::Fetch,
                 FrameFlags::NONE,
-                &payload,
-                1,
+                header.seq,
+                Bytes::copy_from_slice(&payload),
             );
+            let _ = self.send_policy.enqueue(CLIENT_CONN_IDX, stream_id, fp);
+        }
+
+        // 2. Drain all ready frames into dst in one pass.
+        dst.clear();
+        let mut ready: Vec<(usize, StreamId)> = Vec::new();
+        self.send_policy.ready_streams_all(&mut ready);
+        for (conn_idx, sid) in ready {
+            if conn_idx != CLIENT_CONN_IDX {
+                continue;
+            }
+            while let DequeueOutcome::Some(fp) = self.send_policy.dequeue(conn_idx, sid) {
+                self.encode_one_into(dst, sid, fp);
+            }
         }
     }
 }
@@ -496,5 +513,34 @@ mod tests {
         // 6 bytes, so frame wire size = HEADER + 6 + CRC.
         let frame_wire = frame::codec::HEADER_SIZE + second_payload.len() + frame::codec::CRC_SIZE;
         assert_eq!(dst2.len(), 3 * frame_wire);
+    }
+
+    #[test]
+    fn encode_fetches_into_emits_all_requests_not_just_last() {
+        // Regression: encode_fetches_into previously called
+        // encode_frame_coalesced_into per fetch, whose internal
+        // dst.clear() wiped all but the last frame.
+        let mut stack = make_stack();
+        let fetches: Vec<(Vec<u8>, u64)> = vec![
+            (b"topic.a".to_vec(), 0),
+            (b"topic.a".to_vec(), 1),
+            (b"topic.a".to_vec(), 2),
+            (b"topic.a".to_vec(), 3),
+            (b"topic.a".to_vec(), 4),
+        ];
+        let mut dst = Vec::new();
+        stack.encode_fetches_into(&mut dst, &fetches);
+
+        // Each Fetch frame wire size = HEADER + payload + CRC.
+        // Fetch payload = topic_len(2) + topic("topic.a"=7) + offset(8) + max_count(4) = 21.
+        let fetch_payload = 2 + 7 + 8 + 4;
+        let frame_wire = frame::codec::HEADER_SIZE + fetch_payload + frame::codec::CRC_SIZE;
+        assert_eq!(
+            dst.len(),
+            5 * frame_wire,
+            "expected 5 Fetch frames ({} bytes each), got {} bytes",
+            frame_wire,
+            dst.len()
+        );
     }
 }
