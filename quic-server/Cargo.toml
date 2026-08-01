@@ -89,6 +89,9 @@ libc = { workspace = true }
 # Fast hashing for hot-path HashMaps.
 rustc-hash = { workspace = true }
 
+# Stack-allocated scratch buffers (avoids heap alloc per tick).
+arrayvec = { workspace = true }
+
 # Refcounted byte slices for zero-copy frame payloads.
 bytes = { workspace = true }
 

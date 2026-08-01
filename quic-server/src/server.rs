@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use crate::config::{ServerConfig, WorkerMode};
 use crate::error::ServerError;
-use crate::layers::InterWorkerMsg;
 use crate::worker::{Worker, install_crash_handlers, install_signal_handler};
 
 /// Top-level QUIC server.

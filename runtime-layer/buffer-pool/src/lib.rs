@@ -100,6 +100,7 @@
 //! [`error`]: crate::error
 
 #![allow(clippy::module_inception)]
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod allocator;
 pub mod backpressure;

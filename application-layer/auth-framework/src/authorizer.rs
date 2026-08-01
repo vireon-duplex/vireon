@@ -17,7 +17,7 @@ use crate::error::AuthError;
 use crate::health::HealthReport;
 use crate::permission::Permission;
 use crate::principal::PrincipalId;
-use crate::role::{Role, RoleAssignment};
+use crate::role::Role;
 use crate::stats::AuthStats;
 use rustc_hash::FxHashMap;
 

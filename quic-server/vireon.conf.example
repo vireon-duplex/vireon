@@ -320,6 +320,13 @@ initial_cwnd_packets = 100
 # Set to false to reject path changes (e.g. for benchmark isolation).
 # migration = true
 
+# TLS 1.3 session resumption (RFC 8938). When true (default), the server
+# issues NEW_SESSION_TICKET after the handshake. Clients can present the
+# ticket on reconnect for abbreviated handshake (0-RTT), reducing
+# reconnection latency from ~1 RTT to ~0 RTT. Set to false to force
+# full handshake on every connection (e.g. for benchmark isolation).
+# session_resumption = true
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  Buffer Pool

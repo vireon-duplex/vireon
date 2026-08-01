@@ -234,6 +234,10 @@ impl ServerConfig {
             if let Some(v) = q.migration {
                 quic_config.extensions.migration = v;
             }
+            // Session resumption toggle. Defaults to true (RFC 8938).
+            if let Some(v) = q.session_resumption {
+                quic_config.extensions.session_resumption = v;
+            }
         }
 
         // ── CRC resolution ──────────────────────────────────────────

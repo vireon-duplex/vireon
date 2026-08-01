@@ -39,7 +39,6 @@ static PROFILE_OUTPUT: OnceLock<Option<String>> = OnceLock::new();
 
 fn main() -> Result<(), ServerError> {
     let cli = Cli::parse();
-    init_tracing(&cli);
 
     // Install a panic hook that force-closes every registered socket fd.
     // With `panic = "unwind"` (default), Drop chains already run on panic
@@ -56,6 +55,10 @@ fn main() -> Result<(), ServerError> {
         eprintln!("note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace");
     }));
 
+    let config = ServerConfig::from_cli(&cli).map_err(|e| ServerError::Config(format!("{e:#}")))?;
+
+    init_tracing(cli.verbose, config.log_format);
+
     tracing::info!("vireon quic-server starting");
     tracing::debug!(cli = ?cli, "parsed CLI");
 
@@ -64,8 +67,6 @@ fn main() -> Result<(), ServerError> {
         profiler::init();
         let _ = PROFILE_OUTPUT.set(cli.profile_output.clone());
     }
-
-    let config = ServerConfig::from_cli(&cli).map_err(|e| ServerError::Config(format!("{e:#}")))?;
 
     print_banner(&config);
 
@@ -78,19 +79,19 @@ fn main() -> Result<(), ServerError> {
     result
 }
 
-fn init_tracing(cli: &Cli) {
-    use crate::cli::LogFormatArg;
-    let filter = if cli.verbose {
+fn init_tracing(verbose: bool, log_format: crate::config::LogFormat) {
+    use crate::config::LogFormat;
+    let filter = if verbose {
         "quic_server=debug,quic_engine=debug,io=debug,quiche=trace,warn"
     } else {
         "quic_server=info,quic_engine=info,warn"
     };
-    let result = match cli.log_format {
-        Some(LogFormatArg::Json) => tracing_subscriber::fmt()
+    let result = match log_format {
+        LogFormat::Json => tracing_subscriber::fmt()
             .with_env_filter(filter)
             .json()
             .try_init(),
-        _ => tracing_subscriber::fmt()
+        LogFormat::Text => tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_target(false)
             .try_init(),
@@ -119,6 +120,21 @@ fn print_banner(config: &ServerConfig) {
     }
     if let Some(port) = config.metrics_port {
         tracing::info!("  Metrics:  http://0.0.0.0:{port}/metrics");
+    }
+    // Warn if CPU is in powersave mode — causes 3x+ throughput
+    // variability in benchmarks (CPU ramps from 400MHz to 4.6GHz).
+    if let Ok(gov) = std::fs::read_to_string(
+        "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+    ) {
+        let gov = gov.trim();
+        if gov == "powersave" {
+            tracing::warn!(
+                cpu_governor = gov,
+                "CPU governor is 'powersave' — expect 3x+ throughput \
+                 variability. Run: echo performance | sudo tee \
+                 /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor"
+            );
+        }
     }
     tracing::info!("============================================================");
 }
