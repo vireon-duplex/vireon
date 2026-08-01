@@ -89,7 +89,8 @@ pub fn build_quiche_config(
     // outstanding tickets (acceptable — clients fall back to full
     // handshake).
     if quic_cfg.extensions.session_resumption {
-        let ticket_key = generate_ticket_key();
+        let ticket_key = generate_ticket_key()
+            .map_err(|e| QuicError::InvalidConfig(format!("session ticket key: {e}")))?;
         config.set_ticket_key(&ticket_key)?;
         config.enable_early_data();
     }
@@ -118,14 +119,12 @@ pub fn build_quiche_config(
 
 /// Generate 48 random bytes for the session ticket encryption key.
 /// Uses `/dev/urandom` (CSPRNG) — always available on Linux.
-fn generate_ticket_key() -> [u8; 48] {
+fn generate_ticket_key() -> Result<[u8; 48], std::io::Error> {
     use std::io::Read;
-    let mut f = std::fs::File::open("/dev/urandom")
-        .expect("open /dev/urandom");
+    let mut f = std::fs::File::open("/dev/urandom")?;
     let mut key = [0u8; 48];
-    f.read_exact(&mut key)
-        .expect("read ticket key from /dev/urandom");
-    key
+    f.read_exact(&mut key)?;
+    Ok(key)
 }
 
 /// Default idle-check interval derived from the config's idle timeout.

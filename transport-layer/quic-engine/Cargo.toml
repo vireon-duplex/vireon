@@ -29,6 +29,9 @@ bytes = { workspace = true }
 # Fast hashing for CID lookup and per-stream maps.
 rustc-hash = { workspace = true }
 
+# Stack-allocated scratch buffers (avoids heap alloc per tick).
+arrayvec = { workspace = true }
+
 # Vireon runtime-layer primitives. These provide the io_uring-native,
 # thread-per-core, NUMA-aware substrate the engine runs on.
 connection-shard = { path = "../../runtime-layer/connection-shard" }
