@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use arrayvec::ArrayVec;
 use bytes::BytesMut;
 use rustc_hash::FxHashMap;
 
@@ -111,17 +112,17 @@ pub struct VireonStack {
 
     // ── Reusable scratch ────────────────────────────────────────
     /// Pre-allocated scratch for `reap_idle` (avoids per-tick Vec alloc).
-    reap_buf: Vec<(usize, SocketAddr)>,
+    reap_buf: ArrayVec<(usize, SocketAddr), 16>,
     /// Pre-allocated scratch for outgoing frame encoding (avoids per-send alloc).
     send_scratch: Vec<u8>,
     /// Pre-allocated scratch for eviction metadata (avoids per-pass Vec alloc).
-    evict_scratch: Vec<crate::eviction::ConnEvictInfo>,
+    evict_scratch: ArrayVec<crate::eviction::ConnEvictInfo, 32>,
     /// Pre-allocated scratch for flush_outbox direct-send path (avoids per-tick Vec alloc).
     flush_direct: Vec<OutgoingFrame>,
     /// Pre-allocated scratch for flush_outbox policy-ready path (avoids per-tick Vec alloc).
     flush_policy: Vec<OutgoingFrame>,
     /// Pre-allocated scratch for drain_pending_sends keys (avoids per-tick Vec alloc).
-    pending_keys_scratch: Vec<(usize, u64)>,
+    pending_keys_scratch: ArrayVec<(usize, u64), 16>,
 
     // ── Observability ────────────────────────────────────────────
     /// Tick counter — used to throttle periodic stats logging.
@@ -363,12 +364,12 @@ impl VireonStack {
             engine,
             metrics: None,
             connections: ConnectionRegistry::new(),
-            reap_buf: Vec::with_capacity(16),
+            reap_buf: ArrayVec::new(),
             send_scratch: Vec::with_capacity(4096),
-            evict_scratch: Vec::with_capacity(32),
+            evict_scratch: ArrayVec::new(),
             flush_direct: Vec::new(),
             flush_policy: Vec::new(),
-            pending_keys_scratch: Vec::with_capacity(16),
+            pending_keys_scratch: ArrayVec::new(),
             tick_count: 0,
             pressure_throttle: PressureThrottle::new(),
             cgroup_pressure_cache: buffer_pool::PressureLevel::Low,
@@ -485,7 +486,7 @@ impl VireonStack {
             self.encode_and_send(
                 out.conn_idx,
                 out.quic_stream_id,
-                out.header.clone(),
+                out.header,
                 &out.payload,
             );
             if let Some(m) = &self.metrics {
@@ -506,7 +507,7 @@ impl VireonStack {
             self.encode_and_send(
                 out.conn_idx,
                 out.quic_stream_id,
-                out.header.clone(),
+                out.header,
                 &out.payload,
             );
             if let Some(m) = &self.metrics {
@@ -1092,7 +1093,7 @@ impl VireonStack {
         let expired = self.runtime.drain_expired();
         for conn_idx in expired {
             if let Some(cs) = self.connections.get(conn_idx) {
-                self.reap_buf.push((conn_idx, cs.peer_addr));
+                let _ = self.reap_buf.try_push((conn_idx, cs.peer_addr));
             }
         }
 
