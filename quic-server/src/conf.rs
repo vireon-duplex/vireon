@@ -208,6 +208,7 @@ pub struct ServerConf {
     pub task_queue: Option<TaskQueueConf>,
     pub timer_wheel: Option<TimerWheelConf>,
     pub stream_scheduler: Option<StreamSchedulerConf>,
+    pub delivery: Option<DeliveryConf>,
 }
 
 /// `[quic]` section — optional overrides applied on top of the preset.
@@ -408,6 +409,24 @@ pub struct StreamSchedulerConf {
     pub starvation_threshold_us: Option<u64>,
 }
 
+/// `[delivery]` — adaptive fan-out strategy tuning.
+///
+/// Controls when the server switches from **BatchPush** (encode once,
+/// clone per subscriber) to **LogTail** (append WAL, send lightweight
+/// NotifyOffset, subscriber pulls) based on subscriber count.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct DeliveryConf {
+    /// Subscriber count above which LogTail is used instead of BatchPush.
+    /// Requires WAL to be enabled (`--wal-root`). When WAL is absent,
+    /// BatchPush is always used regardless of this threshold.
+    /// Default 256.
+    pub logtail_threshold: Option<usize>,
+    /// Force a strategy regardless of subscriber count:
+    /// `"auto"` (default) | `"batch"` | `"logtail"`.
+    pub force_strategy: Option<String>,
+}
+
 /// fsync policy for the WAL.
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -447,6 +466,23 @@ impl QuicConf {
             "reno" | "cubic" | "bbr" | "bbr2" => Some(s),
             _ => None,
         })
+    }
+}
+
+/// Resolved delivery-strategy mode (from `[delivery].force_strategy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryMode {
+    /// Select based on subscriber count vs `logtail_threshold`.
+    Auto,
+    /// Always use BatchPush (encode once, clone per subscriber).
+    ForceBatch,
+    /// Always use LogTail (WAL append + NotifyOffset). Requires WAL.
+    ForceLogTail,
+}
+
+impl Default for DeliveryMode {
+    fn default() -> Self {
+        Self::Auto
     }
 }
 
@@ -516,6 +552,13 @@ pub struct LayerTuning {
     /// can't drain fast enough. 0 disables the check (accept
     /// everything; eviction is the last line of defense).
     pub publish_backpressure_high_watermark_bytes: usize,
+
+    // ── Adaptive delivery ──
+    /// Subscriber count above which LogTail is used instead of BatchPush.
+    /// Default 256. Only effective when WAL is enabled.
+    pub delivery_logtail_threshold: usize,
+    /// Force a delivery strategy regardless of subscriber count.
+    pub delivery_force_strategy: DeliveryMode,
 }
 
 impl Default for LayerTuning {
@@ -562,6 +605,8 @@ impl Default for LayerTuning {
             // 512 MiB ≈ 50% of PENDING_BYTE_CAP (1 GiB). Leaves headroom
             // for the eviction path to act as the last line of defense.
             publish_backpressure_high_watermark_bytes: 512 * 1024 * 1024,
+            delivery_logtail_threshold: 256,
+            delivery_force_strategy: DeliveryMode::Auto,
         }
     }
 }
