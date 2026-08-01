@@ -249,6 +249,8 @@ run_cluster_example() {
         for p in "${CPIDS[@]}"; do stop_pid "$p"; done
         return
     fi
+    # Stabilization: let cluster nodes exchange first heartbeats.
+    sleep 1
     local res; res=$(run_example "$variant" "$ex" "127.0.0.1:$Q1")
     printf "  %-30s %s\n" "$ex" "$res"
     RESULTS+=("$variant|$ex|$res")

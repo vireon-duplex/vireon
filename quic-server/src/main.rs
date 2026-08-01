@@ -121,6 +121,21 @@ fn print_banner(config: &ServerConfig) {
     if let Some(port) = config.metrics_port {
         tracing::info!("  Metrics:  http://0.0.0.0:{port}/metrics");
     }
+    // Warn if CPU is in powersave mode — causes 3x+ throughput
+    // variability in benchmarks (CPU ramps from 400MHz to 4.6GHz).
+    if let Ok(gov) = std::fs::read_to_string(
+        "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+    ) {
+        let gov = gov.trim();
+        if gov == "powersave" {
+            tracing::warn!(
+                cpu_governor = gov,
+                "CPU governor is 'powersave' — expect 3x+ throughput \
+                 variability. Run: echo performance | sudo tee \
+                 /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor"
+            );
+        }
+    }
     tracing::info!("============================================================");
 }
 

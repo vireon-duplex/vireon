@@ -262,6 +262,9 @@ run_cluster_mode() {
         for p in "${CPIDS[@]}"; do stop_pid "$p"; done
         return
     fi
+    # Stabilization: let cluster nodes exchange first heartbeats and
+    # fully initialize their event loops before the bench connects.
+    sleep 1
     local res; res=$(run_mode "$variant" "$mode" "127.0.0.1:$Q1" "$conns" 5)
     printf "  %-14s conns=%-2d  %s\n" "$mode" "$conns" "$res"
     RESULTS+=("$variant|$mode|$res")
