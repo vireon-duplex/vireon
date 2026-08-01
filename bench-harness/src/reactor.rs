@@ -25,6 +25,10 @@ const STAGGER_PER_WORKER: Duration = Duration::from_micros(200);
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
 /// Poll timeout — bounds the time between shutdown checks.
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
+/// Warmup delay for group/broadcast modes — gives subscribers time to
+/// register before the publisher starts streaming. Prevents the race
+/// where InterWorkerPublish fan-out arrives before the subscription.
+const WARMUP_DELAY: Duration = Duration::from_millis(500);
 /// mio event buffer capacity.
 const EVENTS_CAPACITY: usize = 1024;
 
@@ -163,6 +167,32 @@ fn run_inner(
 
     // Release the barrier — all reactors + main thread synchronize here.
     barrier.wait();
+
+    // Warmup: let subscribers' Subscribe frames reach the server and be
+    // registered before the publisher starts streaming. Without this,
+    // multi-worker mode has a race where the publisher's InterWorkerPublish
+    // fan-out arrives at subscriber workers before their local registry
+    // has the subscription, causing 0-delivery runs.
+    if matches!(mode, BenchMode::Broadcast | BenchMode::Group) {
+        let warmup_deadline = Instant::now() + WARMUP_DELAY;
+        while Instant::now() < warmup_deadline {
+            poll.poll(&mut events, Some(POLL_TIMEOUT))?;
+            for event in events.iter() {
+                let idx = event.token().0;
+                if let Some(conn) = conns[idx].as_mut() {
+                    if matches!(conn.phase, Phase::Ready) {
+                        conn.recv_inbound();
+                        conn.drain_and_process(entries.len());
+                        // tick with a zero-future deadline: subscribers
+                        // send their Subscribe frame (no deadline check),
+                        // publishers immediately return (deadline passed).
+                        conn.tick(entries, coalesce, Instant::now());
+                        conn.flush_outbound();
+                    }
+                }
+            }
+        }
+    }
 
     // ── Phase 3: Measurement ───────────────────────────────────────
     let deadline = Instant::now() + duration;
