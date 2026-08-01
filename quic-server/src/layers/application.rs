@@ -2275,10 +2275,13 @@ impl VireonDispatcher {
         let upper = if head == wal_store::Offset::NONE {
             from
         } else {
-            // Read up to (from + max_count) or head+1, whichever is smaller.
-            let from_plus_cap = wal_store::Offset::new(from.get().saturating_add(max_count as u64));
-            let head_next = wal_store::Offset::new(head.get() + 1);
-            core::cmp::min(from_plus_cap, head_next)
+            // `read_range` treats `until` as INCLUSIVE. To read `max_count`
+            // entries starting at `from`, the inclusive upper bound is
+            // `from + max_count - 1`. Cap at `head` (the last live entry).
+            let from_plus_cap = wal_store::Offset::new(
+                from.get().saturating_add((max_count.saturating_sub(1)) as u64),
+            );
+            core::cmp::min(from_plus_cap, head)
         };
         match wal.read_range(topic_str, from, upper, &mut entries) {
             Ok(count) => {
