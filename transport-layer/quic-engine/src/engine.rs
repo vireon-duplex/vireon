@@ -25,6 +25,7 @@
 //! └──────────────────────────────────────────────────────────────────┘
 //! ```
 
+use arrayvec::ArrayVec;
 use bytes::Bytes;
 use rustc_hash::FxHashMap;
 
@@ -194,13 +195,15 @@ pub struct QuicEngine {
     out_buf: Vec<u8>,
     /// Reusable scratch for collecting readable stream IDs (avoids
     /// per-datagram Vec allocation).
-    readable_buf: Vec<u64>,
+    readable_buf: ArrayVec<u64, 16>,
     /// Reusable scratch for collecting closed connection indices (avoids
     /// per-tick Vec allocation).
     closed_buf: Vec<usize>,
     /// Reusable scratch recording the connections flushed this tick, so
     /// `cleanup_closed` can scan only active connections instead of the
     /// whole slab. Cleared at the start of each `flush_sends`.
+    /// Stays a Vec because its high-water mark is bounded by
+    /// [`DIRTY_FLUSH_BUDGET`] (512), well beyond any reasonable ArrayVec cap.
     flushed_this_tick: Vec<usize>,
     /// Connections with pending sends — avoids O(N) flush scan of idle
     /// connections every tick. Populated by `feed_existing` (ACKs, flow
@@ -322,7 +325,7 @@ impl QuicEngine {
             dcid_to_idx: CrcHashMap::default(),
             pkt_buf: vec![0u8; 65535],
             out_buf: vec![0u8; MAX_PKT_SIZE],
-            readable_buf: Vec::with_capacity(16),
+            readable_buf: ArrayVec::new(),
             closed_buf: Vec::with_capacity(16),
             flushed_this_tick: Vec::with_capacity(64),
             dirty: DirtyBitset::new(),

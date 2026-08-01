@@ -67,6 +67,7 @@
 
 #![allow(clippy::module_name_repetitions)]
 #![allow(dead_code)] // Phase 0: stubs intentionally minimal until Phases 1–15.
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
 // ── Core skeleton modules ────────────────────────────────────────
 pub mod ack_manager;

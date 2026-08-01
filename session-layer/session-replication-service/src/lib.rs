@@ -42,6 +42,8 @@
 //! Modules 1–9 are real implementations. Modules 10–14 ship as
 //! typed skeletons. Functional engines land in Phase 1+.
 
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod builder;
 pub mod config;
 pub mod conflict;

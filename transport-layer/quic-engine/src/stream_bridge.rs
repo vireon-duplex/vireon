@@ -5,6 +5,7 @@
 //! multiple `stream_recv` calls), and pushes decoded frames as
 //! [`QuicEvent::FrameReceived`] into the engine's event queue.
 
+use arrayvec::ArrayVec;
 use bytes::Bytes;
 use rustc_hash::FxHashMap;
 
@@ -66,7 +67,7 @@ pub fn process_readable(
     reactor_id: u32,
     conn_idx: usize,
     events: &mut Vec<QuicEvent>,
-    readable_buf: &mut Vec<u64>,
+    readable_buf: &mut ArrayVec<u64, 16>,
     pool: &BufferPool,
     carryover: &mut FxHashMap<(usize, u64), StreamCarry>,
     delivery_policies: &mut DeliveryPolicyTable,
@@ -74,9 +75,15 @@ pub fn process_readable(
     skip_crc: bool,
 ) {
     // Collect readable stream IDs into the caller-provided buffer to
-    // avoid per-datagram Vec allocation.
+    // avoid per-datagram Vec allocation. If more than 16 streams are
+    // readable, the overflow ones are picked up on the next tick
+    // (quiche keeps them readable until stream_recv drains the data).
     readable_buf.clear();
-    readable_buf.extend(conn.readable());
+    for sid in conn.readable() {
+        if readable_buf.try_push(sid).is_err() {
+            break;
+        }
+    }
 
     let readable_count = readable_buf.len();
     if readable_count > 0 {

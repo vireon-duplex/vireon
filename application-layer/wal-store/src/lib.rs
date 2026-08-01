@@ -47,6 +47,7 @@
 //! the caller's responsibility — this crate only stores and reports.
 
 #![allow(clippy::module_inception)]
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod consumer;
 pub mod entry;
