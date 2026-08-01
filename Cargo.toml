@@ -80,6 +80,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync",
 # thread-per-core with no untrusted keys).
 rustc-hash = "2.1"
 
+# Stack-allocated arrays with dynamic length for small scratch buffers.
+# Used in hot paths to avoid heap allocation when the max size is known.
+arrayvec = "0.7"
+
 # Production-grade function profiler (#[profile] attribute macro).
 profiler = { path = "profiler/runtime" }
 

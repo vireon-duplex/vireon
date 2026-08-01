@@ -25,6 +25,7 @@
 //! └──────────────────────────────────────────────────────────────────┘
 //! ```
 
+use arrayvec::ArrayVec;
 use bytes::Bytes;
 use rustc_hash::FxHashMap;
 
@@ -194,14 +195,14 @@ pub struct QuicEngine {
     out_buf: Vec<u8>,
     /// Reusable scratch for collecting readable stream IDs (avoids
     /// per-datagram Vec allocation).
-    readable_buf: Vec<u64>,
+    readable_buf: ArrayVec<u64, 16>,
     /// Reusable scratch for collecting closed connection indices (avoids
     /// per-tick Vec allocation).
-    closed_buf: Vec<usize>,
+    closed_buf: ArrayVec<usize, 16>,
     /// Reusable scratch recording the connections flushed this tick, so
     /// `cleanup_closed` can scan only active connections instead of the
     /// whole slab. Cleared at the start of each `flush_sends`.
-    flushed_this_tick: Vec<usize>,
+    flushed_this_tick: ArrayVec<usize, 64>,
     /// Connections with pending sends — avoids O(N) flush scan of idle
     /// connections every tick. Populated by `feed_existing` (ACKs, flow
     /// control after recv), `send_stream` (application data), and
@@ -322,9 +323,9 @@ impl QuicEngine {
             dcid_to_idx: CrcHashMap::default(),
             pkt_buf: vec![0u8; 65535],
             out_buf: vec![0u8; MAX_PKT_SIZE],
-            readable_buf: Vec::with_capacity(16),
-            closed_buf: Vec::with_capacity(16),
-            flushed_this_tick: Vec::with_capacity(64),
+            readable_buf: ArrayVec::new(),
+            closed_buf: ArrayVec::new(),
+            flushed_this_tick: ArrayVec::new(),
             dirty: DirtyBitset::new(),
             stream_carryover: FxHashMap::default(),
             delivery_policies: DeliveryPolicyTable::new(),
@@ -725,7 +726,7 @@ impl QuicEngine {
                 return Control::Break;
             }
             budget -= 1;
-            flushed.push(idx);
+            let _ = flushed.try_push(idx);
             if let Some(Some(entry)) = connections.get_mut(idx) {
                 loop {
                     match entry.conn.send(out_buf) {
@@ -763,7 +764,7 @@ impl QuicEngine {
             let idx = self.flushed_this_tick[i];
             if let Some(Some(entry)) = self.connections.get(idx) {
                 if entry.conn.is_closed() {
-                    self.closed_buf.push(idx);
+                    let _ = self.closed_buf.try_push(idx);
                 }
             }
         }

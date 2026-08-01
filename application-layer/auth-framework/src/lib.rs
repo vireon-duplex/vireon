@@ -41,6 +41,7 @@
 //! skeletons. Functional auth + token manager land in Phase 1+.
 
 #![allow(clippy::module_inception)]
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod authenticator;
 pub mod authorizer;
