@@ -173,6 +173,7 @@ fn capture_backtrace() -> String {
 }
 
 #[cfg(not(feature = "leak"))]
+#[allow(dead_code)]
 fn capture_backtrace() -> String {
     String::new()
 }
@@ -187,6 +188,7 @@ fn current_thread_name() -> String {
 
 #[cfg(not(feature = "leak"))]
 #[inline(always)]
+#[allow(dead_code)]
 fn current_thread_name() -> String {
     String::new()
 }

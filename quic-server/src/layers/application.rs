@@ -26,6 +26,7 @@
 //!        └─ next_seq: per-QUIC-stream response seq
 //! ```
 
+use arrayvec::ArrayVec;
 use rustc_hash::FxHashMap;
 use std::net::SocketAddr;
 use std::sync::mpsc;
@@ -266,7 +267,11 @@ pub struct VireonDispatcher {
     /// Reusable scratch for consumer-group fan-out targets.
     /// Avoids a `Vec::new()` allocation per publish in the group fan-out
     /// loop (handle_publish runs thousands of times/sec under load).
-    group_targets_scratch: Vec<(usize, u64)>,
+    group_targets_scratch: ArrayVec<(usize, u64), 8>,
+    /// Reusable scratch for subscriber fan-out targets. Avoids a
+    /// `Vec::new()` allocation per publish — the registry returns owned
+    /// `Subscriber` values which we collect here, then iterate by ref.
+    targets_scratch: Vec<pubsub_engine::Subscriber>,
     /// Reusable scratch for cross-worker inbox drain. Avoids
     /// `Vec::with_capacity(8192)` allocation per tick — the inbox is
     /// usually empty, and even when it's not the capacity grows once
@@ -431,7 +436,7 @@ pub struct VireonDispatcher {
     /// Active retention policy. Defaults to `keep_forever`; mutated
     /// via [`Self::set_wal_retention`]. The sweep is applied to every
     /// tracked topic when [`Self::wal_retention_last_run`] is older
-    /// than [`WAL_RETENTION_SWEEP_INTERVAL`].
+    /// than `wal_sweep_interval`.
     wal_retention: wal_store::RetentionPolicy,
     /// Last time the retention sweep ran ( Instant::now()-based,
     /// throttled by `wal_sweep_interval` to amortise directory walks).
@@ -473,13 +478,6 @@ pub struct VireonDispatcher {
 /// Minimum gap between cross-worker drop warning logs.
 const WORKER_DROP_LOG_COOLDOWN: Duration = Duration::from_secs(5);
 
-/// Minimum gap between WAL retention sweeps. The sweep walks every
-/// tracked topic and may issue a truncation (which copies surviving
-/// entries through a tempfile). 60 s keeps the cost negligible even
-/// on slow disks — retention is a coarse-grained lever, not a per-tick
-/// concern. Sweeps additionally bail early when the policy is
-/// `keep_forever` (no work to do).
-const WAL_RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 impl VireonDispatcher {
     /// Creates a new dispatcher with default-configured modules.
@@ -489,7 +487,8 @@ impl VireonDispatcher {
             pubsub_registry: TopicRegistry::new(PubSubConfig::new()),
             topic_catalog: TopicCatalog::new(),
             outbox: Vec::new(),
-            group_targets_scratch: Vec::with_capacity(8),
+            group_targets_scratch: ArrayVec::new(),
+            targets_scratch: Vec::new(),
             worker_inbox_scratch: Vec::new(),
             cluster_inbox_scratch: Vec::new(),
             conn_metrics: FxHashMap::default(),
@@ -1462,17 +1461,18 @@ impl VireonDispatcher {
             }
         }
 
-        let targets: Vec<Subscriber> = self
-            .pubsub_registry
-            .lookup(topic)
-            .into_iter()
-            .filter(|s| s.conn_idx != ctx.conn_idx)
-            .collect();
+        self.targets_scratch.clear();
+        self.targets_scratch.extend(
+            self.pubsub_registry
+                .lookup(topic)
+                .into_iter()
+                .filter(|s| s.conn_idx != ctx.conn_idx),
+        );
 
         tracing::debug!(
             conn_idx = ctx.conn_idx,
             topic = %topic,
-            targets = targets.len(),
+            targets = self.targets_scratch.len(),
             subs = self.pubsub_registry.len(),
             "[pubsub] publish"
         );
@@ -1530,10 +1530,15 @@ impl VireonDispatcher {
             }
         }
 
-        for target in targets {
+        let target_count = self.targets_scratch.len();
+        for i in 0..target_count {
+            let (conn_idx, quic_stream_id) = {
+                let t = &self.targets_scratch[i];
+                (t.conn_idx, t.quic_stream_id)
+            };
             self.enqueue_frame(
-                target.conn_idx,
-                target.quic_stream_id,
+                conn_idx,
+                quic_stream_id,
                 stream,
                 MessageType::Publish,
                 bytes.clone(),
@@ -1561,7 +1566,7 @@ impl VireonDispatcher {
                 if let Some(off) = wal_offset {
                     self.consumer_offsets.ack(topic_str, m.consumer.as_str(), off);
                 }
-                self.group_targets_scratch.push((m.conn_idx, m.quic_stream_id));
+                let _ = self.group_targets_scratch.try_push((m.conn_idx, m.quic_stream_id));
             }
             let group_len = self.group_targets_scratch.len();
             for i in 0..group_len {
@@ -3159,7 +3164,7 @@ impl VireonDispatcher {
                 let idx = local.rr_idx % local.members.len();
                 local.rr_idx = local.rr_idx.wrapping_add(1);
                 let m = &local.members[idx];
-                self.group_targets_scratch.push((m.conn_idx, m.quic_stream_id));
+                let _ = self.group_targets_scratch.try_push((m.conn_idx, m.quic_stream_id));
             }
             let stream = StreamId::new(0xFFFF_FFFF);
             let group_len = self.group_targets_scratch.len();
@@ -3242,7 +3247,7 @@ impl VireonDispatcher {
     /// topic if the sweep interval has elapsed. Cheap no-op when WAL
     /// is unconfigured or the policy is `keep_forever`.
     ///
-    /// Throttled to one sweep per [`WAL_RETENTION_SWEEP_INTERVAL`]
+    /// Throttled to one sweep per `wal_sweep_interval`
     /// (60 s). The sweep walks every topic known to the store, calls
     /// [`wal_store::RetentionPolicy::apply`], and aggregates the
     /// removed-entry count for a single summary log line.

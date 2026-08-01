@@ -21,6 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Stored token entry.
 struct TokenEntry {
+    #[allow(dead_code)]
     principal: PrincipalId,
     expiry_ns: u64,
 }

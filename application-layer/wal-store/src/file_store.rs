@@ -260,7 +260,7 @@ impl FileStore {
                 Ok(it) => it.filter_map(|e| e.ok()).any(|e| {
                     e.file_name()
                         .to_str()
-                        .map_or(false, |n| n.starts_with("seg-"))
+                        .is_some_and(|n| n.starts_with("seg-"))
                 }),
                 Err(_) => false,
             };
@@ -535,7 +535,7 @@ impl WalStore for FileStore {
             let front_head = front.head_offset();
             if front_head.is_none() {
                 // Empty segment — shouldn't normally exist, but drop it.
-                let seg = tf.segments.pop_front().unwrap();
+                let Some(seg) = tf.segments.pop_front() else { break };
                 removed += seg.len();
                 tf.retained_bytes = tf.retained_bytes.saturating_sub(seg.retained_bytes);
                 self.retained_bytes = self
@@ -545,7 +545,7 @@ impl WalStore for FileStore {
                 continue;
             }
             if front_head.get() < remove_until {
-                let seg = tf.segments.pop_front().unwrap();
+                let Some(seg) = tf.segments.pop_front() else { break };
                 removed += seg.len();
                 tf.retained_bytes = tf.retained_bytes.saturating_sub(seg.retained_bytes);
                 self.retained_bytes = self
@@ -573,13 +573,14 @@ impl WalStore for FileStore {
                 }
             } else {
                 // Entire boundary segment is below remove_until — drop it.
-                let seg = tf.segments.pop_front().unwrap();
-                removed += seg.len();
-                tf.retained_bytes = tf.retained_bytes.saturating_sub(seg.retained_bytes);
-                self.retained_bytes = self
-                    .retained_bytes
-                    .saturating_sub(seg.retained_bytes);
-                let _ = fs::remove_file(seg.path());
+                if let Some(seg) = tf.segments.pop_front() {
+                    removed += seg.len();
+                    tf.retained_bytes = tf.retained_bytes.saturating_sub(seg.retained_bytes);
+                    self.retained_bytes = self
+                        .retained_bytes
+                        .saturating_sub(seg.retained_bytes);
+                    let _ = fs::remove_file(seg.path());
+                }
             }
         }
 

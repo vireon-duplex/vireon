@@ -82,6 +82,19 @@ pub fn build_quiche_config(
     // concurrently.
     config.set_disable_active_migration(!quic_cfg.extensions.migration);
 
+    // TLS 1.3 session resumption (RFC 8938). When enabled, the server
+    // issues NEW_SESSION_TICKET after the handshake. The client can
+    // present the ticket on reconnect for abbreviated handshake (0-RTT).
+    // The ticket key is generated per-process; restarts invalidate
+    // outstanding tickets (acceptable — clients fall back to full
+    // handshake).
+    if quic_cfg.extensions.session_resumption {
+        let ticket_key = generate_ticket_key()
+            .map_err(|e| QuicError::InvalidConfig(format!("session ticket key: {e}")))?;
+        config.set_ticket_key(&ticket_key)?;
+        config.enable_early_data();
+    }
+
     // Pacing helps reduce burstiness on high-throughput links.
     config.enable_pacing(true);
 
@@ -102,6 +115,16 @@ pub fn build_quiche_config(
         .set_initial_congestion_window_packets(quic_cfg.initial_congestion_window_packets as usize);
 
     Ok(config)
+}
+
+/// Generate 48 random bytes for the session ticket encryption key.
+/// Uses `/dev/urandom` (CSPRNG) — always available on Linux.
+fn generate_ticket_key() -> Result<[u8; 48], std::io::Error> {
+    use std::io::Read;
+    let mut f = std::fs::File::open("/dev/urandom")?;
+    let mut key = [0u8; 48];
+    f.read_exact(&mut key)?;
+    Ok(key)
 }
 
 /// Default idle-check interval derived from the config's idle timeout.
