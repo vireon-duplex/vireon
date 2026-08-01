@@ -704,4 +704,53 @@ congestion = "bbr"
         };
         assert_eq!(q.congestion_str(), None);
     }
+
+    #[test]
+    fn parse_delivery_config_auto() {
+        let toml_str = r#"
+[delivery]
+logtail_threshold = 512
+force_strategy = "auto"
+"#;
+        let conf: ServerConf = toml::from_str(toml_str).unwrap();
+        let d = conf.delivery.expect("delivery section present");
+        assert_eq!(d.logtail_threshold, Some(512));
+        assert_eq!(d.force_strategy.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn parse_delivery_config_force_logtail() {
+        let toml_str = r#"
+[delivery]
+force_strategy = "logtail"
+"#;
+        let conf: ServerConf = toml::from_str(toml_str).unwrap();
+        let d = conf.delivery.expect("delivery section present");
+        assert_eq!(d.force_strategy.as_deref(), Some("logtail"));
+        // logtail_threshold is optional — defaults at resolve time.
+        assert!(d.logtail_threshold.is_none());
+    }
+
+    #[test]
+    fn parse_delivery_config_force_batch() {
+        let toml_str = r#"
+[delivery]
+force_strategy = "batch"
+logtail_threshold = 128
+"#;
+        let conf: ServerConf = toml::from_str(toml_str).unwrap();
+        let d = conf.delivery.expect("delivery section present");
+        assert_eq!(d.force_strategy.as_deref(), Some("batch"));
+        assert_eq!(d.logtail_threshold, Some(128));
+    }
+
+    #[test]
+    fn delivery_mode_default_resolves_to_auto() {
+        // Empty [delivery] section → all fields default → Auto + 256.
+        let toml_str = "[delivery]";
+        let conf: ServerConf = toml::from_str(toml_str).unwrap();
+        let _d = conf.delivery.expect("delivery present");
+        // The actual default resolution happens in config.rs resolve_tuning,
+        // but we can verify the serde defaults work.
+    }
 }

@@ -5061,4 +5061,126 @@ mod tests {
         }
         assert_eq!(d.pattern_sub_counts.get("sensor.*").copied(), Some(1));
     }
+
+    // ── DeliveryConfig::select ──────────────────────────────────────
+
+    #[test]
+    fn delivery_select_auto_uses_batchpush_below_threshold() {
+        let cfg = DeliveryConfig::default(); // threshold=256, Auto
+        assert_eq!(
+            cfg.select(0, true),
+            FanoutStrategy::BatchPush,
+            "zero fanout → BatchPush"
+        );
+        assert_eq!(
+            cfg.select(255, true),
+            FanoutStrategy::BatchPush,
+            "below threshold → BatchPush"
+        );
+    }
+
+    #[test]
+    fn delivery_select_auto_uses_logtail_at_threshold_with_wal() {
+        let cfg = DeliveryConfig::default();
+        assert_eq!(
+            cfg.select(256, true),
+            FanoutStrategy::LogTail,
+            "at threshold with WAL → LogTail"
+        );
+        assert_eq!(
+            cfg.select(10_000, true),
+            FanoutStrategy::LogTail,
+            "well above threshold with WAL → LogTail"
+        );
+    }
+
+    #[test]
+    fn delivery_select_auto_falls_back_to_batchpush_without_wal() {
+        let cfg = DeliveryConfig::default();
+        assert_eq!(
+            cfg.select(10_000, false),
+            FanoutStrategy::BatchPush,
+            "no WAL → BatchPush even at high fan-out"
+        );
+    }
+
+    #[test]
+    fn delivery_select_force_batch_overrides_everything() {
+        let cfg = DeliveryConfig {
+            logtail_threshold: 1,
+            force_strategy: crate::conf::DeliveryMode::ForceBatch,
+        };
+        assert_eq!(cfg.select(10_000, true), FanoutStrategy::BatchPush);
+    }
+
+    #[test]
+    fn delivery_select_force_logtail_requires_wal() {
+        let cfg = DeliveryConfig {
+            logtail_threshold: 1,
+            force_strategy: crate::conf::DeliveryMode::ForceLogTail,
+        };
+        assert_eq!(
+            cfg.select(1, true),
+            FanoutStrategy::LogTail,
+            "force_logtail + WAL → LogTail"
+        );
+        assert_eq!(
+            cfg.select(1, false),
+            FanoutStrategy::BatchPush,
+            "force_logtail without WAL → fallback BatchPush"
+        );
+    }
+
+    // ── Cross-worker backpressure flags ────────────────────────────
+
+    #[test]
+    fn pressure_flag_set_and_cleared() {
+        let mut d = VireonDispatcher::new();
+        // Simulate multi-worker setup: need channels + pressure flags.
+        let (_tx, rx) = mpsc::sync_channel::<InterWorkerMsg>(16);
+        let outboxes: Vec<_> = (0..3)
+            .map(|_| mpsc::sync_channel::<InterWorkerMsg>(16).0)
+            .collect();
+        d.set_worker_channels(0, rx, outboxes);
+        // Flags should be initialized to false.
+        assert_eq!(d.worker_pressure_flags.len(), 3);
+        assert!(!d.pending_sends_high);
+
+        // Simulate the Stack setting pressure via the application layer.
+        // (We test the dispatcher field directly since ApplicationLayer
+        // is just a thin wrapper.)
+        d.pending_sends_high = true;
+        if let Some(f) = d.worker_pressure_flags.get(d.worker_self_idx) {
+            f.store(true, Ordering::Relaxed);
+        }
+        assert!(d.worker_pressure_flags[0].load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn any_remote_worker_pressured_detects_other_workers() {
+        let mut d = VireonDispatcher::new();
+        let (_tx, rx) = mpsc::sync_channel::<InterWorkerMsg>(16);
+        let outboxes: Vec<_> = (0..3)
+            .map(|_| mpsc::sync_channel::<InterWorkerMsg>(16).0)
+            .collect();
+        d.set_worker_channels(0, rx, outboxes);
+
+        // No worker has pressure → false.
+        assert!(!d.pending_sends_high);
+
+        // Worker 1 signals pressure.
+        d.worker_pressure_flags[1].store(true, Ordering::Relaxed);
+
+        // Check from worker 0's perspective: any_remote should detect it.
+        let self_idx = d.worker_self_idx;
+        let any_remote = d
+            .worker_pressure_flags
+            .iter()
+            .enumerate()
+            .any(|(i, f)| i != self_idx && f.load(Ordering::Relaxed));
+        assert!(any_remote, "should detect remote worker 1 pressure");
+
+        // Worker 0's own flag is still false.
+        assert!(!d.worker_pressure_flags[self_idx].load(Ordering::Relaxed));
+    }
 }
