@@ -476,6 +476,16 @@ fn realistic_payload(mt: MessageType) -> Vec<u8> {
             v.extend_from_slice(&1u32.to_be_bytes()); // generation
             v
         }
+
+        // NotifyOffset — topic + offset(u64).
+        MessageType::NotifyOffset => {
+            let topic = b"sensor.temperature.zone1";
+            let mut v = Vec::with_capacity(2 + topic.len() + 8);
+            v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            v.extend_from_slice(topic);
+            v.extend_from_slice(&42u64.to_be_bytes());
+            v
+        }
     }
 }
 
@@ -518,6 +528,7 @@ fn type_name(mt: MessageType) -> &'static str {
         MessageType::ConsumerGroupJoin => "ConsumerGroupJoin",
         MessageType::ConsumerGroupLeave => "ConsumerGroupLeave",
         MessageType::ConsumerGroupHeartbeat => "ConsumerGroupHeartbeat",
+        MessageType::NotifyOffset => "NotifyOffset",
     }
 }
 
@@ -549,10 +560,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn workload_has_twenty_five_entries() {
-        // 25 = 22 base message types + ConsumerGroupJoin/Leave/Heartbeat (P5).
+    fn workload_has_twenty_six_entries() {
+        // 26 = 22 base + ConsumerGroupJoin/Leave/Heartbeat (P5) + NotifyOffset.
         let w = build().unwrap();
-        assert_eq!(w.entries.len(), 25);
+        assert_eq!(w.entries.len(), 26);
     }
 
     #[test]
