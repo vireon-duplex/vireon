@@ -198,11 +198,13 @@ pub struct QuicEngine {
     readable_buf: ArrayVec<u64, 16>,
     /// Reusable scratch for collecting closed connection indices (avoids
     /// per-tick Vec allocation).
-    closed_buf: ArrayVec<usize, 16>,
+    closed_buf: Vec<usize>,
     /// Reusable scratch recording the connections flushed this tick, so
     /// `cleanup_closed` can scan only active connections instead of the
     /// whole slab. Cleared at the start of each `flush_sends`.
-    flushed_this_tick: ArrayVec<usize, 64>,
+    /// Stays a Vec because its high-water mark is bounded by
+    /// [`DIRTY_FLUSH_BUDGET`] (512), well beyond any reasonable ArrayVec cap.
+    flushed_this_tick: Vec<usize>,
     /// Connections with pending sends — avoids O(N) flush scan of idle
     /// connections every tick. Populated by `feed_existing` (ACKs, flow
     /// control after recv), `send_stream` (application data), and
@@ -324,8 +326,8 @@ impl QuicEngine {
             pkt_buf: vec![0u8; 65535],
             out_buf: vec![0u8; MAX_PKT_SIZE],
             readable_buf: ArrayVec::new(),
-            closed_buf: ArrayVec::new(),
-            flushed_this_tick: ArrayVec::new(),
+            closed_buf: Vec::with_capacity(16),
+            flushed_this_tick: Vec::with_capacity(64),
             dirty: DirtyBitset::new(),
             stream_carryover: FxHashMap::default(),
             delivery_policies: DeliveryPolicyTable::new(),
@@ -726,7 +728,7 @@ impl QuicEngine {
                 return Control::Break;
             }
             budget -= 1;
-            let _ = flushed.try_push(idx);
+            flushed.push(idx);
             if let Some(Some(entry)) = connections.get_mut(idx) {
                 loop {
                     match entry.conn.send(out_buf) {
@@ -764,7 +766,7 @@ impl QuicEngine {
             let idx = self.flushed_this_tick[i];
             if let Some(Some(entry)) = self.connections.get(idx) {
                 if entry.conn.is_closed() {
-                    let _ = self.closed_buf.try_push(idx);
+                    self.closed_buf.push(idx);
                 }
             }
         }
