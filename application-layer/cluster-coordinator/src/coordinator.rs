@@ -303,9 +303,7 @@ impl ClusterCoordinator {
     #[must_use]
     pub fn tick_health(&mut self) -> Vec<NodeId> {
         let now = Instant::now();
-        let expired = self
-            .failure
-            .check_expired(now, self.heartbeat_timeout);
+        let expired = self.failure.check_expired(now, self.heartbeat_timeout);
         for &n in &expired {
             let dropped = self.mark_node_down(n);
             if dropped > 0 {

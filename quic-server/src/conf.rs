@@ -68,13 +68,11 @@ impl<'de> serde::Deserialize<'de> for HumanDuration {
         }
         match Raw::deserialize(d)? {
             Raw::Int(secs) => Ok(Self(Duration::from_secs(secs))),
-            Raw::Str(s) => parse_human_duration(&s)
-                .map(Self)
-                .ok_or_else(|| {
-                    serde::de::Error::custom(format!(
-                        "invalid duration '{s}' — expected e.g. 30s, 5m, 1h, or raw integer (seconds)"
-                    ))
-                }),
+            Raw::Str(s) => parse_human_duration(&s).map(Self).ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "invalid duration '{s}' — expected e.g. 30s, 5m, 1h, or raw integer (seconds)"
+                ))
+            }),
         }
     }
 }
@@ -449,8 +447,9 @@ impl ServerConf {
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("failed to read config file '{}': {e}", path.display()))?;
-        let conf: Self = toml::from_str(&contents)
-            .map_err(|e| anyhow::anyhow!("failed to parse config file '{}': {e}", path.display()))?;
+        let conf: Self = toml::from_str(&contents).map_err(|e| {
+            anyhow::anyhow!("failed to parse config file '{}': {e}", path.display())
+        })?;
         Ok(conf)
     }
 }
@@ -462,10 +461,12 @@ impl QuicConf {
     /// or `None` if the value doesn't match.
     #[must_use]
     pub fn congestion_str(&self) -> Option<&str> {
-        self.congestion.as_deref().and_then(|s| match s.to_ascii_lowercase().as_str() {
-            "reno" | "cubic" | "bbr" | "bbr2" => Some(s),
-            _ => None,
-        })
+        self.congestion
+            .as_deref()
+            .and_then(|s| match s.to_ascii_lowercase().as_str() {
+                "reno" | "cubic" | "bbr" | "bbr2" => Some(s),
+                _ => None,
+            })
     }
 }
 
@@ -615,14 +616,18 @@ impl Default for LayerTuning {
 impl FromStr for HumanBytes {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        parse_human_bytes(s).map(Self).ok_or_else(|| format!("invalid byte size: {s}"))
+        parse_human_bytes(s)
+            .map(Self)
+            .ok_or_else(|| format!("invalid byte size: {s}"))
     }
 }
 
 impl FromStr for HumanDuration {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        parse_human_duration(s).map(Self).ok_or_else(|| format!("invalid duration: {s}"))
+        parse_human_duration(s)
+            .map(Self)
+            .ok_or_else(|| format!("invalid duration: {s}"))
     }
 }
 
@@ -687,7 +692,10 @@ congestion = "bbr"
         assert_eq!(parse_human_duration("30s"), Some(Duration::from_secs(30)));
         assert_eq!(parse_human_duration("5m"), Some(Duration::from_secs(300)));
         assert_eq!(parse_human_duration("1h"), Some(Duration::from_secs(3600)));
-        assert_eq!(parse_human_duration("500ms"), Some(Duration::from_millis(500)));
+        assert_eq!(
+            parse_human_duration("500ms"),
+            Some(Duration::from_millis(500))
+        );
     }
 
     #[test]
