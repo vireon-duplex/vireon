@@ -2,423 +2,236 @@
   <h1>Vireon</h1>
 
   <p>
-    <strong>A high-performance realtime runtime built on QUIC and io_uring for multi-stream, full-duplex communication at massive scale.</strong>
+    <strong>A QUIC-native pub/sub runtime with per-stream delivery semantics,
+    WAL persistence, consumer groups, and adaptive fan-out.</strong>
   </p>
 
   <p>
-    <a href="https://github.com/pinyoothotaboot/Vireon/actions"><img src="https://img.shields.io/github/actions/workflow/status/pinyoothotaboot/Vireon/ci.yml?style=flat-square" alt="Build Status" /></a>
-    <a href="https://github.com/pinyoothotaboot/Vireon/releases"><img src="https://img.shields.io/github/v/release/pinyoothotaboot/Vireon?style=flat-square" alt="Release" /></a>
+    <a href="https://github.com/pinyoothotaboot/vireon/actions"><img src="https://img.shields.io/github/actions/workflow/status/pinyoothotaboot/vireon/ci.yml?style=flat-square" alt="Build Status" /></a>
+    <a href="https://github.com/pinyoothotaboot/vireon/releases"><img src="https://img.shields.io/github/v/release/pinyoothotaboot/vireon?style=flat-square" alt="Release" /></a>
     <a href="./LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg?style=flat-square" alt="License" /></a>
-    <a href="https://rust-lang.org"><img src="https://img.shields.io/badge/Rust-1.90+-orange.svg?style=flat-square" alt="Rust Version" /></a>
+    <a href="https://rust-lang.org"><img src="https://img.shields.io/badge/Rust-1.85+-orange.svg?style=flat-square" alt="Rust Version" /></a>
   </p>
 </div>
 
 ---
 
-## 📖 About The Project
+## About
 
-Vireon is a next-generation realtime runtime engineered for massive scale. Built entirely in **Rust** and leveraging the power of **QUIC** alongside **io_uring**, it provides an ultra-low latency, full-duplex communication layer capable of multiplexing millions of concurrent streams without breaking a sweat.
+Vireon is a pub/sub runtime built in Rust on **QUIC** (`quiche`) and
+**`io_uring`**. Each subscriber opens a dedicated QUIC stream with its own
+flow-control and loss-recovery window, so a congested topic (heavy video,
+bursty telemetry) never blocks lighter topics — the core differentiator over
+single-stream transports.
 
-### ✨ Key Features
+The server is a single binary (`quic-server`) that handles the data plane;
+clients connect through the Rust SDK (`vireon-sdk`). Both ship in this repo.
 
-- **Blazing Fast I/O:** Utilizes `io_uring` for true asynchronous file and network operations, bypassing traditional kernel bottlenecks.
-- **Next-Gen Transport:** Powered by QUIC for multiplexed, 0-RTT, full-duplex communication over UDP.
-- **Clean Architecture:** Domain-centric design with pluggable ports for underlying storage and transport engines.
-- **Highly Scalable:** Asynchronous at its core built on Tokio, operating exclusively with non-blocking, bounded channels.
-- **Cloud-Native Ready:** Designed for containerized deployments with out-of-the-box observability (Prometheus metrics, OpenTelemetry tracing).
+### Highlights
 
-## 🏗 Architecture
+- **Per-stream delivery policies** — `ReliableOrdered`, `LatestOnly`,
+  `RealtimeDropOld`. Declared at stream-open; enforced by the server's
+  send-policy layer.
+- **WAL persistence** — durable publish with offset-based replay
+  (`Fetch`/`FetchReply` protocol). Survives subscriber disconnects and
+  enables crash recovery.
+- **Adaptive fan-out** — `BatchPush` (encode once, `Bytes::clone` per sub)
+  for small fan-out; `LogTail` (WAL append + lightweight `NotifyOffset`) for
+  large fan-out. Auto-selected from a configurable threshold.
+- **Consumer groups** — load-balanced round-robin delivery across N members,
+  one message per consumer per publish.
+- **Cluster mode** — consistent-hash-ring routing with configurable
+  replication factor; cross-node fan-out via the inter-node UDP mesh.
+- **Connection migration** — clients survive NAT/Wi-Fi handoff without
+  reconnect (QUIC path migration, separate from multipath).
+- **mTLS** — optional client certificate verification at the TLS layer.
+- **io_uring data plane** — zero-copy sends, registered buffers, SQPOLL,
+  multishot receive. Bypasses syscall-per-packet overhead.
 
-Vireon employs a strict Clean Architecture strategy, isolating the core domain logic from infrastructure details. Transport and storage mechanisms are treated as interchangeable ports to allow for deep deployment flexibility.
+## Quick start
+
+```bash
+git clone https://github.com/pinyoothotaboot/vireon.git
+cd vireon
+cargo build --release
+
+# Self-signed dev cert (production: use a real CA).
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
+  -days 365 -nodes -subj "/CN=localhost"
+
+# Start the server.
+./target/release/quic-server --cert cert.pem --key key.pem --port 4433
+```
+
+Server is now listening on `127.0.0.1:4433`. Open another terminal and run an
+example:
+
+```bash
+# All 3 delivery policies in one run.
+cargo run -p vireon-sdk --release --example quickstart
+```
+
+For the full tutorial — publisher/subscriber code, connection pool, consumer
+groups, WAL, cluster, production checklist — see
+[`docs/getting-started.md`](./docs/getting-started.md).
+
+## Configuration
+
+Beyond quick testing, use a TOML config file:
+
+```toml
+# vireon.conf
+bind = "0.0.0.0"
+port = 4433
+cert = "/etc/vireon/cert.pem"
+key  = "/etc/vireon/key.pem"
+mode = "multi"          # "single" | "multi"
+workers = 0             # 0 = auto (one per CPU core)
+metrics_port = 9090     # Prometheus /metrics endpoint
+
+[delivery]
+logtail_threshold = 256  # switch to LogTail above this fan-out
+
+# WAL (enables durable delivery + crash recovery)
+wal_root = "/var/lib/vireon/wal"
+[wal_sync]
+mode = "batched"          # "never" | "batched" | "fsync"
+```
+
+```bash
+./target/release/quic-server --config vireon.conf
+```
+
+CLI flags override the config file. Key flags:
+
+| Flag | Purpose |
+|---|---|
+| `--cert` / `--key` | TLS certificate + private key |
+| `--client-ca` | Enable mTLS (require client certs) |
+| `--mode single\|multi` | Worker thread model |
+| `--workers N` | Worker count (0 = auto) |
+| `--wal-root PATH` | Enable WAL at this directory |
+| `--metrics-port N` | Prometheus scrape port |
+| `--cluster-node-id N` | Cluster node identity (enables cluster mode) |
+| `--cluster-peers MAP` | `id=host:port,id=host:port,...` |
+| `--cluster-replication-factor N` | Topic replication (default 1) |
+| `--skip-crc` / `--enforce-crc` | Toggle CRC32C verification (default skip) |
+| `--config FILE` | Load TOML config |
+
+Run `quic-server --help` for the full list.
+
+## Architecture
+
+Layered Clean Architecture. Dependencies point inward only — the domain
+knows nothing about I/O.
 
 <div align="center">
   <img src="resources/Vireon.png" alt="Vireon Architecture Diagram" />
 </div>
 
-For a deep dive into the design decisions and broker domain model, please consult our [Architecture Document](./ARCHITECTURE.md).
+Layer breakdown:
 
-## 🚀 Getting Started
+| Layer | Crates | Responsibility |
+|---|---|---|
+| **message** | `frame` | Wire format: header, payload codecs, CRC32C |
+| **io** | `io` | `io_uring` ring, registered buffers, zero-copy send |
+| **runtime** | `buffer-pool`, `timer-wheel`, `task-queue`, `cqe-processor`, `reactor`, `send-queue`, `connection-shard` | Async runtime primitives |
+| **transport** | `quic-engine` | QUIC packet routing, stream scheduler, pacer |
+| **session** | `session-manager`, `session-registry`, `session-router`, `session-migration-manager`, `session-replication-service` | Connection state, cluster membership |
+| **stream** | `stream-manager`, `stream-scheduler`, `delivery-policy`, `send-policy` | Per-stream semantics, fairness, drop policy |
+| **application** | `pubsub-engine`, `wal-store`, `consumer-groups`, `cluster-coordinator`, `topic-acl`, `auth-framework`, `resource-quotas`, `observability-sdk` | Pub/sub domain: topics, patterns, fan-out, ACL |
+| **binary** | `quic-server`, `quic-client`, `bench-harness`, `vireon-sdk`, `profiler` | Binaries and the client SDK |
 
-To get a local development instance of Vireon running, follow these steps.
+See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the authoritative design
+reference, and [`OPERATIONS.md`](./OPERATIONS.md) /
+[`DEPLOYMENT.md`](./DEPLOYMENT.md) for production operations.
 
-### Prerequisites
+## Examples
 
-Ensure you have the latest stable version of Rust installed:
+The SDK ships runnable scenarios under
+[`client-sdk/examples/`](./client-sdk/examples/). Each one auto-spawns its
+own server on an ephemeral port.
+
+| Scenario | Proves |
+|---|---|
+| `quickstart` | All 3 delivery policies in one run |
+| `s07_hol_congestion` | 5 dedicated streams — video congestion does not degrade lighter streams |
+| `s09_reconnect` | Server killed mid-session; SDK reconnects + replays subscriptions |
+| `s10_mtls` | Mutual TLS with client certificate verification |
+| `s11_ordering` | 500 frames on `ReliableOrdered` — exact-once, in-order, zero gaps |
+| `s12_full_limit` | Max fan-out throughput under sustained publish |
+| `s13_aggregate_throughput` | Multi-connection aggregate bandwidth |
+| `s14_pool_multiplex` | `ClientPool` publish-side multiplexing across N connections |
+| `s15_consumer_group` | Load-balanced consumer group delivery |
+| `s16_cluster_replication` | 3-node cluster, replication-factor 2 |
+| `s17_multicore_modes` | SDK correctness under single-worker and multi-worker servers |
+| `s18_cross_node_fanout` | Cross-node delivery through the consistent hash ring |
+| `s19_connection_migration` | QUIC connection migration survives a UDP rebind |
+| `s20_logtail_delivery` | LogTail path (WAL + `NotifyOffset` + auto-Fetch) |
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-# Specific required components:
-rustup component add rustfmt clippy
+cargo run -p vireon-sdk --release --example <name>
 ```
 
-### Installation
-
-1. Clone the repository
-   ```bash
-   git clone https://github.com/pinyoothotaboot/Vireon.git
-   cd Vireon
-   ```
-2. Run the project in release mode for optimal performance
-   ```bash
-   cargo run --release
-   ```
-
-## 🧪 Testing & Quality Assurance
-
-Vireon enforces strict code quality gates to maintain performance and safety. Before contributing or opening a PR, ensure all checks pass:
+## Quality
 
 ```bash
-# Format and linting
+# Format + lint.
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 
-# Tests
+# Test suite.
 cargo test --workspace
 
-# Security and dependency audit
+# Security and dependency audit.
 cargo audit
 cargo deny check
 ```
 
-For comprehensive details on our specific testing coverage and layers, refer to [TESTING.md](./TESTING.md).
+See [`TESTING.md`](./TESTING.md) for the testing strategy and coverage layers.
 
-## 📊 Profiler
+## Profiling
 
-Vireon ships with a **production-grade function profiler** (`#[profile]` attribute macro) that instruments hot-path functions across all modules — frame encode/decode, CRC32C, io_uring CQE processing, buffer pool allocation, timer wheel, stream scheduling, consistent hashing, GSO batching, and more.
+Vireon ships two complementary profilers:
 
-- **< 30 ns overhead** per instrumented call when active
-- **Zero-cost** when disabled (Guard compiles to a no-op; the compiler eliminates it entirely)
-- Thread-local accumulation with lock-free global aggregation — no mutex on the hot path
-- 512-bucket logarithmic histogram for P50 / P95 / P99 percentile reporting
-- Background flush thread with configurable interval
-- Multiple export formats: text report, JSON, CSV, Chrome Trace, flamegraph (folded stack), Graphviz DOT
+1. **In-process function profiler** (`profiler/`) — `#[profile]` attribute
+   macro that times annotated functions with sub-microsecond overhead.
+   Exports as text, JSON, CSV, Chrome Trace, flamegraph, or Graphviz.
+   See [`profiler/DESIGN.md`](./profiler/DESIGN.md).
 
-See [`profiler/DESIGN.md`](./profiler/DESIGN.md) for the full architecture.
+   ```bash
+   cargo run --release -p quic-server --features profiling -- \
+     --cert cert.pem --key key.pem --port 4433 \
+     --profile-output report.json
+   ```
 
-### Quick Start
+2. **`perf`-based flamegraph** — samples the entire call stack (including
+   stdlib, `quiche`, syscalls) with zero code changes. The
+   `scripts/flamegraph.sh` orchestrator builds, loads, records, and renders:
 
-```rust,no_run
-use profiler::{Profiler, ProfilerConfig};
+   ```bash
+   make flamegraph            # 15s, 64 conns, single worker
+   ./scripts/flamegraph.sh --duration 30 --conns 256
+   ```
 
-// 1. Initialize with defaults (or use the builder for custom config).
-Profiler::init(ProfilerConfig::default());
+Both produce symbolicated output thanks to the dedicated
+`[profile.flamegraph]` build profile (release opts + debug symbols).
 
-// 2. Enable profiling globally.
-Profiler::enable();
+## Contributing
 
-// 3. Start the background flush thread.
-Profiler::start();
+Contributions are welcome. Review
+[`CONTRIBUTING.md`](./CONTRIBUTING.md) and [`SKILLS.md`](./SKILLS.md) before
+opening a PR. Run `cargo fmt`, `cargo clippy`, and `cargo test --workspace`
+locally — CI enforces all three. See [`CHANGELOG.md`](./CHANGELOG.md) for
+version history and [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md) for the
+contributor code of conduct.
 
-// ... run your workload — instrumented functions are timed automatically ...
+## Security
 
-// 4. Print a formatted report.
-println!("{}", Profiler::report());
+Do **not** open a public issue for security vulnerabilities. See
+[`SECURITY.md`](./SECURITY.md) for the reporting process.
 
-// 5. Stop + flush remaining data.
-Profiler::stop();
-```
+## License
 
-### Enabling / Disabling
-
-There are two independent layers of control:
-
-#### Compile-time (feature flag)
-
-By default the profiler is compiled in **zero-cost disabled** mode — the `Guard` is a zero-sized type with an empty `Drop`, so the optimizer removes it entirely. No binary bloat, no runtime overhead.
-
-To activate instrumentation, build with the `profiling` feature:
-
-```bash
-# Enable for the server binary.
-cargo run --release -p quic-server --features profiling -- --cert cert.pem --key key.pem --port 4433
-
-# Enable for the client binary.
-cargo run --release -p quic-client --features profiling -- ...
-
-# Run profiler's own tests (require the feature).
-cargo test -p profiler --features enabled
-```
-
-#### Runtime (API toggle)
-
-Even when compiled with `enabled`, you can toggle profiling at runtime without recompiling:
-
-```rust
-use profiler::Profiler;
-
-// Pause profiling — existing guards skip recording (no data lost).
-Profiler::disable();
-
-// Resume profiling.
-Profiler::enable();
-```
-
-### Instrumenting a Function
-
-Add `#[profile]` to any free function, method, async function, generic function, or trait-impl method:
-
-```rust,ignore
-use profiler::profile;
-
-#[profile]
-fn process_packet(data: &[u8]) -> usize {
-    data.len()
-}
-
-#[profile]
-async fn send_stream(id: u64) -> Result<(), Error> {
-    // ...
-}
-```
-
-The macro expands to:
-
-```rust,ignore
-fn process_packet(data: &[u8]) -> usize {
-    let _profiler_guard = ::profiler::Guard::enter("process_packet");
-    data.len()
-} // Guard::drop → compute elapsed → collector::record("process_packet", ns)
-```
-
-> `const fn` is not supported (Drop is non-const). The attribute is silently ignored on `const fn`.
-
-### Configuration
-
-```rust
-use profiler::ProfilerConfig;
-
-let config = ProfilerConfig::builder()
-    .enabled()                   // start enabled (default: false)
-    .sampling(1)                 // sample every N-th call (1 = all)
-    .flush_interval_ms(500)      // background flush period
-    .thread_local_capacity(2048) // flush threshold per thread
-    .build();
-
-profiler::Profiler::init(config);
-```
-
-| Field | Default | Description |
-|---|---|---|
-| `enabled` | `false` | Whether profiling is active on init |
-| `sampling` | `1` | Record every N-th call (1 = every call) |
-| `export_path` | `None` | Reserved for file-based export |
-| `flush_interval_ms` | `1000` | Background thread tick period |
-| `histogram_precision` | `16` | Sub-buckets per octave (512 total buckets) |
-| `thread_local_capacity` | `1024` | Thread-local entries before forced flush |
-
-### Export Formats
-
-```rust
-// Formatted text table (function, calls, avg, min, max, p50, p95, p99).
-let text = Profiler::report();
-
-// Machine-readable.
-let json  = Profiler::export_json();           // JSON array of snapshots
-let csv   = Profiler::export_csv();            // CSV with header row
-
-// Visualization.
-let trace = Profiler::export_chrome_trace();   // chrome://tracing
-let folded = Profiler::export_flamegraph();    // flamegraph.pl input
-let dot    = Profiler::export_dot();           // Graphviz call graph
-```
-
-### Viewing Reports (Server / Client Binaries)
-
-The `quic-server` and `quic-client` binaries dump the profiler report automatically on shutdown.
-Pass `--profile-output <file>` to select the destination and format (selected by file extension):
-
-```bash
-# Run the server — report is dumped to report.json on shutdown.
-cargo run --release -p quic-server --features profiling -- \
-    --cert cert.pem --key key.pem --port 4433 \
-    --profile-output report.json
-```
-
-Supported extensions:
-
-| Extension | Format |
-|---|---|
-| `.json` | JSON array of function snapshots |
-| `.csv` | CSV with header row |
-| `.ctrace` | Chrome Trace (`chrome://tracing`) |
-| `.folded` | Folded stacks for `flamegraph.pl` |
-| `.dot` | Graphviz call graph |
-| *(other / none)* | Formatted text table |
-
-#### Shutdown behavior
-
-- **Graceful (one Ctrl-C / SIGTERM):** the drain begins, connections close, and once the reactor exits the report is written to the `--profile-output` path (or logged — see below).
-- **Forced (second Ctrl-C / SIGTERM):** the process exits immediately with code 130, but the report is **still dumped** via the signal handler before `process::exit` — so you never lose data by force-quitting.
-- **No `--profile-output`:** the top-10 functions by total time are printed to the log via `tracing::info!`, and a hint suggests rerunning with `--profile-output` for the full report.
-
-```bash
-# Example: graceful shutdown with no file → log summary
-RUST_LOG=quic_server=info cargo run --release -p quic-server --features profiling -- \
-    --cert cert.pem --key key.pem --port 4433
-# Ctrl-C once → log lines like:
-#   profiler: top functions by total time (of 30):
-#     encode_into        calls=  12345  total=  4567890 ns  avg=  370 ns  p99=  1200 ns
-#     ...
-```
-
-### Already-Instrumented Hot Paths
-
-The following functions carry `#[profile]` across the workspace:
-
-| Crate | Key Functions |
-|---|---|
-| `frame` | `encode_into`, `decode_with_len`, `decode_frame`, `crc32c` |
-| `cqe-processor` | `drain_cq`, `dispatch_one`, `CqDrainer::drain` |
-| `buffer-pool` | `get`, `try_get`, `acquire`, `release_buffer`, `flush` |
-| `timer-wheel` | `advance`, `add`, `next_deadline` |
-| `quic-engine` | `build_quiche_config`, `GsoBatcher::push/flush`, `Crc32cHasher::write` |
-| `stream-scheduler` | `tick`, `submit_batch`, `select`, `jain_index` |
-| `session-registry` | `ConsistentHash::add_node`, `lookup`, `lookup_n` |
-| `reactor` | `EventLoop::run_one_tick` |
-
-## 🔥 Flamegraph Profiling
-
-The in-process profiler above only captures **annotated** functions. For the complete picture — including stdlib, `quiche`, and `io_uring` syscalls — use the **`perf`-based flamegraph** workflow ([`flamegraph-rs/flamegraph`](https://github.com/flamegraph-rs/flamegraph)). It samples the entire call stack via the kernel with zero code changes.
-
-### Prerequisites
-
-```bash
-# 1. Linux perf (kernel symbols for your running kernel).
-sudo apt install linux-tools-common "linux-tools-$(uname -r)"
-
-# 2. Allow userspace sampling without root.
-sudo sysctl kernel.perf_event_paranoid=1
-
-# 3. A folded-stack renderer (pick one):
-cargo install inferno          # preferred — Rust port, no Perl needed
-# — or —
-# install flamegraph.pl (Perl) from https://github.com/brendangregg/FlameGraph
-```
-
-### Option A — Server Under Load (recommended)
-
-The `scripts/flamegraph.sh` orchestrator builds both binaries with the `flamegraph` profile, starts the server, records it under realistic bench-harness traffic, then renders the SVG:
-
-```bash
-# Default: 15s, 64 connections, single worker.
-make flamegraph
-# — or with custom parameters —
-./scripts/flamegraph.sh --duration 30 --conns 256 --port 4433
-```
-
-| Flag | Default | Description |
-|---|---|---|
-| `--duration` | `15` | Recording window in seconds |
-| `--conns` | `64` | Concurrent connections from bench-harness |
-| `--mode` | `single` | Worker mode (`single` / `multi`) |
-| `--port` | `4433` | Server UDP port |
-| `--out` | `flamegraph.svg` | Output SVG path |
-
-The resulting `flamegraph.svg` shows real function names (e.g. `quic_engine::engine`, `quiche::Connection::recv`, io_uring ops) — not raw hex addresses.
-
-The script also keeps the raw `perf.data` next to the SVG (pass `--no-data` to skip it). Use `perf` to inspect it interactively:
-
-```bash
-perf report -i profiles/flamegraph.data          # interactive TUI (navigate + zoom)
-perf report -i profiles/flamegraph.data --stdio | less   # text dump
-```
-
-### Reading `perf report` — Finding Hotspots
-
-The TUI lists functions sorted by **Overhead %** (share of CPU samples). A handful of functions usually account for 80%+ of CPU — those are your optimization targets.
-
-**The key distinction — press `H` to toggle:**
-
-| View | What it shows |
-|---|---|
-| **Children** (default) | Time in this function **plus** everything it calls |
-| **Self** | Time the function spends in its **own** body (excludes sub-calls) |
-
-`main` has Children ~99% but Self ~0% — it's not the bottleneck. A function with high **Self %** is where the CPU actually burns. Use **Self** to find real hotspots, **Children** to understand who drives them.
-
-**Navigation:**
-
-| Key | Action |
-|---|---|
-| `Enter` | Zoom into a function / view call graph / annotate |
-| `+` / `-` | Expand / collapse call-graph nodes |
-| `a` | Annotate **assembly** — see which instructions burn CPU |
-| `s` | Annotate **source** (works because the `flamegraph` profile keeps debug info) |
-| `/` | Filter by symbol name |
-| `H` | Toggle Self / Children |
-
-**Typical workflow:**
-
-1. Open `perf report`, press `H` for **Self** view.
-2. Note the top 3–5 functions (Self > 5%).
-3. `Enter` → zoom in → see the call graph (who calls it, what it calls).
-4. Press `a` to annotate — find the specific loop / instruction that dominates.
-
-**What "hot" usually looks like in vireon:**
-
-| Symbol | Meaning | Action if unexpectedly high |
-|---|---|---|
-| `quiche::Connection::recv/send` | QUIC packet processing | Normal under load |
-| `crc32c::compute` | Frame checksum | Use `--skip-crc` in trusted mode |
-| `frame::encode_into` / `decode_frame` | Codec | Check for copies |
-| `memcpy` / `__rust_alloc` | Hidden allocation/copy | Should be zero-copy |
-| `io_uring_enter` / `entry_SYSCALL` | Syscall overhead | SQPOLL should reduce this |
-| `parking_lot` / mutex | Lock contention | Should not appear on hot path |
-
-**Quick text export (no TUI):**
-
-```bash
-# Top-25 hotspots as text.
-perf report -i profiles/flamegraph.data --stdio | grep -A30 'Overhead' | head -35
-
-# Only vireon's own functions (filter out stdlib/quiche).
-perf report -i profiles/flamegraph.data --symbol-filter='quic_engine|frame::|crc32c|reactor'
-
-# Before/after comparison.
-perf report -i profiles/before.data --stdio > before.txt
-perf report -i profiles/after.data  --stdio > after.txt
-diff before.txt after.txt
-```
-
-### Option B — Ad-hoc Single Process
-
-For quick profiling of a single binary (no load orchestration), use `cargo-flamegraph` directly with the `flamegraph` profile:
-
-```bash
-# Install the cargo subcommand (one-time).
-cargo install flamegraph
-
-# Profile the bench-harness client itself.
-cargo flamegraph --profile flamegraph -p bench-harness -- -c 64 -d 10
-
-# Profile the server (Ctrl-C to stop after applying external load).
-cargo flamegraph --profile flamegraph -p quic-server -- \
-    --cert cert.pem --key key.pem --port 4433
-```
-
-### How the `flamegraph` Profile Works
-
-The workspace defines a dedicated `[profile.flamegraph]` that inherits the release optimizations (`opt-level = 3`, LTO, `panic = "abort"`) while keeping debug symbols for `perf` symbol resolution:
-
-```toml
-[profile.flamegraph]
-inherits = "release"
-debug = "line-tables-only"   # function names + line numbers
-strip = false                # keep symbols for perf
-```
-
-Production release binaries remain fully stripped — only the `flamegraph` profile carries symbols.
-
-## 🤝 Contributing
-
-Contributions are what make the open-source community an amazing place to learn, inspire, and build robust software. Any contributions to Vireon are **greatly appreciated**.
-
-Please review our [Contributing Guidelines](./CONTRIBUTING.md) and [Engineering Standards](./SKILLS.md) to understand our workflow and expectations before submitting your PR.
-
-## 🛡 Security
-
-If you discover a security vulnerability within Vireon, please do **NOT** open a public issue. Review our [Security Policy](./SECURITY.md) for the correct reporting procedures.
-
-## 📄 License
-
-Distributed under the GNU Affero General Public License v3.0 (AGPL-3.0). See [`LICENSE`](./LICENSE) for more information.
+Distributed under the GNU Affero General Public License v3.0 (AGPL-3.0). See
+[`LICENSE`](./LICENSE) for details.
