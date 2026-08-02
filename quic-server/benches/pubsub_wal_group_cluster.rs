@@ -166,7 +166,7 @@ fn bench_wal_replay(c: &mut Criterion) {
 // ── Group B: P5 — consumer-group round-robin ─────────────────────────
 
 /// Encodes a `ConsumerGroupJoin` payload in the wire format the
-/// dispatcher's `parse_group_prefix` expects (application.rs:1374):
+/// dispatcher's `parse_group_prefix` expects:
 /// `topic_len:u16 BE | topic | group_len:u16 BE | group |
 ///  consumer_len:u16 BE | consumer | partitions:u32 BE`. Built with
 /// plain Vec byte ops — `frame::ByteWriter` is slice-backed with no

@@ -73,6 +73,10 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const PENDING_MAX_STREAMS: usize = 65_536;
 const PENDING_MAX_ATTEMPTS: u8 = 255;
 const PENDING_BYTE_CAP: usize = 1024 * 1024 * 1024; // 1 GiB
+/// Threshold at which this worker signals backpressure to other workers.
+/// Kept well below `PENDING_BYTE_CAP` so cross-worker drain gating kicks
+/// in before the hard eviction path.
+const PENDING_PRESSURE_THRESHOLD: usize = PENDING_BYTE_CAP / 4; // 256 MiB
 
 /// Per-stream pending bytes awaiting (re)send.
 ///
@@ -422,6 +426,9 @@ impl VireonStack {
     /// Processes a batch of [`QuicEvent`]s through the layer stack.
     pub fn process_events(&mut self, events: Vec<QuicEvent>) {
         // Drive the stream scheduler once per batch (not per-frame).
+        // Signal pending-sends pressure so cross-worker draining is gated.
+        self.application
+            .set_pending_pressure(self.pending_bytes >= PENDING_PRESSURE_THRESHOLD);
         self.application.on_batch_tick();
 
         for event in events {
@@ -466,6 +473,10 @@ impl VireonStack {
         // Drain + send all outgoing frames accumulated during the batch.
         // Shared with the no-events tick path via `flush_outbox`.
         self.flush_outbox();
+        // Update pressure flag after flush — frames that landed in
+        // pending_sends during flush may have crossed the threshold.
+        self.application
+            .set_pending_pressure(self.pending_bytes >= PENDING_PRESSURE_THRESHOLD);
     }
 
     /// Drains the application outbox and sends every frame via the
@@ -687,9 +698,15 @@ impl VireonStack {
         // drift toward the hard eviction path, which corrupts streams.
         // The topic is parsed from the publish payload so the ack can
         // name it; if parsing fails we still reject with a generic msg.
+        //
+        // Also checks cross-worker pressure: if a remote worker housing
+        // subscribers has a backed-up pending_sends, backpressure the
+        // publisher here instead of letting the cross-worker try_send
+        // silently drop the publish.
         if header.msg_type == MessageType::Publish
             && self.publish_bp_high_watermark > 0
-            && self.pending_bytes >= self.publish_bp_high_watermark
+            && (self.pending_bytes >= self.publish_bp_high_watermark
+                || self.application.any_remote_worker_pressured())
         {
             self.publishes_backpressured = self.publishes_backpressured.saturating_add(1);
             let topic = crate::metrics::extract_topic_from_publish(&payload[..])
@@ -1227,6 +1244,10 @@ impl IoHandler for VireonStack {
         // stream re-enters the dirty bitset and emits packets without
         // waiting an extra tick.
         self.drain_pending_sends();
+        // Successfully retried sends may have lowered pending_bytes —
+        // clear the pressure flag so cross-worker draining resumes.
+        self.application
+            .set_pending_pressure(self.pending_bytes >= PENDING_PRESSURE_THRESHOLD);
 
         // ── Periodic observability (every 1000 ticks ≈ ~1s) ────────
         if self.tick_count % 1000 == 0 && !self.connections.is_empty() {
@@ -1400,8 +1421,12 @@ impl IoHandler for VireonStack {
             // forwarded from other workers pile up undelivered when
             // this worker has no incoming QUIC traffic to trigger
             // `process_events`.
+            self.application
+                .set_pending_pressure(self.pending_bytes >= PENDING_PRESSURE_THRESHOLD);
             self.application.on_batch_tick();
             self.flush_outbox();
+            self.application
+                .set_pending_pressure(self.pending_bytes >= PENDING_PRESSURE_THRESHOLD);
         }
 
         // [transport-layer] Flush outgoing packets queued by process_events

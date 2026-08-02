@@ -113,7 +113,7 @@ fn publish_and_drain(d: &mut VireonDispatcher, topic: &pubsub_engine::Topic, pay
     d.handle_publish(&ctx(0, 999), StreamId::new(999), topic, payload);
 
     // Route the fan-out outbox through send-policy — same two-pass
-    // drain as `stack.rs::process_events`.
+    // drain the stack's per-batch event loop uses.
     let outbox = d.drain_outbox();
     for out in outbox {
         match d.enqueue_egress(out) {

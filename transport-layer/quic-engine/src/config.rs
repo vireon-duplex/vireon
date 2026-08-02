@@ -271,8 +271,7 @@ impl Default for QuicConfig {
 /// Deployment-class presets. Each preset populates a [`QuicConfig`]
 /// with values tuned for that environment.
 ///
-/// Matches the preset style of
-/// [`connection_shard::config::Preset`](../../connection-shard/src/config.rs).
+/// Matches the preset style used by the connection-shard crate.
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub enum Preset {
