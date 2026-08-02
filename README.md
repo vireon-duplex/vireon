@@ -8,7 +8,7 @@
   <p>
     <a href="https://github.com/pinyoothotaboot/Vireon/actions"><img src="https://img.shields.io/github/actions/workflow/status/pinyoothotaboot/Vireon/ci.yml?style=flat-square" alt="Build Status" /></a>
     <a href="https://github.com/pinyoothotaboot/Vireon/releases"><img src="https://img.shields.io/github/v/release/pinyoothotaboot/Vireon?style=flat-square" alt="Release" /></a>
-    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square" alt="License" /></a>
+    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg?style=flat-square" alt="License" /></a>
     <a href="https://rust-lang.org"><img src="https://img.shields.io/badge/Rust-1.90+-orange.svg?style=flat-square" alt="Rust Version" /></a>
   </p>
 </div>
@@ -421,4 +421,4 @@ If you discover a security vulnerability within Vireon, please do **NOT** open a
 
 ## 📄 License
 
-Distributed under the MIT License. See [`LICENSE`](./LICENSE) for more information.
+Distributed under the GNU Affero General Public License v3.0 (AGPL-3.0). See [`LICENSE`](./LICENSE) for more information.

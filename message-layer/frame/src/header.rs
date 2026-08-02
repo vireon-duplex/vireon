@@ -560,7 +560,7 @@ impl std::ops::BitAnd for FrameFlags {
 /// replay-by-offset semantics: `Fetch` requests missed entries from a topic's
 /// WAL; `FetchReply` returns one entry per frame.
 ///
-/// The `u8` representation leaves `0x00` and `0x1A`–`0xFF` reserved for future
+/// The `u8` representation leaves `0x00` and `0x1B`–`0xFF` reserved for future
 /// expansion; unknown bytes surface as [`FrameError::UnknownMessageType`] rather
 /// than silent corruption.
 #[repr(u8)]
@@ -634,13 +634,21 @@ pub enum MessageType {
     /// Payload is `topic_len(u16) | topic | group_len(u16) | group_id
     /// | consumer_len(u16) | consumer_id | generation(u32)`.
     ConsumerGroupHeartbeat = 0x19,
+
+    // ---- adaptive delivery (high-fanout optimization) ----
+    /// Server → subscriber: a new message is available at WAL `offset`
+    /// for `topic`. Lightweight alternative to forwarding the full
+    /// payload when fan-out is high — the subscriber auto-fetches via
+    /// [`MessageType::Fetch`]. Payload is `topic_len(u16) | topic |
+    /// offset(u64)`.
+    NotifyOffset = 0x1A,
 }
 
 /// Every defined [`MessageType`], ascending by wire byte.
 ///
 /// Useful for exhaustive round-trip tests and for dispatchers that want to
 /// validate they handle every variant.
-pub const ALL_MESSAGE_TYPES: [MessageType; 25] = [
+pub const ALL_MESSAGE_TYPES: [MessageType; 26] = [
     MessageType::TextToken,
     MessageType::AudioFrame,
     MessageType::VideoFrame,
@@ -666,6 +674,7 @@ pub const ALL_MESSAGE_TYPES: [MessageType; 25] = [
     MessageType::ConsumerGroupJoin,
     MessageType::ConsumerGroupLeave,
     MessageType::ConsumerGroupHeartbeat,
+    MessageType::NotifyOffset,
 ];
 
 impl MessageType {
@@ -704,6 +713,7 @@ impl MessageType {
             0x17 => Self::ConsumerGroupJoin,
             0x18 => Self::ConsumerGroupLeave,
             0x19 => Self::ConsumerGroupHeartbeat,
+            0x1A => Self::NotifyOffset,
             _ => return None,
         })
     }
@@ -737,6 +747,7 @@ impl MessageType {
                 | Self::ConsumerGroupJoin
                 | Self::ConsumerGroupLeave
                 | Self::ConsumerGroupHeartbeat
+                | Self::NotifyOffset
         )
     }
 
@@ -758,6 +769,7 @@ impl MessageType {
                 | Self::ConsumerGroupJoin
                 | Self::ConsumerGroupLeave
                 | Self::ConsumerGroupHeartbeat
+                | Self::NotifyOffset
         )
     }
 
@@ -1148,7 +1160,7 @@ mod tests {
     #[test]
     fn reserved_and_unknown_bytes_map_to_none() {
         assert_eq!(MessageType::from_byte(0x00), None);
-        assert_eq!(MessageType::from_byte(0x1A), None);
+        assert_eq!(MessageType::from_byte(0x1B), None);
         assert_eq!(MessageType::from_byte(0xFF), None);
         assert!(matches!(
             MessageType::try_from(0x42),
@@ -1168,7 +1180,7 @@ mod tests {
     #[test]
     fn wire_bytes_are_dense_and_unique() {
         let bytes: Vec<u8> = ALL_MESSAGE_TYPES.iter().map(|mt| mt.as_byte()).collect();
-        assert_eq!(bytes, (0x01..=0x19u8).collect::<Vec<_>>());
+        assert_eq!(bytes, (0x01..=0x1Au8).collect::<Vec<_>>());
         let unique: std::collections::HashSet<_> = bytes.iter().copied().collect();
         assert_eq!(unique.len(), bytes.len());
     }
