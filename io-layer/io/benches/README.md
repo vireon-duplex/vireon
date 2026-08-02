@@ -34,26 +34,11 @@ ring/socket/pool fixture builders). Every bench pulls it in via
 
 ## Headline numbers
 
-Measured on the development host with `--sample-size 20
---measurement-time 0.5`:
-
-| Bench | Typical |
-|-------|---------|
-| `ring_init/init_ring/entries=256`        | ~60 µs |
-| `ring_init/register_sparse_files/1024`   | ~5 µs  |
-| `buffer_pool/init_buffer_ring/count=256` | ~5.7 µs |
-| `buffer_pool/refill_buffer`              | ~1.1 ns |
-| `buffer_pool/get_buffer_address/random`  | ~1.8 ns |
-| `timer_ops/retire/hit`                   | ~66 ns |
-| `timer_ops/is_active/active`             | ~8 ns  |
-| `connection/completion_decode/recv_success` | ~232 ps |
-| `connection/send_zc/2048B`              | ~3.7 µs |
-| `metrics/record_cqe_completion/rx_success` | ~4 ns |
-| `metrics/snapshot/after_10k_ops`         | ~930 ps |
-| `udp_roundtrip/1033B`                    | ~10 µs |
-
-Numbers are host-dependent and intended for regression tracking, not
-absolute comparison.
+Run `cargo bench -p io` on your hardware to establish a baseline.
+Ring/buffer init is single-digit-microsecond; hot-path lookups
+(refill, address, retire) are nanoseconds; completion decode is
+sub-nanosecond. Use the numbers for regression tracking across
+commits, not absolute comparison across hosts.
 
 ## Hardware performance counters (Linux only)
 

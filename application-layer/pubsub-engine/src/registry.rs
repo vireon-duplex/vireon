@@ -3,8 +3,8 @@
 //! `PubSubEngine` (`engine.rs`) stores subscriptions by id with a flat
 //! `HashMap<SubscriptionId, TopicPattern>` and matches a published topic
 //! by iterating every entry — O(subscriptions) per publish. The dispatcher
-//! hot path (`quic-server/src/layers/application.rs::handle_publish`) needs
-//! to find *where* to send each delivered frame, so it kept its own
+//! hot path (the application layer's `handle_publish`) needs to find *where*
+//! to send each delivered frame, so it kept its own
 //! `Vec<(TopicPattern, conn_idx, quic_stream_id)>` and did the same linear
 //! scan.
 //!

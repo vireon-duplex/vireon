@@ -136,14 +136,10 @@ cargo bench -p kernel-nic --bench cpuset -- \
 | `socket_create`    | Single UDP socket create+bind+configure (full options). |
 | `cpuset`           | `CpuSet` set/contains/first at 16–1024-bit fan-out. |
 
-### Smoke-test numbers (single run, your Mileage Will Vary)
+### Smoke-test numbers
 
-| Bench | Result |
-|-------|--------|
-| `cpuset_set/1024`         | ~1.0 µs (~988 Melem/s) |
-| `cpuset_contains/1024`    | ~328 ns (~3.1 Gelem/s) |
-| `cpuset_first/set_with_6_bits` | ~362 ps |
-| `socket_create/single`    | sub-µs (criterion-reported) |
+Run `cargo bench -p kernel-nic` to measure on your hardware. CpuSet
+operations are nanoseconds-per-call; socket creation is sub-microsecond.
 
 ### Phase 5 results
 
