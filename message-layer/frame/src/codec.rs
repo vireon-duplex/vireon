@@ -323,7 +323,10 @@ pub fn encode_into_slice_skip_crc(
     })?;
     let needed = HEADER_SIZE + payload.len() + CRC_SIZE;
     if dst.len() < needed {
-        return Err(FrameError::BufferTooSmall { needed, have: dst.len() });
+        return Err(FrameError::BufferTooSmall {
+            needed,
+            have: dst.len(),
+        });
     }
     // SAFETY: `dst.len() >= needed` (checked above).
     unsafe {

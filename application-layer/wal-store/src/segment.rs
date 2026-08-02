@@ -41,7 +41,10 @@ pub const SEGMENT_EXT: &str = ".wal";
 /// Build the filename for a segment whose first entry has `base_offset`.
 #[must_use]
 pub fn segment_filename(base_offset: Offset) -> String {
-    format!("{SEGMENT_PREFIX}{base_offset:0OFFSET_WIDTH$}{SEGMENT_EXT}", base_offset = base_offset.get())
+    format!(
+        "{SEGMENT_PREFIX}{base_offset:0OFFSET_WIDTH$}{SEGMENT_EXT}",
+        base_offset = base_offset.get()
+    )
 }
 
 /// Parse a base offset out of a `seg-NNNNNNNNNN.wal` filename.
@@ -102,10 +105,7 @@ impl Segment {
     /// On a malformed tail entry, the file is truncated to the last good
     /// position — mirroring the single-file recovery contract.
     pub fn open_recover(path: PathBuf, base_offset: Offset) -> Result<Self, WalError> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)?;
+        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
         let mut index: Vec<(Offset, u64)> = Vec::new();
         let mut retained_bytes: u64 = 0;
         // Scan the whole file to rebuild the index.

@@ -60,9 +60,9 @@
 use arrayvec::ArrayVec;
 use rustc_hash::FxHashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use auth_framework::authenticator::AuthenticationPipeline;
@@ -187,15 +187,9 @@ pub enum InterWorkerMsg {
         msg_type: MessageType,
     },
     /// Sender `worker_idx` now has ≥1 subscriber for `pattern`.
-    SubGained {
-        worker_idx: u16,
-        pattern: String,
-    },
+    SubGained { worker_idx: u16, pattern: String },
     /// Sender `worker_idx` has 0 subscribers for `pattern`.
-    SubLost {
-        worker_idx: u16,
-        pattern: String,
-    },
+    SubLost { worker_idx: u16, pattern: String },
     /// Sender `worker_idx` gained a consumer-group member.
     /// Worker 0 uses this to maintain a global member registry.
     GroupGained {
@@ -618,7 +612,6 @@ pub struct VireonDispatcher {
 
 /// Minimum gap between cross-worker drop warning logs.
 const WORKER_DROP_LOG_COOLDOWN: Duration = Duration::from_secs(5);
-
 
 impl VireonDispatcher {
     /// Creates a new dispatcher with default-configured modules.
@@ -1448,9 +1441,7 @@ impl VireonDispatcher {
                     // pattern churn.
                     self.pattern_sub_counts.remove(pattern_str);
                     // Notify other workers that this worker lost interest.
-                    if !pattern_str.starts_with("_heartbeat.")
-                        && !self.worker_outboxes.is_empty()
-                    {
+                    if !pattern_str.starts_with("_heartbeat.") && !self.worker_outboxes.is_empty() {
                         self.broadcast_worker_msg(InterWorkerMsg::SubLost {
                             worker_idx: self.worker_self_idx as u16,
                             pattern: pattern_str.to_string(),
@@ -1468,9 +1459,8 @@ impl VireonDispatcher {
         );
         // Stop re-broadcasting the forwarded subscription (if any).
         if removed > 0 {
-            self.forwarded_subs.retain(|fs| {
-                !(fs.conn_idx == ctx.conn_idx as u32 && fs.pattern == pattern_str)
-            });
+            self.forwarded_subs
+                .retain(|fs| !(fs.conn_idx == ctx.conn_idx as u32 && fs.pattern == pattern_str));
         }
         let mut rbuf = itoa::Buffer::new();
         let r = rbuf.format(removed);
@@ -1505,7 +1495,10 @@ impl VireonDispatcher {
             .check_acl(ctx.conn_idx, Action::Publish, topic)
             .is_allow()
         {
-            self.conn_metrics.entry(ctx.conn_idx).or_default().record_reject();
+            self.conn_metrics
+                .entry(ctx.conn_idx)
+                .or_default()
+                .record_reject();
             if self.acl_denied_drop.tick() {
                 tracing::info!(
                     conn_idx = ctx.conn_idx,
@@ -1745,8 +1738,12 @@ impl VireonDispatcher {
                 self.notify_scratch
                     .extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
                 self.notify_scratch.extend_from_slice(topic_str.as_bytes());
-                self.notify_scratch.extend_from_slice(&offset.get().to_be_bytes());
-                (self.notify_scratch.split().freeze(), MessageType::NotifyOffset)
+                self.notify_scratch
+                    .extend_from_slice(&offset.get().to_be_bytes());
+                (
+                    self.notify_scratch.split().freeze(),
+                    MessageType::NotifyOffset,
+                )
             }
         };
 
@@ -1793,9 +1790,12 @@ impl VireonDispatcher {
                 local.rr_idx = local.rr_idx.wrapping_add(1);
                 let m = &local.members[idx];
                 if let Some(off) = wal_offset {
-                    self.consumer_offsets.ack(topic_str, m.consumer.as_str(), off);
+                    self.consumer_offsets
+                        .ack(topic_str, m.consumer.as_str(), off);
                 }
-                let _ = self.group_targets_scratch.try_push((m.conn_idx, m.quic_stream_id));
+                let _ = self
+                    .group_targets_scratch
+                    .try_push((m.conn_idx, m.quic_stream_id));
             }
             let group_len = self.group_targets_scratch.len();
             for i in 0..group_len {
@@ -1879,7 +1879,8 @@ impl VireonDispatcher {
                 bitmap |= mask;
             }
         }
-        self.topic_worker_bitmap_cache.insert(topic.to_string(), bitmap);
+        self.topic_worker_bitmap_cache
+            .insert(topic.to_string(), bitmap);
         bitmap
     }
 
@@ -1902,11 +1903,7 @@ impl VireonDispatcher {
     /// Returns the validated `&str` (no allocation) instead of an owned
     /// `Topic` — the publish hot path calls this thousands of times/sec
     /// and the old `Topic::new` allocated a `String` per publish.
-    fn validate_topic_or_log<'a>(
-        &self,
-        ctx: &FrameContext,
-        raw: &'a str,
-    ) -> Option<&'a str> {
+    fn validate_topic_or_log<'a>(&self, ctx: &FrameContext, raw: &'a str) -> Option<&'a str> {
         match pubsub_engine::Topic::validate(raw) {
             Ok(()) => Some(raw),
             Err(e) => {
@@ -2018,12 +2015,7 @@ impl VireonDispatcher {
     }
 
     /// Removes a topic from the catalog.
-    pub fn handle_topic_delete(
-        &mut self,
-        ctx: &FrameContext,
-        stream: StreamId,
-        topic: &str,
-    ) {
+    pub fn handle_topic_delete(&mut self, ctx: &FrameContext, stream: StreamId, topic: &str) {
         // Phase 7: TopicDelete is the most dangerous operation (it can
         // wipe subscriber state), so its ACL action is separate from
         // TopicCreate. Deny returns an error ack and skips the catalog
@@ -2320,7 +2312,8 @@ impl VireonDispatcher {
             // entries starting at `from`, the inclusive upper bound is
             // `from + max_count - 1`. Cap at `head` (the last live entry).
             let from_plus_cap = wal_store::Offset::new(
-                from.get().saturating_add((max_count.saturating_sub(1)) as u64),
+                from.get()
+                    .saturating_add((max_count.saturating_sub(1)) as u64),
             );
             core::cmp::min(from_plus_cap, head)
         };
@@ -3056,7 +3049,9 @@ impl VireonDispatcher {
             return; // single-node mode
         };
         let interval = coord.heartbeat_interval();
-        let due = self.last_health_check.map_or(true, |t| now.duration_since(t) >= interval);
+        let due = self
+            .last_health_check
+            .map_or(true, |t| now.duration_since(t) >= interval);
         if !due {
             return;
         }
@@ -3070,7 +3065,10 @@ impl VireonDispatcher {
                 let peers = coord.membership().alive_nodes();
                 for peer in peers {
                     if peer != self.node_id {
-                        let _ = tx.send(OutgoingMsg { msg: hb.clone(), target: peer });
+                        let _ = tx.send(OutgoingMsg {
+                            msg: hb.clone(),
+                            target: peer,
+                        });
                     }
                 }
             }
@@ -3117,7 +3115,10 @@ impl VireonDispatcher {
                     let peers = coord.membership().alive_nodes();
                     for peer in peers {
                         if peer != self.node_id {
-                            let _ = tx.send(OutgoingMsg { msg: gossip.clone(), target: peer });
+                            let _ = tx.send(OutgoingMsg {
+                                msg: gossip.clone(),
+                                target: peer,
+                            });
                         }
                     }
                 }
@@ -3260,17 +3261,20 @@ impl VireonDispatcher {
                 InterWorkerMsg::Publish { framed, msg_type } => {
                     self.deliver_framed_local(framed, msg_type);
                 }
-                InterWorkerMsg::SubGained { worker_idx, pattern } => {
+                InterWorkerMsg::SubGained {
+                    worker_idx,
+                    pattern,
+                } => {
                     if let Ok(pat) = pubsub_engine::TopicPattern::new(&pattern) {
                         let bit = 1u32 << worker_idx;
-                        *self
-                            .remote_pattern_interest
-                            .entry(pat)
-                            .or_insert(0) |= bit;
+                        *self.remote_pattern_interest.entry(pat).or_insert(0) |= bit;
                     }
                     self.topic_worker_bitmap_cache.clear();
                 }
-                InterWorkerMsg::SubLost { worker_idx, pattern } => {
+                InterWorkerMsg::SubLost {
+                    worker_idx,
+                    pattern,
+                } => {
                     if let Ok(pat) = pubsub_engine::TopicPattern::new(&pattern) {
                         if let Some(bitmap) = self.remote_pattern_interest.get_mut(&pat) {
                             *bitmap &= !(1u32 << worker_idx);
@@ -3320,17 +3324,15 @@ impl VireonDispatcher {
                         }
                     }
                 }
-                InterWorkerMsg::GroupDeliver { framed, target, msg_type } => match target {
+                InterWorkerMsg::GroupDeliver {
+                    framed,
+                    target,
+                    msg_type,
+                } => match target {
                     Some((conn_idx, stream_id)) => {
                         // Worker 0 routed a delivery to a member on this worker.
                         let stream = StreamId::new(0xFFFF_FFFF);
-                        self.enqueue_frame(
-                            conn_idx,
-                            stream_id,
-                            stream,
-                            msg_type,
-                            framed,
-                        );
+                        self.enqueue_frame(conn_idx, stream_id, stream, msg_type, framed);
                     }
                     None => {
                         // Another worker asks us (worker 0) to do global
@@ -3409,13 +3411,7 @@ impl VireonDispatcher {
             for decision in decisions {
                 match decision {
                     Target::Local(conn_idx, stream_id) => {
-                        self.enqueue_frame(
-                            conn_idx,
-                            stream_id,
-                            stream,
-                            msg_type,
-                            framed.clone(),
-                        );
+                        self.enqueue_frame(conn_idx, stream_id, stream, msg_type, framed.clone());
                     }
                     Target::Remote(worker_idx, conn_idx, stream_id) => {
                         if let Some(outbox) = self.worker_outboxes.get(worker_idx as usize) {
@@ -3438,19 +3434,15 @@ impl VireonDispatcher {
                 let idx = local.rr_idx % local.members.len();
                 local.rr_idx = local.rr_idx.wrapping_add(1);
                 let m = &local.members[idx];
-                let _ = self.group_targets_scratch.try_push((m.conn_idx, m.quic_stream_id));
+                let _ = self
+                    .group_targets_scratch
+                    .try_push((m.conn_idx, m.quic_stream_id));
             }
             let stream = StreamId::new(0xFFFF_FFFF);
             let group_len = self.group_targets_scratch.len();
             for i in 0..group_len {
                 let (conn_idx, stream_id) = self.group_targets_scratch[i];
-                self.enqueue_frame(
-                    conn_idx,
-                    stream_id,
-                    stream,
-                    msg_type,
-                    framed.clone(),
-                );
+                self.enqueue_frame(conn_idx, stream_id, stream, msg_type, framed.clone());
             }
         }
     }
@@ -3533,9 +3525,9 @@ impl VireonDispatcher {
         // Throttle interval applies to BOTH retention and offset-snapshot
         // so the disk walk happens at most once per `wal_sweep_interval`.
         let now = Instant::now();
-        let due = self.wal_retention_last_run.map_or(true, |t| {
-            now.duration_since(t) >= self.wal_sweep_interval
-        });
+        let due = self
+            .wal_retention_last_run
+            .map_or(true, |t| now.duration_since(t) >= self.wal_sweep_interval);
         if !due {
             return;
         }
@@ -3543,8 +3535,8 @@ impl VireonDispatcher {
 
         // Run the retention walk only if a policy is configured. The
         // common case (keep-forever) skips the directory walk entirely.
-        let has_policy = self.wal_retention.max_bytes.is_some()
-            || self.wal_retention.max_age_ns.is_some();
+        let has_policy =
+            self.wal_retention.max_bytes.is_some() || self.wal_retention.max_age_ns.is_some();
         if has_policy {
             if let Some(wal) = self.wal.as_mut() {
                 let now_ns = std::time::SystemTime::now()
@@ -3558,7 +3550,9 @@ impl VireonDispatcher {
                     let mut errored: u64 = 0;
                     for topic in &topics {
                         match policy.apply::<wal_store::FileStore>(wal, topic, now_ns) {
-                            Ok(stats) => total_removed = total_removed.saturating_add(stats.removed),
+                            Ok(stats) => {
+                                total_removed = total_removed.saturating_add(stats.removed)
+                            }
                             Err(_) => errored = errored.saturating_add(1),
                         }
                     }
@@ -3684,7 +3678,8 @@ impl AppDispatcher for VireonDispatcher {
             .remove_connection_with_patterns(conn_idx);
         let removed = removed_patterns.len();
         // Stop re-broadcasting any forwarded subscriptions for this conn.
-        self.forwarded_subs.retain(|fs| fs.conn_idx != conn_idx as u32);
+        self.forwarded_subs
+            .retain(|fs| fs.conn_idx != conn_idx as u32);
         // Decrement per-pattern quota counters to match.
         if !removed_patterns.is_empty() {
             for pat in &removed_patterns {
@@ -3693,9 +3688,7 @@ impl AppDispatcher for VireonDispatcher {
                     if *count == 0 {
                         self.pattern_sub_counts.remove(pat);
                         // Notify other workers that this worker lost interest.
-                        if !pat.starts_with("_heartbeat.")
-                            && !self.worker_outboxes.is_empty()
-                        {
+                        if !pat.starts_with("_heartbeat.") && !self.worker_outboxes.is_empty() {
                             self.broadcast_worker_msg(InterWorkerMsg::SubLost {
                                 worker_idx: self.worker_self_idx as u16,
                                 pattern: pat.clone(),
@@ -3963,9 +3956,11 @@ impl ApplicationLayer {
     /// backpressure their publishers before forwarding.
     pub fn set_pending_pressure(&mut self, high: bool) {
         self.dispatcher.pending_sends_high = high;
-        if let Some(flag) = self.dispatcher.worker_pressure_flags.get(
-            self.dispatcher.worker_self_idx,
-        ) {
+        if let Some(flag) = self
+            .dispatcher
+            .worker_pressure_flags
+            .get(self.dispatcher.worker_self_idx)
+        {
             flag.store(high, Ordering::Relaxed);
         }
     }
