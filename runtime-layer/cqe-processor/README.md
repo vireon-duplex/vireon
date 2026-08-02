@@ -169,13 +169,10 @@ cargo bench -p cqe-processor --bench stats -- \
 | `stats`    | `StatsCollector` increment + snapshot |
 | `batch`    | `large_batch` 1k–64k drain scaling + `sustained_dispatch` 256×64 with drain between rounds |
 
-### Smoke-test numbers (single run, your Mileage Will Vary)
+### Smoke-test numbers
 
-| Bench | Result |
-|-------|--------|
-| `stats_increment/1024`     | ~5.6 µs (~183 Melem/s) |
-| `stats_snapshot/single`    | ~19 ns / call |
-| `dispatch_recv/single`     | sub-µs (criterion-reported) |
+Run `cargo bench -p cqe-processor` to measure on your hardware. Per-CQE
+dispatch is sub-microsecond; stats operations are nanoseconds-per-call.
 
 [`error`]: src/error.rs
 [`config`]: src/config.rs
