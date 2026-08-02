@@ -7,8 +7,9 @@
   </p>
 
   <p>
-    <a href="https://github.com/pinyoothotaboot/vireon/actions"><img src="https://img.shields.io/github/actions/workflow/status/pinyoothotaboot/vireon/ci.yml?style=flat-square" alt="Build Status" /></a>
-    <a href="https://github.com/pinyoothotaboot/vireon/releases"><img src="https://img.shields.io/github/v/release/pinyoothotaboot/vireon?style=flat-square" alt="Release" /></a>
+    <a href="https://github.com/pinyoothotaboot/Vireon/actions"><img src="https://img.shields.io/github/actions/workflow/status/pinyoothotaboot/Vireon/ci.yml?style=flat-square" alt="Build Status" /></a>
+    <a href="https://github.com/pinyoothotaboot/Vireon/releases"><img src="https://img.shields.io/github/v/release/pinyoothotaboot/Vireon?style=flat-square" alt="Release" /></a>
+    <a href="https://github.com/pinyoothotaboot/Vireon/pkgs/container/vireon"><img src="https://img.shields.io/badge/docker-ghcr.io-blue.svg?style=flat-square" alt="Docker" /></a>
     <a href="./LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg?style=flat-square" alt="License" /></a>
     <a href="https://rust-lang.org"><img src="https://img.shields.io/badge/Rust-1.85+-orange.svg?style=flat-square" alt="Rust Version" /></a>
   </p>
@@ -48,23 +49,74 @@ clients connect through the Rust SDK (`vireon-sdk`). Both ship in this repo.
 - **io_uring data plane** — zero-copy sends, registered buffers, SQPOLL,
   multishot receive. Bypasses syscall-per-packet overhead.
 
-## Quick start
+## Install
+
+Pick one of three ways to get the server running. All three produce the
+same `quic-server` binary; the SDK (`vireon-sdk`) is added to your project
+separately via Cargo.
+
+### Option A — Docker (fastest)
+
+Pre-built multi-arch images are published to GitHub Container Registry on
+every release tag:
 
 ```bash
-git clone https://github.com/pinyoothotaboot/vireon.git
-cd vireon
-cargo build --release
-
-# Self-signed dev cert (production: use a real CA).
-openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
-  -days 365 -nodes -subj "/CN=localhost"
-
-# Start the server.
-./target/release/quic-server --cert cert.pem --key key.pem --port 4433
+docker pull ghcr.io/pinyoothotaboot/vireon:latest
+docker run --rm -p 4433:4433/udp -p 9090:9090/tcp \
+  -v "$PWD/cert.pem:/cert.pem:ro" \
+  -v "$PWD/key.pem:/key.pem:ro" \
+  ghcr.io/pinyoothotaboot/vireon:latest \
+  --cert /cert.pem --key /key.pem --port 4433
 ```
 
-Server is now listening on `127.0.0.1:4433`. Open another terminal and run an
-example:
+Available tags: `latest`, `v0.1.0`, `0.1`, `0`. Platforms: `linux/amd64`,
+`linux/arm64`. See [packages](https://github.com/pinyoothotaboot/Vireon/pkgs/container/vireon).
+
+### Option B — Prebuilt binary
+
+Each release publishes a stripped `quic-server-linux-amd64` binary. Download
+from the [Releases page](https://github.com/pinyoothotaboot/Vireon/releases):
+
+```bash
+# After downloading and chmod +x quic-server-linux-amd64
+./quic-server-linux-amd64 --cert cert.pem --key key.pem --port 4433
+```
+
+Linux x86_64 only — `io_uring` is Linux-specific. For other architectures
+or platforms, build from source (below).
+
+### Option C — Build from source
+
+Requires Rust 1.85+ (edition 2024) and Linux kernel 5.6+ (io_uring).
+
+```bash
+git clone https://github.com/pinyoothotaboot/Vireon.git
+cd Vireon
+cargo build --release
+# Binary lands at target/release/quic-server
+```
+
+The build pulls `quiche` (BoringSSL) which needs `cmake`, `golang`,
+`ninja-build`, `perl`, `python3`, and `pkg-config` — install via your
+package manager if the build fails on a missing tool.
+
+## Quick start
+
+Generate a self-signed cert (dev only — production: use a real CA):
+
+```bash
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
+  -days 365 -nodes -subj "/CN=localhost"
+```
+
+Start the server (using whichever install path you picked above):
+
+```bash
+quic-server --cert cert.pem --key key.pem --port 4433
+```
+
+The server is now listening on `127.0.0.1:4433`. Open another terminal and
+run an example:
 
 ```bash
 # All 3 delivery policies in one run.
