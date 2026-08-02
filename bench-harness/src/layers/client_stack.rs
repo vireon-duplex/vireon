@@ -213,10 +213,9 @@ impl ClientStack {
     ///
     /// Returns the number of frames decoded.
     pub fn on_stream_data(&mut self, quic_sid: u64, data: &[u8]) -> usize {
-        let decoder = self
-            .decoders
-            .entry(quic_sid)
-            .or_insert_with(|| FrameDecoder::with_capacity(DECODER_CAPACITY).skip_crc(self.skip_crc));
+        let decoder = self.decoders.entry(quic_sid).or_insert_with(|| {
+            FrameDecoder::with_capacity(DECODER_CAPACITY).skip_crc(self.skip_crc)
+        });
         decoder.push(data);
 
         let mut count = 0usize;
@@ -252,17 +251,14 @@ impl ClientStack {
                     // entry is available. Parse topic + offset, queue a
                     // Fetch request so the caller can send it on the next
                     // tick. Wire format: topic_len(u16) | topic | offset(u64).
-                    if frame.msg_type == MessageType::NotifyOffset
-                        && frame.payload.len() >= 2 + 8
-                    {
+                    if frame.msg_type == MessageType::NotifyOffset && frame.payload.len() >= 2 + 8 {
                         let topic_len =
                             u16::from_be_bytes([frame.payload[0], frame.payload[1]]) as usize;
                         if frame.payload.len() >= 2 + topic_len + 8 {
                             let topic = frame.payload[2..2 + topic_len].to_vec();
                             let mut off_buf = [0u8; 8];
-                            off_buf.copy_from_slice(
-                                &frame.payload[2 + topic_len..2 + topic_len + 8],
-                            );
+                            off_buf
+                                .copy_from_slice(&frame.payload[2 + topic_len..2 + topic_len + 8]);
                             self.pending_fetches
                                 .push((topic, u64::from_be_bytes(off_buf)));
                         }
@@ -352,7 +348,9 @@ impl ClientStack {
             payload.extend_from_slice(topic_bytes);
             payload.extend_from_slice(&offset.to_be_bytes());
             payload.extend_from_slice(&1u32.to_be_bytes()); // max_count = 1
-            let header = self.app.prepare_frame(0, MessageType::Fetch, FrameFlags::NONE);
+            let header = self
+                .app
+                .prepare_frame(0, MessageType::Fetch, FrameFlags::NONE);
             let fp = FramePayload::new(
                 MessageType::Fetch,
                 FrameFlags::NONE,
@@ -392,8 +390,7 @@ fn extract_seq_from_fetch_reply(reply: &[u8]) -> Option<u64> {
         return None;
     }
     // The inner payload starts with topic_len(2) + topic + bench_seq(8).
-    let inner_topic_len =
-        u16::from_be_bytes([reply[inner_off], reply[inner_off + 1]]) as usize;
+    let inner_topic_len = u16::from_be_bytes([reply[inner_off], reply[inner_off + 1]]) as usize;
     let seq_off = inner_off + 2 + inner_topic_len;
     if reply.len() < seq_off + BENCH_SEQ_BYTES {
         return None;

@@ -30,7 +30,6 @@ pub mod stream;
 // duplicate-compile view without affecting the lib's public API.
 #[allow(unused_imports)]
 pub use application::{
-    AppDispatcher, ApplicationLayer, FrameContext, InterWorkerMsg, OutgoingFrame,
-    VireonDispatcher,
+    AppDispatcher, ApplicationLayer, FrameContext, InterWorkerMsg, OutgoingFrame, VireonDispatcher,
 };
 pub use runtime::RuntimeLayer;

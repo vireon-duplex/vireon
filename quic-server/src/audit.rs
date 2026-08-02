@@ -350,24 +350,14 @@ mod tests {
         let path = tmp_path("resume.vaud");
         {
             let mut log = AuditLog::open(&path).unwrap();
-            log.record(
-                AuditKind::TopicCreated,
-                AuditResult::Allowed,
-                "a",
-                "t1",
-            )
-            .unwrap();
+            log.record(AuditKind::TopicCreated, AuditResult::Allowed, "a", "t1")
+                .unwrap();
         }
         {
             let mut log = AuditLog::open(&path).unwrap();
             assert_eq!(log.entry_count(), 1, "should resume from 1 entry");
-            log.record(
-                AuditKind::TopicDeleted,
-                AuditResult::Allowed,
-                "b",
-                "t1",
-            )
-            .unwrap();
+            log.record(AuditKind::TopicDeleted, AuditResult::Allowed, "b", "t1")
+                .unwrap();
             assert_eq!(log.entry_count(), 2);
         }
         let _ = std::fs::remove_file(&path);
@@ -405,11 +395,7 @@ mod tests {
         // Reopen: the chain should detect the broken hash and stop
         // after 0 valid entries.
         let log = AuditLog::open(&path).unwrap();
-        assert_eq!(
-            log.entry_count(),
-            0,
-            "tampered entry should not be counted"
-        );
+        assert_eq!(log.entry_count(), 0, "tampered entry should not be counted");
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(path.parent().unwrap());

@@ -245,10 +245,7 @@ impl InterNodeMessage {
     ///
     /// # Errors
     /// Same as [`encode`](Self::encode).
-    pub fn encode_into<'a>(
-        &self,
-        buf: &'a mut BytesMut,
-    ) -> Result<&'a [u8], ClusterError> {
+    pub fn encode_into<'a>(&self, buf: &'a mut BytesMut) -> Result<&'a [u8], ClusterError> {
         let topic_bytes = self.topic_or_pattern.as_bytes();
         let topic_len = topic_bytes.len();
         if topic_len == 0 {

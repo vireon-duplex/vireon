@@ -280,12 +280,19 @@ impl ServerConfig {
         let echo = cli.echo || conf.echo.unwrap_or(false);
 
         // ── Log format ─────────────────────────────────────────────
-        let log_format = cli.log_format.clone().map(LogFormat::from).or_else(|| {
-            conf.log_format.as_deref().map(|s| match s.to_ascii_lowercase().as_str() {
-                "json" => LogFormat::Json,
-                _ => LogFormat::Text,
+        let log_format = cli
+            .log_format
+            .clone()
+            .map(LogFormat::from)
+            .or_else(|| {
+                conf.log_format
+                    .as_deref()
+                    .map(|s| match s.to_ascii_lowercase().as_str() {
+                        "json" => LogFormat::Json,
+                        _ => LogFormat::Text,
+                    })
             })
-        }).unwrap_or_default();
+            .unwrap_or_default();
 
         // ── ACL ─────────────────────────────────────────────────────
         let acl_rules_path = cli
@@ -315,7 +322,10 @@ impl ServerConfig {
             .or(conf.wal_root.clone())
             .filter(|s| !s.is_empty())
             .map(std::path::PathBuf::from);
-        let wal_retention_secs = cli.wal_retention_secs.or(conf.wal_retention_secs).unwrap_or(0);
+        let wal_retention_secs = cli
+            .wal_retention_secs
+            .or(conf.wal_retention_secs)
+            .unwrap_or(0);
         let wal_max_bytes = cli.wal_max_bytes.or(conf.wal_max_bytes).unwrap_or(0);
         let wal_retention = build_wal_retention(wal_retention_secs, wal_max_bytes);
 
@@ -323,9 +333,7 @@ impl ServerConfig {
         let wal_sync = match conf.wal_sync.as_ref() {
             Some(s) => match s.mode.as_str() {
                 "never" => wal_store::SyncPolicy::Never,
-                "every_flush" | "every-flush" | "everyflush" => {
-                    wal_store::SyncPolicy::EveryFlush
-                }
+                "every_flush" | "every-flush" | "everyflush" => wal_store::SyncPolicy::EveryFlush,
                 "group_commit" | "group-commit" | "groupcommit" => {
                     let ms = s.group_commit_ms.unwrap_or(100).max(1);
                     wal_store::SyncPolicy::GroupCommit(std::time::Duration::from_millis(ms))
@@ -367,10 +375,7 @@ impl ServerConfig {
         // 0 / "" = not set (single-node mode). Filter so Some(0) /
         // Some("") don't trigger the cluster-peers requirement.
         let cli_node = cli.cluster_node_id.filter(|&id| id != 0);
-        let cli_peers = cli
-            .cluster_peers
-            .clone()
-            .filter(|s| !s.is_empty());
+        let cli_peers = cli.cluster_peers.clone().filter(|s| !s.is_empty());
         let cli_rf = cli.cluster_replication_factor;
 
         let (conf_node, conf_peers, conf_rf, conf_vnodes) = match &conf.cluster {
@@ -387,14 +392,9 @@ impl ServerConfig {
         let cluster_peers = cli_peers.or(conf_peers);
         let cluster_replication_factor = cli_rf.or(conf_rf);
         let cluster_vnodes = conf_vnodes;
-        let cluster_heartbeat_interval = conf
-            .cluster
-            .as_ref()
-            .and_then(|c| c.heartbeat_interval_ms);
-        let cluster_heartbeat_timeout = conf
-            .cluster
-            .as_ref()
-            .and_then(|c| c.heartbeat_timeout_ms);
+        let cluster_heartbeat_interval =
+            conf.cluster.as_ref().and_then(|c| c.heartbeat_interval_ms);
+        let cluster_heartbeat_timeout = conf.cluster.as_ref().and_then(|c| c.heartbeat_timeout_ms);
 
         let cluster = match (cluster_node_id, cluster_peers.as_deref()) {
             (Some(id), Some(peers_str)) => {
@@ -407,12 +407,8 @@ impl ServerConfig {
                     heartbeat_interval_ms: cluster_heartbeat_interval,
                     heartbeat_timeout_ms: cluster_heartbeat_timeout,
                 };
-                let cfg = crate::cluster::build_cluster_transport_config(
-                    self_id,
-                    &peers,
-                    opts,
-                )
-                .map_err(|e| anyhow::anyhow!("cluster-peers: {e}"))?;
+                let cfg = crate::cluster::build_cluster_transport_config(self_id, &peers, opts)
+                    .map_err(|e| anyhow::anyhow!("cluster-peers: {e}"))?;
                 Some(cfg)
             }
             (Some(_), None) => {
@@ -430,12 +426,8 @@ impl ServerConfig {
 
         // ── Metrics ─────────────────────────────────────────────────
         // 0 = disabled. Filter so Some(0) doesn't start a listener.
-        let metrics_port = cli
-            .metrics_port
-            .or(conf.metrics_port)
-            .filter(|&p| p != 0);
-        let metrics = metrics_port
-            .map(|_| Arc::new(crate::metrics::ServerMetrics::new()));
+        let metrics_port = cli.metrics_port.or(conf.metrics_port).filter(|&p| p != 0);
+        let metrics = metrics_port.map(|_| Arc::new(crate::metrics::ServerMetrics::new()));
 
         // ── Layer tuning ────────────────────────────────────────────
         let tuning = resolve_tuning(&conf);
@@ -571,15 +563,25 @@ fn resolve_tuning(conf: &ServerConf) -> LayerTuning {
 
     // ── Buffer pool ──
     if let Some(bp) = &conf.buffer_pool {
-        if let Some(v) = bp.huge_threshold { t.buffer_huge_threshold = v.0 as usize; }
-        if let Some(v) = bp.cgroup_fraction { t.buffer_cgroup_fraction = v; }
+        if let Some(v) = bp.huge_threshold {
+            t.buffer_huge_threshold = v.0 as usize;
+        }
+        if let Some(v) = bp.cgroup_fraction {
+            t.buffer_cgroup_fraction = v;
+        }
     }
 
     // ── Backpressure / connection shard ──
     if let Some(bp) = &conf.backpressure {
-        if let Some(v) = bp.connection_capacity { t.connection_capacity = v; }
-        if let Some(v) = bp.soft_pct { t.soft_bp_pct = v; }
-        if let Some(v) = bp.hard_pct { t.hard_bp_pct = v; }
+        if let Some(v) = bp.connection_capacity {
+            t.connection_capacity = v;
+        }
+        if let Some(v) = bp.soft_pct {
+            t.soft_bp_pct = v;
+        }
+        if let Some(v) = bp.hard_pct {
+            t.hard_bp_pct = v;
+        }
         if let Some(v) = bp.publish_high_watermark_bytes {
             t.publish_backpressure_high_watermark_bytes = v.0 as usize;
         }
@@ -587,19 +589,37 @@ fn resolve_tuning(conf: &ServerConf) -> LayerTuning {
 
     // ── Reactor tick budget ──
     if let Some(r) = &conf.reactor {
-        if let Some(v) = r.max_cqes { t.reactor_max_cqes = v; }
-        if let Some(v) = r.max_tasks { t.reactor_max_tasks = v; }
-        if let Some(v) = r.max_send_flush { t.reactor_max_send_flush = v; }
-        if let Some(v) = r.tick_deadline_us { t.reactor_tick_deadline_ns = v * 1_000; }
+        if let Some(v) = r.max_cqes {
+            t.reactor_max_cqes = v;
+        }
+        if let Some(v) = r.max_tasks {
+            t.reactor_max_tasks = v;
+        }
+        if let Some(v) = r.max_send_flush {
+            t.reactor_max_send_flush = v;
+        }
+        if let Some(v) = r.tick_deadline_us {
+            t.reactor_tick_deadline_ns = v * 1_000;
+        }
     }
 
     // ── Send queue / batching ──
     if let Some(s) = &conf.send_batch {
-        if let Some(v) = s.max_packets { t.send_batch_max_packets = v; }
-        if let Some(v) = s.max_bytes { t.send_batch_max_bytes = v.0 as usize; }
-        if let Some(v) = s.max_age_us { t.send_batch_max_age_ns = v * 1_000; }
-        if let Some(v) = s.high_watermark_pct { t.send_high_watermark_pct = v; }
-        if let Some(v) = s.low_watermark_pct { t.send_low_watermark_pct = v; }
+        if let Some(v) = s.max_packets {
+            t.send_batch_max_packets = v;
+        }
+        if let Some(v) = s.max_bytes {
+            t.send_batch_max_bytes = v.0 as usize;
+        }
+        if let Some(v) = s.max_age_us {
+            t.send_batch_max_age_ns = v * 1_000;
+        }
+        if let Some(v) = s.high_watermark_pct {
+            t.send_high_watermark_pct = v;
+        }
+        if let Some(v) = s.low_watermark_pct {
+            t.send_low_watermark_pct = v;
+        }
     }
 
     // ── Eviction ──
@@ -607,9 +627,15 @@ fn resolve_tuning(conf: &ServerConf) -> LayerTuning {
         if let Some(v) = e.idle_threshold_secs {
             t.eviction_idle_threshold_ns = v * 1_000_000_000;
         }
-        if let Some(v) = e.high_evict_fraction { t.eviction_high_fraction = v as f32; }
-        if let Some(v) = e.critical_evict_fraction { t.eviction_critical_fraction = v as f32; }
-        if let Some(v) = e.min_survivors { t.eviction_min_survivors = v; }
+        if let Some(v) = e.high_evict_fraction {
+            t.eviction_high_fraction = v as f32;
+        }
+        if let Some(v) = e.critical_evict_fraction {
+            t.eviction_critical_fraction = v as f32;
+        }
+        if let Some(v) = e.min_survivors {
+            t.eviction_min_survivors = v;
+        }
     }
 
     // ── WAL sweep interval ──
@@ -619,44 +645,80 @@ fn resolve_tuning(conf: &ServerConf) -> LayerTuning {
 
     // ── Session ──
     if let Some(s) = &conf.session {
-        if let Some(v) = s.max_sessions { t.session_max_sessions = v; }
-        if let Some(v) = s.max_per_tenant { t.session_max_per_tenant = v; }
-        if let Some(v) = s.idle_timeout { t.session_idle_timeout_ns = v.0.as_nanos() as u64; }
-        if let Some(v) = s.handshake_timeout { t.session_handshake_timeout_ns = v.0.as_nanos() as u64; }
-        if let Some(v) = s.max_streams_per_session { t.session_max_streams_per_session = v; }
-        if let Some(v) = s.max_memory_per_session { t.session_max_memory_per_session = v.0; }
+        if let Some(v) = s.max_sessions {
+            t.session_max_sessions = v;
+        }
+        if let Some(v) = s.max_per_tenant {
+            t.session_max_per_tenant = v;
+        }
+        if let Some(v) = s.idle_timeout {
+            t.session_idle_timeout_ns = v.0.as_nanos() as u64;
+        }
+        if let Some(v) = s.handshake_timeout {
+            t.session_handshake_timeout_ns = v.0.as_nanos() as u64;
+        }
+        if let Some(v) = s.max_streams_per_session {
+            t.session_max_streams_per_session = v;
+        }
+        if let Some(v) = s.max_memory_per_session {
+            t.session_max_memory_per_session = v.0;
+        }
     }
 
     // ── Stream ──
     if let Some(s) = &conf.stream {
-        if let Some(v) = s.max_streams_bidi { t.stream_max_bidi = v; }
-        if let Some(v) = s.max_streams_uni { t.stream_max_uni = v; }
+        if let Some(v) = s.max_streams_bidi {
+            t.stream_max_bidi = v;
+        }
+        if let Some(v) = s.max_streams_uni {
+            t.stream_max_uni = v;
+        }
     }
 
     // ── Task queue ──
     if let Some(q) = &conf.task_queue {
-        if let Some(v) = q.capacity { t.task_queue_capacity = v; }
-        if let Some(v) = q.batch_max_tasks { t.task_batch_max_tasks = v; }
-        if let Some(v) = q.batch_max_time_us { t.task_batch_max_time_ns = v * 1_000; }
-        if let Some(v) = q.shutdown_grace_secs { t.task_shutdown_grace_ns = v * 1_000_000_000; }
+        if let Some(v) = q.capacity {
+            t.task_queue_capacity = v;
+        }
+        if let Some(v) = q.batch_max_tasks {
+            t.task_batch_max_tasks = v;
+        }
+        if let Some(v) = q.batch_max_time_us {
+            t.task_batch_max_time_ns = v * 1_000;
+        }
+        if let Some(v) = q.shutdown_grace_secs {
+            t.task_shutdown_grace_ns = v * 1_000_000_000;
+        }
     }
 
     // ── Timer wheel ──
     if let Some(tw) = &conf.timer_wheel {
-        if let Some(v) = tw.tick_us { t.timer_tick_ns = v * 1_000; }
-        if let Some(v) = tw.capacity_per_shard { t.timer_capacity_per_shard = v; }
+        if let Some(v) = tw.tick_us {
+            t.timer_tick_ns = v * 1_000;
+        }
+        if let Some(v) = tw.capacity_per_shard {
+            t.timer_capacity_per_shard = v;
+        }
     }
 
     // ── Stream scheduler ──
     if let Some(ss) = &conf.stream_scheduler {
-        if let Some(v) = ss.max_streams_per_tick { t.scheduler_max_streams_per_tick = v; }
-        if let Some(v) = ss.max_bytes_per_tick { t.scheduler_max_bytes_per_tick = v.0 as usize; }
-        if let Some(v) = ss.starvation_threshold_us { t.scheduler_starvation_threshold_us = v; }
+        if let Some(v) = ss.max_streams_per_tick {
+            t.scheduler_max_streams_per_tick = v;
+        }
+        if let Some(v) = ss.max_bytes_per_tick {
+            t.scheduler_max_bytes_per_tick = v.0 as usize;
+        }
+        if let Some(v) = ss.starvation_threshold_us {
+            t.scheduler_starvation_threshold_us = v;
+        }
     }
 
     // ── Adaptive delivery ──
     if let Some(d) = &conf.delivery {
-        if let Some(v) = d.logtail_threshold { t.delivery_logtail_threshold = v; }
+        if let Some(v) = d.logtail_threshold {
+            t.delivery_logtail_threshold = v;
+        }
         if let Some(v) = d.force_strategy.as_deref() {
             t.delivery_force_strategy = match v.trim().to_ascii_lowercase().as_str() {
                 "batch" | "batchpush" | "push" => crate::conf::DeliveryMode::ForceBatch,
@@ -699,19 +761,40 @@ mod tests {
 
     #[test]
     fn parse_worker_mode_variants() {
-        assert!(matches!(parse_worker_mode_arg("single"), Some(WorkerModeArg::Single)));
-        assert!(matches!(parse_worker_mode_arg("MULTI"), Some(WorkerModeArg::Multi)));
-        assert!(matches!(parse_worker_mode_arg("Distributed"), Some(WorkerModeArg::Distributed)));
+        assert!(matches!(
+            parse_worker_mode_arg("single"),
+            Some(WorkerModeArg::Single)
+        ));
+        assert!(matches!(
+            parse_worker_mode_arg("MULTI"),
+            Some(WorkerModeArg::Multi)
+        ));
+        assert!(matches!(
+            parse_worker_mode_arg("Distributed"),
+            Some(WorkerModeArg::Distributed)
+        ));
         assert!(parse_worker_mode_arg("bogus").is_none());
     }
 
     #[test]
     fn parse_preset_variants() {
         assert!(matches!(parse_preset_arg("cloud"), Some(PresetArg::Cloud)));
-        assert!(matches!(parse_preset_arg("BARE-METAL"), Some(PresetArg::BareMetal)));
-        assert!(matches!(parse_preset_arg("hundred-gbe"), Some(PresetArg::HundredGbe)));
-        assert!(matches!(parse_preset_arg("low-latency"), Some(PresetArg::LowLatency)));
-        assert!(matches!(parse_preset_arg("max-throughput"), Some(PresetArg::MaxThroughput)));
+        assert!(matches!(
+            parse_preset_arg("BARE-METAL"),
+            Some(PresetArg::BareMetal)
+        ));
+        assert!(matches!(
+            parse_preset_arg("hundred-gbe"),
+            Some(PresetArg::HundredGbe)
+        ));
+        assert!(matches!(
+            parse_preset_arg("low-latency"),
+            Some(PresetArg::LowLatency)
+        ));
+        assert!(matches!(
+            parse_preset_arg("max-throughput"),
+            Some(PresetArg::MaxThroughput)
+        ));
         assert!(parse_preset_arg("nope").is_none());
     }
 }
