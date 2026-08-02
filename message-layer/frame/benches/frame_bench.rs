@@ -296,7 +296,8 @@ fn realistic_payload(mt: MessageType) -> Vec<u8> {
             let topic = b"metrics.cpu.host.0";
             let group = b"zone1-alerts";
             let consumer = b"consumer-1";
-            let mut v = Vec::with_capacity(2 + topic.len() + 2 + group.len() + 2 + consumer.len() + 4);
+            let mut v =
+                Vec::with_capacity(2 + topic.len() + 2 + group.len() + 2 + consumer.len() + 4);
             v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
             v.extend_from_slice(topic);
             v.extend_from_slice(&(group.len() as u16).to_be_bytes());
@@ -323,7 +324,8 @@ fn realistic_payload(mt: MessageType) -> Vec<u8> {
             let topic = b"metrics.cpu.host.0";
             let group = b"zone1-alerts";
             let consumer = b"consumer-1";
-            let mut v = Vec::with_capacity(2 + topic.len() + 2 + group.len() + 2 + consumer.len() + 4);
+            let mut v =
+                Vec::with_capacity(2 + topic.len() + 2 + group.len() + 2 + consumer.len() + 4);
             v.extend_from_slice(&(topic.len() as u16).to_be_bytes());
             v.extend_from_slice(topic);
             v.extend_from_slice(&(group.len() as u16).to_be_bytes());

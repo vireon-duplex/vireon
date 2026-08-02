@@ -166,11 +166,7 @@ impl TopicTrie {
     /// Recursive lookup using lazy `&str` slicing — zero allocation
     /// for segment parsing (the previous version allocated a
     /// `Vec<&str>` on every publish).
-    fn lookup_recursive(
-        node: &TrieNode,
-        topic_rest: &str,
-        out: &mut Vec<SubscriptionId>,
-    ) {
+    fn lookup_recursive(node: &TrieNode, topic_rest: &str, out: &mut Vec<SubscriptionId>) {
         if topic_rest.is_empty() {
             // All segments consumed — collect subs at this node.
             out.extend_from_slice(&node.subs);

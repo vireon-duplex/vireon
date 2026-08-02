@@ -470,11 +470,7 @@ impl WalStore for FileStore {
             .and_then(|tf| tf.segments.front())
             .and_then(|s| {
                 let o = s.oldest_offset();
-                if o.is_none() {
-                    None
-                } else {
-                    Some(o)
-                }
+                if o.is_none() { None } else { Some(o) }
             })
             .unwrap_or(Offset::NONE)
     }
@@ -485,11 +481,7 @@ impl WalStore for FileStore {
             .and_then(|tf| tf.segments.back())
             .and_then(|s| {
                 let o = s.head_offset();
-                if o.is_none() {
-                    None
-                } else {
-                    Some(o)
-                }
+                if o.is_none() { None } else { Some(o) }
             })
             .unwrap_or(Offset::NONE)
     }
@@ -515,11 +507,7 @@ impl WalStore for FileStore {
             .back()
             .and_then(|s| {
                 let o = s.head_offset();
-                if o.is_none() {
-                    None
-                } else {
-                    Some(o)
-                }
+                if o.is_none() { None } else { Some(o) }
             })
             .unwrap_or(Offset::NONE);
         let remove_until = if before_offset.get() > head_o.get() {
@@ -535,22 +523,22 @@ impl WalStore for FileStore {
             let front_head = front.head_offset();
             if front_head.is_none() {
                 // Empty segment — shouldn't normally exist, but drop it.
-                let Some(seg) = tf.segments.pop_front() else { break };
+                let Some(seg) = tf.segments.pop_front() else {
+                    break;
+                };
                 removed += seg.len();
                 tf.retained_bytes = tf.retained_bytes.saturating_sub(seg.retained_bytes);
-                self.retained_bytes = self
-                    .retained_bytes
-                    .saturating_sub(seg.retained_bytes);
+                self.retained_bytes = self.retained_bytes.saturating_sub(seg.retained_bytes);
                 let _ = fs::remove_file(seg.path());
                 continue;
             }
             if front_head.get() < remove_until {
-                let Some(seg) = tf.segments.pop_front() else { break };
+                let Some(seg) = tf.segments.pop_front() else {
+                    break;
+                };
                 removed += seg.len();
                 tf.retained_bytes = tf.retained_bytes.saturating_sub(seg.retained_bytes);
-                self.retained_bytes = self
-                    .retained_bytes
-                    .saturating_sub(seg.retained_bytes);
+                self.retained_bytes = self.retained_bytes.saturating_sub(seg.retained_bytes);
                 let _ = fs::remove_file(seg.path());
             } else {
                 break;
@@ -565,8 +553,7 @@ impl WalStore for FileStore {
                 .position(|(o, _)| o.get() >= remove_until);
             if let Some(cutoff) = cutoff {
                 if cutoff > 0 {
-                    let (trim_removed, byte_delta) =
-                        Self::trim_segment_head(boundary, cutoff)?;
+                    let (trim_removed, byte_delta) = Self::trim_segment_head(boundary, cutoff)?;
                     removed += trim_removed;
                     tf.retained_bytes = tf.retained_bytes.saturating_sub(byte_delta);
                     self.retained_bytes = self.retained_bytes.saturating_sub(byte_delta);
@@ -576,9 +563,7 @@ impl WalStore for FileStore {
                 if let Some(seg) = tf.segments.pop_front() {
                     removed += seg.len();
                     tf.retained_bytes = tf.retained_bytes.saturating_sub(seg.retained_bytes);
-                    self.retained_bytes = self
-                        .retained_bytes
-                        .saturating_sub(seg.retained_bytes);
+                    self.retained_bytes = self.retained_bytes.saturating_sub(seg.retained_bytes);
                     let _ = fs::remove_file(seg.path());
                 }
             }
@@ -608,10 +593,7 @@ impl FileStore {
     /// number of bytes freed (old retained − new retained). The caller
     /// must subtract `byte_delta` from both the topic-level and
     /// store-level `retained_bytes`.
-    fn trim_segment_head(
-        seg: &mut Segment,
-        cutoff: usize,
-    ) -> Result<(usize, u64), WalError> {
+    fn trim_segment_head(seg: &mut Segment, cutoff: usize) -> Result<(usize, u64), WalError> {
         use std::io::{Read, Seek, SeekFrom, Write};
         let dir = seg.path().parent().ok_or(WalError::InvalidTopic {
             reason: "segment path has no parent dir",
@@ -644,7 +626,8 @@ impl FileStore {
             let payload_len =
                 u32::from_le_bytes([head_buf[22], head_buf[23], head_buf[24], head_buf[25]])
                     as usize;
-            let entry_len = crate::entry::HEADER_LEN + key_len + payload_len + crate::entry::CRC_LEN;
+            let entry_len =
+                crate::entry::HEADER_LEN + key_len + payload_len + crate::entry::CRC_LEN;
             dst.write_all(&head_buf)?;
             let mut rest = vec![0u8; entry_len - crate::entry::HEADER_LEN];
             src.read_exact(&mut rest)?;
@@ -846,7 +829,10 @@ mod tests {
         let off = s.append("t", rec(b"hello")).unwrap();
         assert_eq!(off, Offset::new(0));
         assert_eq!(s.len("t"), 1);
-        assert_eq!(s.read("t", Offset::new(0)).unwrap().payload.as_ref(), b"hello");
+        assert_eq!(
+            s.read("t", Offset::new(0)).unwrap().payload.as_ref(),
+            b"hello"
+        );
     }
 
     #[test]
