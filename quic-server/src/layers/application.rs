@@ -348,6 +348,16 @@ impl ConnMetrics {
     }
 }
 
+/// A subscription that may need forwarding to a remote topic owner.
+/// Tracked for periodic re-broadcast so that a lost UDP datagram or a
+/// late-forming cluster ring doesn't permanently break delivery.
+#[derive(Clone)]
+struct ForwardedSub {
+    conn_idx: u32,
+    stream_id: u64,
+    pattern: String,
+}
+
 /// Production dispatcher that routes frames by [`MessageType`] to the
 /// appropriate application-layer module(s).
 ///
@@ -528,6 +538,14 @@ pub struct VireonDispatcher {
     /// iterating `remote_pattern_interest` + calling `TopicPattern::matches`
     /// on every publish. Invalidated (cleared) on SubGained/SubLost.
     topic_worker_bitmap_cache: FxHashMap<String, u32>,
+    /// Subscriptions forwarded to remote topic owners. Each entry records
+    /// the (owner, conn_idx, stream_id, pattern) tuple needed to
+    /// re-construct an `InterNodeMessage::Subscribe`. Re-broadcast on
+    /// every heartbeat tick (1 s) to self-heal from lost UDP datagrams —
+    /// inter-node Subscribe is fire-and-forget, so a single packet drop
+    /// would otherwise cause a subscriber to receive 0 deliveries until
+    /// manual re-subscribe.
+    forwarded_subs: Vec<ForwardedSub>,
     /// ── per-frame error throttles ────────────────────────────────
     /// Persistently misbehaving clients (malformed payloads, denied
     /// topics, stuck WAL disk) can fire warn!/info! per inbound frame.
@@ -660,6 +678,7 @@ impl VireonDispatcher {
             worker_drop_cooldown: crate::log_throttle::Cooldown::new(WORKER_DROP_LOG_COOLDOWN),
             remote_pattern_interest: FxHashMap::default(),
             topic_worker_bitmap_cache: FxHashMap::default(),
+            forwarded_subs: Vec::new(),
             // Per-class throttles. `every` values chosen so that under
             // a sustained ~5k frames/s/conn burst we still see ~5
             // log lines/s per category — enough to diagnose without
@@ -1353,26 +1372,42 @@ impl VireonDispatcher {
                 // the owner of our local interest so future publishes
                 // fan out to us. The owner will record us in its
                 // RemoteSubscriberRegistry.
-                if let Some(coord) = &self.coordinator {
-                    if let Some(owner) = coord.router().owner_of(pattern_str) {
-                        if owner != self.node_id {
-                            if let Some(tx) = &self.cluster_outgoing_tx {
-                                let msg = InterNodeMessage::subscribe(
-                                    self.node_id,
-                                    ctx.conn_idx as u32,
-                                    ctx.quic_stream_id,
-                                    pattern_str.to_string(),
+                //
+                // We track EVERY local subscription for periodic re-broadcast
+                // (even if the cluster ring isn't formed yet) so that a
+                // late-forming ring or a lost UDP datagram self-heals on the
+                // next heartbeat tick. The re-broadcast resolves the owner
+                // dynamically and skips self-owned patterns.
+                if self.coordinator.is_some() {
+                    // Try immediate forward if the owner is already known.
+                    if let Some(coord) = &self.coordinator {
+                        if let Some(owner) = coord.router().owner_of(pattern_str) {
+                            if owner != self.node_id {
+                                if let Some(tx) = &self.cluster_outgoing_tx {
+                                    let msg = InterNodeMessage::subscribe(
+                                        self.node_id,
+                                        ctx.conn_idx as u32,
+                                        ctx.quic_stream_id,
+                                        pattern_str.to_string(),
+                                    );
+                                    let _ = tx.send(OutgoingMsg { msg, target: owner });
+                                }
+                                tracing::debug!(
+                                    conn_idx = ctx.conn_idx,
+                                    pattern = %pattern_str,
+                                    owner = %owner.raw(),
+                                    "[cluster] subscribe forwarded to owner"
                                 );
-                                let _ = tx.send(OutgoingMsg { msg, target: owner });
                             }
-                            tracing::debug!(
-                                conn_idx = ctx.conn_idx,
-                                pattern = %pattern_str,
-                                owner = %owner.raw(),
-                                "[cluster] subscribe forwarded to owner"
-                            );
                         }
                     }
+                    // Always track for periodic re-broadcast (handles ring
+                    // not-yet-formed AND datagram loss).
+                    self.forwarded_subs.push(ForwardedSub {
+                        conn_idx: ctx.conn_idx as u32,
+                        stream_id: ctx.quic_stream_id,
+                        pattern: pattern_str.to_string(),
+                    });
                 }
 
                 self.send_ack(
@@ -1431,6 +1466,12 @@ impl VireonDispatcher {
             active = self.pubsub_registry.len(),
             "[pubsub] unsubscribe"
         );
+        // Stop re-broadcasting the forwarded subscription (if any).
+        if removed > 0 {
+            self.forwarded_subs.retain(|fs| {
+                !(fs.conn_idx == ctx.conn_idx as u32 && fs.pattern == pattern_str)
+            });
+        }
         let mut rbuf = itoa::Buffer::new();
         let r = rbuf.format(removed);
         self.send_ack(
@@ -3036,6 +3077,35 @@ impl VireonDispatcher {
             self.last_heartbeat_send = Some(now);
         }
 
+        // Re-broadcast forwarded subscriptions to their topic owners.
+        // Inter-node Subscribe is fire-and-forget UDP — a single lost
+        // datagram (or a ring not yet formed at subscribe time) means the
+        // owner never learns about our subscriber, causing 0 deliveries
+        // until manual re-subscribe. Re-sending on every heartbeat tick
+        // (1 s) self-heals from both. The owner's `add_remote_sub` is
+        // idempotent, so duplicates are harmless.
+        if is_heartbeater {
+            if let Some(tx) = &self.cluster_outgoing_tx {
+                for fs in &self.forwarded_subs {
+                    // Resolve owner dynamically — the ring may have grown
+                    // since the subscribe arrived.
+                    let Some(owner) = coord.router().owner_of(&fs.pattern) else {
+                        continue; // ring not yet formed for this pattern
+                    };
+                    if owner == self.node_id {
+                        continue; // we own this pattern — no forwarding needed
+                    }
+                    let msg = InterNodeMessage::subscribe(
+                        self.node_id,
+                        fs.conn_idx,
+                        fs.stream_id,
+                        fs.pattern.clone(),
+                    );
+                    let _ = tx.send(OutgoingMsg { msg, target: owner });
+                }
+            }
+        }
+
         // Check for expired nodes.
         let expired = coord.tick_health();
         if !expired.is_empty() {
@@ -3613,6 +3683,8 @@ impl AppDispatcher for VireonDispatcher {
             .pubsub_registry
             .remove_connection_with_patterns(conn_idx);
         let removed = removed_patterns.len();
+        // Stop re-broadcasting any forwarded subscriptions for this conn.
+        self.forwarded_subs.retain(|fs| fs.conn_idx != conn_idx as u32);
         // Decrement per-pattern quota counters to match.
         if !removed_patterns.is_empty() {
             for pat in &removed_patterns {
