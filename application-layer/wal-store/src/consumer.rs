@@ -327,7 +327,10 @@ mod tests {
         assert_eq!(loaded.len(), 3);
         assert_eq!(loaded.get("orders", "worker-1"), Offset::new(42));
         assert_eq!(loaded.get("orders", "worker-2"), Offset::new(17));
-        assert_eq!(loaded.get("analytics.events", "consumer-a"), Offset::new(1000));
+        assert_eq!(
+            loaded.get("analytics.events", "consumer-a"),
+            Offset::new(1000)
+        );
         // resume_from should also work after load.
         assert_eq!(loaded.resume_from("orders", "worker-1"), Offset::new(43));
 

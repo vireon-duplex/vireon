@@ -1274,11 +1274,8 @@ impl ConnState {
                     Err(quiche::Error::Done) => {
                         self.blocked_writes += 1;
                         self.flow_control_waits += 1;
-                        self.write_syscalls += flush_conn(
-                            &mut self.conn,
-                            &mut self.send_buf,
-                            self.socket.as_raw_fd(),
-                        );
+                        self.write_syscalls +=
+                            flush_conn(&mut self.conn, &mut self.send_buf, self.socket.as_raw_fd());
                         return;
                     }
                     Err(e) => {

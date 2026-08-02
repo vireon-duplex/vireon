@@ -399,9 +399,7 @@ fn build_inter_worker_pubsub_channels(
 )> {
     let cap = 262_144;
     let channels: Vec<_> = (0..n)
-        .map(|_| {
-            std::sync::mpsc::sync_channel::<crate::layers::application::InterWorkerMsg>(cap)
-        })
+        .map(|_| std::sync::mpsc::sync_channel::<crate::layers::application::InterWorkerMsg>(cap))
         .collect();
     let senders: Vec<_> = channels.iter().map(|(s, _)| s.clone()).collect();
     channels
