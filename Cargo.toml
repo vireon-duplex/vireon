@@ -1,6 +1,7 @@
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 repository = "https://github.com/pinyoothotaboot/vireon.git"
 authors = ["pinyoothotaboot"]
 license = "GNU AFFERO GENERAL PUBLIC LICENSE v3.0"
@@ -10,6 +11,7 @@ license = "GNU AFFERO GENERAL PUBLIC LICENSE v3.0"
 name = "vireon"
 version = { workspace = true }
 edition = { workspace = true }
+rust-version = { workspace = true }
 description = "A high-performance realtime runtime built on QUIC and io_uring for multi-stream, full-duplex communication at massive scale."
 repository = { workspace = true }
 readme = "README.md"
