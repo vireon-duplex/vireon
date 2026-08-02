@@ -123,9 +123,9 @@ fn print_banner(config: &ServerConfig) {
     }
     // Warn if CPU is in powersave mode — causes 3x+ throughput
     // variability in benchmarks (CPU ramps from 400MHz to 4.6GHz).
-    if let Ok(gov) = std::fs::read_to_string(
-        "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
-    ) {
+    if let Ok(gov) =
+        std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+    {
         let gov = gov.trim();
         if gov == "powersave" {
             tracing::warn!(

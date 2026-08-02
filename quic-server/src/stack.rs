@@ -335,10 +335,8 @@ impl VireonStack {
                         error = %e,
                         "[wal] failed to load consumer offsets — starting fresh"
                     );
-                    application.set_consumer_offsets(
-                        wal_store::ConsumerOffsets::new(),
-                        offsets_path,
-                    );
+                    application
+                        .set_consumer_offsets(wal_store::ConsumerOffsets::new(), offsets_path);
                 }
             }
         }
@@ -460,11 +458,7 @@ impl VireonStack {
                 } => {
                     self.on_stream_finished(conn_idx, stream_id);
                 }
-                QuicEvent::PeerAddressChanged {
-                    conn_idx,
-                    from,
-                    to,
-                } => {
+                QuicEvent::PeerAddressChanged { conn_idx, from, to } => {
                     self.on_peer_address_changed(conn_idx, from, to);
                 }
             }
@@ -501,12 +495,7 @@ impl VireonStack {
         // Capacity is preserved across ticks — no per-tick allocation.
         let direct = std::mem::take(&mut self.flush_direct);
         for out in &direct {
-            self.encode_and_send(
-                out.conn_idx,
-                out.quic_stream_id,
-                out.header,
-                &out.payload,
-            );
+            self.encode_and_send(out.conn_idx, out.quic_stream_id, out.header, &out.payload);
             if let Some(m) = &self.metrics {
                 m.inc(&m.deliveries_total);
                 if out.header.msg_type == MessageType::Publish {
@@ -522,12 +511,7 @@ impl VireonStack {
         self.application.drain_ready_egress(&mut self.flush_policy);
         let policy = std::mem::take(&mut self.flush_policy);
         for out in &policy {
-            self.encode_and_send(
-                out.conn_idx,
-                out.quic_stream_id,
-                out.header,
-                &out.payload,
-            );
+            self.encode_and_send(out.conn_idx, out.quic_stream_id, out.header, &out.payload);
             if let Some(m) = &self.metrics {
                 m.inc(&m.deliveries_total);
                 if out.header.msg_type == MessageType::Publish {
@@ -712,8 +696,12 @@ impl VireonStack {
             let topic = crate::metrics::extract_topic_from_publish(&payload[..])
                 .map(|t| t.to_string())
                 .unwrap_or_default();
-            self.application
-                .reject_publish_backpressure(conn_idx, quic_stream_id, header.stream_id, &topic);
+            self.application.reject_publish_backpressure(
+                conn_idx,
+                quic_stream_id,
+                header.stream_id,
+                &topic,
+            );
             if let Some(m) = &self.metrics {
                 m.inc(&m.publishes_total);
             }
@@ -981,7 +969,8 @@ impl VireonStack {
         // Snapshot keys to release the borrow on `pending_sends` before
         // we call `engine.send_stream` (which takes &mut self).
         self.pending_keys_scratch.clear();
-        self.pending_keys_scratch.extend(self.pending_sends.keys().copied());
+        self.pending_keys_scratch
+            .extend(self.pending_sends.keys().copied());
         let mut succeeded = 0u32;
         let mut still_blocked = 0u32;
         let mut dropped = 0u32;
@@ -1092,8 +1081,12 @@ impl VireonStack {
         let mut bytes = 0u64;
         // Collect keys first so we don't mutate while iterating.
         self.pending_keys_scratch.clear();
-        self.pending_keys_scratch
-            .extend(self.pending_sends.keys().filter(|(c, _)| *c == conn_idx).copied());
+        self.pending_keys_scratch.extend(
+            self.pending_sends
+                .keys()
+                .filter(|(c, _)| *c == conn_idx)
+                .copied(),
+        );
         for key in self.pending_keys_scratch.drain(..) {
             if let Some(p) = self.pending_sends.remove(&key) {
                 entries += 1;

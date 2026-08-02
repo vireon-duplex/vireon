@@ -124,7 +124,10 @@ impl ServerMetrics {
         // Fast path: read-lock + atomic bump.  Recover from lock
         // poisoning (a panicked worker) rather than crashing the server.
         {
-            let map = self.topic_counters.read().unwrap_or_else(|e| e.into_inner());
+            let map = self
+                .topic_counters
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(m) = map.get(topic) {
                 m.publishes.fetch_add(1, Ordering::Relaxed);
                 m.bytes_recv.fetch_add(payload_len, Ordering::Relaxed);
@@ -246,9 +249,7 @@ impl ServerMetrics {
                     }
                 }
 
-                out.push_str(
-                    "\n# HELP vireon_topic_deliveries_total Deliveries sent per topic.\n",
-                );
+                out.push_str("\n# HELP vireon_topic_deliveries_total Deliveries sent per topic.\n");
                 out.push_str("# TYPE vireon_topic_deliveries_total counter\n");
                 for (topic, m) in &*map {
                     let v = m.deliveries.load(Ordering::Relaxed);

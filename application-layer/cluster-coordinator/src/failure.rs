@@ -44,13 +44,18 @@ impl FailureDetector {
 
     /// Register or refresh a heartbeat from `node` at time `now`.
     pub fn record_heartbeat(&mut self, node: NodeId, now: Instant) {
-        self.nodes.entry(node).or_insert(NodeHealth { last_seen: now }).last_seen = now;
+        self.nodes
+            .entry(node)
+            .or_insert(NodeHealth { last_seen: now })
+            .last_seen = now;
     }
 
     /// Register a node as alive (e.g. from initial membership). Uses
     /// `now` as the seed last-seen time.
     pub fn seed_alive(&mut self, node: NodeId, now: Instant) {
-        self.nodes.entry(node).or_insert(NodeHealth { last_seen: now });
+        self.nodes
+            .entry(node)
+            .or_insert(NodeHealth { last_seen: now });
     }
 
     /// Forget a node entirely (after it's been marked down and removed
@@ -70,13 +75,11 @@ impl FailureDetector {
         let expired: Vec<NodeId> = self
             .nodes
             .iter()
-            .filter_map(|(&id, h)| {
-                if h.last_seen < cutoff {
-                    Some(id)
-                } else {
-                    None
-                }
-            })
+            .filter_map(
+                |(&id, h)| {
+                    if h.last_seen < cutoff { Some(id) } else { None }
+                },
+            )
             .collect();
         for id in &expired {
             self.nodes.remove(id);
