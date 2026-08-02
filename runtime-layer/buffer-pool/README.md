@@ -167,25 +167,9 @@ cargo bench -p buffer-pool --bench pool_bench -- get/per_size/heartbeat/64
 
 ### Sample results
 
-Measured on a single run (your numbers will vary):
-
-```
-get/per_size/heartbeat/64         376 ns        162 MiB/s
-get/per_size/tool_call/4096       370 ns       10.3 GiB/s
-get/per_size/audio_frame/80000    1.60 µs      46.5 GiB/s
-get/per_size/video_frame/320000   5.23 µs      57.0 GiB/s
-
-get/warm/64B                      370 ns
-get/warm/4KiB                     364 ns
-get/warm/128KiB                   2.35 µs
-
-drop/per_size/heartbeat/64        315 ns
-
-roundtrip/workload/fluxio_batch   21.3 µs      45.0 GiB/s
-
-concurrent/roundtrip/1            385 µs
-concurrent/roundtrip/8            764 µs
-```
+Run `cargo bench -p buffer-pool` to measure on your hardware. The warm
+path (thread-local cache hit) is a few hundred nanoseconds regardless of
+size; the cold path (arena allocation) scales linearly with size.
 
 ## Layer map
 

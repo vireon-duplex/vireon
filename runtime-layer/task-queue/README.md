@@ -154,13 +154,10 @@ cargo bench -p task-queue --bench soak -- \
 | `mpsc`        | `spawn_cross_thread` latency, burst push throughput (16–1024), consumer drain, sustained inbox pressure |
 | `soak`        | 16×256 spawn→tick cycle + 32×512 steady-state; sanity-asserts pool is fully recycled each tick |
 
-### Smoke-test numbers (single run, your Mileage Will Vary)
+### Smoke-test numbers
 
-| Bench | Result |
-|-------|--------|
-| `spawn/single`              | ~180 ns / call |
-| `spawn_burst/n=256`         | ~6.7 µs (~38 Melem/s) |
-| `spawn_counter/single`      | ~180 ns / call |
+Run `cargo bench -p task-queue` to measure on your hardware. Single
+spawn is a couple of hundred nanoseconds; burst spawn scales linearly.
 
 ### Leak detection
 
