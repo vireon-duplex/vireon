@@ -2142,6 +2142,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "vireon-c"
+version = "0.1.0"
+dependencies = [
+ "once_cell",
+ "tokio",
+ "vireon-sdk",
+]
+
+[[package]]
 name = "vireon-cpp"
 version = "0.1.0"
 dependencies = [
