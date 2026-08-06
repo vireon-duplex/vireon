@@ -2191,6 +2191,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "vireon-php"
+version = "0.1.0"
+dependencies = [
+ "once_cell",
+ "tokio",
+ "vireon-sdk",
+]
+
+[[package]]
 name = "vireon-python"
 version = "0.1.0"
 dependencies = [
