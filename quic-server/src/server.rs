@@ -159,6 +159,7 @@ impl QuicServer {
             crate::replay::SharedReplayState::new(crate::replay::ReplayConfig {
                 max_messages_per_stream: config.tuning.replay_max_messages_per_stream,
                 max_bytes: config.tuning.replay_max_bytes,
+                idle_session_ttl_secs: config.tuning.replay_idle_session_ttl_secs,
             }),
         )));
 
