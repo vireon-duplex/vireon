@@ -546,7 +546,7 @@ pub struct VireonDispatcher {
     /// Sender into the cluster transport's outgoing queue. Workers push
     /// [`OutgoingMsg`]s here to send inter-node UDP datagrams. `None`
     /// in single-node mode.
-    cluster_outgoing_tx: Option<mpsc::Sender<OutgoingMsg>>,
+    cluster_outgoing_tx: Option<mpsc::SyncSender<OutgoingMsg>>,
     /// Per-worker incoming queue from the cluster transport. Each
     /// worker drains its own queue in `on_batch_tick` →
     /// [`Self::drain_cluster_inbox`]. `None` in single-node mode.
@@ -1173,7 +1173,7 @@ impl VireonDispatcher {
     pub fn set_cluster(
         &mut self,
         cfg: &ClusterConfig,
-        outgoing_tx: mpsc::Sender<OutgoingMsg>,
+        outgoing_tx: mpsc::SyncSender<OutgoingMsg>,
         incoming_rx: mpsc::Receiver<InterNodeMessage>,
     ) {
         match ClusterCoordinator::new(cfg.clone()) {
@@ -1720,7 +1720,7 @@ impl VireonDispatcher {
                                         ctx.quic_stream_id,
                                         pattern_str.to_string(),
                                     );
-                                    let _ = tx.send(OutgoingMsg { msg, target: owner });
+                                    let _ = tx.try_send(OutgoingMsg { msg, target: owner });
                                 }
                                 tracing::debug!(
                                     conn_idx = ctx.conn_idx,
@@ -1905,7 +1905,7 @@ impl VireonDispatcher {
                             topic_arc.clone(),
                             payload_bytes.clone(),
                         );
-                        let _ = tx.send(OutgoingMsg { msg, target: owner });
+                        let _ = tx.try_send(OutgoingMsg { msg, target: owner });
                     }
                     tracing::debug!(
                         conn_idx = ctx.conn_idx,
@@ -1934,7 +1934,7 @@ impl VireonDispatcher {
                                 payload_bytes.clone(),
                             );
                             for target in &replicas {
-                                let _ = tx.send(OutgoingMsg {
+                                let _ = tx.try_send(OutgoingMsg {
                                     msg: msg.clone(),
                                     target: *target,
                                 });
@@ -1968,7 +1968,7 @@ impl VireonDispatcher {
                             if replicas.contains(&target) {
                                 continue;
                             }
-                            let _ = tx.send(OutgoingMsg {
+                            let _ = tx.try_send(OutgoingMsg {
                                 msg: msg.clone(),
                                 target,
                             });
@@ -3586,7 +3586,7 @@ impl VireonDispatcher {
                                         msg.payload.clone(),
                                     );
                                     for target in fanout_targets {
-                                        let _ = tx.send(OutgoingMsg {
+                                        let _ = tx.try_send(OutgoingMsg {
                                             msg: fanout.clone(),
                                             target,
                                         });
@@ -3717,7 +3717,7 @@ impl VireonDispatcher {
                 let peers = coord.membership().alive_nodes();
                 for peer in peers {
                     if peer != self.node_id {
-                        let _ = tx.send(OutgoingMsg {
+                        let _ = tx.try_send(OutgoingMsg {
                             msg: hb.clone(),
                             target: peer,
                         });
@@ -3751,7 +3751,7 @@ impl VireonDispatcher {
                         fs.stream_id,
                         fs.pattern.clone(),
                     );
-                    let _ = tx.send(OutgoingMsg { msg, target: owner });
+                    let _ = tx.try_send(OutgoingMsg { msg, target: owner });
                 }
             }
         }
@@ -3767,7 +3767,7 @@ impl VireonDispatcher {
                     let peers = coord.membership().alive_nodes();
                     for peer in peers {
                         if peer != self.node_id {
-                            let _ = tx.send(OutgoingMsg {
+                            let _ = tx.try_send(OutgoingMsg {
                                 msg: gossip.clone(),
                                 target: peer,
                             });
@@ -4936,7 +4936,7 @@ impl ApplicationLayer {
     pub fn set_cluster(
         &mut self,
         cfg: &ClusterConfig,
-        outgoing_tx: mpsc::Sender<OutgoingMsg>,
+        outgoing_tx: mpsc::SyncSender<OutgoingMsg>,
         incoming_rx: mpsc::Receiver<InterNodeMessage>,
     ) {
         self.dispatcher.set_cluster(cfg, outgoing_tx, incoming_rx);
