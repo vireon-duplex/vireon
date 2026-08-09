@@ -41,11 +41,25 @@ impl MessageLayer {
     /// this, the ACL check path falls back to the configured default
     /// principal for every connection.
     ///
+    /// Reliability-layer frames (`Ack`, `Resume`, `ResumeOk`,
+    /// `ResumeUnavailable`) are also dispatched to the application layer
+    /// so `VireonDispatcher::handle_ack` / `handle_resume` can act on
+    /// them. The stream layer has no reliability state.
+    ///
     /// All other non-data frames (StreamOpen, StreamClose, StreamReset,
-    /// Fragment, Ack) are consumed by lower layers.
+    /// Fragment) are consumed by lower layers.
     #[must_use]
     pub fn classify(&self, frame: &FrameRef<'_>) -> FrameAction {
-        if frame.msg_type.is_data() || frame.msg_type == MessageType::Handshake {
+        if frame.msg_type.is_data()
+            || frame.msg_type == MessageType::Handshake
+            || matches!(
+                frame.msg_type,
+                MessageType::Ack
+                    | MessageType::Resume
+                    | MessageType::ResumeOk
+                    | MessageType::ResumeUnavailable
+            )
+        {
             FrameAction::DispatchToApp
         } else {
             FrameAction::Consumed
@@ -101,10 +115,26 @@ mod tests {
             MessageType::StreamOpen,
             MessageType::StreamClose,
             MessageType::StreamReset,
-            MessageType::Ack,
             MessageType::Fragment,
         ] {
             assert_eq!(classify_msg_type(&ml, mt), FrameAction::Consumed, "{mt:?}");
+        }
+    }
+
+    #[test]
+    fn reliability_frames_dispatch_to_app() {
+        let ml = MessageLayer::new();
+        for mt in [
+            MessageType::Ack,
+            MessageType::Resume,
+            MessageType::ResumeOk,
+            MessageType::ResumeUnavailable,
+        ] {
+            assert_eq!(
+                classify_msg_type(&ml, mt),
+                FrameAction::DispatchToApp,
+                "{mt:?}"
+            );
         }
     }
 }
