@@ -127,6 +127,9 @@ impl Worker {
             &config.tuning,
         )?;
         handler.metrics = config.metrics.clone();
+        if let Some(m) = &config.metrics {
+            handler.set_metrics(m.clone());
+        }
 
         Ok(Self {
             core_id,

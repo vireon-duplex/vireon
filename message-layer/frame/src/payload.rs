@@ -374,7 +374,11 @@ impl<'a> ErrorPayload<'a> {
 ///
 /// Produced by [`parse_payload`]. The variable-length variants
 /// (`StreamReset`, `Error`, pub/sub) borrow from the input payload buffer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// Note: this enum is `Clone` but not `Copy` because the resume-related
+/// variants ([`Resume`](ResumePayload), [`ResumeOk`](ResumeOkPayload),
+/// [`ResumeUnavailable`](ResumeUnavailablePayload)) own a `Vec` of slots.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParsedPayload<'a> {
     /// [`MessageType::StreamOpen`].
     StreamOpen(StreamOpen),
@@ -404,6 +408,12 @@ pub enum ParsedPayload<'a> {
     Fetch(FetchPayload<'a>),
     /// [`MessageType::FetchReply`].
     FetchReply(FetchReplyPayload<'a>),
+    /// [`MessageType::Resume`] — client resume / session-hello.
+    Resume(ResumePayload),
+    /// [`MessageType::ResumeOk`] — server resume accepted.
+    ResumeOk(ResumeOkPayload),
+    /// [`MessageType::ResumeUnavailable`] — replay window exceeded.
+    ResumeUnavailable(ResumeUnavailablePayload),
 }
 
 // ── Pub/sub payloads ────────────────────────────────────────────────
@@ -743,6 +753,246 @@ impl<'a> FetchReplyPayload<'a> {
     }
 }
 
+// ── Resume / reliability payloads ───────────────────────────────────
+
+/// One per-stream resume slot carried in a [`ResumePayload`].
+///
+/// Fixed 16-byte record: `stream_id(8) + last_acked(8)`. Owned (`Copy`)
+/// rather than borrowed because it is a pair of integers parsed out of the
+/// wire buffer — there is no variable-length field to borrow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ResumeSlot {
+    /// Logical stream to resume.
+    pub stream_id: u64,
+    /// Highest sequence the client has already accepted/acked for this
+    /// stream. The server replays `last_acked + 1 .. newest`.
+    pub last_acked: u64,
+}
+
+impl ResumeSlot {
+    /// Fixed wire size: 16 bytes.
+    pub const WIRE_SIZE: usize = 16;
+
+    /// Encodes into `w`.
+    #[inline]
+    pub fn encode(&self, w: &mut ByteWriter) {
+        w.write_u64(self.stream_id);
+        w.write_u64(self.last_acked);
+    }
+
+    /// Decodes from `r`.
+    pub fn decode(r: &mut ByteReader) -> Result<Self, PayloadError> {
+        if r.remaining() < Self::WIRE_SIZE {
+            return Err(PayloadError::Truncated {
+                needed: Self::WIRE_SIZE,
+                have: r.remaining(),
+            });
+        }
+        Ok(Self {
+            stream_id: r.read_u64(),
+            last_acked: r.read_u64(),
+        })
+    }
+}
+
+/// Payload for [`MessageType::Resume`] (client → server).
+///
+/// Carries a client-stable `logical_session_id` (generated once, survives
+/// reconnects — distinct from the per-connection [`crate::header::SessionId`]
+/// the server reassigns each connect) and a list of per-stream resume slots.
+/// An empty slot list is a "session hello" that registers the logical id on
+/// first connect so the server begins retaining replay state for it.
+///
+/// Wire layout: `logical_session_id(8) + count(1) + count × ResumeSlot(16)`.
+///
+/// Unlike most payload types this owns a `Vec` rather than borrowing, because
+/// the variable count of fixed-size records does not map cleanly to a single
+/// borrowed slice. Resume frames are rare (once per reconnect), so the
+/// allocation is negligible.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResumePayload {
+    /// Client-stable logical session identifier.
+    pub logical_session_id: u64,
+    /// Per-stream `(stream_id, last_acked)` resume slots. Empty on first
+    /// connect (session hello).
+    pub streams: Vec<ResumeSlot>,
+}
+
+/// Fixed header portion of a Resume payload: `logical_session_id(8) + count(1)`.
+const RESUME_HEAD_SIZE: usize = 9;
+
+impl ResumePayload {
+    /// Encodes into `w`.
+    pub fn encode(&self, w: &mut ByteWriter) {
+        w.write_u64(self.logical_session_id);
+        // count is capped at u8::MAX — a single Resume can resume at most 255
+        // streams, which is well above any realistic per-client stream count.
+        let count = u8::try_from(self.streams.len()).unwrap_or(u8::MAX);
+        w.write_u8(count);
+        for s in &self.streams {
+            s.encode(w);
+        }
+    }
+
+    /// Exact wire size this value will occupy.
+    #[inline]
+    pub fn wire_size(&self) -> usize {
+        RESUME_HEAD_SIZE + self.streams.len().min(u8::MAX as usize) * ResumeSlot::WIRE_SIZE
+    }
+
+    /// Decodes from `r`.
+    pub fn decode(r: &mut ByteReader) -> Result<Self, PayloadError> {
+        if r.remaining() < RESUME_HEAD_SIZE {
+            return Err(PayloadError::Truncated {
+                needed: RESUME_HEAD_SIZE,
+                have: r.remaining(),
+            });
+        }
+        let logical_session_id = r.read_u64();
+        let count = r.read_u8() as usize;
+        let needed = count * ResumeSlot::WIRE_SIZE;
+        if r.remaining() < needed {
+            return Err(PayloadError::Truncated {
+                needed: RESUME_HEAD_SIZE + needed,
+                have: RESUME_HEAD_SIZE + r.remaining(),
+            });
+        }
+        let mut streams = Vec::with_capacity(count);
+        for _ in 0..count {
+            streams.push(ResumeSlot::decode(r)?);
+        }
+        Ok(Self {
+            logical_session_id,
+            streams,
+        })
+    }
+}
+
+/// One per-stream result slot carried in [`ResumeOkPayload`] /
+/// [`ResumeUnavailablePayload`].
+///
+/// Fixed 16-byte record: `stream_id(8) + oldest_available(8)`. In a
+/// `ResumeOk` the `oldest_available` tells the client the window floor; in a
+/// `ResumeUnavailable` it tells the client the earliest seq the server could
+/// have replayed, so the client can decide its fallback strategy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ResumeOkSlot {
+    /// Logical stream this result refers to.
+    pub stream_id: u64,
+    /// Oldest sequence the server still has retained for this stream.
+    pub oldest_available: u64,
+}
+
+impl ResumeOkSlot {
+    /// Fixed wire size: 16 bytes (same layout as [`ResumeSlot`]).
+    pub const WIRE_SIZE: usize = 16;
+
+    /// Encodes into `w`.
+    #[inline]
+    pub fn encode(&self, w: &mut ByteWriter) {
+        w.write_u64(self.stream_id);
+        w.write_u64(self.oldest_available);
+    }
+
+    /// Decodes from `r`.
+    pub fn decode(r: &mut ByteReader) -> Result<Self, PayloadError> {
+        if r.remaining() < Self::WIRE_SIZE {
+            return Err(PayloadError::Truncated {
+                needed: Self::WIRE_SIZE,
+                have: r.remaining(),
+            });
+        }
+        Ok(Self {
+            stream_id: r.read_u64(),
+            oldest_available: r.read_u64(),
+        })
+    }
+}
+
+/// Payload for [`MessageType::ResumeOk`] (server → client).
+///
+/// One result slot per requested stream. The server follows this frame with
+/// the actual replayed `Publish` frames for each accepted stream.
+///
+/// Wire layout: `count(1) + count × ResumeOkSlot(16)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResumeOkPayload {
+    /// One `(stream_id, oldest_available)` per requested stream.
+    pub streams: Vec<ResumeOkSlot>,
+}
+
+/// Fixed header portion: `count(1)`.
+const RESUME_OK_HEAD_SIZE: usize = 1;
+
+impl ResumeOkPayload {
+    /// Encodes into `w`.
+    pub fn encode(&self, w: &mut ByteWriter) {
+        let count = u8::try_from(self.streams.len()).unwrap_or(u8::MAX);
+        w.write_u8(count);
+        for s in &self.streams {
+            s.encode(w);
+        }
+    }
+
+    /// Exact wire size this value will occupy.
+    #[inline]
+    pub fn wire_size(&self) -> usize {
+        RESUME_OK_HEAD_SIZE + self.streams.len().min(u8::MAX as usize) * ResumeOkSlot::WIRE_SIZE
+    }
+
+    /// Decodes from `r`.
+    pub fn decode(r: &mut ByteReader) -> Result<Self, PayloadError> {
+        if r.remaining() < RESUME_OK_HEAD_SIZE {
+            return Err(PayloadError::Truncated {
+                needed: RESUME_OK_HEAD_SIZE,
+                have: r.remaining(),
+            });
+        }
+        let count = r.read_u8() as usize;
+        let needed = count * ResumeOkSlot::WIRE_SIZE;
+        if r.remaining() < needed {
+            return Err(PayloadError::Truncated {
+                needed: RESUME_OK_HEAD_SIZE + needed,
+                have: RESUME_OK_HEAD_SIZE + r.remaining(),
+            });
+        }
+        let mut streams = Vec::with_capacity(count);
+        for _ in 0..count {
+            streams.push(ResumeOkSlot::decode(r)?);
+        }
+        Ok(Self { streams })
+    }
+}
+
+/// Payload for [`MessageType::ResumeUnavailable`] (server → client).
+///
+/// Same wire shape as [`ResumeOkPayload`] — reports the oldest retained
+/// sequence per stream so the client knows its resume request was below the
+/// window floor and must fall back to a fresh subscription.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResumeUnavailablePayload(pub Vec<ResumeOkSlot>);
+
+impl ResumeUnavailablePayload {
+    /// Encodes into `w` (delegates to the [`ResumeOkPayload`] shape).
+    pub fn encode(&self, w: &mut ByteWriter) {
+        ResumeOkPayload {
+            streams: self.0.clone(),
+        }
+        .encode(w);
+    }
+
+    /// Exact wire size this value will occupy.
+    #[inline]
+    pub fn wire_size(&self) -> usize {
+        RESUME_OK_HEAD_SIZE + self.0.len().min(u8::MAX as usize) * ResumeOkSlot::WIRE_SIZE
+    }
+
+    /// Decodes from `r`.
+    pub fn decode(r: &mut ByteReader) -> Result<Self, PayloadError> {
+        Ok(Self(ResumeOkPayload::decode(r)?.streams))
+    }
+}
+
 // ── Top-level convenience functions ─────────────────────────────────
 
 /// Parses a payload based on the frame's `msg_type`.
@@ -788,6 +1038,11 @@ pub fn parse_payload<'a>(
         MessageType::FetchReply => Some(ParsedPayload::FetchReply(FetchReplyPayload::decode(
             &mut r,
         )?)),
+        MessageType::Resume => Some(ParsedPayload::Resume(ResumePayload::decode(&mut r)?)),
+        MessageType::ResumeOk => Some(ParsedPayload::ResumeOk(ResumeOkPayload::decode(&mut r)?)),
+        MessageType::ResumeUnavailable => Some(ParsedPayload::ResumeUnavailable(
+            ResumeUnavailablePayload::decode(&mut r)?,
+        )),
         // Data-plane types and Fragment have no structured payload here.
         _ => None,
     };
@@ -812,6 +1067,9 @@ pub fn payload_wire_size(payload: &ParsedPayload<'_>) -> usize {
         ParsedPayload::TopicDelete(p) => p.wire_size(),
         ParsedPayload::Fetch(p) => p.wire_size(),
         ParsedPayload::FetchReply(p) => p.wire_size(),
+        ParsedPayload::Resume(p) => p.wire_size(),
+        ParsedPayload::ResumeOk(p) => p.wire_size(),
+        ParsedPayload::ResumeUnavailable(p) => p.wire_size(),
     }
 }
 
@@ -836,6 +1094,9 @@ pub fn encode_payload(payload: &ParsedPayload<'_>) -> Vec<u8> {
         ParsedPayload::TopicDelete(p) => p.encode(&mut w),
         ParsedPayload::Fetch(p) => p.encode(&mut w),
         ParsedPayload::FetchReply(p) => p.encode(&mut w),
+        ParsedPayload::Resume(p) => p.encode(&mut w),
+        ParsedPayload::ResumeOk(p) => p.encode(&mut w),
+        ParsedPayload::ResumeUnavailable(p) => p.encode(&mut w),
     }
     buf
 }
@@ -1506,6 +1767,153 @@ mod tests {
         let bytes = encode_payload(&original);
         assert!(bytes.is_empty());
         let parsed = parse_payload(MessageType::Heartbeat, &bytes)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    // ── Resume / reliability payloads ──────────────────────────────
+
+    #[test]
+    fn resume_slot_round_trip() {
+        let slot = ResumeSlot {
+            stream_id: 42,
+            last_acked: 99,
+        };
+        let mut buf = [0u8; ResumeSlot::WIRE_SIZE];
+        let mut w = ByteWriter::new(&mut buf);
+        slot.encode(&mut w);
+        let decoded = ResumeSlot::decode(&mut ByteReader::new(&buf)).unwrap();
+        assert_eq!(decoded, slot);
+    }
+
+    #[test]
+    fn resume_payload_round_trip_with_slots() {
+        let rp = ResumePayload {
+            logical_session_id: 0xDEAD_BEEF,
+            streams: vec![
+                ResumeSlot {
+                    stream_id: 1,
+                    last_acked: 100,
+                },
+                ResumeSlot {
+                    stream_id: 2,
+                    last_acked: 200,
+                },
+            ],
+        };
+        let mut buf = vec![0u8; rp.wire_size()];
+        let mut w = ByteWriter::new(&mut buf);
+        rp.encode(&mut w);
+        let decoded = ResumePayload::decode(&mut ByteReader::new(&buf)).unwrap();
+        assert_eq!(decoded, rp);
+        // count = 2 → head(9) + 2×16 = 41
+        assert_eq!(rp.wire_size(), 9 + 32);
+    }
+
+    #[test]
+    fn resume_payload_empty_slots_is_session_hello() {
+        let rp = ResumePayload {
+            logical_session_id: 7,
+            streams: vec![],
+        };
+        let mut buf = vec![0u8; rp.wire_size()];
+        let mut w = ByteWriter::new(&mut buf);
+        rp.encode(&mut w);
+        assert_eq!(buf.len(), 9); // head only, no slots
+        let decoded = ResumePayload::decode(&mut ByteReader::new(&buf)).unwrap();
+        assert_eq!(decoded, rp);
+    }
+
+    #[test]
+    fn resume_payload_truncated_head() {
+        let err = ResumePayload::decode(&mut ByteReader::new(&[0; 4])).unwrap_err();
+        assert!(matches!(err, PayloadError::Truncated { needed: 9, have: 4 }));
+    }
+
+    #[test]
+    fn resume_payload_truncated_slots() {
+        // head(9) + count=1 but no slot bytes.
+        let mut buf = vec![0u8; 9];
+        let mut w = ByteWriter::new(&mut buf);
+        w.write_u64(7);
+        w.write_u8(1); // claims 1 slot
+        let err = ResumePayload::decode(&mut ByteReader::new(&buf)).unwrap_err();
+        assert!(matches!(
+            err,
+            PayloadError::Truncated { needed, have } if needed == 9 + 16 && have == 9
+        ));
+    }
+
+    #[test]
+    fn resume_ok_payload_round_trip() {
+        let ok = ResumeOkPayload {
+            streams: vec![
+                ResumeOkSlot {
+                    stream_id: 1,
+                    oldest_available: 101,
+                },
+                ResumeOkSlot {
+                    stream_id: 2,
+                    oldest_available: 0,
+                },
+            ],
+        };
+        let mut buf = vec![0u8; ok.wire_size()];
+        let mut w = ByteWriter::new(&mut buf);
+        ok.encode(&mut w);
+        let decoded = ResumeOkPayload::decode(&mut ByteReader::new(&buf)).unwrap();
+        assert_eq!(decoded, ok);
+        assert_eq!(ok.wire_size(), 1 + 32);
+    }
+
+    #[test]
+    fn resume_unavailable_payload_round_trip() {
+        let un = ResumeUnavailablePayload(vec![ResumeOkSlot {
+            stream_id: 9,
+            oldest_available: 500,
+        }]);
+        let mut buf = vec![0u8; un.wire_size()];
+        let mut w = ByteWriter::new(&mut buf);
+        un.encode(&mut w);
+        let decoded = ResumeUnavailablePayload::decode(&mut ByteReader::new(&buf)).unwrap();
+        assert_eq!(decoded, un);
+    }
+
+    #[test]
+    fn parse_payload_dispatches_resume_types() {
+        let original = ParsedPayload::Resume(ResumePayload {
+            logical_session_id: 42,
+            streams: vec![ResumeSlot {
+                stream_id: 7,
+                last_acked: 3,
+            }],
+        });
+        let bytes = encode_payload(&original);
+        let parsed = parse_payload(MessageType::Resume, &bytes)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed, original);
+
+        let original = ParsedPayload::ResumeOk(ResumeOkPayload {
+            streams: vec![ResumeOkSlot {
+                stream_id: 7,
+                oldest_available: 4,
+            }],
+        });
+        let bytes = encode_payload(&original);
+        let parsed = parse_payload(MessageType::ResumeOk, &bytes)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed, original);
+
+        let original =
+            ParsedPayload::ResumeUnavailable(ResumeUnavailablePayload(vec![ResumeOkSlot {
+                stream_id: 7,
+                oldest_available: 500,
+            }]));
+        let bytes = encode_payload(&original);
+        let parsed = parse_payload(MessageType::ResumeUnavailable, &bytes)
             .unwrap()
             .unwrap();
         assert_eq!(parsed, original);
