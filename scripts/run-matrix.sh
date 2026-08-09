@@ -324,9 +324,9 @@ done
 # Phase 2: disconnect subscriber, publish 20 gap frames
 # Phase 3: reconnect with Resume, verify gap filled, dup=0
 #
-# Single-worker is the guaranteed resume path. Multi-worker may hit
-# ResumeUnavailable (known limitation — resume reliable only when the
-# reconnect lands on the same worker).
+# Both single- and multi-worker PASS: the replay buffer is shared across
+# workers via Arc<Mutex<SharedReplayState>>, so resume is reliable
+# regardless of which worker the reconnect lands on.
 echo
 echo "▶ [5/4b] s21 ACK+Sequence+Resume (reliability × single,multi)"
 for workers in 1 4; do
@@ -347,12 +347,6 @@ for workers in 1 4; do
         printf "  %-20s PASS %ss | p1=%s p3=%s dup=%s\n" \
             "$s21_label" "$s21_elapsed" "${s21_p1:-?}" "${s21_p3:-?}" "${s21_dup:-?}"
         RESULTS+=("s21|$s21_label|PASS")
-    elif [ "$workers" -gt 1 ] && [[ "$s21_ver" == "RELIABILITY INCOMPLETE" ]]; then
-        # Multi-worker: resume reliable only when reconnect lands on the same
-        # worker (explicit non-goal: cross-worker replay). Mark as XFAIL.
-        printf "  %-20s XFAIL %ss | %s | p1=%s p3=%s dup=%s (multi-worker: cross-worker replay non-goal)\n" \
-            "$s21_label" "$s21_elapsed" "${s21_ver:-?}" "${s21_p1:-?}" "${s21_p3:-?}" "${s21_dup:-?}"
-        RESULTS+=("s21|$s21_label|XFAIL")
     else
         printf "  %-20s FAIL(rc=$s21_rc) %ss | %s | p1=%s p3=%s dup=%s\n" \
             "$s21_label" "$s21_elapsed" "${s21_ver:-?}" "${s21_p1:-?}" "${s21_p3:-?}" "${s21_dup:-?}"

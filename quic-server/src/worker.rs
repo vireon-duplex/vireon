@@ -130,6 +130,9 @@ impl Worker {
         if let Some(m) = &config.metrics {
             handler.set_metrics(m.clone());
         }
+        if let Some(shared) = &config.shared_replay {
+            handler.set_shared_replay(shared.clone());
+        }
 
         Ok(Self {
             core_id,

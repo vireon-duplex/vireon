@@ -151,6 +151,17 @@ impl QuicServer {
         // the message regardless of which worker the publisher landed on.
         let pubsub_channels = build_inter_worker_pubsub_channels(num_workers);
 
+        // Create a shared replay buffer so a reconnecting client can resume
+        // regardless of which worker it lands on. Each worker's dispatcher
+        // swaps its per-worker buffer for this shared one at startup.
+        let mut config = self.config.clone();
+        config.shared_replay = Some(Arc::new(std::sync::Mutex::new(
+            crate::replay::SharedReplayState::new(crate::replay::ReplayConfig {
+                max_messages_per_stream: config.tuning.replay_max_messages_per_stream,
+                max_bytes: config.tuning.replay_max_bytes,
+            }),
+        )));
+
         let mut handles = Vec::with_capacity(num_workers);
         let mut stop_rx_list = Vec::with_capacity(num_workers);
 
@@ -163,7 +174,7 @@ impl QuicServer {
             // Pop the next cluster handle in order (core_id matches).
             let cluster_handle = cluster_handles.as_mut().and_then(|q| q.pop_front());
             let (handle, stop_rx) = Worker::spawn(
-                self.config.clone(),
+                config.clone(),
                 core_id,
                 num_workers as u32,
                 inbox_rx,
