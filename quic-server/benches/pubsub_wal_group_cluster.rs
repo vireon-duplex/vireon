@@ -85,7 +85,7 @@ fn dispatcher_with_wal() -> (VireonDispatcher, TempDir) {
 fn populate_wal(d: &mut VireonDispatcher, topic: &pubsub_engine::Topic, n: u64) {
     let payload = [0xABu8; 32];
     for i in 0..n {
-        d.handle_publish(&ctx(1, 200), StreamId::new(2), topic, &payload);
+        d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), &payload, false);
         // Vary the byte so each entry is distinct (not that the WAL cares).
         let _ = i;
     }
@@ -152,7 +152,7 @@ fn bench_wal_replay(c: &mut Criterion) {
             },
             |(mut d, _keepalive)| {
                 for _ in 0..100u64 {
-                    d.handle_publish(&ctx(1, 200), StreamId::new(2), &topic, &payload);
+                    d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), &payload, false);
                 }
                 black_box(d.drain_outbox());
             },
@@ -249,7 +249,7 @@ fn bench_group_fanout(c: &mut Criterion) {
             |b, &_| {
                 b.iter(|| {
                     for _ in 0..batch {
-                        d.handle_publish(&ctx(0, 999), StreamId::new(999), &topic, &payload);
+                        d.handle_publish(&ctx(0, 999), StreamId::new(999), topic.as_str(), &payload, false);
                     }
                     black_box(d.drain_outbox());
                 });
@@ -391,7 +391,7 @@ fn bench_cluster_routing(c: &mut Criterion) {
     let _keep_inc_tx = inc_tx;
     group.bench_function("forward_path_K4", |b| {
         b.iter(|| {
-            d_fwd.handle_publish(&ctx(0, 999), StreamId::new(999), &fwd_topic, &payload);
+            d_fwd.handle_publish(&ctx(0, 999), StreamId::new(999), fwd_topic.as_str(), &payload, false);
             // Drain forwarded inter-node messages.
             while out_rx.try_recv().is_ok() {}
             let _ = d_fwd.drain_outbox();
@@ -407,7 +407,7 @@ fn bench_cluster_routing(c: &mut Criterion) {
     let _keep_inc_tx2 = inc_tx2;
     group.bench_function("own_path_K4", |b| {
         b.iter(|| {
-            d_own.handle_publish(&ctx(0, 999), StreamId::new(999), &own_topic, &payload);
+            d_own.handle_publish(&ctx(0, 999), StreamId::new(999), own_topic.as_str(), &payload, false);
             while out_rx2.try_recv().is_ok() {}
             let _ = d_own.drain_outbox();
         });

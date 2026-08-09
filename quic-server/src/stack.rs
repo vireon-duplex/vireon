@@ -419,6 +419,13 @@ impl VireonStack {
         self.reactor_stop = Some(stop);
     }
 
+    /// Propagates the shared metrics counters to the application-layer
+    /// dispatcher so reliability handlers can bump outcome counters.
+    /// Called from `Worker::new` after `VireonStack::new`.
+    pub fn set_metrics(&mut self, metrics: Arc<crate::metrics::ServerMetrics>) {
+        self.application.set_metrics(metrics);
+    }
+
     // ── Event processing ──────────────────────────────────────────
 
     /// Processes a batch of [`QuicEvent`]s through the layer stack.

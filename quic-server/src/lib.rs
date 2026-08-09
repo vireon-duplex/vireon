@@ -25,4 +25,6 @@ pub mod conf;
 pub mod error;
 pub mod layers;
 pub mod log_throttle;
+pub mod metrics;
+pub mod replay;
 pub mod socket_registry;
