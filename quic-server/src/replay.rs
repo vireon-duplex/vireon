@@ -33,7 +33,7 @@ use std::collections::VecDeque;
 use bytes::Bytes;
 use frame::codec::FrameHeader;
 use frame::header::StreamId;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 // ── Config ──────────────────────────────────────────────────────────
 
@@ -51,6 +51,10 @@ pub struct ReplayConfig {
     /// stream that is being appended to first; if that is insufficient older
     /// sessions are pruned.
     pub max_bytes: usize,
+    /// Idle logical-session TTL in seconds. Sessions with no live connection
+    /// and no activity (append/ack/resume) for this duration are reaped by
+    /// the periodic sweep. 0 = never reap (retain indefinitely).
+    pub idle_session_ttl_secs: u64,
 }
 
 impl Default for ReplayConfig {
@@ -58,6 +62,7 @@ impl Default for ReplayConfig {
         Self {
             max_messages_per_stream: 10_000,
             max_bytes: 128 * 1024 * 1024, // 128 MiB
+            idle_session_ttl_secs: 300,   // 5 minutes
         }
     }
 }
@@ -420,6 +425,10 @@ pub struct SharedReplayState {
     /// `logical_session_id → next-outgoing seq per quic_stream_id`.
     /// Shared so dormant continuation uses monotonically increasing seqs.
     pub session_stream_seq: FxHashMap<(u64, u64), Seq>,
+    /// `logical_session_id → last activity timestamp`. Updated on
+    /// register/append/acknowledge/resume. Used by `reap_idle` to
+    /// expire dormant sessions whose TTL has elapsed.
+    last_activity: FxHashMap<u64, std::time::Instant>,
 }
 
 impl SharedReplayState {
@@ -430,7 +439,85 @@ impl SharedReplayState {
             buffer: ReplayBuffer::new(config),
             dormant_sessions: FxHashMap::default(),
             session_stream_seq: FxHashMap::default(),
+            last_activity: FxHashMap::default(),
         }
+    }
+
+    /// Records activity for a logical session (call from register/append/
+    /// acknowledge/resume).
+    pub fn touch(&mut self, logical_session_id: u64) {
+        self.last_activity
+            .insert(logical_session_id, std::time::Instant::now());
+    }
+
+    /// Reaps idle dormant sessions and buffer entries for sessions with no
+    /// live connection. Returns the number of sessions dropped.
+    ///
+    /// `live_sessions` is the set of logical session ids that currently have
+    /// an active connection on ANY worker — these are never reaped.
+    pub fn reap_idle(
+        &mut self,
+        live_sessions: &FxHashSet<u64>,
+        ttl: std::time::Duration,
+    ) -> usize {
+        if ttl.is_zero() {
+            return 0;
+        }
+        let now = std::time::Instant::now();
+        let mut dropped = 0usize;
+
+        // Reap dormant_sessions: drop entries whose last activity is older
+        // than ttl (or unknown — treat unknown as ancient so stale entries
+        // from a pre-activity-tracking epoch are cleaned up).
+        self.dormant_sessions.retain(|sid, _| {
+            if live_sessions.contains(sid) {
+                return true;
+            }
+            let idle = self
+                .last_activity
+                .get(sid)
+                .map(|t| now.duration_since(*t) >= ttl)
+                .unwrap_or(true);
+            if idle {
+                dropped += 1;
+                false
+            } else {
+                true
+            }
+        });
+
+        // Reap buffer entries for sessions with no live connection and idle
+        // beyond ttl. These are sessions that disconnected, had replay data
+        // retained, and never resumed within the TTL window.
+        let idle_buffer_sids: Vec<u64> = self
+            .buffer
+            .by_session
+            .keys()
+            .filter(|sid| !live_sessions.contains(sid))
+            .filter(|sid| {
+                self.last_activity
+                    .get(sid)
+                    .map(|t| now.duration_since(*t) >= ttl)
+                    .unwrap_or(true)
+            })
+            .copied()
+            .collect();
+        for sid in &idle_buffer_sids {
+            self.buffer.drop_session(*sid);
+            self.last_activity.remove(sid);
+            self.session_stream_seq.retain(|key, _| key.0 != *sid);
+            dropped += 1;
+        }
+
+        // Clean up last_activity entries for sessions that no longer exist
+        // anywhere (not in buffer, not dormant, not live).
+        self.last_activity.retain(|sid, _| {
+            live_sessions.contains(sid)
+                || self.buffer.by_session.contains_key(sid)
+                || self.dormant_sessions.contains_key(sid)
+        });
+
+        dropped
     }
 }
 
