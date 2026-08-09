@@ -58,7 +58,7 @@
 //! `N × 16 bytes` — optimal for high fan-out (hundreds+ subscribers).
 
 use arrayvec::ArrayVec;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -682,6 +682,11 @@ pub struct VireonDispatcher {
     /// client re-sends `Resume` with the same id, and the new conn_idx
     /// is rebound to it.
     conn_logical_session: FxHashMap<usize, u64>,
+    /// Last time the idle-session reaper ran. The reaper is piggy-backed
+    /// on `on_batch_tick` and runs at most every `reaper_interval`.
+    last_reaper_run: Option<std::time::Instant>,
+    /// Interval between idle-session reaper sweeps. Default 5 s.
+    reaper_interval: std::time::Duration,
     /// Transient: set to `true` only while `handle_publish` is in its
     /// fan-out section AND the incoming publish carried `ACK_REQ`. Read
     /// by [`Self::enqueue_frame`] to stamp `ACK_REQ` on outgoing
@@ -804,6 +809,8 @@ impl VireonDispatcher {
                 crate::replay::SharedReplayState::new(ReplayConfig::default()),
             )),
             conn_logical_session: FxHashMap::default(),
+            last_reaper_run: None,
+            reaper_interval: std::time::Duration::from_secs(5),
             reliable_fanout: false,
             session_last_acked: FxHashMap::default(),
             metrics: None,
@@ -868,6 +875,48 @@ impl VireonDispatcher {
 
     /// Snapshots the replay-buffer occupancy into the `replay_window_bytes`
     /// and `replay_window_messages` Prometheus gauges. Called once per
+    /// Periodically reaps idle dormant sessions and stale replay buffer
+    /// entries. Called from `on_batch_tick`; runs at most every
+    /// `reaper_interval` to amortize the lock + iteration cost.
+    pub fn maybe_reap_idle_sessions(&mut self) {
+        let now = std::time::Instant::now();
+        let should_run = self
+            .last_reaper_run
+            .map(|t| now.duration_since(t) >= self.reaper_interval)
+            .unwrap_or(true);
+        if !should_run {
+            return;
+        }
+        self.last_reaper_run = Some(now);
+        let ttl_secs = self
+            .replay
+            .lock()
+            .map(|rs| rs.buffer.config().idle_session_ttl_secs)
+            .unwrap_or(0);
+        if ttl_secs == 0 {
+            return;
+        }
+        // Build the set of live logical sessions (those with an active
+        // connection on THIS worker). Only this worker's connections are
+        // visible here — cross-worker sessions are protected by the fact
+        // that the other worker's reap won't find them live either, so a
+        // truly-dead session is reaped by all workers independently.
+        let live: FxHashSet<u64> = self.conn_logical_session.values().copied().collect();
+        let ttl = std::time::Duration::from_secs(ttl_secs);
+        let dropped = self
+            .replay
+            .lock()
+            .map(|mut rs| rs.reap_idle(&live, ttl))
+            .unwrap_or(0);
+        if dropped > 0 {
+            tracing::info!(
+                dropped,
+                ttl_secs,
+                "[reaper] expired idle dormant/replay sessions"
+            );
+        }
+    }
+
     /// batch tick from [`ApplicationLayer::on_batch_tick`]; no-op when no
     /// metrics store is attached (benches / unit tests).
     pub fn publish_replay_gauges(&self) {
@@ -993,6 +1042,7 @@ impl VireonDispatcher {
                     payload: payload.clone(),
                 },
             );
+            rs.touch(logical);
         }
         self.outbox.push(OutgoingFrame {
             conn_idx,
@@ -2167,6 +2217,7 @@ impl VireonDispatcher {
                         );
                         rs.session_stream_seq
                             .insert((logical, *qsid), seq_val.next());
+                        rs.touch(logical);
                     }
                 }
             }
@@ -2218,11 +2269,10 @@ impl VireonDispatcher {
             );
             return;
         };
-        self.replay
-            .lock()
-            .unwrap()
-            .buffer
-            .acknowledge(logical, stream, ack_seq);
+        let mut rs = self.replay.lock().unwrap();
+        rs.buffer.acknowledge(logical, stream, ack_seq);
+        rs.touch(logical);
+        drop(rs);
         self.session_last_acked.insert((logical, stream), ack_seq);
         if let Some(m) = &self.metrics {
             m.inc(&m.messages_acked_total);
@@ -2284,6 +2334,7 @@ impl VireonDispatcher {
         {
             let mut rs = self.replay.lock().unwrap();
             rs.buffer.register_session(logical_session_id);
+            rs.touch(logical_session_id);
             // The session is live again — stop retaining gap frames for it
             // (live fan-out will reach the subscriber directly from here on).
             rs.dormant_sessions.remove(&logical_session_id);
@@ -4124,6 +4175,7 @@ impl VireonDispatcher {
                         );
                         rs.session_stream_seq
                             .insert((logical, *qsid), seq_val.next());
+                        rs.touch(logical);
                     }
                 }
             }
@@ -4522,6 +4574,7 @@ impl ApplicationLayer {
                 .with_replay_config(ReplayConfig {
                     max_messages_per_stream: t.replay_max_messages_per_stream,
                     max_bytes: t.replay_max_bytes,
+                    idle_session_ttl_secs: t.replay_idle_session_ttl_secs,
                 }),
             metric_frames_rx,
             metric_connections,
@@ -4665,6 +4718,7 @@ impl ApplicationLayer {
         self.dispatcher.drain_worker_inbox();
         self.dispatcher.maybe_run_wal_retention();
         self.dispatcher.tick_cluster_health();
+        self.dispatcher.maybe_reap_idle_sessions();
         // Snapshot replay-window gauges into the shared metrics store so
         // the Prometheus endpoint reflects current buffer occupancy.
         self.dispatcher.publish_replay_gauges();
