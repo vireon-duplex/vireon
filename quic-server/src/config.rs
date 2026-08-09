@@ -413,6 +413,7 @@ impl ServerConfig {
                     vnodes: cluster_vnodes,
                     heartbeat_interval_ms: cluster_heartbeat_interval,
                     heartbeat_timeout_ms: cluster_heartbeat_timeout,
+                    channel_cap: conf.cluster.as_ref().and_then(|c| c.channel_cap),
                 };
                 let cfg = crate::cluster::build_cluster_transport_config(self_id, &peers, opts)
                     .map_err(|e| anyhow::anyhow!("cluster-peers: {e}"))?;
