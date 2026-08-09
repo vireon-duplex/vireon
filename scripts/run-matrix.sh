@@ -318,6 +318,42 @@ for rf in 1 2 3; do
     done
 done
 
+# ── ACK + Sequence + Resume reliability test ────────────────────
+# s21 spawns its own server and exercises the full reliability path:
+# Phase 1: publish 100 frames, verify received=100, dup=0
+# Phase 2: disconnect subscriber, publish 20 gap frames
+# Phase 3: reconnect with Resume, verify gap filled, dup=0
+#
+# Both single- and multi-worker PASS: the replay buffer is shared across
+# workers via Arc<Mutex<SharedReplayState>>, so resume is reliable
+# regardless of which worker the reconnect lands on.
+echo
+echo "▶ [5/4b] s21 ACK+Sequence+Resume (reliability × single,multi)"
+for workers in 1 4; do
+    s21_label="w${workers}"
+    s21_log="$CONF_DIR/ex-${RUN_ID}-s21-${s21_label}.log"
+    s21_start=$(date +%s.%N)
+    VIREON_WORKERS="$workers" \
+        timeout 90 cargo run -p vireon-sdk --release --example s21_ack_sequence_resume \
+        > "$s21_log" 2>&1
+    s21_rc=$?
+    s21_end=$(date +%s.%N)
+    s21_elapsed=$(awk "BEGIN{printf \"%.1f\", $s21_end-$s21_start}")
+    s21_ver=$(grep -oE 'RELIABILITY VERIFIED|RELIABILITY INCOMPLETE' "$s21_log" | tail -1)
+    s21_p1=$(grep -oP 'Phase 1:.*?received \K[0-9]+' "$s21_log" 2>/dev/null | tail -1)
+    s21_p3=$(grep -oP 'Phase 3:.*?received \K[0-9]+' "$s21_log" 2>/dev/null | tail -1)
+    s21_dup=$(grep -oP 'duplicates=\K[0-9]+' "$s21_log" 2>/dev/null | tail -1)
+    if [ "$s21_rc" -eq 0 ] && [[ "$s21_ver" == "RELIABILITY VERIFIED" ]]; then
+        printf "  %-20s PASS %ss | p1=%s p3=%s dup=%s\n" \
+            "$s21_label" "$s21_elapsed" "${s21_p1:-?}" "${s21_p3:-?}" "${s21_dup:-?}"
+        RESULTS+=("s21|$s21_label|PASS")
+    else
+        printf "  %-20s FAIL(rc=$s21_rc) %ss | %s | p1=%s p3=%s dup=%s\n" \
+            "$s21_label" "$s21_elapsed" "${s21_ver:-?}" "${s21_p1:-?}" "${s21_p3:-?}" "${s21_dup:-?}"
+        RESULTS+=("s21|$s21_label|FAIL")
+    fi
+done
+
 # ── Connection-migration smoke test ─────────────────────────────
 # We can't simulate a real IP/port change in loopback without raw
 # QUIC packet injection in the SDK. But we CAN verify:

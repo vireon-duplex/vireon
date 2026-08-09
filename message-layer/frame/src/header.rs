@@ -642,13 +642,37 @@ pub enum MessageType {
     /// [`MessageType::Fetch`]. Payload is `topic_len(u16) | topic |
     /// offset(u64)`.
     NotifyOffset = 0x1A,
+
+    // ---- application-level reliability (resume / replay) ----
+    /// Client → server: resume a logical session from a per-stream
+    /// `last_acked` sequence. Carries a client-stable `logical_session_id`
+    /// (distinct from the per-connection [`SessionId`]) plus a list of
+    /// `(stream_id, last_acked)` slots. An empty slot list is a "session
+    /// hello" that registers the logical id on first connect so the server
+    /// can retain replay state for it. Payload is
+    /// [`crate::payload::ResumePayload`].
+    Resume = 0x1B,
+    /// Server → client: resume accepted. Reports the oldest retained
+    /// sequence per requested stream so the client can detect whether the
+    /// replay starts exactly at `last_acked + 1` or was clamped up to the
+    /// window floor. Payload is [`crate::payload::ResumeOkPayload`].
+    /// The server follows this frame with the actual replayed `Publish`
+    /// frames.
+    ResumeOk = 0x1C,
+    /// Server → client: resume rejected because at least one requested
+    /// stream's `last_acked` is older than the server's oldest retained
+    /// sequence (replay window exceeded). The client falls back to a
+    /// fresh subscription. Payload is
+    /// [`crate::payload::ResumeUnavailablePayload`] (same shape as
+    /// [`crate::payload::ResumeOkPayload`]).
+    ResumeUnavailable = 0x1D,
 }
 
 /// Every defined [`MessageType`], ascending by wire byte.
 ///
 /// Useful for exhaustive round-trip tests and for dispatchers that want to
 /// validate they handle every variant.
-pub const ALL_MESSAGE_TYPES: [MessageType; 26] = [
+pub const ALL_MESSAGE_TYPES: [MessageType; 29] = [
     MessageType::TextToken,
     MessageType::AudioFrame,
     MessageType::VideoFrame,
@@ -675,6 +699,9 @@ pub const ALL_MESSAGE_TYPES: [MessageType; 26] = [
     MessageType::ConsumerGroupLeave,
     MessageType::ConsumerGroupHeartbeat,
     MessageType::NotifyOffset,
+    MessageType::Resume,
+    MessageType::ResumeOk,
+    MessageType::ResumeUnavailable,
 ];
 
 impl MessageType {
@@ -714,6 +741,9 @@ impl MessageType {
             0x18 => Self::ConsumerGroupLeave,
             0x19 => Self::ConsumerGroupHeartbeat,
             0x1A => Self::NotifyOffset,
+            0x1B => Self::Resume,
+            0x1C => Self::ResumeOk,
+            0x1D => Self::ResumeUnavailable,
             _ => return None,
         })
     }
@@ -1160,7 +1190,8 @@ mod tests {
     #[test]
     fn reserved_and_unknown_bytes_map_to_none() {
         assert_eq!(MessageType::from_byte(0x00), None);
-        assert_eq!(MessageType::from_byte(0x1B), None);
+        // 0x1B–0x1D are now Resume / ResumeOk / ResumeUnavailable.
+        assert_eq!(MessageType::from_byte(0x1E), None);
         assert_eq!(MessageType::from_byte(0xFF), None);
         assert!(matches!(
             MessageType::try_from(0x42),
@@ -1180,7 +1211,7 @@ mod tests {
     #[test]
     fn wire_bytes_are_dense_and_unique() {
         let bytes: Vec<u8> = ALL_MESSAGE_TYPES.iter().map(|mt| mt.as_byte()).collect();
-        assert_eq!(bytes, (0x01..=0x1Au8).collect::<Vec<_>>());
+        assert_eq!(bytes, (0x01..=0x1Du8).collect::<Vec<_>>());
         let unique: std::collections::HashSet<_> = bytes.iter().copied().collect();
         assert_eq!(unique.len(), bytes.len());
     }

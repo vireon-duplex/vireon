@@ -214,14 +214,9 @@ impl StreamLayer {
                         }
                     }
                 },
-                MessageType::Ack => {
-                    tracing::trace!(
-                        conn_idx,
-                        stream_id = logical_stream,
-                        seq = frame.seq.get(),
-                        "ack"
-                    );
-                }
+                // Ack / Resume / ResumeOk / ResumeUnavailable are dispatched
+                // to the application layer by the message layer's classify()
+                // — they never enter this control-dispatch block.
                 // Data-plane types are handled above.
                 _ => {
                     if self.unexpected_type_throttle.tick() {
