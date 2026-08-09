@@ -249,6 +249,27 @@ fn encode_resume_unavailable(slots: Vec<ResumeOkSlot>) -> Bytes {
     buf.freeze()
 }
 
+/// Topic-pattern match for dormant-session retention. Mirrors
+/// `TopicPattern::matches` from `pubsub-engine` but operates on raw `&str`
+/// (the dormant-session map stores `Box<str>` patterns, not constructed
+/// `TopicPattern`s, to avoid validation overhead on the disconnect path).
+/// Supports single-segment `*` wildcards; segment counts must match.
+fn pattern_matches(pattern: &str, topic: &str) -> bool {
+    let mut pat = pattern.split('.');
+    let mut top = topic.split('.');
+    loop {
+        match (pat.next(), top.next()) {
+            (Some(p), Some(t)) => {
+                if p != "*" && p != t {
+                    return false;
+                }
+            }
+            (None, None) => return true,
+            _ => return false, // different segment counts
+        }
+    }
+}
+
 // ── FrameContext & OutgoingFrame ──────────────────────────────────
 
 /// Connection + stream context passed into dispatcher callbacks.
@@ -673,6 +694,23 @@ pub struct VireonDispatcher {
     /// the reliability-layer handlers can bump `resume_*` / `messages_*`
     /// outcome counters directly.
     metrics: Option<Arc<crate::metrics::ServerMetrics>>,
+    /// Per-`(logical_session, quic_stream_id)` next-outgoing seq counter.
+    /// Keyed by the subscriber's QUIC stream id (what the client uses as
+    /// its ACK/Resume key), NOT the publisher's logical stream. When a
+    /// subscriber disconnects, this counter keeps advancing for dormant
+    /// retention so gap frames get monotonically-increasing seqs that
+    /// continue from where live delivery left off.
+    session_stream_seq: FxHashMap<(u64, u64), Seq>,
+    /// `logical_session_id → (quic_stream_ids, patterns)` for subscribers
+    /// that have disconnected but whose logical session is still retained
+    /// in the replay buffer. Reliable publishes matching a dormant
+    /// session's patterns are retained in the buffer (keyed by each
+    /// quic_stream_id) so `Resume` can replay the gap.
+    dormant_session_patterns: FxHashMap<u64, (Vec<u64>, Vec<Box<str>>)>,
+    /// `(conn_idx, quic_stream_id) → pending replay frames` for Resume
+    /// replays targeting a QUIC stream the client hasn't opened yet.
+    /// Flushed to the outbox when the matching StreamOpen arrives.
+    pending_replays: FxHashMap<(usize, u64), Vec<OutgoingFrame>>,
 }
 
 /// Minimum gap between cross-worker drop warning logs.
@@ -772,6 +810,9 @@ impl VireonDispatcher {
             reliable_fanout: false,
             session_last_acked: FxHashMap::default(),
             metrics: None,
+            session_stream_seq: FxHashMap::default(),
+            dormant_session_patterns: FxHashMap::default(),
+            pending_replays: FxHashMap::default(),
         }
     }
 
@@ -926,9 +967,15 @@ impl VireonDispatcher {
         };
         *seq = seq_val.next();
         if let Some(logical) = logical {
+            // Key the replay ring by the subscriber's quic_stream_id (not
+            // the publisher's logical stream). The client keys its ACK
+            // and Resume state by the QUIC stream id it receives on, so
+            // the replay lookup must use the same key to match.
+            self.session_stream_seq
+                .insert((logical, quic_stream_id), seq_val.next());
             self.replay.append(
                 logical,
-                logical_stream,
+                StreamId::new(quic_stream_id),
                 ReplayEntry {
                     seq: seq_val.get(),
                     header: header.clone(),
@@ -1200,6 +1247,19 @@ impl VireonDispatcher {
         // when drain_ready_egress rebuilds the OutgoingFrame.
         self.egress_quic_streams
             .insert((conn_idx, logical_stream), quic_stream_id);
+        // Flush any pending resume-replay frames for this stream. The
+        // Resume (sent on the default stream) may have arrived before the
+        // client opened this dedicated stream, so the replayed frames were
+        // buffered until now.
+        if let Some(pending) = self.pending_replays.remove(&(conn_idx, quic_stream_id)) {
+            tracing::debug!(
+                conn_idx,
+                quic_stream_id,
+                count = pending.len(),
+                "[reliability] flushing pending replay frames on StreamOpen"
+            );
+            self.outbox.extend(pending);
+        }
     }
 
     /// Removes send-policy state for a single stream. Called when the
@@ -2049,6 +2109,48 @@ impl VireonDispatcher {
             }
         }
 
+        // ── Dormant session retention ──────────────────────────────────
+        // Reliable publishes that match a dormant session's subscription
+        // patterns are retained in the replay buffer even though the
+        // subscriber's connection is gone. This ensures gap frames
+        // published during a disconnect survive until Resume replays them.
+        if reliable && !self.dormant_session_patterns.is_empty() {
+            // Collect affected (session, quic_stream_ids) first to avoid
+            // borrowing self while mutating replay/session_stream_seq.
+            let dormant: Vec<(u64, Vec<u64>)> = self
+                .dormant_session_patterns
+                .iter()
+                .filter(|(_, (_, pats))| {
+                    pats.iter()
+                        .any(|p| pattern_matches(p.as_ref(), topic_str))
+                })
+                .map(|(&l, (qsid, _))| (l, qsid.clone()))
+                .collect();
+            for (logical, quic_stream_ids) in dormant {
+                for qsid in &quic_stream_ids {
+                    let seq_val = self
+                        .session_stream_seq
+                        .get(&(logical, *qsid))
+                        .copied()
+                        .unwrap_or(Seq::ZERO);
+                    let header = FrameHeader::new(stream, MessageType::Publish)
+                        .with_seq(seq_val)
+                        .with_flags(FrameFlags::ACK_REQ);
+                    self.replay.append(
+                        logical,
+                        StreamId::new(*qsid),
+                        ReplayEntry {
+                            seq: seq_val.get(),
+                            header: header.clone(),
+                            payload: fanout_bytes.clone(),
+                        },
+                    );
+                    self.session_stream_seq
+                        .insert((logical, *qsid), seq_val.next());
+                }
+            }
+        }
+
         // End of reliable fan-out section — always reset so subsequent
         // `enqueue_frame` calls (e.g. from `send_ack` on the next frame)
         // are not treated as reliable.
@@ -2155,6 +2257,9 @@ impl VireonDispatcher {
         self.conn_logical_session
             .insert(ctx.conn_idx, logical_session_id);
         self.replay.register_session(logical_session_id);
+        // The session is live again — stop retaining gap frames for it
+        // (live fan-out will reach the subscriber directly from here on).
+        self.dormant_session_patterns.remove(&logical_session_id);
         if let Some(m) = &self.metrics {
             m.inc(&m.resume_attempts_total);
         }
@@ -2246,15 +2351,23 @@ impl VireonDispatcher {
         }
 
         // Re-send each retained Publish frame with ACK_REQ set. The
-        // OutgoingFrame's conn_idx/quic_stream_id are re-bound to the new
-        // connection, but the retained header's seq is preserved — the
-        // client dedups by header.seq across reconnects, so a fresh seq
-        // would either be dropped as a duplicate (if < highest_accepted)
-        // or break monotonicity.
+        // OutgoingFrame's conn_idx is re-bound to the new connection, and
+        // the quic_stream_id is set to the SUBSCRIBER's original stream
+        // (stored in the replay key) so the frames land on the same
+        // dedicated stream the client's StreamHandle is listening on.
+        // The retained header's seq is preserved — the client dedups by
+        // header.seq across reconnects, so a fresh seq would either be
+        // dropped as a duplicate (if < highest_accepted) or break
+        // monotonicity.
         let new_conn = ctx.conn_idx;
-        let new_quic_stream = ctx.quic_stream_id;
         let mut replayed_total: usize = 0;
-        for (_stream, entries) in to_replay {
+        for (replay_stream, entries) in to_replay {
+            // The replay key is the subscriber's quic_stream_id.
+            let target_quic_stream = replay_stream.get();
+            let buf = self
+                .pending_replays
+                .entry((new_conn, target_quic_stream))
+                .or_default();
             for entry in entries {
                 // The retained header already carries the original logical
                 // stream, msg_type=Publish, flags=ACK_REQ, and seq. Re-stamp
@@ -2267,9 +2380,9 @@ impl VireonDispatcher {
                     .entry(new_conn)
                     .or_default()
                     .record_delivery_out(entry.payload.len());
-                self.outbox.push(OutgoingFrame {
+                buf.push(OutgoingFrame {
                     conn_idx: new_conn,
-                    quic_stream_id: new_quic_stream,
+                    quic_stream_id: target_quic_stream,
                     header,
                     payload: entry.payload,
                 });
@@ -4143,12 +4256,43 @@ impl AppDispatcher for VireonDispatcher {
             }
         }
         let principal = self.principals.remove(&conn_idx);
+        // Save subscription patterns + quic_stream_ids for dormant retention
+        // when the conn has a registered logical session. Reliable publishes
+        // matching these patterns are retained in the replay buffer (keyed by
+        // each quic_stream_id) even while the subscriber is disconnected, so
+        // Resume can replay the gap.
+        if let Some(&logical) = self.conn_logical_session.get(&conn_idx) {
+            if !removed_patterns.is_empty() {
+                // Collect the quic_stream_ids that have replay entries for
+                // this logical session. session_stream_seq is keyed by
+                // (logical, quic_stream_id).
+                let quic_stream_ids: Vec<u64> = self
+                    .session_stream_seq
+                    .keys()
+                    .filter(|&&(l, _)| l == logical)
+                    .map(|&(_, qsid)| qsid)
+                    .collect();
+                self.dormant_session_patterns.insert(
+                    logical,
+                    (
+                        quic_stream_ids,
+                        removed_patterns
+                            .iter()
+                            .map(|p| p.as_str().into())
+                            .collect(),
+                    ),
+                );
+            }
+        }
         // Unbind the logical session — the session itself outlives the
         // connection (retained entries stay in the replay buffer for a
         // future Resume), only the conn_idx mapping goes away. A
         // reconnecting client re-sends Resume and re-establishes the
         // mapping on the new conn_idx.
         self.conn_logical_session.remove(&conn_idx);
+        // Drop any pending replay frames for this connection (the streams
+        // are gone, they'll be re-buffered on the next Resume).
+        self.pending_replays.retain(|&(c, _), _| c != conn_idx);
 
         // Log + drop per-connection metrics on close.
         if let Some(m) = self.conn_metrics.remove(&conn_idx) {
