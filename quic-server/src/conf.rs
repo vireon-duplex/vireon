@@ -207,6 +207,11 @@ pub struct ServerConf {
     pub timer_wheel: Option<TimerWheelConf>,
     pub stream_scheduler: Option<StreamSchedulerConf>,
     pub delivery: Option<DeliveryConf>,
+
+    // ── Replay / reliability ──
+    /// `[replay]` section — in-memory replay buffer for ACK + Sequence +
+    /// Resume reliability. See `vireon.conf.example`.
+    pub replay: Option<ReplayConf>,
 }
 
 /// `[quic]` section — optional overrides applied on top of the preset.
@@ -425,6 +430,26 @@ pub struct DeliveryConf {
     pub force_strategy: Option<String>,
 }
 
+/// `[replay]` section — reliability-layer replay buffer limits.
+///
+/// The server retains copies of every `Publish` fan-out that carries
+/// `FrameFlags::ACK_REQ`, keyed by `(logical_session_id, stream_id)`.
+/// Acks release retained entries; a reconnecting client's `Resume` frame
+/// replays the gap. These limits bound the in-memory window.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct ReplayConf {
+    /// Max retained messages per `(session, stream)` ring. Older entries
+    /// are evicted once exceeded. Default 10_000.
+    pub max_messages_per_stream: Option<usize>,
+    /// Soft total byte cap across the whole buffer. Default 128 MiB.
+    pub max_bytes: Option<HumanBytes>,
+    /// Idle logical-session TTL in seconds. Sessions that receive no Ack
+    /// or Resume activity for this long are dropped, releasing their
+    /// retained entries. Default 300 (5 minutes).
+    pub idle_session_ttl_secs: Option<u64>,
+}
+
 /// fsync policy for the WAL.
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -560,6 +585,15 @@ pub struct LayerTuning {
     pub delivery_logtail_threshold: usize,
     /// Force a delivery strategy regardless of subscriber count.
     pub delivery_force_strategy: DeliveryMode,
+
+    // ── Replay / reliability ──
+    /// Max retained messages per `(session, stream)` ring in the in-memory
+    /// replay buffer. Default 10_000.
+    pub replay_max_messages_per_stream: usize,
+    /// Soft total byte cap across the whole replay buffer. Default 128 MiB.
+    pub replay_max_bytes: usize,
+    /// Idle logical-session TTL in seconds. Default 300.
+    pub replay_idle_session_ttl_secs: u64,
 }
 
 impl Default for LayerTuning {
@@ -608,6 +642,9 @@ impl Default for LayerTuning {
             publish_backpressure_high_watermark_bytes: 512 * 1024 * 1024,
             delivery_logtail_threshold: 256,
             delivery_force_strategy: DeliveryMode::Auto,
+            replay_max_messages_per_stream: 10_000,
+            replay_max_bytes: 128 * 1024 * 1024,
+            replay_idle_session_ttl_secs: 300,
         }
     }
 }

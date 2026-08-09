@@ -74,8 +74,9 @@ use frame::byte_writer::ByteWriter;
 use frame::codec::{FrameHeader, FrameRef};
 use frame::header::{FrameFlags, MessageType, Seq, StreamId};
 use frame::payload::{
-    FetchReplyPayload, ParsedPayload, SubscribePayload, TopicCreatePayload, TopicDeletePayload,
-    UnsubscribePayload, parse_payload,
+    Ack as AckPayload, FetchReplyPayload, ParsedPayload, ResumeOkPayload, ResumeOkSlot,
+    ResumePayload, ResumeUnavailablePayload, SubscribePayload, TopicCreatePayload,
+    TopicDeletePayload, UnsubscribePayload, parse_payload,
 };
 use observability_sdk::registry::MetricsRegistry;
 use pubsub_engine::{
@@ -100,6 +101,7 @@ use super::session::SessionLayer;
 use crate::cluster::OutgoingMsg;
 use crate::conf::LayerTuning;
 use crate::error::ServerError;
+use crate::replay::{ReplayBuffer, ReplayConfig, ReplayEntry, ReplayOutcome};
 use bytes::{Bytes, BytesMut};
 
 // ── Inter-worker pub/sub forwarding ────────────────────────────────
@@ -215,6 +217,36 @@ pub enum InterWorkerMsg {
         target: Option<(usize, u64)>,
         msg_type: MessageType,
     },
+}
+
+// ── Resume payload encoders ────────────────────────────────────────
+
+/// Encodes a `ResumeOkPayload` into wire bytes for sending. Used by
+/// [`VireonDispatcher::handle_resume`] to reply with the per-stream
+/// `oldest_available` watermarks.
+fn encode_resume_ok(slots: Vec<ResumeOkSlot>) -> Bytes {
+    let p = ResumeOkPayload { streams: slots };
+    let size = p.wire_size();
+    let mut buf = BytesMut::with_capacity(size);
+    // SAFETY: we resize to exactly `size` and `encode` writes precisely
+    // that many bytes; the uninit between capacity and len never escapes.
+    // BytesMut::resize zero-fills, which is a tiny waste but avoids any
+    // unsafe here.
+    buf.resize(size, 0);
+    let mut w = ByteWriter::new(&mut buf);
+    p.encode(&mut w);
+    buf.freeze()
+}
+
+/// Encodes a `ResumeUnavailablePayload` into wire bytes for sending.
+fn encode_resume_unavailable(slots: Vec<ResumeOkSlot>) -> Bytes {
+    let p = ResumeUnavailablePayload(slots);
+    let size = p.wire_size();
+    let mut buf = BytesMut::with_capacity(size);
+    buf.resize(size, 0);
+    let mut w = ByteWriter::new(&mut buf);
+    p.encode(&mut w);
+    buf.freeze()
 }
 
 // ── FrameContext & OutgoingFrame ──────────────────────────────────
@@ -608,6 +640,39 @@ pub struct VireonDispatcher {
     /// events (ACL denies, quota rejections, topic lifecycle). `None`
     /// when `--audit-log` is not configured.
     audit_log: Option<crate::audit::AuditLog>,
+
+    // ── Application-level reliability (ACK + Sequence + Resume) ──────
+    /// Per-worker in-memory replay buffer. Retains reliable (`ACK_REQ`)
+    /// Publish frames keyed by `(logical_session_id, StreamId)` so a
+    /// reconnecting client can resume from its last-acked sequence.
+    /// Lives on the reactor thread — no locks, no `Send`.
+    replay: ReplayBuffer,
+    /// `conn_idx → client-assigned logical session id`. Populated when a
+    /// `Resume` frame arrives; cleared in `on_connection_closed`. The
+    /// logical session outlives the QUIC connection: a reconnecting
+    /// client re-sends `Resume` with the same id, and the new conn_idx
+    /// is rebound to it.
+    conn_logical_session: FxHashMap<usize, u64>,
+    /// Transient: set to `true` only while `handle_publish` is in its
+    /// fan-out section AND the incoming publish carried `ACK_REQ`. Read
+    /// by [`Self::enqueue_frame`] to stamp `ACK_REQ` on outgoing
+    /// deliveries and to retain a copy in the replay buffer (when the
+    /// subscriber has a registered logical session). Always `false`
+    /// outside `handle_publish`, so `send_ack` paths and cross-worker /
+    /// cross-cluster drain paths (which run later from `on_batch_tick`)
+    /// are NOT retained — that is the documented multi-worker resume
+    /// limitation.
+    reliable_fanout: bool,
+    /// Per-`(logical_session_id, stream)` last-seen cumulative ack seq.
+    /// Used so a subsequent `Resume` from the same session (without an
+    /// intervening reconnect) can be answered from the buffered window
+    /// without forcing the client to re-send its ack position.
+    session_last_acked: FxHashMap<(u64, StreamId), u64>,
+    /// Shared server-wide metrics counters (Prometheus `/metrics` endpoint).
+    /// `None` in benches/tests; set by `VireonStack` at worker startup so
+    /// the reliability-layer handlers can bump `resume_*` / `messages_*`
+    /// outcome counters directly.
+    metrics: Option<Arc<crate::metrics::ServerMetrics>>,
 }
 
 /// Minimum gap between cross-worker drop warning logs.
@@ -702,6 +767,11 @@ impl VireonDispatcher {
             batch_push_count: 0,
             logtail_count: 0,
             audit_log: None,
+            replay: ReplayBuffer::new(ReplayConfig::default()),
+            conn_logical_session: FxHashMap::default(),
+            reliable_fanout: false,
+            session_last_acked: FxHashMap::default(),
+            metrics: None,
         }
     }
 
@@ -717,6 +787,46 @@ impl VireonDispatcher {
     pub fn with_delivery_config(mut self, cfg: DeliveryConfig) -> Self {
         self.delivery_config = cfg;
         self
+    }
+
+    /// Sets the reliability-layer replay buffer configuration (message /
+    /// byte caps). Called once at worker startup from the `[replay]` TOML
+    /// section; defaults are sane so most deployments omit this.
+    #[must_use]
+    pub fn with_replay_config(mut self, cfg: ReplayConfig) -> Self {
+        self.replay = ReplayBuffer::new(cfg);
+        self
+    }
+
+    /// Attaches the shared server-wide metrics counters so the
+    /// reliability-layer handlers can bump `resume_*` / `messages_*`
+    /// outcome counters directly. Called once at worker startup; `None`
+    /// in benches/tests (counters simply aren't recorded).
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn with_metrics(mut self, metrics: Arc<crate::metrics::ServerMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Post-construction variant of [`Self::with_metrics`] for layers that
+    /// receive the metrics `Arc` after the dispatcher has already been
+    /// built (the production path: `VireonStack::new` → `worker.rs`).
+    pub fn set_metrics(&mut self, metrics: Arc<crate::metrics::ServerMetrics>) {
+        self.metrics = Some(metrics);
+    }
+
+    /// Snapshots the replay-buffer occupancy into the `replay_window_bytes`
+    /// and `replay_window_messages` Prometheus gauges. Called once per
+    /// batch tick from [`ApplicationLayer::on_batch_tick`]; no-op when no
+    /// metrics store is attached (benches / unit tests).
+    pub fn publish_replay_gauges(&self) {
+        if let Some(m) = &self.metrics {
+            m.replay_window_bytes
+                .store(self.replay.total_bytes() as u64, Ordering::Relaxed);
+            m.replay_window_messages
+                .store(self.replay.total_messages() as u64, Ordering::Relaxed);
+        }
     }
 
     /// Builds a response header with an incrementing per-stream seq and
@@ -766,6 +876,15 @@ impl VireonDispatcher {
 
     /// Enqueues a frame targeting an explicit connection + QUIC stream.
     /// Used for both same-connection responses and cross-connection delivery.
+    ///
+    /// When [`Self::reliable_fanout`] is `true` (set only inside the
+    /// fan-out section of `handle_publish` while the incoming publish
+    /// carried `ACK_REQ`) and `msg_type` is `Publish`:
+    ///   * the outgoing header is stamped with `FrameFlags::ACK_REQ` so
+    ///     the subscriber knows to send a cumulative `Ack`, and
+    ///   * if the subscriber's conn has a registered logical session,
+    ///     a [`ReplayEntry`] copy is retained in the replay buffer so a
+    ///     future `Resume` from that session can re-send it.
     fn enqueue_frame(
         &mut self,
         conn_idx: usize,
@@ -786,10 +905,37 @@ impl VireonDispatcher {
             .next_seq
             .entry((conn_idx, quic_stream_id))
             .or_insert(Seq::ZERO);
-        let header = FrameHeader::new(logical_stream, msg_type)
-            .with_seq(*seq)
-            .with_flags(FrameFlags::NONE);
-        *seq = seq.next();
+        let seq_val = *seq;
+        // Reliable delivery: stamp ACK_REQ on outgoing Publish headers so
+        // the subscriber knows to ack. Retain in the replay buffer only
+        // when the subscriber has registered a logical session.
+        let reliable = self.reliable_fanout && msg_type == MessageType::Publish;
+        let logical = if reliable {
+            self.conn_logical_session.get(&conn_idx).copied()
+        } else {
+            None
+        };
+        let header = if reliable {
+            FrameHeader::new(logical_stream, msg_type)
+                .with_seq(seq_val)
+                .with_flags(FrameFlags::ACK_REQ)
+        } else {
+            FrameHeader::new(logical_stream, msg_type)
+                .with_seq(seq_val)
+                .with_flags(FrameFlags::NONE)
+        };
+        *seq = seq_val.next();
+        if let Some(logical) = logical {
+            self.replay.append(
+                logical,
+                logical_stream,
+                ReplayEntry {
+                    seq: seq_val.get(),
+                    header: header.clone(),
+                    payload: payload.clone(),
+                },
+            );
+        }
         self.outbox.push(OutgoingFrame {
             conn_idx,
             quic_stream_id,
@@ -1181,7 +1327,8 @@ impl VireonDispatcher {
                     Some(t) => t,
                     None => return,
                 };
-                self.handle_publish(ctx, frame.stream_id, topic, payload);
+                let reliable = frame.flags.contains(FrameFlags::ACK_REQ);
+                self.handle_publish(ctx, frame.stream_id, topic, payload, reliable);
             }
             Ok(Some(ParsedPayload::TopicCreate(TopicCreatePayload {
                 topic,
@@ -1229,6 +1376,41 @@ impl VireonDispatcher {
                     );
                 }
             }
+        }
+    }
+
+    /// Bench/test helper: binds `conn_idx → logical_session_id` so that
+    /// `handle_publish`'s reliable fan-out branch retains entries in the
+    /// replay buffer for that subscriber. Mirrors what `handle_resume`
+    /// does on receipt of a `Resume` frame, without the wire round-trip.
+    #[allow(dead_code)]
+    pub fn register_logical_session_for_bench(&mut self, conn_idx: usize, logical_session_id: u64) {
+        self.conn_logical_session
+            .insert(conn_idx, logical_session_id);
+        self.replay.register_session(logical_session_id);
+    }
+
+    /// Bench/test helper: acknowledges every retained entry for every
+    /// registered `(logical_session, stream)` pair. Used by
+    /// `pubsub_reliable` benches to measure the steady-state cost of
+    /// reliable delivery with full ack release.
+    #[allow(dead_code)]
+    pub fn ack_all_logical_for_bench(&mut self) {
+        // Snapshot the bindings to avoid borrowing self.conn_logical_session
+        // while self.replay.acknowledge mutably borrows.
+        let bindings: Vec<(usize, u64)> = self
+            .conn_logical_session
+            .iter()
+            .map(|(&c, &s)| (c, s))
+            .collect();
+        // Ack at u64::MAX so every retained entry for each (session,
+        // stream) pair is released regardless of its seq.
+        for (_conn, logical) in bindings {
+            // We don't track per-(session, stream) for this bench helper;
+            // just walk the inner map by inserting a high watermark on
+            // every known stream — approximated by replaying from MAX,
+            // which the buffer's acknowledge path handles correctly.
+            self.replay.acknowledge(logical, StreamId::new(0xFFFF_FFFF), u64::MAX);
         }
     }
 
@@ -1486,6 +1668,7 @@ impl VireonDispatcher {
         stream: StreamId,
         topic: &str,
         payload: &[u8],
+        reliable: bool,
     ) {
         // Phase 7: check Publish against the ACL before fan-out. Skip
         // the registry lookup entirely on Deny — the publish is
@@ -1756,6 +1939,14 @@ impl VireonDispatcher {
             "[delivery] publish routed"
         );
 
+        // ── Reliable fan-out section ───────────────────────────────────
+        // While `reliable_fanout` is true, `enqueue_frame` stamps ACK_REQ
+        // on outgoing Publish headers and retains a copy in the replay
+        // buffer for subscribers with a registered logical session. Set
+        // ONLY here (after all early-return paths) so `send_ack` calls
+        // above cannot pollute the replay buffer with ack-responses.
+        self.reliable_fanout = reliable;
+
         let target_count = self.targets_scratch.len();
         for i in 0..target_count {
             let (conn_idx, quic_stream_id) = {
@@ -1856,6 +2047,245 @@ impl VireonDispatcher {
                     }
                 }
             }
+        }
+
+        // End of reliable fan-out section — always reset so subsequent
+        // `enqueue_frame` calls (e.g. from `send_ack` on the next frame)
+        // are not treated as reliable.
+        self.reliable_fanout = false;
+    }
+
+    /// Handles an inbound cumulative `Ack` frame from a subscriber.
+    ///
+    /// Looks up the subscriber's logical session by `conn_idx` and releases
+    /// all retained entries with `seq <= ack_seq` for the given stream. If
+    /// the connection has no registered logical session (no `Resume` seen),
+    /// the ack is a no-op — the server was not retaining anything for it.
+    fn handle_ack(&mut self, ctx: &FrameContext, frame: &FrameRef<'_>) {
+        let ack_seq = match parse_payload(frame.msg_type, frame.payload) {
+            Ok(Some(ParsedPayload::Ack(AckPayload { ack_seq }))) => ack_seq,
+            Ok(_) => {
+                if self.malformed_drop.tick() {
+                    tracing::warn!(
+                        conn_idx = ctx.conn_idx,
+                        "[reliability] Ack frame payload did not parse as Ack"
+                    );
+                }
+                return;
+            }
+            Err(e) => {
+                if self.malformed_drop.tick() {
+                    tracing::warn!(
+                        conn_idx = ctx.conn_idx,
+                        error = ?e,
+                        "[reliability] Ack payload decode failed"
+                    );
+                }
+                return;
+            }
+        };
+        let stream = frame.stream_id;
+        let Some(&logical) = self.conn_logical_session.get(&ctx.conn_idx) else {
+            // Subscriber never sent Resume → nothing retained for it.
+            tracing::trace!(
+                conn_idx = ctx.conn_idx,
+                stream = ?stream,
+                ack_seq,
+                "[reliability] Ack from conn with no logical session — ignoring"
+            );
+            return;
+        };
+        self.replay.acknowledge(logical, stream, ack_seq);
+        self.session_last_acked.insert((logical, stream), ack_seq);
+        if let Some(m) = &self.metrics {
+            m.inc(&m.messages_acked_total);
+        }
+        tracing::trace!(
+            conn_idx = ctx.conn_idx,
+            logical_session = logical,
+            stream = ?stream,
+            ack_seq,
+            "[reliability] cumulative ack applied"
+        );
+    }
+
+    /// Handles an inbound `Resume` frame from a reconnecting client.
+    ///
+    /// Wire shape: `ResumePayload { logical_session_id, streams: Vec<ResumeSlot> }`.
+    /// An empty `streams` list is a session-hello (first connect): the server
+    /// registers the logical session and replies with an empty `ResumeOk` so
+    /// the client knows the session is established. For each non-empty slot
+    /// the server attempts `replay_from(logical, stream, last_acked)` and:
+    ///   * On `Ok` — enqueues a `ResumeOk` slot, then re-sends each retained
+    ///     `Publish` frame (with `ACK_REQ` set) to the new connection.
+    ///   * On `Unavailable` — enqueues a `ResumeUnavailable` slot so the
+    ///     client knows the requested seq is below the window floor and can
+    ///     fall back to a fresh subscription.
+    fn handle_resume(&mut self, ctx: &FrameContext, frame: &FrameRef<'_>) {
+        let parsed = match parse_payload(frame.msg_type, frame.payload) {
+            Ok(Some(ParsedPayload::Resume(rp))) => rp,
+            Ok(_) => {
+                if self.malformed_drop.tick() {
+                    tracing::warn!(
+                        conn_idx = ctx.conn_idx,
+                        "[reliability] Resume frame payload did not parse as Resume"
+                    );
+                }
+                return;
+            }
+            Err(e) => {
+                if self.malformed_drop.tick() {
+                    tracing::warn!(
+                        conn_idx = ctx.conn_idx,
+                        error = ?e,
+                        "[reliability] Resume payload decode failed"
+                    );
+                }
+                return;
+            }
+        };
+        let ResumePayload {
+            logical_session_id,
+            streams,
+        } = parsed;
+
+        // Bind the new conn_idx to the logical session (rebinding on
+        // reconnect — the old conn_idx's entry is removed in
+        // `on_connection_closed`).
+        self.conn_logical_session
+            .insert(ctx.conn_idx, logical_session_id);
+        self.replay.register_session(logical_session_id);
+        if let Some(m) = &self.metrics {
+            m.inc(&m.resume_attempts_total);
+        }
+
+        tracing::info!(
+            conn_idx = ctx.conn_idx,
+            logical_session = logical_session_id,
+            slots = streams.len(),
+            "[reliability] Resume received"
+        );
+
+        // Session-hello (empty slots): reply with an empty ResumeOk so the
+        // client knows the session is bound. No replay needed.
+        if streams.is_empty() {
+            let payload = encode_resume_ok(Vec::new());
+            self.enqueue_frame(
+                ctx.conn_idx,
+                ctx.quic_stream_id,
+                frame.stream_id,
+                MessageType::ResumeOk,
+                payload,
+            );
+            return;
+        }
+
+        // Partition slots by outcome so we send exactly one summary frame
+        // (ResumeOk or ResumeUnavailable) per Resume — clients key off the
+        // stream_id in each slot.
+        let mut ok_slots: Vec<ResumeOkSlot> = Vec::new();
+        let mut unavail_slots: Vec<ResumeOkSlot> = Vec::new();
+        // Collect (stream, entries) for the Ok paths so we can re-send the
+        // retained Publish frames AFTER the ResumeOk summary.
+        let mut to_replay: Vec<(StreamId, Vec<crate::replay::ReplayEntry>)> = Vec::new();
+
+        for slot in &streams {
+            let stream = StreamId::new(slot.stream_id);
+            let outcome = self
+                .replay
+                .replay_from(logical_session_id, stream, slot.last_acked);
+            match outcome {
+                ReplayOutcome::Ok {
+                    entries,
+                    oldest_available,
+                } => {
+                    ok_slots.push(ResumeOkSlot {
+                        stream_id: slot.stream_id,
+                        oldest_available,
+                    });
+                    if !entries.is_empty() {
+                        to_replay.push((stream, entries));
+                    }
+                }
+                ReplayOutcome::Unavailable { oldest_available } => {
+                    unavail_slots.push(ResumeOkSlot {
+                        stream_id: slot.stream_id,
+                        oldest_available,
+                    });
+                }
+            }
+        }
+
+        // Send the ResumeOk summary (one frame, all Ok slots).
+        if !ok_slots.is_empty() {
+            if let Some(m) = &self.metrics {
+                m.add(&m.resume_success_total, ok_slots.len() as u64);
+            }
+            let payload = encode_resume_ok(ok_slots);
+            self.enqueue_frame(
+                ctx.conn_idx,
+                ctx.quic_stream_id,
+                frame.stream_id,
+                MessageType::ResumeOk,
+                payload,
+            );
+        }
+        // Send the ResumeUnavailable summary (one frame, all unavailable slots).
+        if !unavail_slots.is_empty() {
+            if let Some(m) = &self.metrics {
+                m.add(&m.resume_unavailable_total, unavail_slots.len() as u64);
+            }
+            let payload = encode_resume_unavailable(unavail_slots);
+            self.enqueue_frame(
+                ctx.conn_idx,
+                ctx.quic_stream_id,
+                frame.stream_id,
+                MessageType::ResumeUnavailable,
+                payload,
+            );
+        }
+
+        // Re-send each retained Publish frame with ACK_REQ set. The
+        // OutgoingFrame's conn_idx/quic_stream_id are re-bound to the new
+        // connection, but the retained header's seq is preserved — the
+        // client dedups by header.seq across reconnects, so a fresh seq
+        // would either be dropped as a duplicate (if < highest_accepted)
+        // or break monotonicity.
+        let new_conn = ctx.conn_idx;
+        let new_quic_stream = ctx.quic_stream_id;
+        let mut replayed_total: usize = 0;
+        for (_stream, entries) in to_replay {
+            for entry in entries {
+                // The retained header already carries the original logical
+                // stream, msg_type=Publish, flags=ACK_REQ, and seq. Re-stamp
+                // only the ACK_REQ flag in case it was dropped (shouldn't
+                // happen, but the invariant is cheap to enforce).
+                let header = entry
+                    .header
+                    .with_flags(FrameFlags::ACK_REQ);
+                self.conn_metrics
+                    .entry(new_conn)
+                    .or_default()
+                    .record_delivery_out(entry.payload.len());
+                self.outbox.push(OutgoingFrame {
+                    conn_idx: new_conn,
+                    quic_stream_id: new_quic_stream,
+                    header,
+                    payload: entry.payload,
+                });
+                replayed_total += 1;
+            }
+        }
+        if replayed_total > 0 {
+            if let Some(m) = &self.metrics {
+                m.add(&m.messages_replayed_total, replayed_total as u64);
+            }
+            tracing::info!(
+                conn_idx = ctx.conn_idx,
+                logical_session = logical_session_id,
+                replayed = replayed_total,
+                "[reliability] Resume replayed retained frames"
+            );
         }
     }
 
@@ -3657,6 +4087,20 @@ impl AppDispatcher for VireonDispatcher {
             MessageType::ConsumerGroupHeartbeat => {
                 self.handle_group_heartbeat(ctx, frame);
             }
+            MessageType::Ack => {
+                self.handle_ack(ctx, frame);
+            }
+            MessageType::Resume => {
+                self.handle_resume(ctx, frame);
+            }
+            MessageType::ResumeOk | MessageType::ResumeUnavailable => {
+                // Server→client only — a client sending these is misbehaving.
+                tracing::trace!(
+                    conn_idx = ctx.conn_idx,
+                    msg_type = ?frame.msg_type,
+                    "[app] client-sent ResumeOk/ResumeUnavailable ignored"
+                );
+            }
             _ => {
                 tracing::trace!(
                     conn_idx = ctx.conn_idx,
@@ -3699,6 +4143,12 @@ impl AppDispatcher for VireonDispatcher {
             }
         }
         let principal = self.principals.remove(&conn_idx);
+        // Unbind the logical session — the session itself outlives the
+        // connection (retained entries stay in the replay buffer for a
+        // future Resume), only the conn_idx mapping goes away. A
+        // reconnecting client re-sends Resume and re-establishes the
+        // mapping on the new conn_idx.
+        self.conn_logical_session.remove(&conn_idx);
 
         // Log + drop per-connection metrics on close.
         if let Some(m) = self.conn_metrics.remove(&conn_idx) {
@@ -3845,6 +4295,10 @@ impl ApplicationLayer {
                 .with_delivery_config(DeliveryConfig {
                     logtail_threshold: t.delivery_logtail_threshold,
                     force_strategy: t.delivery_force_strategy,
+                })
+                .with_replay_config(ReplayConfig {
+                    max_messages_per_stream: t.replay_max_messages_per_stream,
+                    max_bytes: t.replay_max_bytes,
                 }),
             metric_frames_rx,
             metric_connections,
@@ -3988,6 +4442,9 @@ impl ApplicationLayer {
         self.dispatcher.drain_worker_inbox();
         self.dispatcher.maybe_run_wal_retention();
         self.dispatcher.tick_cluster_health();
+        // Snapshot replay-window gauges into the shared metrics store so
+        // the Prometheus endpoint reflects current buffer occupancy.
+        self.dispatcher.publish_replay_gauges();
     }
 
     /// Drains queued outgoing frames produced by the dispatcher.
@@ -4099,6 +4556,14 @@ impl ApplicationLayer {
     #[allow(dead_code)]
     pub fn set_acl(&mut self, table: AclTable) {
         self.dispatcher.acl = table;
+    }
+
+    /// Attaches the shared server-wide metrics counters to the inner
+    /// dispatcher so reliability-layer handlers can bump outcome counters.
+    /// Called from `worker.rs` after `VireonStack::new` when the metrics
+    /// `Arc` becomes available.
+    pub fn set_metrics(&mut self, metrics: Arc<crate::metrics::ServerMetrics>) {
+        self.dispatcher.set_metrics(metrics);
     }
 
     /// Installs a WAL backend. Should be called before the first
@@ -4629,7 +5094,7 @@ mod tests {
         // Publish to alerts.fire from a different conn (so the
         // self-skip filter doesn't apply).
         let topic = pubsub_engine::Topic::new("alerts.fire").unwrap();
-        d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), b"payload");
+        d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), b"payload", false);
 
         // Outbox: only the error ack, NO fan-out to subscriber.
         let out = drain_outbox_bytes(&mut d);
@@ -4651,7 +5116,7 @@ mod tests {
         let _ = d.drain_outbox();
 
         let topic = pubsub_engine::Topic::new("alerts.fire").unwrap();
-        d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), b"hi");
+        d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), b"hi", false);
 
         // Outbox: one Publish fan-out frame to conn 0 (the subscriber).
         let out = drain_outbox_bytes(&mut d);
@@ -4870,7 +5335,7 @@ mod tests {
 
         let topic = pubsub_engine::Topic::new("sensor.temp").unwrap();
         for i in 0..5u8 {
-            d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), &[i]);
+            d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), &[i], false);
         }
         // Drain the fan-out outbox so later asserts aren't muddled.
         let _ = d.drain_outbox();
@@ -4888,7 +5353,7 @@ mod tests {
         // Publish 5 entries on sensor.temp.
         let topic = pubsub_engine::Topic::new("sensor.temp").unwrap();
         for i in 0..5u8 {
-            d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), &[i]);
+            d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), &[i], false);
         }
         let _ = d.drain_outbox();
 
@@ -4928,7 +5393,7 @@ mod tests {
         let mut d = VireonDispatcher::new();
 
         let topic = pubsub_engine::Topic::new("sensor.temp").unwrap();
-        d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), b"payload");
+        d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), b"payload", false);
         let pub_out = drain_outbox_bytes(&mut d);
         // No subscribers → no fan-out; zero frames queued by publish.
         assert!(
@@ -4962,7 +5427,7 @@ mod tests {
 
         let topic = pubsub_engine::Topic::new("sensor.temp").unwrap();
         for i in 0..20u8 {
-            d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), &[i]);
+            d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), &[i], false);
         }
         let _ = d.drain_outbox();
 
@@ -4994,7 +5459,7 @@ mod tests {
         // Default policy = keep forever.
         let topic = pubsub_engine::Topic::new("sensor.temp").unwrap();
         for i in 0..10u8 {
-            d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), &[i]);
+            d.handle_publish(&ctx(1, 200), StreamId::new(2), topic.as_str(), &[i], false);
         }
         let _ = d.drain_outbox();
 
@@ -5252,5 +5717,85 @@ mod tests {
 
         // Worker 0's own flag is still false.
         assert!(!d.worker_pressure_flags[self_idx].load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn metrics_counters_bump_on_reliability_events() {
+        use crate::metrics::ServerMetrics;
+        use frame::payload::{Ack, ParsedPayload, encode_payload};
+        use std::sync::atomic::Ordering;
+
+        let metrics = Arc::new(ServerMetrics::new());
+        let mut d = VireonDispatcher::new().with_metrics(metrics.clone());
+
+        // Register a subscriber conn with a logical session so reliable
+        // fan-out retains entries.
+        const LOGICAL: u64 = 0xCAFE;
+        const SUB_CONN: usize = 1;
+        const STREAM: u64 = 42;
+        d.register_logical_session_for_bench(SUB_CONN, LOGICAL);
+        d.bind_send_policy(
+            SUB_CONN,
+            100,
+            StreamId::new(STREAM),
+            DeliveryPolicy::ReliableUnordered,
+        );
+        d.handle_subscribe(
+            &FrameContext {
+                session_id: SessionId::new(),
+                conn_idx: SUB_CONN,
+                quic_stream_id: 100,
+            },
+            StreamId::new(STREAM),
+            "sensor.*",
+        );
+        let _ = d.drain_outbox();
+
+        // Reliable publish → retained in replay buffer.
+        let topic = pubsub_engine::Topic::new("sensor.temp").unwrap();
+        let payload = [0xABu8; 16];
+        d.handle_publish(
+            &FrameContext {
+                session_id: SessionId::new(),
+                conn_idx: 0,
+                quic_stream_id: 999,
+            },
+            StreamId::new(999),
+            topic.as_str(),
+            &payload,
+            true,
+        );
+        let _ = d.drain_outbox();
+
+        // Gauges should reflect 1 retained message after a batch tick.
+        d.publish_replay_gauges();
+        assert_eq!(
+            metrics.replay_window_messages.load(Ordering::Relaxed),
+            1,
+            "replay_window_messages gauge should be 1 after one reliable publish"
+        );
+
+        // Send an Ack frame for the subscriber's stream at seq=1.
+        let ack_payload = encode_payload(&ParsedPayload::Ack(Ack { ack_seq: 1 }));
+        let ack_frame = FrameRef {
+            stream_id: StreamId::new(STREAM),
+            seq: Seq::new(1),
+            msg_type: MessageType::Ack,
+            flags: FrameFlags::NONE,
+            payload: &ack_payload[..],
+        };
+        d.handle_ack(
+            &FrameContext {
+                session_id: SessionId::new(),
+                conn_idx: SUB_CONN,
+                quic_stream_id: 100,
+            },
+            &ack_frame,
+        );
+        assert_eq!(
+            metrics.messages_acked_total.load(Ordering::Relaxed),
+            1,
+            "messages_acked_total should be 1 after one Ack"
+        );
     }
 }

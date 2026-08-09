@@ -76,6 +76,26 @@ pub struct ServerMetrics {
     /// A non-zero value means clients changed their 4-tuple and the
     /// QUIC connection survived (DCID-based routing).
     pub migrations_total: AtomicU64,
+    /// Total application-level Ack frames received from subscribers
+    /// (reliability layer). Each Ack releases one or more retained
+    /// replay entries on the server.
+    pub messages_acked_total: AtomicU64,
+    /// Total Publish frames re-sent to reconnecting clients via the
+    /// Resume replay path (reliability layer).
+    pub messages_replayed_total: AtomicU64,
+    /// Total `Resume` frames received from reconnecting clients.
+    pub resume_attempts_total: AtomicU64,
+    /// Total `ResumeOk` replies sent (a subset of `resume_attempts_total`
+    /// — the rest are `ResumeUnavailable`).
+    pub resume_success_total: AtomicU64,
+    /// Total `ResumeUnavailable` replies sent (the requested seq was
+    /// below the retained window floor).
+    pub resume_unavailable_total: AtomicU64,
+    /// Current replay-window retained bytes (gauge: inc on append, dec
+    /// on ack/eviction). Summed across all logical sessions.
+    pub replay_window_bytes: AtomicU64,
+    /// Current replay-window retained messages (gauge).
+    pub replay_window_messages: AtomicU64,
     /// Per-topic breakdown. Read-locked on every publish/delivery for
     /// the lookup; write-locked only when a new topic is first seen.
     /// The `Arc<TopicMetrics>` inner lets workers bump atomics without
@@ -99,6 +119,13 @@ impl ServerMetrics {
             bytes_sent_total: AtomicU64::new(0),
             rate_limit_rejections_total: AtomicU64::new(0),
             migrations_total: AtomicU64::new(0),
+            messages_acked_total: AtomicU64::new(0),
+            messages_replayed_total: AtomicU64::new(0),
+            resume_attempts_total: AtomicU64::new(0),
+            resume_success_total: AtomicU64::new(0),
+            resume_unavailable_total: AtomicU64::new(0),
+            replay_window_bytes: AtomicU64::new(0),
+            replay_window_messages: AtomicU64::new(0),
             topic_counters: RwLock::new(HashMap::new()),
             started_at: Instant::now(),
         }
@@ -187,6 +214,13 @@ impl ServerMetrics {
         let sent = self.bytes_sent_total.load(Ordering::Relaxed);
         let rl_rej = self.rate_limit_rejections_total.load(Ordering::Relaxed);
         let migrations = self.migrations_total.load(Ordering::Relaxed);
+        let msgs_acked = self.messages_acked_total.load(Ordering::Relaxed);
+        let msgs_replayed = self.messages_replayed_total.load(Ordering::Relaxed);
+        let resume_attempts = self.resume_attempts_total.load(Ordering::Relaxed);
+        let resume_success = self.resume_success_total.load(Ordering::Relaxed);
+        let resume_unavail = self.resume_unavailable_total.load(Ordering::Relaxed);
+        let replay_bytes = self.replay_window_bytes.load(Ordering::Relaxed);
+        let replay_msgs = self.replay_window_messages.load(Ordering::Relaxed);
         let uptime = self.started_at.elapsed().as_secs();
 
         // Prometheus text format v0.0.4.
@@ -226,6 +260,34 @@ impl ServerMetrics {
         out.push_str("# HELP vireon_migrations_total Connection-migration / NAT-rebinding events (connection survived).\n");
         out.push_str("# TYPE vireon_migrations_total counter\n");
         out.push_str(&format!("vireon_migrations_total {migrations}\n\n"));
+
+        out.push_str("# HELP vireon_messages_acked_total Application-level Ack frames received from subscribers.\n");
+        out.push_str("# TYPE vireon_messages_acked_total counter\n");
+        out.push_str(&format!("vireon_messages_acked_total {msgs_acked}\n\n"));
+
+        out.push_str("# HELP vireon_messages_replayed_total Publish frames re-sent to reconnecting clients via the Resume replay path.\n");
+        out.push_str("# TYPE vireon_messages_replayed_total counter\n");
+        out.push_str(&format!("vireon_messages_replayed_total {msgs_replayed}\n\n"));
+
+        out.push_str("# HELP vireon_resume_attempts_total Resume frames received from reconnecting clients.\n");
+        out.push_str("# TYPE vireon_resume_attempts_total counter\n");
+        out.push_str(&format!("vireon_resume_attempts_total {resume_attempts}\n\n"));
+
+        out.push_str("# HELP vireon_resume_success_total ResumeOk replies sent (replay window covered the request).\n");
+        out.push_str("# TYPE vireon_resume_success_total counter\n");
+        out.push_str(&format!("vireon_resume_success_total {resume_success}\n\n"));
+
+        out.push_str("# HELP vireon_resume_unavailable_total ResumeUnavailable replies sent (requested seq below the retained window floor).\n");
+        out.push_str("# TYPE vireon_resume_unavailable_total counter\n");
+        out.push_str(&format!("vireon_resume_unavailable_total {resume_unavail}\n\n"));
+
+        out.push_str("# HELP vireon_replay_window_bytes Current replay-window retained bytes (gauge).\n");
+        out.push_str("# TYPE vireon_replay_window_bytes gauge\n");
+        out.push_str(&format!("vireon_replay_window_bytes {replay_bytes}\n\n"));
+
+        out.push_str("# HELP vireon_replay_window_messages Current replay-window retained messages (gauge).\n");
+        out.push_str("# TYPE vireon_replay_window_messages gauge\n");
+        out.push_str(&format!("vireon_replay_window_messages {replay_msgs}\n\n"));
 
         out.push_str("# HELP vireon_uptime_seconds Seconds since server start.\n");
         out.push_str("# TYPE vireon_uptime_seconds gauge\n");

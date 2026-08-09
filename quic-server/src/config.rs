@@ -728,6 +728,19 @@ fn resolve_tuning(conf: &ServerConf) -> LayerTuning {
         }
     }
 
+    // ── Replay / reliability ──
+    if let Some(r) = &conf.replay {
+        if let Some(v) = r.max_messages_per_stream {
+            t.replay_max_messages_per_stream = v;
+        }
+        if let Some(v) = r.max_bytes {
+            t.replay_max_bytes = v.0 as usize;
+        }
+        if let Some(v) = r.idle_session_ttl_secs {
+            t.replay_idle_session_ttl_secs = v;
+        }
+    }
+
     t
 }
 
