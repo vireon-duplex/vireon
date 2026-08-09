@@ -17,6 +17,7 @@ mod eviction;
 mod layers;
 mod log_throttle;
 mod metrics;
+mod priority;
 mod replay;
 mod server;
 mod socket_registry;

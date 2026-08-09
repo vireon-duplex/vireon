@@ -635,6 +635,7 @@ mod tests {
         let mut buf = ReplayBuffer::new(ReplayConfig {
             max_messages_per_stream: 3,
             max_bytes: usize::MAX,
+            idle_session_ttl_secs: 300,
         });
         buf.register_session(1);
         for s in 0..10 {
@@ -708,6 +709,7 @@ mod tests {
         let mut buf = ReplayBuffer::new(ReplayConfig {
             max_messages_per_stream: 1000,
             max_bytes: 100, // tiny → forces eviction
+            idle_session_ttl_secs: 300,
         });
         buf.register_session(1);
         // Each entry is ~22 + 7 + 4 = 33 bytes. With a 100-byte cap, ~3 fit.
