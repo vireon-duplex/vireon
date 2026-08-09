@@ -89,6 +89,9 @@ struct PendingSend {
     /// Consecutive `FlowBlocked` results since last progress.
     /// Reset to 0 whenever `send_stream` accepts ≥1 byte.
     blocked_attempts: u8,
+    /// Egress priority lane — controls drain order in
+    /// `drain_pending_sends` (Control → Realtime → Throughput).
+    priority: crate::priority::Priority,
 }
 
 /// The full multi-layer stack — owns the application chain, the
@@ -180,6 +183,13 @@ pub struct VireonStack {
     pending_sends: FxHashMap<(usize, u64), PendingSend>,
     /// Total bytes currently held in `pending_sends` (for cap enforcement).
     pending_bytes: usize,
+    /// Per-connection byte totals in `pending_sends`. Lets a single
+    /// slow subscriber be bounded independently of the global budget so
+    /// one stuck connection cannot starve the others (cross-connection
+    /// fairness). Removed when a conn's total returns to 0.
+    pending_per_conn: FxHashMap<usize, usize>,
+    /// Configured per-connection byte cap. `usize::MAX` disables.
+    pending_per_conn_cap: usize,
     /// Frames dropped after exhausting `PENDING_MAX_ATTEMPTS` or hitting
     /// a cap. Surfaced in the periodic `[distribution]` log.
     pending_drops: u64,
@@ -397,6 +407,8 @@ impl VireonStack {
             skip_crc,
             pending_sends: FxHashMap::with_capacity_and_hasher(64, Default::default()),
             pending_bytes: 0,
+            pending_per_conn: FxHashMap::with_capacity_and_hasher(64, Default::default()),
+            pending_per_conn_cap: tuning.pending_per_conn_cap,
             pending_drops: 0,
             pending_gap_bytes: 0,
             publish_bp_high_watermark: tuning.publish_backpressure_high_watermark_bytes,
@@ -507,11 +519,15 @@ impl VireonStack {
                 Some(out) => self.flush_direct.push(out),
             }
         }
+        // Sort by priority (Control=0 < Realtime=1 < Throughput=2) so
+        // latency-sensitive frames are encoded+sent first. Stable sort
+        // preserves FIFO order within the same priority lane.
+        self.flush_direct.sort_by_key(|f| f.priority);
         // mem::take moves the Vec out so encode_and_send can borrow self.
         // Capacity is preserved across ticks — no per-tick allocation.
         let direct = std::mem::take(&mut self.flush_direct);
         for out in &direct {
-            self.encode_and_send(out.conn_idx, out.quic_stream_id, out.header, &out.payload);
+            self.encode_and_send(out.conn_idx, out.quic_stream_id, out.priority, out.header, &out.payload);
             if let Some(m) = &self.metrics {
                 m.inc(&m.deliveries_total);
                 if out.header.msg_type == MessageType::Publish {
@@ -525,9 +541,10 @@ impl VireonStack {
 
         self.flush_policy.clear();
         self.application.drain_ready_egress(&mut self.flush_policy);
+        self.flush_policy.sort_by_key(|f| f.priority);
         let policy = std::mem::take(&mut self.flush_policy);
         for out in &policy {
-            self.encode_and_send(out.conn_idx, out.quic_stream_id, out.header, &out.payload);
+            self.encode_and_send(out.conn_idx, out.quic_stream_id, out.priority, out.header, &out.payload);
             if let Some(m) = &self.metrics {
                 m.inc(&m.deliveries_total);
                 if out.header.msg_type == MessageType::Publish {
@@ -687,7 +704,11 @@ impl VireonStack {
         // the raw frame back immediately. This isolates transport-layer
         // performance from application-layer overhead.
         if self.echo {
-            self.encode_and_send(conn_idx, quic_stream_id, header, &payload[..]);
+            let priority = crate::priority::Priority::derive(
+                header.msg_type,
+                None,
+            );
+            self.encode_and_send(conn_idx, quic_stream_id, priority, header, &payload[..]);
             return;
         }
 
@@ -769,6 +790,7 @@ impl VireonStack {
         &mut self,
         conn_idx: usize,
         quic_stream_id: u64,
+        priority: crate::priority::Priority,
         header: codec::FrameHeader,
         payload: &[u8],
     ) {
@@ -808,7 +830,8 @@ impl VireonStack {
         if let Some(p) = self.pending_sends.get_mut(&key) {
             let prev_len = p.data.len();
             p.data.extend_from_slice(&self.send_scratch[..n]);
-            self.pending_bytes += p.data.len() - prev_len;
+            let delta = p.data.len() - prev_len;
+            self.add_pending(conn_idx, delta);
             self.enforce_pending_caps_on_insert(conn_idx, quic_stream_id);
             return;
         }
@@ -829,7 +852,7 @@ impl VireonStack {
                     // next frame for this stream appends to it instead
                     // of landing at the wrong offset.
                     let tail = BytesMut::from_iter(&self.send_scratch[written..n]);
-                    self.insert_pending(conn_idx, quic_stream_id, tail);
+                    self.insert_pending(conn_idx, quic_stream_id, priority, tail);
                 }
             }
             Err(QuicSendError::FlowBlocked) => {
@@ -838,7 +861,7 @@ impl VireonStack {
                 // retry on a subsequent tick so the peer eventually
                 // receives the data and recharges flow-control credit.
                 let data = BytesMut::from_iter(&self.send_scratch[..n]);
-                self.insert_pending(conn_idx, quic_stream_id, data);
+                self.insert_pending(conn_idx, quic_stream_id, priority, data);
             }
             Err(e) => {
                 tracing::debug!(
@@ -878,19 +901,42 @@ impl VireonStack {
 
     // ── Per-stream pending-send buffer ───────────────────────────
 
+    /// Adds `n` bytes to both the global and per-connection pending
+    /// counters. Centralized so every mutation site stays in sync —
+    /// a missed update would desync the fairness budget.
+    #[inline]
+    fn add_pending(&mut self, conn_idx: usize, n: usize) {
+        self.pending_bytes += n;
+        *self.pending_per_conn.entry(conn_idx).or_insert(0) += n;
+    }
+
+    /// Subtracts `n` bytes from both counters. Removes the per-conn
+    /// entry when it returns to zero so the map doesn't leak stale
+    /// zero-byte entries from disconnected connections.
+    #[inline]
+    fn sub_pending(&mut self, conn_idx: usize, n: usize) {
+        self.pending_bytes -= n;
+        let e = self.pending_per_conn.entry(conn_idx).or_insert(0);
+        *e -= n;
+        if *e == 0 {
+            self.pending_per_conn.remove(&conn_idx);
+        }
+    }
+
     /// Inserts a new `PendingSend` for `(conn_idx, stream_id)`,
     /// respecting the byte cap. The stream cap (`PENDING_MAX_STREAMS`)
     /// is bounded by the number of active connections × streams and is
     /// not expected to hit in practice; the byte cap is the primary
     /// defense against OOM under chronic subscriber starvation.
-    fn insert_pending(&mut self, conn_idx: usize, quic_stream_id: u64, data: BytesMut) {
+    fn insert_pending(&mut self, conn_idx: usize, quic_stream_id: u64, priority: crate::priority::Priority, data: BytesMut) {
         self.enforce_pending_caps(conn_idx, quic_stream_id, data.len());
-        self.pending_bytes += data.len();
+        self.add_pending(conn_idx, data.len());
         self.pending_sends.insert(
             (conn_idx, quic_stream_id),
             PendingSend {
                 data,
                 blocked_attempts: 0,
+                priority,
             },
         );
     }
@@ -901,6 +947,40 @@ impl VireonStack {
     /// mid-append.
     fn enforce_pending_caps_on_insert(&mut self, conn_idx: usize, quic_stream_id: u64) {
         let key = (conn_idx, quic_stream_id);
+        // Per-connection fairness: when THIS conn's pending total exceeds
+        // its individual cap, head-chop the oldest entry for the SAME
+        // conn (skipping the entry currently being appended to — evicting
+        // it mid-append would corrupt the byte stream). This scopes the
+        // damage to the offending conn instead of evicting a random
+        // victim from an unrelated conn.
+        while self.pending_per_conn.get(&conn_idx).copied().unwrap_or(0)
+            > self.pending_per_conn_cap
+        {
+            let Some((victim_key, victim_len)) = self
+                .pending_sends
+                .iter()
+                .find(|(k, _)| k.0 == conn_idx && **k != key)
+                .map(|(k, v)| (*k, v.data.len()))
+            else {
+                break; // only this stream has pending — can't self-evict
+            };
+            self.pending_sends.remove(&victim_key);
+            self.sub_pending(victim_key.0, victim_len);
+            self.pending_drops += 1;
+            if self.pending_evict_throttle.tick() {
+                tracing::warn!(
+                    conn_idx = victim_key.0,
+                    quic_stream_id = victim_key.1,
+                    evicted_bytes = victim_len,
+                    queue_len = self.pending_sends.len(),
+                    queue_bytes = self.pending_bytes,
+                    total = self.pending_evict_throttle.count(),
+                    "[pending] evicted entry to satisfy per-conn cap — subscriber stream may corrupt \
+                     (logging every 128th)"
+                );
+            }
+        }
+        // Global caps (byte total + stream count) — same behavior as before.
         while self.pending_bytes > PENDING_BYTE_CAP
             || self.pending_sends.len() > PENDING_MAX_STREAMS
         {
@@ -917,7 +997,7 @@ impl VireonStack {
                 break; // no other entry to evict
             };
             self.pending_sends.remove(&victim_key);
-            self.pending_bytes -= victim_len;
+            self.sub_pending(victim_key.0, victim_len);
             self.pending_drops += 1;
             if self.pending_evict_throttle.tick() {
                 tracing::warn!(
@@ -927,7 +1007,7 @@ impl VireonStack {
                     queue_len = self.pending_sends.len(),
                     queue_bytes = self.pending_bytes,
                     total = self.pending_evict_throttle.count(),
-                    "[pending] evicted entry to satisfy caps — subscriber stream may corrupt \
+                    "[pending] evicted entry to satisfy global caps — subscriber stream may corrupt \
                      (logging every 128th)"
                 );
             }
@@ -938,6 +1018,35 @@ impl VireonStack {
     /// would fit under both caps. Called by `insert_pending`.
     fn enforce_pending_caps(&mut self, conn_idx: usize, quic_stream_id: u64, incoming_len: usize) {
         let key = (conn_idx, quic_stream_id);
+        // Per-connection fairness (see enforce_pending_caps_on_insert).
+        while self.pending_per_conn.get(&conn_idx).copied().unwrap_or(0) + incoming_len
+            > self.pending_per_conn_cap
+        {
+            let Some((victim_key, victim_len)) = self
+                .pending_sends
+                .iter()
+                .find(|(k, _)| k.0 == conn_idx && **k != key)
+                .map(|(k, v)| (*k, v.data.len()))
+            else {
+                break;
+            };
+            self.pending_sends.remove(&victim_key);
+            self.sub_pending(victim_key.0, victim_len);
+            self.pending_drops += 1;
+            if self.pending_evict_throttle.tick() {
+                tracing::warn!(
+                    conn_idx = victim_key.0,
+                    quic_stream_id = victim_key.1,
+                    evicted_bytes = victim_len,
+                    queue_len = self.pending_sends.len(),
+                    queue_bytes = self.pending_bytes,
+                    total = self.pending_evict_throttle.count(),
+                    "[pending] evicted entry to satisfy per-conn cap — subscriber stream may corrupt \
+                     (logging every 128th)"
+                );
+            }
+        }
+        // Global caps.
         while self.pending_bytes + incoming_len > PENDING_BYTE_CAP
             || self.pending_sends.len() + 1 > PENDING_MAX_STREAMS
         {
@@ -952,7 +1061,7 @@ impl VireonStack {
                 break;
             };
             self.pending_sends.remove(&victim_key);
-            self.pending_bytes -= victim_len;
+            self.sub_pending(victim_key.0, victim_len);
             self.pending_drops += 1;
             if self.pending_evict_throttle.tick() {
                 tracing::warn!(
@@ -962,7 +1071,7 @@ impl VireonStack {
                     queue_len = self.pending_sends.len(),
                     queue_bytes = self.pending_bytes,
                     total = self.pending_evict_throttle.count(),
-                    "[pending] evicted entry to satisfy caps — subscriber stream may corrupt \
+                    "[pending] evicted entry to satisfy global caps — subscriber stream may corrupt \
                      (logging every 128th)"
                 );
             }
@@ -983,15 +1092,27 @@ impl VireonStack {
             return;
         }
         // Snapshot keys to release the borrow on `pending_sends` before
-        // we call `engine.send_stream` (which takes &mut self).
+        // we call `engine.send_stream` (which takes &mut self). Take
+        // ownership of the scratch Vec so method calls on `self` (which
+        // borrow all of `self`) don't conflict with the iteration borrow.
         self.pending_keys_scratch.clear();
         self.pending_keys_scratch
             .extend(self.pending_sends.keys().copied());
+        // Sort by priority so Control/Realtime entries are retried before
+        // Throughput entries. This ensures latency-sensitive frames get
+        // the first shot at QUIC flow-control credit each tick.
+        self.pending_keys_scratch.sort_by_key(|key| {
+            self.pending_sends
+                .get(key)
+                .map(|p| p.priority)
+                .unwrap_or(crate::priority::Priority::Throughput)
+        });
+        let pending_keys = std::mem::take(&mut self.pending_keys_scratch);
         let mut succeeded = 0u32;
         let mut still_blocked = 0u32;
         let mut dropped = 0u32;
 
-        for &key in &self.pending_keys_scratch {
+        for &key in &pending_keys {
             let Some(p) = self.pending_sends.get_mut(&key) else {
                 continue;
             };
@@ -1004,11 +1125,11 @@ impl VireonStack {
                     if let Some(m) = &self.metrics {
                         m.add(&m.bytes_sent_total, written as u64);
                     }
-                    self.pending_bytes -= prev_len;
+                    self.sub_pending(key.0, prev_len);
                     if written < buf.len() {
                         // Partial write — buffer the tail, reset attempts.
                         let tail = buf.split_off(written);
-                        self.pending_bytes += tail.len();
+                        self.add_pending(key.0, tail.len());
                         if let Some(p) = self.pending_sends.get_mut(&key) {
                             p.data = tail;
                             p.blocked_attempts = 0;
@@ -1028,13 +1149,14 @@ impl VireonStack {
                 }
                 Err(QuicSendError::FlowBlocked) => {
                     // Restore the buffer; bump attempts.
-                    self.pending_bytes -= prev_len;
-                    self.pending_bytes += buf.len(); // same length, but be explicit
+                    self.sub_pending(key.0, prev_len);
+                    self.add_pending(key.0, buf.len());
                     if let Some(p) = self.pending_sends.get_mut(&key) {
                         p.data = buf;
                         p.blocked_attempts = p.blocked_attempts.saturating_add(1);
                         if p.blocked_attempts >= PENDING_MAX_ATTEMPTS {
-                            self.pending_bytes -= p.data.len();
+                            let dropped_len = p.data.len();
+                            self.sub_pending(key.0, dropped_len);
                             self.pending_sends.remove(&key);
                             dropped += 1;
                         } else {
@@ -1050,7 +1172,7 @@ impl VireonStack {
                 }
                 Err(e) => {
                     // Unknown connection or quiche error — drop and log.
-                    self.pending_bytes -= prev_len;
+                    self.sub_pending(key.0, prev_len);
                     self.pending_sends.remove(&key);
                     tracing::warn!(
                         conn_idx = key.0,
@@ -1065,6 +1187,8 @@ impl VireonStack {
         }
 
         self.pending_drops += u64::from(dropped);
+        // Restore the scratch Vec (preserves capacity for next tick).
+        self.pending_keys_scratch = pending_keys;
         if succeeded > 0 || still_blocked > 0 || dropped > 0 {
             tracing::trace!(
                 succeeded,
@@ -1103,13 +1227,18 @@ impl VireonStack {
                 .filter(|(c, _)| *c == conn_idx)
                 .copied(),
         );
-        for key in self.pending_keys_scratch.drain(..) {
+        let keys = std::mem::take(&mut self.pending_keys_scratch);
+        for &key in &keys {
             if let Some(p) = self.pending_sends.remove(&key) {
                 entries += 1;
                 bytes += p.data.len() as u64;
-                self.pending_bytes = self.pending_bytes.saturating_sub(p.data.len());
+                self.sub_pending(key.0, p.data.len());
             }
         }
+        // Restore the scratch Vec (preserves capacity for next call).
+        self.pending_keys_scratch = keys;
+        // Defensive: ensure no stale zero-byte entry leaks for this conn.
+        self.pending_per_conn.remove(&conn_idx);
         if bytes > 0 {
             self.pending_gap_bytes = self.pending_gap_bytes.saturating_add(bytes);
         }
