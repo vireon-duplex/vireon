@@ -262,6 +262,11 @@ pub struct ClusterConf {
     /// Heartbeat timeout in milliseconds — peers with no heartbeat
     /// within this window are declared down. Default 5000.
     pub heartbeat_timeout_ms: Option<u64>,
+    /// Bounded channel capacity for cluster transport queues (both
+    /// outgoing worker→transport and incoming transport→worker).
+    /// Default 65536. When full, messages are dropped to protect the
+    /// process from OOM under sustained cross-node congestion.
+    pub channel_cap: Option<usize>,
 }
 
 /// `[buffer_pool]` — per-worker buffer allocation pool tuning.
