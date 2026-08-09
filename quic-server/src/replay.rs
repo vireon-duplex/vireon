@@ -398,6 +398,42 @@ impl ReplayBuffer {
     }
 }
 
+// ── Shared state for multi-worker ───────────────────────────────────
+
+use frame::header::Seq;
+
+/// Cross-worker shared replay state. Wraps the [`ReplayBuffer`] with the
+/// per-session tracking that was previously per-worker, so a publish on
+/// worker A can retain gap frames for a dormant subscriber that
+/// disconnected from worker B.
+///
+/// All fields are behind a single `Mutex` (in the containing
+/// `Arc<Mutex<SharedReplayState>>`) — contention is negligible because
+/// reliability operations are opt-in and rare.
+#[derive(Debug)]
+pub struct SharedReplayState {
+    /// The replay buffer itself.
+    pub buffer: ReplayBuffer,
+    /// `logical_session_id → (quic_stream_ids, patterns)` for dormant
+    /// subscribers. Shared so any worker can retain matching gap frames.
+    pub dormant_sessions: FxHashMap<u64, (Vec<u64>, Vec<Box<str>>)>,
+    /// `logical_session_id → next-outgoing seq per quic_stream_id`.
+    /// Shared so dormant continuation uses monotonically increasing seqs.
+    pub session_stream_seq: FxHashMap<(u64, u64), Seq>,
+}
+
+impl SharedReplayState {
+    /// Creates a new shared state with the given config.
+    #[must_use]
+    pub fn new(config: ReplayConfig) -> Self {
+        Self {
+            buffer: ReplayBuffer::new(config),
+            dormant_sessions: FxHashMap::default(),
+            session_stream_seq: FxHashMap::default(),
+        }
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
