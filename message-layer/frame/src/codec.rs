@@ -1086,7 +1086,7 @@ mod tests {
         }
     }
 
-    const ALL_MESSAGE_TYPES_TEST: [MessageType; 26] = crate::header::ALL_MESSAGE_TYPES;
+    const ALL_MESSAGE_TYPES_TEST: [MessageType; 29] = crate::header::ALL_MESSAGE_TYPES;
 
     // ---------- seq ordering across frames ----------
 

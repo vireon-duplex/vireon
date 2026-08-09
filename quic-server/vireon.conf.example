@@ -567,3 +567,44 @@ logtail_threshold = 256
 #   "batch"     — always BatchPush
 #   "logtail"   — always LogTail (requires WAL)
 # force_strategy = "auto"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Reliability layer — ACK + Sequence + Resume
+# ──────────────────────────────────────────────────────────────────────
+#
+# Vireon Reliable mode (ACK_REQ flag on Publish frames) provides
+# at-least-once delivery. The receiver accepts a message into its
+# stream and sends a cumulative Ack (ack_seq = highest contiguous
+# accepted seq). The server retains sent messages in a bounded
+# in-memory replay window and removes them once acked.
+#
+# On reconnect, the client sends a Resume(logical_session_id,
+# [(stream, last_acked)]); the server replays last_acked+1..newest
+# from the window. If the requested seq is older than the window
+# floor, the server returns ResumeUnavailable and the client falls
+# back to a fresh subscription.
+#
+# Duplicates are possible after reconnect/retry and are suppressed
+# by the receiver's highest_accepted watermark. Exactly-once is NOT
+# provided.
+#
+# The replay buffer is in-memory only (no RocksDB). It is lost on
+# server restart. Multi-worker: resume is reliable only when the
+# reconnect lands on the same worker; else ResumeUnavailable →
+# fresh subscription. Cross-node replay is not supported.
+[replay]
+
+# Max retained messages per (session, stream) ring. Older entries
+# are evicted once exceeded. Default: 10_000.
+max_messages_per_stream = 10000
+
+# Soft total byte cap across the whole replay buffer. Human-readable
+# suffixes (KB/MB/GB) are accepted. Default: 128 MiB.
+max_bytes = "128MB"
+
+# Idle logical-session TTL in seconds. Sessions that receive no Ack
+# or Resume activity for this long are dropped, releasing their
+# retained entries. Default: 300 (5 minutes).
+idle_session_ttl_secs = 300
+
