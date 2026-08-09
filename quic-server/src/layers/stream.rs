@@ -214,19 +214,9 @@ impl StreamLayer {
                         }
                     }
                 },
-                // Ack is now acted on at the application layer
-                // (`VireonDispatcher::handle_ack`); the stream layer is
-                // agnostic to it. Leaving a trace-only arm keeps the
-                // control-dispatch match exhaustive without consuming the
-                // payload here.
-                MessageType::Ack => {
-                    tracing::trace!(
-                        conn_idx,
-                        stream_id = logical_stream,
-                        seq = frame.seq.get(),
-                        "ack (handled at application layer)"
-                    );
-                }
+                // Ack / Resume / ResumeOk / ResumeUnavailable are dispatched
+                // to the application layer by the message layer's classify()
+                // — they never enter this control-dispatch block.
                 // Data-plane types are handled above.
                 _ => {
                     if self.unexpected_type_throttle.tick() {
