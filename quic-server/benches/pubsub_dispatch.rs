@@ -110,7 +110,7 @@ fn build_fanout_dispatcher() -> VireonDispatcher {
 /// batch, minus the QUIC encode+send (which is transport cost, not
 /// dispatcher cost, and is measured by `bench-harness`).
 fn publish_and_drain(d: &mut VireonDispatcher, topic: &pubsub_engine::Topic, payload: &[u8]) {
-    d.handle_publish(&ctx(0, 999), StreamId::new(999), topic, payload);
+    d.handle_publish(&ctx(0, 999), StreamId::new(999), topic.as_str(), payload, false);
 
     // Route the fan-out outbox through send-policy — same two-pass
     // drain the stack's per-batch event loop uses.
