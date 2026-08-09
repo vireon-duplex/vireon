@@ -297,6 +297,10 @@ pub struct BackpressureConf {
     /// subscribers can't drain fast enough. `0` (default) uses the
     /// built-in 512 MiB threshold; set explicitly to disable.
     pub publish_high_watermark_bytes: Option<HumanBytes>,
+    /// Per-connection pending-sends byte cap. Bounds the memory a single
+    /// slow subscriber can hold so one stuck connection cannot starve
+    /// the global budget. Default 64 MiB.
+    pub pending_per_conn_cap: Option<HumanBytes>,
 }
 
 /// `[reactor]` — per-tick processing budget for the io_uring reactor.
@@ -578,6 +582,11 @@ pub struct LayerTuning {
     /// can't drain fast enough. 0 disables the check (accept
     /// everything; eviction is the last line of defense).
     pub publish_backpressure_high_watermark_bytes: usize,
+    /// Per-connection byte cap on `pending_sends`. Bounds the memory a
+    /// single slow subscriber can hold so one stuck connection cannot
+    /// starve the global budget and cause publishes for *other*
+    /// subscribers to be rejected. Default 64 MiB.
+    pub pending_per_conn_cap: usize,
 
     // ── Adaptive delivery ──
     /// Subscriber count above which LogTail is used instead of BatchPush.
@@ -640,6 +649,7 @@ impl Default for LayerTuning {
             // 512 MiB ≈ 50% of PENDING_BYTE_CAP (1 GiB). Leaves headroom
             // for the eviction path to act as the last line of defense.
             publish_backpressure_high_watermark_bytes: 512 * 1024 * 1024,
+            pending_per_conn_cap: 64 * 1024 * 1024,
             delivery_logtail_threshold: 256,
             delivery_force_strategy: DeliveryMode::Auto,
             replay_max_messages_per_stream: 10_000,

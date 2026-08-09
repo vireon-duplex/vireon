@@ -593,6 +593,9 @@ fn resolve_tuning(conf: &ServerConf) -> LayerTuning {
         if let Some(v) = bp.publish_high_watermark_bytes {
             t.publish_backpressure_high_watermark_bytes = v.0 as usize;
         }
+        if let Some(v) = bp.pending_per_conn_cap {
+            t.pending_per_conn_cap = v.0 as usize;
+        }
     }
 
     // ── Reactor tick budget ──
