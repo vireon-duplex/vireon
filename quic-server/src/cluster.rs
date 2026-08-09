@@ -92,7 +92,7 @@ pub struct OutgoingMsg {
 /// coordination — all topics are owned locally.
 pub struct ClusterWorkerHandle {
     /// Sender into the transport thread's outgoing queue.
-    pub outgoing_tx: mpsc::Sender<OutgoingMsg>,
+    pub outgoing_tx: mpsc::SyncSender<OutgoingMsg>,
     /// Per-worker incoming queue (one of the transport's broadcast fan-out).
     pub incoming_rx: mpsc::Receiver<InterNodeMessage>,
 }
@@ -112,6 +112,9 @@ pub struct ClusterTransportConfig {
     /// Peer id → resolved UDP address. Used by the transport thread to
     /// look up where to send each outgoing datagram.
     pub peer_addrs: FxHashMap<NodeId, SocketAddr>,
+    /// Bounded channel capacity for both outgoing (worker → transport)
+    /// and incoming (transport → worker) cluster queues. Default 65536.
+    pub channel_cap: usize,
 }
 
 /// Parse a `--cluster-peers "id=host:port,id=host:port,..."` CLI string
@@ -174,6 +177,8 @@ pub struct ClusterOpts {
     pub heartbeat_interval_ms: Option<u64>,
     /// Heartbeat timeout in milliseconds. `None` = 5000.
     pub heartbeat_timeout_ms: Option<u64>,
+    /// Bounded channel capacity for cluster queues. `None` = 65536.
+    pub channel_cap: Option<usize>,
 }
 
 /// Returns an error if `self_id` is nil, the peer list is empty, the
@@ -233,6 +238,7 @@ pub fn build_cluster_transport_config(
         cluster_cfg,
         bind_addr,
         peer_addrs,
+        channel_cap: opts.channel_cap.unwrap_or(65536),
     })
 }
 
@@ -315,11 +321,12 @@ pub fn launch_cluster(
         "cluster transport bound"
     );
 
-    let (outgoing_tx, outgoing_rx) = mpsc::channel::<OutgoingMsg>();
+    let channel_cap = cfg.channel_cap.max(1);
+    let (outgoing_tx, outgoing_rx) = mpsc::sync_channel::<OutgoingMsg>(channel_cap);
     let mut incoming_txs = Vec::with_capacity(num_workers);
     let mut handles = Vec::with_capacity(num_workers);
     for _ in 0..num_workers {
-        let (itx, irx) = mpsc::channel::<InterNodeMessage>();
+        let (itx, irx) = mpsc::sync_channel::<InterNodeMessage>(channel_cap);
         incoming_txs.push(itx);
         handles.push(ClusterWorkerHandle {
             outgoing_tx: outgoing_tx.clone(),
@@ -348,7 +355,7 @@ fn run_transport(
     socket: UdpSocket,
     peers: FxHashMap<NodeId, SocketAddr>,
     outgoing_rx: mpsc::Receiver<OutgoingMsg>,
-    incoming_txs: Vec<mpsc::Sender<InterNodeMessage>>,
+    incoming_txs: Vec<mpsc::SyncSender<InterNodeMessage>>,
     self_id: NodeId,
 ) {
     let mut recv_buf = vec![0u8; RECV_BUF_LEN];
@@ -383,10 +390,12 @@ fn run_transport(
                     match InterNodeMessage::decode(&recv_buf[..n]) {
                         Ok(msg) => {
                             // Broadcast to every worker's incoming queue.
-                            // A full worker queue silently drops — the
-                            // worker will catch up on the next message.
+                            // A full worker queue (bounded sync_channel)
+                            // drops the message — the worker is behind on
+                            // its own pending_sends, and Item 1/4 will
+                            // contain the damage locally.
                             for tx in &incoming_txs {
-                                let _ = tx.send(msg.clone());
+                                let _ = tx.try_send(msg.clone());
                             }
                         }
                         Err(e) => {
@@ -455,7 +464,7 @@ fn process_outgoing(
     self_id: NodeId,
     peers: &FxHashMap<NodeId, SocketAddr>,
     socket: &UdpSocket,
-    incoming_txs: &[mpsc::Sender<InterNodeMessage>],
+    incoming_txs: &[mpsc::SyncSender<InterNodeMessage>],
     encode_buf: &mut bytes::BytesMut,
 ) {
     if out.target == self_id {
@@ -463,7 +472,7 @@ fn process_outgoing(
         // but if it does, loop back through the incoming queue so the
         // message is handled locally.
         for tx in incoming_txs {
-            let _ = tx.send(out.msg.clone());
+            let _ = tx.try_send(out.msg.clone());
         }
         return;
     }

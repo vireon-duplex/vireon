@@ -58,7 +58,7 @@
 //! `N × 16 bytes` — optimal for high fan-out (hundreds+ subscribers).
 
 use arrayvec::ArrayVec;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -304,6 +304,11 @@ pub struct OutgoingFrame {
     pub header: FrameHeader,
     /// Payload bytes (refcounted for cheap cloning / zero-copy reuse).
     pub payload: Bytes,
+    /// Egress priority lane — derived from the stream's DeliveryPolicy at
+    /// enqueue time. Controls ordering in flush_outbox and
+    /// drain_pending_sends so Realtime frames aren't stuck behind
+    /// Throughput frames.
+    pub priority: crate::priority::Priority,
 }
 
 // ── AppDispatcher trait ───────────────────────────────────────────
@@ -457,6 +462,10 @@ pub struct VireonDispatcher {
     /// the key (not the QUIC id) because `SendPolicyTable` is keyed by
     /// logical id and egress rebuild needs to recover the QUIC stream.
     egress_quic_streams: FxHashMap<(usize, StreamId), u64>,
+    /// Per-stream DeliveryPolicy mirror. Used to derive egress
+    /// [`Priority`] without a cross-crate lookup into the send-policy
+    /// table. Populated at `bind_send_policy` time.
+    stream_policy: FxHashMap<(usize, StreamId), DeliveryPolicy>,
 
     /// [application-layer] Topic-ACL table. Phase 7 ships with a single
     /// broad allow-all rule (`allow("*.*", None, ALL)`) so existing
@@ -537,7 +546,7 @@ pub struct VireonDispatcher {
     /// Sender into the cluster transport's outgoing queue. Workers push
     /// [`OutgoingMsg`]s here to send inter-node UDP datagrams. `None`
     /// in single-node mode.
-    cluster_outgoing_tx: Option<mpsc::Sender<OutgoingMsg>>,
+    cluster_outgoing_tx: Option<mpsc::SyncSender<OutgoingMsg>>,
     /// Per-worker incoming queue from the cluster transport. Each
     /// worker drains its own queue in `on_batch_tick` →
     /// [`Self::drain_cluster_inbox`]. `None` in single-node mode.
@@ -682,6 +691,11 @@ pub struct VireonDispatcher {
     /// client re-sends `Resume` with the same id, and the new conn_idx
     /// is rebound to it.
     conn_logical_session: FxHashMap<usize, u64>,
+    /// Last time the idle-session reaper ran. The reaper is piggy-backed
+    /// on `on_batch_tick` and runs at most every `reaper_interval`.
+    last_reaper_run: Option<std::time::Instant>,
+    /// Interval between idle-session reaper sweeps. Default 5 s.
+    reaper_interval: std::time::Duration,
     /// Transient: set to `true` only while `handle_publish` is in its
     /// fan-out section AND the incoming publish carried `ACK_REQ`. Read
     /// by [`Self::enqueue_frame`] to stamp `ACK_REQ` on outgoing
@@ -727,6 +741,7 @@ impl VireonDispatcher {
             next_seq: FxHashMap::default(),
             send_policy: SendPolicyTable::new(),
             egress_quic_streams: FxHashMap::default(),
+            stream_policy: FxHashMap::default(),
             // Permissive default: any principal can do anything on any
             // two-segment topic. Operators swap this out via
             // [`Self::with_acl`] when enforcing real authorization.
@@ -804,6 +819,8 @@ impl VireonDispatcher {
                 crate::replay::SharedReplayState::new(ReplayConfig::default()),
             )),
             conn_logical_session: FxHashMap::default(),
+            last_reaper_run: None,
+            reaper_interval: std::time::Duration::from_secs(5),
             reliable_fanout: false,
             session_last_acked: FxHashMap::default(),
             metrics: None,
@@ -868,6 +885,48 @@ impl VireonDispatcher {
 
     /// Snapshots the replay-buffer occupancy into the `replay_window_bytes`
     /// and `replay_window_messages` Prometheus gauges. Called once per
+    /// Periodically reaps idle dormant sessions and stale replay buffer
+    /// entries. Called from `on_batch_tick`; runs at most every
+    /// `reaper_interval` to amortize the lock + iteration cost.
+    pub fn maybe_reap_idle_sessions(&mut self) {
+        let now = std::time::Instant::now();
+        let should_run = self
+            .last_reaper_run
+            .map(|t| now.duration_since(t) >= self.reaper_interval)
+            .unwrap_or(true);
+        if !should_run {
+            return;
+        }
+        self.last_reaper_run = Some(now);
+        let ttl_secs = self
+            .replay
+            .lock()
+            .map(|rs| rs.buffer.config().idle_session_ttl_secs)
+            .unwrap_or(0);
+        if ttl_secs == 0 {
+            return;
+        }
+        // Build the set of live logical sessions (those with an active
+        // connection on THIS worker). Only this worker's connections are
+        // visible here — cross-worker sessions are protected by the fact
+        // that the other worker's reap won't find them live either, so a
+        // truly-dead session is reaped by all workers independently.
+        let live: FxHashSet<u64> = self.conn_logical_session.values().copied().collect();
+        let ttl = std::time::Duration::from_secs(ttl_secs);
+        let dropped = self
+            .replay
+            .lock()
+            .map(|mut rs| rs.reap_idle(&live, ttl))
+            .unwrap_or(0);
+        if dropped > 0 {
+            tracing::info!(
+                dropped,
+                ttl_secs,
+                "[reaper] expired idle dormant/replay sessions"
+            );
+        }
+    }
+
     /// batch tick from [`ApplicationLayer::on_batch_tick`]; no-op when no
     /// metrics store is attached (benches / unit tests).
     pub fn publish_replay_gauges(&self) {
@@ -993,10 +1052,16 @@ impl VireonDispatcher {
                     payload: payload.clone(),
                 },
             );
+            rs.touch(logical);
         }
         self.outbox.push(OutgoingFrame {
             conn_idx,
             quic_stream_id,
+            priority: self
+                .stream_policy
+                .get(&(conn_idx, logical_stream))
+                .map(|p| crate::priority::Priority::derive(header.msg_type, Some(*p)))
+                .unwrap_or_else(|| crate::priority::Priority::derive(header.msg_type, None)),
             header,
             payload,
         });
@@ -1108,7 +1173,7 @@ impl VireonDispatcher {
     pub fn set_cluster(
         &mut self,
         cfg: &ClusterConfig,
-        outgoing_tx: mpsc::Sender<OutgoingMsg>,
+        outgoing_tx: mpsc::SyncSender<OutgoingMsg>,
         incoming_rx: mpsc::Receiver<InterNodeMessage>,
     ) {
         match ClusterCoordinator::new(cfg.clone()) {
@@ -1236,6 +1301,7 @@ impl VireonDispatcher {
                     self.outbox.push(OutgoingFrame {
                         conn_idx,
                         quic_stream_id,
+                        priority: crate::priority::Priority::derive(fp.msg_type, Some(policy)),
                         header: FrameHeader::new(logical_stream, fp.msg_type)
                             .with_seq(fp.seq)
                             .with_flags(fp.flags),
@@ -1258,6 +1324,8 @@ impl VireonDispatcher {
         // when drain_ready_egress rebuilds the OutgoingFrame.
         self.egress_quic_streams
             .insert((conn_idx, logical_stream), quic_stream_id);
+        self.stream_policy
+            .insert((conn_idx, logical_stream), policy);
         // Flush any pending resume-replay frames for this stream. The
         // Resume (sent on the default stream) may have arrived before the
         // client opened this dedicated stream, so the replayed frames were
@@ -1280,6 +1348,7 @@ impl VireonDispatcher {
     fn remove_send_policy(&mut self, conn_idx: usize, logical_stream: StreamId) {
         self.send_policy.remove_stream(conn_idx, logical_stream);
         self.egress_quic_streams.remove(&(conn_idx, logical_stream));
+        self.stream_policy.remove(&(conn_idx, logical_stream));
     }
 
     /// Removes send-policy state for every stream on a connection.
@@ -1287,6 +1356,7 @@ impl VireonDispatcher {
     fn remove_connection_send_policy(&mut self, conn_idx: usize) {
         self.send_policy.remove_connection(conn_idx);
         self.egress_quic_streams.retain(|&(c, _), _| c != conn_idx);
+        self.stream_policy.retain(|&(c, _), _| c != conn_idx);
     }
 
     // ── Send-policy egress ─────────────────────────────────────────
@@ -1366,9 +1436,15 @@ impl VireonDispatcher {
                 else {
                     continue;
                 };
+                let priority = self
+                    .stream_policy
+                    .get(&(conn_idx, stream_id))
+                    .map(|p| crate::priority::Priority::derive(fp.msg_type, Some(*p)))
+                    .unwrap_or_else(|| crate::priority::Priority::derive(fp.msg_type, None));
                 out.push(OutgoingFrame {
                     conn_idx,
                     quic_stream_id,
+                    priority,
                     header: FrameHeader::new(stream_id, fp.msg_type)
                         .with_seq(fp.seq)
                         .with_flags(fp.flags),
@@ -1644,7 +1720,7 @@ impl VireonDispatcher {
                                         ctx.quic_stream_id,
                                         pattern_str.to_string(),
                                     );
-                                    let _ = tx.send(OutgoingMsg { msg, target: owner });
+                                    let _ = tx.try_send(OutgoingMsg { msg, target: owner });
                                 }
                                 tracing::debug!(
                                     conn_idx = ctx.conn_idx,
@@ -1829,7 +1905,7 @@ impl VireonDispatcher {
                             topic_arc.clone(),
                             payload_bytes.clone(),
                         );
-                        let _ = tx.send(OutgoingMsg { msg, target: owner });
+                        let _ = tx.try_send(OutgoingMsg { msg, target: owner });
                     }
                     tracing::debug!(
                         conn_idx = ctx.conn_idx,
@@ -1858,7 +1934,7 @@ impl VireonDispatcher {
                                 payload_bytes.clone(),
                             );
                             for target in &replicas {
-                                let _ = tx.send(OutgoingMsg {
+                                let _ = tx.try_send(OutgoingMsg {
                                     msg: msg.clone(),
                                     target: *target,
                                 });
@@ -1892,7 +1968,7 @@ impl VireonDispatcher {
                             if replicas.contains(&target) {
                                 continue;
                             }
-                            let _ = tx.send(OutgoingMsg {
+                            let _ = tx.try_send(OutgoingMsg {
                                 msg: msg.clone(),
                                 target,
                             });
@@ -2167,6 +2243,7 @@ impl VireonDispatcher {
                         );
                         rs.session_stream_seq
                             .insert((logical, *qsid), seq_val.next());
+                        rs.touch(logical);
                     }
                 }
             }
@@ -2218,11 +2295,10 @@ impl VireonDispatcher {
             );
             return;
         };
-        self.replay
-            .lock()
-            .unwrap()
-            .buffer
-            .acknowledge(logical, stream, ack_seq);
+        let mut rs = self.replay.lock().unwrap();
+        rs.buffer.acknowledge(logical, stream, ack_seq);
+        rs.touch(logical);
+        drop(rs);
         self.session_last_acked.insert((logical, stream), ack_seq);
         if let Some(m) = &self.metrics {
             m.inc(&m.messages_acked_total);
@@ -2284,6 +2360,7 @@ impl VireonDispatcher {
         {
             let mut rs = self.replay.lock().unwrap();
             rs.buffer.register_session(logical_session_id);
+            rs.touch(logical_session_id);
             // The session is live again — stop retaining gap frames for it
             // (live fan-out will reach the subscriber directly from here on).
             rs.dormant_sessions.remove(&logical_session_id);
@@ -2414,6 +2491,7 @@ impl VireonDispatcher {
                 buf.push(OutgoingFrame {
                     conn_idx: new_conn,
                     quic_stream_id: target_quic_stream,
+                    priority: crate::priority::Priority::derive(header.msg_type, None),
                     header,
                     payload: entry.payload,
                 });
@@ -3508,7 +3586,7 @@ impl VireonDispatcher {
                                         msg.payload.clone(),
                                     );
                                     for target in fanout_targets {
-                                        let _ = tx.send(OutgoingMsg {
+                                        let _ = tx.try_send(OutgoingMsg {
                                             msg: fanout.clone(),
                                             target,
                                         });
@@ -3639,7 +3717,7 @@ impl VireonDispatcher {
                 let peers = coord.membership().alive_nodes();
                 for peer in peers {
                     if peer != self.node_id {
-                        let _ = tx.send(OutgoingMsg {
+                        let _ = tx.try_send(OutgoingMsg {
                             msg: hb.clone(),
                             target: peer,
                         });
@@ -3673,7 +3751,7 @@ impl VireonDispatcher {
                         fs.stream_id,
                         fs.pattern.clone(),
                     );
-                    let _ = tx.send(OutgoingMsg { msg, target: owner });
+                    let _ = tx.try_send(OutgoingMsg { msg, target: owner });
                 }
             }
         }
@@ -3689,7 +3767,7 @@ impl VireonDispatcher {
                     let peers = coord.membership().alive_nodes();
                     for peer in peers {
                         if peer != self.node_id {
-                            let _ = tx.send(OutgoingMsg {
+                            let _ = tx.try_send(OutgoingMsg {
                                 msg: gossip.clone(),
                                 target: peer,
                             });
@@ -4124,6 +4202,7 @@ impl VireonDispatcher {
                         );
                         rs.session_stream_seq
                             .insert((logical, *qsid), seq_val.next());
+                        rs.touch(logical);
                     }
                 }
             }
@@ -4522,6 +4601,7 @@ impl ApplicationLayer {
                 .with_replay_config(ReplayConfig {
                     max_messages_per_stream: t.replay_max_messages_per_stream,
                     max_bytes: t.replay_max_bytes,
+                    idle_session_ttl_secs: t.replay_idle_session_ttl_secs,
                 }),
             metric_frames_rx,
             metric_connections,
@@ -4665,6 +4745,7 @@ impl ApplicationLayer {
         self.dispatcher.drain_worker_inbox();
         self.dispatcher.maybe_run_wal_retention();
         self.dispatcher.tick_cluster_health();
+        self.dispatcher.maybe_reap_idle_sessions();
         // Snapshot replay-window gauges into the shared metrics store so
         // the Prometheus endpoint reflects current buffer occupancy.
         self.dispatcher.publish_replay_gauges();
@@ -4855,7 +4936,7 @@ impl ApplicationLayer {
     pub fn set_cluster(
         &mut self,
         cfg: &ClusterConfig,
-        outgoing_tx: mpsc::Sender<OutgoingMsg>,
+        outgoing_tx: mpsc::SyncSender<OutgoingMsg>,
         incoming_rx: mpsc::Receiver<InterNodeMessage>,
     ) {
         self.dispatcher.set_cluster(cfg, outgoing_tx, incoming_rx);
@@ -4894,6 +4975,7 @@ mod tests {
         OutgoingFrame {
             conn_idx,
             quic_stream_id,
+            priority: crate::priority::Priority::Throughput,
             header: FrameHeader::new(StreamId::new(stream), MessageType::Publish)
                 .with_seq(Seq::new(seq))
                 .with_flags(FrameFlags::NONE),
