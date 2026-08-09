@@ -89,6 +89,9 @@ struct PendingSend {
     /// Consecutive `FlowBlocked` results since last progress.
     /// Reset to 0 whenever `send_stream` accepts ≥1 byte.
     blocked_attempts: u8,
+    /// Egress priority lane — controls drain order in
+    /// `drain_pending_sends` (Control → Realtime → Throughput).
+    priority: crate::priority::Priority,
 }
 
 /// The full multi-layer stack — owns the application chain, the
@@ -516,11 +519,15 @@ impl VireonStack {
                 Some(out) => self.flush_direct.push(out),
             }
         }
+        // Sort by priority (Control=0 < Realtime=1 < Throughput=2) so
+        // latency-sensitive frames are encoded+sent first. Stable sort
+        // preserves FIFO order within the same priority lane.
+        self.flush_direct.sort_by_key(|f| f.priority);
         // mem::take moves the Vec out so encode_and_send can borrow self.
         // Capacity is preserved across ticks — no per-tick allocation.
         let direct = std::mem::take(&mut self.flush_direct);
         for out in &direct {
-            self.encode_and_send(out.conn_idx, out.quic_stream_id, out.header, &out.payload);
+            self.encode_and_send(out.conn_idx, out.quic_stream_id, out.priority, out.header, &out.payload);
             if let Some(m) = &self.metrics {
                 m.inc(&m.deliveries_total);
                 if out.header.msg_type == MessageType::Publish {
@@ -534,9 +541,10 @@ impl VireonStack {
 
         self.flush_policy.clear();
         self.application.drain_ready_egress(&mut self.flush_policy);
+        self.flush_policy.sort_by_key(|f| f.priority);
         let policy = std::mem::take(&mut self.flush_policy);
         for out in &policy {
-            self.encode_and_send(out.conn_idx, out.quic_stream_id, out.header, &out.payload);
+            self.encode_and_send(out.conn_idx, out.quic_stream_id, out.priority, out.header, &out.payload);
             if let Some(m) = &self.metrics {
                 m.inc(&m.deliveries_total);
                 if out.header.msg_type == MessageType::Publish {
@@ -696,7 +704,11 @@ impl VireonStack {
         // the raw frame back immediately. This isolates transport-layer
         // performance from application-layer overhead.
         if self.echo {
-            self.encode_and_send(conn_idx, quic_stream_id, header, &payload[..]);
+            let priority = crate::priority::Priority::derive(
+                header.msg_type,
+                None,
+            );
+            self.encode_and_send(conn_idx, quic_stream_id, priority, header, &payload[..]);
             return;
         }
 
@@ -778,6 +790,7 @@ impl VireonStack {
         &mut self,
         conn_idx: usize,
         quic_stream_id: u64,
+        priority: crate::priority::Priority,
         header: codec::FrameHeader,
         payload: &[u8],
     ) {
@@ -839,7 +852,7 @@ impl VireonStack {
                     // next frame for this stream appends to it instead
                     // of landing at the wrong offset.
                     let tail = BytesMut::from_iter(&self.send_scratch[written..n]);
-                    self.insert_pending(conn_idx, quic_stream_id, tail);
+                    self.insert_pending(conn_idx, quic_stream_id, priority, tail);
                 }
             }
             Err(QuicSendError::FlowBlocked) => {
@@ -848,7 +861,7 @@ impl VireonStack {
                 // retry on a subsequent tick so the peer eventually
                 // receives the data and recharges flow-control credit.
                 let data = BytesMut::from_iter(&self.send_scratch[..n]);
-                self.insert_pending(conn_idx, quic_stream_id, data);
+                self.insert_pending(conn_idx, quic_stream_id, priority, data);
             }
             Err(e) => {
                 tracing::debug!(
@@ -915,7 +928,7 @@ impl VireonStack {
     /// is bounded by the number of active connections × streams and is
     /// not expected to hit in practice; the byte cap is the primary
     /// defense against OOM under chronic subscriber starvation.
-    fn insert_pending(&mut self, conn_idx: usize, quic_stream_id: u64, data: BytesMut) {
+    fn insert_pending(&mut self, conn_idx: usize, quic_stream_id: u64, priority: crate::priority::Priority, data: BytesMut) {
         self.enforce_pending_caps(conn_idx, quic_stream_id, data.len());
         self.add_pending(conn_idx, data.len());
         self.pending_sends.insert(
@@ -923,6 +936,7 @@ impl VireonStack {
             PendingSend {
                 data,
                 blocked_attempts: 0,
+                priority,
             },
         );
     }
@@ -1084,6 +1098,15 @@ impl VireonStack {
         self.pending_keys_scratch.clear();
         self.pending_keys_scratch
             .extend(self.pending_sends.keys().copied());
+        // Sort by priority so Control/Realtime entries are retried before
+        // Throughput entries. This ensures latency-sensitive frames get
+        // the first shot at QUIC flow-control credit each tick.
+        self.pending_keys_scratch.sort_by_key(|key| {
+            self.pending_sends
+                .get(key)
+                .map(|p| p.priority)
+                .unwrap_or(crate::priority::Priority::Throughput)
+        });
         let pending_keys = std::mem::take(&mut self.pending_keys_scratch);
         let mut succeeded = 0u32;
         let mut still_blocked = 0u32;

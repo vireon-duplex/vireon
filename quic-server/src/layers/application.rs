@@ -304,6 +304,11 @@ pub struct OutgoingFrame {
     pub header: FrameHeader,
     /// Payload bytes (refcounted for cheap cloning / zero-copy reuse).
     pub payload: Bytes,
+    /// Egress priority lane — derived from the stream's DeliveryPolicy at
+    /// enqueue time. Controls ordering in flush_outbox and
+    /// drain_pending_sends so Realtime frames aren't stuck behind
+    /// Throughput frames.
+    pub priority: crate::priority::Priority,
 }
 
 // ── AppDispatcher trait ───────────────────────────────────────────
@@ -457,6 +462,10 @@ pub struct VireonDispatcher {
     /// the key (not the QUIC id) because `SendPolicyTable` is keyed by
     /// logical id and egress rebuild needs to recover the QUIC stream.
     egress_quic_streams: FxHashMap<(usize, StreamId), u64>,
+    /// Per-stream DeliveryPolicy mirror. Used to derive egress
+    /// [`Priority`] without a cross-crate lookup into the send-policy
+    /// table. Populated at `bind_send_policy` time.
+    stream_policy: FxHashMap<(usize, StreamId), DeliveryPolicy>,
 
     /// [application-layer] Topic-ACL table. Phase 7 ships with a single
     /// broad allow-all rule (`allow("*.*", None, ALL)`) so existing
@@ -732,6 +741,7 @@ impl VireonDispatcher {
             next_seq: FxHashMap::default(),
             send_policy: SendPolicyTable::new(),
             egress_quic_streams: FxHashMap::default(),
+            stream_policy: FxHashMap::default(),
             // Permissive default: any principal can do anything on any
             // two-segment topic. Operators swap this out via
             // [`Self::with_acl`] when enforcing real authorization.
@@ -1047,6 +1057,11 @@ impl VireonDispatcher {
         self.outbox.push(OutgoingFrame {
             conn_idx,
             quic_stream_id,
+            priority: self
+                .stream_policy
+                .get(&(conn_idx, logical_stream))
+                .map(|p| crate::priority::Priority::derive(header.msg_type, Some(*p)))
+                .unwrap_or_else(|| crate::priority::Priority::derive(header.msg_type, None)),
             header,
             payload,
         });
@@ -1286,6 +1301,7 @@ impl VireonDispatcher {
                     self.outbox.push(OutgoingFrame {
                         conn_idx,
                         quic_stream_id,
+                        priority: crate::priority::Priority::derive(fp.msg_type, Some(policy)),
                         header: FrameHeader::new(logical_stream, fp.msg_type)
                             .with_seq(fp.seq)
                             .with_flags(fp.flags),
@@ -1308,6 +1324,8 @@ impl VireonDispatcher {
         // when drain_ready_egress rebuilds the OutgoingFrame.
         self.egress_quic_streams
             .insert((conn_idx, logical_stream), quic_stream_id);
+        self.stream_policy
+            .insert((conn_idx, logical_stream), policy);
         // Flush any pending resume-replay frames for this stream. The
         // Resume (sent on the default stream) may have arrived before the
         // client opened this dedicated stream, so the replayed frames were
@@ -1330,6 +1348,7 @@ impl VireonDispatcher {
     fn remove_send_policy(&mut self, conn_idx: usize, logical_stream: StreamId) {
         self.send_policy.remove_stream(conn_idx, logical_stream);
         self.egress_quic_streams.remove(&(conn_idx, logical_stream));
+        self.stream_policy.remove(&(conn_idx, logical_stream));
     }
 
     /// Removes send-policy state for every stream on a connection.
@@ -1337,6 +1356,7 @@ impl VireonDispatcher {
     fn remove_connection_send_policy(&mut self, conn_idx: usize) {
         self.send_policy.remove_connection(conn_idx);
         self.egress_quic_streams.retain(|&(c, _), _| c != conn_idx);
+        self.stream_policy.retain(|&(c, _), _| c != conn_idx);
     }
 
     // ── Send-policy egress ─────────────────────────────────────────
@@ -1416,9 +1436,15 @@ impl VireonDispatcher {
                 else {
                     continue;
                 };
+                let priority = self
+                    .stream_policy
+                    .get(&(conn_idx, stream_id))
+                    .map(|p| crate::priority::Priority::derive(fp.msg_type, Some(*p)))
+                    .unwrap_or_else(|| crate::priority::Priority::derive(fp.msg_type, None));
                 out.push(OutgoingFrame {
                     conn_idx,
                     quic_stream_id,
+                    priority,
                     header: FrameHeader::new(stream_id, fp.msg_type)
                         .with_seq(fp.seq)
                         .with_flags(fp.flags),
@@ -2465,6 +2491,7 @@ impl VireonDispatcher {
                 buf.push(OutgoingFrame {
                     conn_idx: new_conn,
                     quic_stream_id: target_quic_stream,
+                    priority: crate::priority::Priority::derive(header.msg_type, None),
                     header,
                     payload: entry.payload,
                 });
@@ -4948,6 +4975,7 @@ mod tests {
         OutgoingFrame {
             conn_idx,
             quic_stream_id,
+            priority: crate::priority::Priority::Throughput,
             header: FrameHeader::new(StreamId::new(stream), MessageType::Publish)
                 .with_seq(Seq::new(seq))
                 .with_flags(FrameFlags::NONE),
