@@ -330,6 +330,33 @@ for rf in 1 2 3; do
     done
 done
 
+# ── Reliable pub/sub overhead (criterion bench, no server) ──────
+# Measures dispatcher dispatch cost with ACK+Sequence+Resume enabled:
+#   ephemeral      — baseline (no ACK_REQ flag)
+#   reliable       — ACK_REQ on, no acks (retained entries accumulate)
+#   reliable_ackd  — ACK_REQ on + per-frame ack release
+#
+# This is a micro-benchmark (criterion), not a loadtest mode — it
+# exercises the dispatcher in-process without QUIC transport.
+echo
+echo "▶ [5/4b] pubsub_reliable bench (ephemeral vs reliable vs reliable+ackd)"
+RELIABLE_BENCH_LOG="$CONF_DIR/bench-${RUN_ID}-pubsub_reliable.log"
+cargo bench -p quic-server --bench pubsub_reliable > "$RELIABLE_BENCH_LOG" 2>&1
+reliable_bench_rc=$?
+if [ "$reliable_bench_rc" -eq 0 ]; then
+    # Criterion prints the bench name on one line and `time: [...]` on
+    # the next. Grab each batch=1000 variant and its median.
+    for variant in ephemeral reliable reliable_ackd; do
+        median=$(grep -A2 "pubsub_reliable/${variant}/1000$" "$RELIABLE_BENCH_LOG" 2>/dev/null \
+            | grep -oP 'time:\s+\[\K[0-9.]+ [a-z]+' | head -1)
+        printf "  %-40s %s\n" "${variant}/1000" "${median:-?}"
+    done
+    RESULTS+=("pubsub_reliable|criterion|PASS")
+else
+    printf "  %-40s FAIL(rc=$reliable_bench_rc)\n" "pubsub_reliable"
+    RESULTS+=("pubsub_reliable|criterion|FAIL")
+fi
+
 # ── Connection-migration smoke test (config flag + /metrics) ────
 # Same regression / wiring check as run-matrix.sh, but driven through
 # the bench harness stream mode so we exercise the data-plane path.
