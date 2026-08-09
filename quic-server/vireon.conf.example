@@ -368,6 +368,17 @@ soft_pct = 80
 # rejects new connections entirely.
 hard_pct = 95
 
+# High-watermark on total buffered pending_sends bytes (across all
+# subscriber streams on this worker). When exceeded, new Publish frames
+# are rejected with a backpressure error ack. Default 512 MiB.
+# publish_high_watermark_bytes = "512MB"
+
+# Per-connection pending-sends byte cap. Bounds the memory a single
+# slow subscriber can hold so one stuck connection cannot starve the
+# global budget and cause publishes for OTHER subscribers to be
+# rejected. Default 64 MiB.
+# pending_per_conn_cap = "64MB"
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  Reactor Tick Budget
