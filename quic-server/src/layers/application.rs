@@ -101,7 +101,7 @@ use super::session::SessionLayer;
 use crate::cluster::OutgoingMsg;
 use crate::conf::LayerTuning;
 use crate::error::ServerError;
-use crate::replay::{ReplayBuffer, ReplayConfig, ReplayEntry, ReplayOutcome};
+use crate::replay::{ReplayConfig, ReplayEntry, ReplayOutcome};
 use bytes::{Bytes, BytesMut};
 
 // ── Inter-worker pub/sub forwarding ────────────────────────────────
@@ -187,6 +187,9 @@ pub enum InterWorkerMsg {
     Publish {
         framed: Bytes,
         msg_type: MessageType,
+        /// Whether the original publish carried ACK_REQ — the receiving
+        /// worker needs this to set `reliable_fanout` for replay retention.
+        reliable: bool,
     },
     /// Sender `worker_idx` now has ≥1 subscriber for `pattern`.
     SubGained { worker_idx: u16, pattern: String },
@@ -666,8 +669,13 @@ pub struct VireonDispatcher {
     /// Per-worker in-memory replay buffer. Retains reliable (`ACK_REQ`)
     /// Publish frames keyed by `(logical_session_id, StreamId)` so a
     /// reconnecting client can resume from its last-acked sequence.
-    /// Lives on the reactor thread — no locks, no `Send`.
-    replay: ReplayBuffer,
+    /// Wrapped in `Arc<Mutex<SharedReplayState>>` so multi-worker
+    /// deployments can share a single buffer + dormant-session map —
+    /// a reconnecting client may land on a different worker than the
+    /// original connection, and the replay entries must be findable
+    /// regardless. Lock contention is negligible (reliability
+    /// operations are opt-in and rare compared to the ephemeral hot path).
+    replay: Arc<std::sync::Mutex<crate::replay::SharedReplayState>>,
     /// `conn_idx → client-assigned logical session id`. Populated when a
     /// `Resume` frame arrives; cleared in `on_connection_closed`. The
     /// logical session outlives the QUIC connection: a reconnecting
@@ -694,19 +702,6 @@ pub struct VireonDispatcher {
     /// the reliability-layer handlers can bump `resume_*` / `messages_*`
     /// outcome counters directly.
     metrics: Option<Arc<crate::metrics::ServerMetrics>>,
-    /// Per-`(logical_session, quic_stream_id)` next-outgoing seq counter.
-    /// Keyed by the subscriber's QUIC stream id (what the client uses as
-    /// its ACK/Resume key), NOT the publisher's logical stream. When a
-    /// subscriber disconnects, this counter keeps advancing for dormant
-    /// retention so gap frames get monotonically-increasing seqs that
-    /// continue from where live delivery left off.
-    session_stream_seq: FxHashMap<(u64, u64), Seq>,
-    /// `logical_session_id → (quic_stream_ids, patterns)` for subscribers
-    /// that have disconnected but whose logical session is still retained
-    /// in the replay buffer. Reliable publishes matching a dormant
-    /// session's patterns are retained in the buffer (keyed by each
-    /// quic_stream_id) so `Resume` can replay the gap.
-    dormant_session_patterns: FxHashMap<u64, (Vec<u64>, Vec<Box<str>>)>,
     /// `(conn_idx, quic_stream_id) → pending replay frames` for Resume
     /// replays targeting a QUIC stream the client hasn't opened yet.
     /// Flushed to the outbox when the matching StreamOpen arrives.
@@ -805,13 +800,13 @@ impl VireonDispatcher {
             batch_push_count: 0,
             logtail_count: 0,
             audit_log: None,
-            replay: ReplayBuffer::new(ReplayConfig::default()),
+            replay: Arc::new(std::sync::Mutex::new(
+                crate::replay::SharedReplayState::new(ReplayConfig::default()),
+            )),
             conn_logical_session: FxHashMap::default(),
             reliable_fanout: false,
             session_last_acked: FxHashMap::default(),
             metrics: None,
-            session_stream_seq: FxHashMap::default(),
-            dormant_session_patterns: FxHashMap::default(),
             pending_replays: FxHashMap::default(),
         }
     }
@@ -835,7 +830,9 @@ impl VireonDispatcher {
     /// section; defaults are sane so most deployments omit this.
     #[must_use]
     pub fn with_replay_config(mut self, cfg: ReplayConfig) -> Self {
-        self.replay = ReplayBuffer::new(cfg);
+        self.replay = Arc::new(std::sync::Mutex::new(
+            crate::replay::SharedReplayState::new(cfg),
+        ));
         self
     }
 
@@ -857,16 +854,29 @@ impl VireonDispatcher {
         self.metrics = Some(metrics);
     }
 
+    /// Replaces the per-worker replay buffer with a shared one, so all
+    /// workers in a multi-worker deployment can find replay entries
+    /// regardless of which worker the original subscriber landed on.
+    /// Called once at worker startup when `num_workers > 1`.
+    #[allow(dead_code)]
+    pub fn set_shared_replay(
+        &mut self,
+        shared: Arc<std::sync::Mutex<crate::replay::SharedReplayState>>,
+    ) {
+        self.replay = shared;
+    }
+
     /// Snapshots the replay-buffer occupancy into the `replay_window_bytes`
     /// and `replay_window_messages` Prometheus gauges. Called once per
     /// batch tick from [`ApplicationLayer::on_batch_tick`]; no-op when no
     /// metrics store is attached (benches / unit tests).
     pub fn publish_replay_gauges(&self) {
         if let Some(m) = &self.metrics {
+            let rs = self.replay.lock().unwrap();
             m.replay_window_bytes
-                .store(self.replay.total_bytes() as u64, Ordering::Relaxed);
+                .store(rs.buffer.total_bytes() as u64, Ordering::Relaxed);
             m.replay_window_messages
-                .store(self.replay.total_messages() as u64, Ordering::Relaxed);
+                .store(rs.buffer.total_messages() as u64, Ordering::Relaxed);
         }
     }
 
@@ -971,9 +981,10 @@ impl VireonDispatcher {
             // the publisher's logical stream). The client keys its ACK
             // and Resume state by the QUIC stream id it receives on, so
             // the replay lookup must use the same key to match.
-            self.session_stream_seq
+            let mut rs = self.replay.lock().unwrap();
+            rs.session_stream_seq
                 .insert((logical, quic_stream_id), seq_val.next());
-            self.replay.append(
+            rs.buffer.append(
                 logical,
                 StreamId::new(quic_stream_id),
                 ReplayEntry {
@@ -1447,7 +1458,11 @@ impl VireonDispatcher {
     pub fn register_logical_session_for_bench(&mut self, conn_idx: usize, logical_session_id: u64) {
         self.conn_logical_session
             .insert(conn_idx, logical_session_id);
-        self.replay.register_session(logical_session_id);
+        self.replay
+            .lock()
+            .unwrap()
+            .buffer
+            .register_session(logical_session_id);
     }
 
     /// Bench/test helper: acknowledges every retained entry for every
@@ -1470,7 +1485,11 @@ impl VireonDispatcher {
             // just walk the inner map by inserting a high watermark on
             // every known stream — approximated by replaying from MAX,
             // which the buffer's acknowledge path handles correctly.
-            self.replay.acknowledge(logical, StreamId::new(0xFFFF_FFFF), u64::MAX);
+            self.replay
+                .lock()
+                .unwrap()
+                .buffer
+                .acknowledge(logical, StreamId::new(0xFFFF_FFFF), u64::MAX);
         }
     }
 
@@ -2093,6 +2112,7 @@ impl VireonDispatcher {
                         outbox.try_send(InterWorkerMsg::Publish {
                             framed: fanout_bytes.clone(),
                             msg_type: fanout_msg_type,
+                            reliable,
                         })
                     {
                         self.worker_drop_count = self.worker_drop_count.wrapping_add(1);
@@ -2114,39 +2134,40 @@ impl VireonDispatcher {
         // patterns are retained in the replay buffer even though the
         // subscriber's connection is gone. This ensures gap frames
         // published during a disconnect survive until Resume replays them.
-        if reliable && !self.dormant_session_patterns.is_empty() {
-            // Collect affected (session, quic_stream_ids) first to avoid
-            // borrowing self while mutating replay/session_stream_seq.
-            let dormant: Vec<(u64, Vec<u64>)> = self
-                .dormant_session_patterns
-                .iter()
-                .filter(|(_, (_, pats))| {
-                    pats.iter()
-                        .any(|p| pattern_matches(p.as_ref(), topic_str))
-                })
-                .map(|(&l, (qsid, _))| (l, qsid.clone()))
-                .collect();
-            for (logical, quic_stream_ids) in dormant {
-                for qsid in &quic_stream_ids {
-                    let seq_val = self
-                        .session_stream_seq
-                        .get(&(logical, *qsid))
-                        .copied()
-                        .unwrap_or(Seq::ZERO);
-                    let header = FrameHeader::new(stream, MessageType::Publish)
-                        .with_seq(seq_val)
-                        .with_flags(FrameFlags::ACK_REQ);
-                    self.replay.append(
-                        logical,
-                        StreamId::new(*qsid),
-                        ReplayEntry {
-                            seq: seq_val.get(),
-                            header: header.clone(),
-                            payload: fanout_bytes.clone(),
-                        },
-                    );
-                    self.session_stream_seq
-                        .insert((logical, *qsid), seq_val.next());
+        if reliable {
+            let mut rs = self.replay.lock().unwrap();
+            if !rs.dormant_sessions.is_empty() {
+                let dormant: Vec<(u64, Vec<u64>)> = rs
+                    .dormant_sessions
+                    .iter()
+                    .filter(|(_, (_, pats))| {
+                        pats.iter()
+                            .any(|p| pattern_matches(p.as_ref(), topic_str))
+                    })
+                    .map(|(&l, (qsid, _))| (l, qsid.clone()))
+                    .collect();
+                for (logical, quic_stream_ids) in dormant {
+                    for qsid in &quic_stream_ids {
+                        let seq_val = rs
+                            .session_stream_seq
+                            .get(&(logical, *qsid))
+                            .copied()
+                            .unwrap_or(Seq::ZERO);
+                        let header = FrameHeader::new(stream, MessageType::Publish)
+                            .with_seq(seq_val)
+                            .with_flags(FrameFlags::ACK_REQ);
+                        rs.buffer.append(
+                            logical,
+                            StreamId::new(*qsid),
+                            ReplayEntry {
+                                seq: seq_val.get(),
+                                header: header.clone(),
+                                payload: fanout_bytes.clone(),
+                            },
+                        );
+                        rs.session_stream_seq
+                            .insert((logical, *qsid), seq_val.next());
+                    }
                 }
             }
         }
@@ -2197,7 +2218,11 @@ impl VireonDispatcher {
             );
             return;
         };
-        self.replay.acknowledge(logical, stream, ack_seq);
+        self.replay
+            .lock()
+            .unwrap()
+            .buffer
+            .acknowledge(logical, stream, ack_seq);
         self.session_last_acked.insert((logical, stream), ack_seq);
         if let Some(m) = &self.metrics {
             m.inc(&m.messages_acked_total);
@@ -2256,10 +2281,13 @@ impl VireonDispatcher {
         // `on_connection_closed`).
         self.conn_logical_session
             .insert(ctx.conn_idx, logical_session_id);
-        self.replay.register_session(logical_session_id);
-        // The session is live again — stop retaining gap frames for it
-        // (live fan-out will reach the subscriber directly from here on).
-        self.dormant_session_patterns.remove(&logical_session_id);
+        {
+            let mut rs = self.replay.lock().unwrap();
+            rs.buffer.register_session(logical_session_id);
+            // The session is live again — stop retaining gap frames for it
+            // (live fan-out will reach the subscriber directly from here on).
+            rs.dormant_sessions.remove(&logical_session_id);
+        }
         if let Some(m) = &self.metrics {
             m.inc(&m.resume_attempts_total);
         }
@@ -2298,6 +2326,9 @@ impl VireonDispatcher {
             let stream = StreamId::new(slot.stream_id);
             let outcome = self
                 .replay
+                .lock()
+                .unwrap()
+                .buffer
                 .replay_from(logical_session_id, stream, slot.last_acked);
             match outcome {
                 ReplayOutcome::Ok {
@@ -3798,11 +3829,16 @@ impl VireonDispatcher {
                 InterWorkerMsg::Publish {
                     framed: Bytes::new(),
                     msg_type: MessageType::Publish,
+                    reliable: false,
                 },
             );
             match msg {
-                InterWorkerMsg::Publish { framed, msg_type } => {
-                    self.deliver_framed_local(framed, msg_type);
+                InterWorkerMsg::Publish {
+                    framed,
+                    msg_type,
+                    reliable,
+                } => {
+                    self.deliver_framed_local(framed, msg_type, reliable);
                 }
                 InterWorkerMsg::SubGained {
                     worker_idx,
@@ -4004,7 +4040,7 @@ impl VireonDispatcher {
     /// Same semantics as `cluster_deliver_local` for regular fan-out.
     /// Consumer-group delivery is NOT handled here — it goes through
     /// the `GroupDeliver` inter-worker path to worker 0.
-    fn deliver_framed_local(&mut self, framed: Bytes, msg_type: MessageType) {
+    fn deliver_framed_local(&mut self, framed: Bytes, msg_type: MessageType, reliable: bool) {
         // Zero-copy topic parse: first 2 bytes = topic_len BE, then topic.
         if framed.len() < 2 {
             return;
@@ -4035,6 +4071,11 @@ impl VireonDispatcher {
             .into_iter()
             .collect();
 
+        // Set reliable_fanout so enqueue_frame stamps ACK_REQ and retains
+        // copies in the shared replay buffer for subscribers with logical
+        // sessions. Reset after the fan-out loop.
+        self.reliable_fanout = reliable;
+
         // Synthetic stream id for forwarded publishes (same convention
         // as `cluster_deliver_local`).
         let stream = StreamId::new(0xFFFF_FFFF);
@@ -4047,6 +4088,48 @@ impl VireonDispatcher {
                 framed.clone(),
             );
         }
+
+        // Dormant session retention for cross-worker publishes — same logic
+        // as handle_publish, but using the shared replay state.
+        if reliable {
+            let mut rs = self.replay.lock().unwrap();
+            if !rs.dormant_sessions.is_empty() {
+                let dormant: Vec<(u64, Vec<u64>)> = rs
+                    .dormant_sessions
+                    .iter()
+                    .filter(|(_, (_, pats))| {
+                        pats.iter()
+                            .any(|p| pattern_matches(p.as_ref(), topic_str))
+                    })
+                    .map(|(&l, (qsid, _))| (l, qsid.clone()))
+                    .collect();
+                for (logical, quic_stream_ids) in dormant {
+                    for qsid in &quic_stream_ids {
+                        let seq_val = rs
+                            .session_stream_seq
+                            .get(&(logical, *qsid))
+                            .copied()
+                            .unwrap_or(Seq::ZERO);
+                        let header = FrameHeader::new(stream, MessageType::Publish)
+                            .with_seq(seq_val)
+                            .with_flags(FrameFlags::ACK_REQ);
+                        rs.buffer.append(
+                            logical,
+                            StreamId::new(*qsid),
+                            ReplayEntry {
+                                seq: seq_val.get(),
+                                header: header.clone(),
+                                payload: framed.clone(),
+                            },
+                        );
+                        rs.session_stream_seq
+                            .insert((logical, *qsid), seq_val.next());
+                    }
+                }
+            }
+        }
+
+        self.reliable_fanout = false;
 
         // Consumer-group delivery is handled exclusively via the
         // GroupDeliver path (see handle_publish → do_group_delivery).
@@ -4257,22 +4340,18 @@ impl AppDispatcher for VireonDispatcher {
         }
         let principal = self.principals.remove(&conn_idx);
         // Save subscription patterns + quic_stream_ids for dormant retention
-        // when the conn has a registered logical session. Reliable publishes
-        // matching these patterns are retained in the replay buffer (keyed by
-        // each quic_stream_id) even while the subscriber is disconnected, so
-        // Resume can replay the gap.
+        // when the conn has a registered logical session. Stored in the
+        // shared replay state so any worker can retain matching gap frames.
         if let Some(&logical) = self.conn_logical_session.get(&conn_idx) {
             if !removed_patterns.is_empty() {
-                // Collect the quic_stream_ids that have replay entries for
-                // this logical session. session_stream_seq is keyed by
-                // (logical, quic_stream_id).
-                let quic_stream_ids: Vec<u64> = self
+                let mut rs = self.replay.lock().unwrap();
+                let quic_stream_ids: Vec<u64> = rs
                     .session_stream_seq
                     .keys()
                     .filter(|&&(l, _)| l == logical)
                     .map(|&(_, qsid)| qsid)
                     .collect();
-                self.dormant_session_patterns.insert(
+                rs.dormant_sessions.insert(
                     logical,
                     (
                         quic_stream_ids,
@@ -4708,6 +4787,17 @@ impl ApplicationLayer {
     /// `Arc` becomes available.
     pub fn set_metrics(&mut self, metrics: Arc<crate::metrics::ServerMetrics>) {
         self.dispatcher.set_metrics(metrics);
+    }
+
+    /// Replaces the dispatcher's replay buffer with a shared, cross-worker
+    /// one. Called from `worker.rs` when `num_workers > 1` so all workers
+    /// can find replay entries regardless of which worker handled the
+    /// original subscriber connection.
+    pub fn set_shared_replay(
+        &mut self,
+        shared: Arc<std::sync::Mutex<crate::replay::SharedReplayState>>,
+    ) {
+        self.dispatcher.replay = shared;
     }
 
     /// Installs a WAL backend. Should be called before the first

@@ -426,6 +426,15 @@ impl VireonStack {
         self.application.set_metrics(metrics);
     }
 
+    /// Propagates a shared replay buffer so all workers in a multi-worker
+    /// deployment can find replay entries across worker boundaries.
+    pub fn set_shared_replay(
+        &mut self,
+        shared: Arc<std::sync::Mutex<crate::replay::SharedReplayState>>,
+    ) {
+        self.application.set_shared_replay(shared);
+    }
+
     // ── Event processing ──────────────────────────────────────────
 
     /// Processes a batch of [`QuicEvent`]s through the layer stack.

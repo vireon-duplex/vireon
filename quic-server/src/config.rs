@@ -115,6 +115,13 @@ pub struct ServerConfig {
     /// metrics are disabled; `Some(Arc<...>)` when the endpoint is
     /// active.
     pub metrics: Option<Arc<crate::metrics::ServerMetrics>>,
+    /// Shared replay buffer for multi-worker resume reliability. `None`
+    /// in single-worker mode (each worker has its own buffer). `Some`
+    /// in multi-worker mode — all workers share the same buffer so a
+    /// reconnecting client can resume regardless of which worker it
+    /// lands on.
+    #[allow(dead_code)]
+    pub shared_replay: Option<Arc<std::sync::Mutex<crate::replay::SharedReplayState>>>,
 
     /// Log output format: plain text (default) or JSON (structured).
     pub log_format: LogFormat,
@@ -456,6 +463,7 @@ impl ServerConfig {
             cluster,
             metrics_port,
             metrics,
+            shared_replay: None,
             log_format,
             audit_log,
             tuning,
