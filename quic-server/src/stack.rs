@@ -1098,14 +1098,14 @@ impl VireonStack {
         self.pending_keys_scratch.clear();
         self.pending_keys_scratch
             .extend(self.pending_sends.keys().copied());
-        // Sort by priority so Control/Realtime entries are retried before
-        // Throughput entries. This ensures latency-sensitive frames get
+        // Sort by priority so Control/Critical entries are retried before
+        // Normal/Low entries. This ensures latency-sensitive frames get
         // the first shot at QUIC flow-control credit each tick.
         self.pending_keys_scratch.sort_by_key(|key| {
             self.pending_sends
                 .get(key)
                 .map(|p| p.priority)
-                .unwrap_or(crate::priority::Priority::Throughput)
+                .unwrap_or(crate::priority::Priority::Normal)
         });
         let pending_keys = std::mem::take(&mut self.pending_keys_scratch);
         let mut succeeded = 0u32;

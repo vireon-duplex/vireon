@@ -57,6 +57,7 @@ fn outgoing(
     OutgoingFrame {
         conn_idx,
         quic_stream_id,
+        priority: crate::priority::Priority::Normal,
         header: FrameHeader::new(StreamId::new(stream), MessageType::Publish)
             .with_seq(Seq::new(seq))
             .with_flags(FrameFlags::NONE),
@@ -91,6 +92,7 @@ fn build_fanout_dispatcher() -> VireonDispatcher {
             quic_stream_id,
             StreamId::new(logical_stream),
             policy,
+            send_policy::StreamPriority::Normal,
         );
         // Register the subscription so `handle_publish` finds them.
         d.handle_subscribe(
@@ -260,7 +262,7 @@ fn bench_policy_enqueue(c: &mut Criterion) {
                 || {
                     // Setup: fresh dispatcher with one bound stream.
                     let mut d = VireonDispatcher::new();
-                    d.bind_send_policy(0, 42, StreamId::new(7), policy);
+                    d.bind_send_policy(0, 42, StreamId::new(7), policy, send_policy::StreamPriority::Normal);
                     d
                 },
                 |mut d| {
