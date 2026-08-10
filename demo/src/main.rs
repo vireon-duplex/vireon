@@ -37,12 +37,12 @@ const VIDEO_TOPIC: &str = "video.frame";
 const AI_TOPIC: &str = "ai.token";
 
 const AUDIO_PAYLOAD: usize = 160; // Opus 20 ms @ 64 kbps
-const VIDEO_PAYLOAD: usize = 65_536; // H.264 P-frame
-const AI_PAYLOAD: usize = 1_024; // LLM token chunk
+const VIDEO_PAYLOAD: usize = 262_144; // 256 KiB H.264 frame (~60 fps)
+const AI_PAYLOAD: usize = 16_384; // 16 KiB LLM token batch
 
 const AUDIO_INTERVAL: Duration = Duration::from_millis(20); // 50 fps
-const VIDEO_INTERVAL: Duration = Duration::from_millis(100); // 10 fps
-const AI_INTERVAL: Duration = Duration::from_millis(10); // 100 fps
+const VIDEO_INTERVAL: Duration = Duration::from_millis(16); // ~60 fps
+const AI_INTERVAL: Duration = Duration::from_millis(1); // ~1000 fps
 
 const PHASE_DURATION: Duration = Duration::from_secs(10);
 const RESTART_WAIT: Duration = Duration::from_secs(3);
@@ -244,25 +244,42 @@ async fn subscriber_task(
 
 // ── Output helpers ──────────────────────────────────────────────────
 
+fn fmt_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * 1024;
+    if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else {
+        format!("{} KiB", bytes / KIB)
+    }
+}
+
 fn print_per_stream(delta: &Snapshot, elapsed: Duration) {
     let secs = elapsed.as_secs_f64().max(0.001);
     println!(
-        "  Audio  {:>5} frames | {:>6} KiB | {:>5.1} fps",
+        "  Audio  {:>5} frames | {:>9} | {:>5.1} fps",
         delta.audio_frames,
-        delta.audio_bytes / 1024,
+        fmt_bytes(delta.audio_bytes),
         delta.audio_frames as f64 / secs,
     );
     println!(
-        "  Video  {:>5} frames | {:>6} KiB | {:>5.1} fps",
+        "  Video  {:>5} frames | {:>9} | {:>5.1} fps",
         delta.video_frames,
-        delta.video_bytes / 1024,
+        fmt_bytes(delta.video_bytes),
         delta.video_frames as f64 / secs,
     );
     println!(
-        "  AI     {:>5} frames | {:>6} KiB | {:>5.1} fps",
+        "  AI     {:>5} frames | {:>9} | {:>5.1} fps",
         delta.ai_frames,
-        delta.ai_bytes / 1024,
+        fmt_bytes(delta.ai_bytes),
         delta.ai_frames as f64 / secs,
+    );
+    let total_bytes = delta.audio_bytes + delta.video_bytes + delta.ai_bytes;
+    println!(
+        "  Total  {:>5} frames | {:>9} | {:>5.1} MiB/s",
+        delta.audio_frames + delta.video_frames + delta.ai_frames,
+        fmt_bytes(total_bytes),
+        total_bytes as f64 / (1024.0 * 1024.0) / secs,
     );
 }
 
@@ -388,7 +405,7 @@ async fn main() {
     // ── Phase 1: Concurrent streaming ────────────────────────────────
 
     println!("\n>>> Phase 1: Concurrent streaming (10 s)");
-    println!("    Audio @ 50 fps | Video @ 10 fps | AI @ 100 fps\n");
+    println!("    Audio @ 50 fps | Video @ 60 fps | AI @ 1000 fps\n");
 
     let p1_start = stats.snapshot();
     let p1_begin = Instant::now();
@@ -463,8 +480,8 @@ async fn main() {
         total.audio_frames, total.video_frames, total.ai_frames
     );
     println!(
-        "  Total data delivered:    {} KiB",
-        (total.audio_bytes + total.video_bytes + total.ai_bytes) / 1024
+        "  Total data delivered:    {}",
+        fmt_bytes(total.audio_bytes + total.video_bytes + total.ai_bytes)
     );
     println!(
         "  QUIC connections used:   2 (1 publisher + 1 subscriber)"
