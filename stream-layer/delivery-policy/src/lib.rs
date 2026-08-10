@@ -27,8 +27,9 @@
 //! `MessageType::StreamOpen` payload (defined in [`policy::StreamOpenMeta`]):
 //!
 //! ```text
-//! byte 0: DeliveryPolicy discriminant (0x01..=0x04)
-//! byte 1..: reserved (forward-compat for QoS, priority, topic binding)
+//! byte 0:   DeliveryPolicy discriminant (0x01..=0x04)
+//! byte 1:   StreamPriority discriminant (0x01..=0x04)
+//! byte 2..: reserved (forward-compat for future extensions)
 //! ```
 //!
 //! ## Layering
@@ -54,6 +55,6 @@ pub mod table;
 pub use decision::{Decision, FramePayload};
 pub use error::DeliveryPolicyError;
 pub use metrics::{DeliveryPolicyMetrics, MetricsSnapshot};
-pub use policy::{DeliveryPolicy, StreamOpenMeta};
+pub use policy::{DeliveryPolicy, StreamOpenMeta, StreamPriority};
 pub use state::PerStreamState;
 pub use table::DeliveryPolicyTable;
