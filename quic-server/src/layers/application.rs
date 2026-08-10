@@ -85,7 +85,7 @@ use pubsub_engine::{
 use resource_quotas::enforcer::QuotaEnforcer;
 use send_policy::{
     DeliveryPolicy, DequeueOutcome, EnqueueDecision, FramePayload as SendFramePayload,
-    SendPolicyTable, StreamOpenMeta,
+    SendPolicyTable, StreamOpenMeta, StreamPriority,
 };
 use session_manager::SessionId;
 use topic_acl::{AclDecision, AclTable, AclTableBuilder, Action, ActionSet, PrincipalId};
@@ -462,10 +462,11 @@ pub struct VireonDispatcher {
     /// the key (not the QUIC id) because `SendPolicyTable` is keyed by
     /// logical id and egress rebuild needs to recover the QUIC stream.
     egress_quic_streams: FxHashMap<(usize, StreamId), u64>,
-    /// Per-stream DeliveryPolicy mirror. Used to derive egress
-    /// [`Priority`] without a cross-crate lookup into the send-policy
-    /// table. Populated at `bind_send_policy` time.
-    stream_policy: FxHashMap<(usize, StreamId), DeliveryPolicy>,
+    /// Per-stream egress [`StreamPriority`] mirror. Used to derive the
+    /// internal [`Priority`] for egress scheduling without a cross-crate
+    /// lookup into the send-policy table. Populated at `bind_send_policy`
+    /// time; cleared on stream close / connection close.
+    stream_priority: FxHashMap<(usize, StreamId), StreamPriority>,
     /// (conn_idx, quic_stream_id) pairs where the subscriber has paused
     /// delivery. Fan-out skips these; resume triggers a replay fill for
     /// reliable streams. Cleared on disconnect.
@@ -745,7 +746,7 @@ impl VireonDispatcher {
             next_seq: FxHashMap::default(),
             send_policy: SendPolicyTable::new(),
             egress_quic_streams: FxHashMap::default(),
-            stream_policy: FxHashMap::default(),
+            stream_priority: FxHashMap::default(),
             paused_streams: FxHashSet::default(),
             // Permissive default: any principal can do anything on any
             // two-segment topic. Operators swap this out via
@@ -1069,11 +1070,10 @@ impl VireonDispatcher {
         self.outbox.push(OutgoingFrame {
             conn_idx,
             quic_stream_id,
-            priority: self
-                .stream_policy
-                .get(&(conn_idx, logical_stream))
-                .map(|p| crate::priority::Priority::derive(header.msg_type, Some(*p)))
-                .unwrap_or_else(|| crate::priority::Priority::derive(header.msg_type, None)),
+            priority: crate::priority::Priority::derive(
+                header.msg_type,
+                self.stream_priority.get(&(conn_idx, logical_stream)).copied(),
+            ),
             header,
             payload,
         });
@@ -1349,6 +1349,7 @@ impl VireonDispatcher {
         quic_stream_id: u64,
         logical_stream: StreamId,
         policy: DeliveryPolicy,
+        priority: StreamPriority,
     ) {
         match self.send_policy.bind(conn_idx, logical_stream, policy) {
             Ok(flushed) => {
@@ -1360,7 +1361,7 @@ impl VireonDispatcher {
                     self.outbox.push(OutgoingFrame {
                         conn_idx,
                         quic_stream_id,
-                        priority: crate::priority::Priority::derive(fp.msg_type, Some(policy)),
+                        priority: crate::priority::Priority::derive(fp.msg_type, Some(priority)),
                         header: FrameHeader::new(logical_stream, fp.msg_type)
                             .with_seq(fp.seq)
                             .with_flags(fp.flags),
@@ -1383,8 +1384,8 @@ impl VireonDispatcher {
         // when drain_ready_egress rebuilds the OutgoingFrame.
         self.egress_quic_streams
             .insert((conn_idx, logical_stream), quic_stream_id);
-        self.stream_policy
-            .insert((conn_idx, logical_stream), policy);
+        self.stream_priority
+            .insert((conn_idx, logical_stream), priority);
         // Flush any pending resume-replay frames for this stream. The
         // Resume (sent on the default stream) may have arrived before the
         // client opened this dedicated stream, so the replayed frames were
@@ -1407,7 +1408,7 @@ impl VireonDispatcher {
     fn remove_send_policy(&mut self, conn_idx: usize, logical_stream: StreamId) {
         self.send_policy.remove_stream(conn_idx, logical_stream);
         self.egress_quic_streams.remove(&(conn_idx, logical_stream));
-        self.stream_policy.remove(&(conn_idx, logical_stream));
+        self.stream_priority.remove(&(conn_idx, logical_stream));
     }
 
     /// Removes send-policy state for every stream on a connection.
@@ -1415,7 +1416,7 @@ impl VireonDispatcher {
     fn remove_connection_send_policy(&mut self, conn_idx: usize) {
         self.send_policy.remove_connection(conn_idx);
         self.egress_quic_streams.retain(|&(c, _), _| c != conn_idx);
-        self.stream_policy.retain(|&(c, _), _| c != conn_idx);
+        self.stream_priority.retain(|&(c, _),_| c != conn_idx);
         self.paused_streams.retain(|&(c, _)| c != conn_idx);
     }
 
@@ -1496,11 +1497,10 @@ impl VireonDispatcher {
                 else {
                     continue;
                 };
-                let priority = self
-                    .stream_policy
-                    .get(&(conn_idx, stream_id))
-                    .map(|p| crate::priority::Priority::derive(fp.msg_type, Some(*p)))
-                    .unwrap_or_else(|| crate::priority::Priority::derive(fp.msg_type, None));
+                let priority = crate::priority::Priority::derive(
+                    fp.msg_type,
+                    self.stream_priority.get(&(conn_idx, stream_id)).copied(),
+                );
                 out.push(OutgoingFrame {
                     conn_idx,
                     quic_stream_id,
@@ -4731,6 +4731,7 @@ impl ApplicationLayer {
                     ctx.quic_stream_id,
                     frame.stream_id,
                     meta.policy,
+                    meta.priority,
                 ),
                 Err(e) => {
                     if self.dispatcher.malformed_drop.tick() {
@@ -5051,7 +5052,7 @@ mod tests {
         OutgoingFrame {
             conn_idx,
             quic_stream_id,
-            priority: crate::priority::Priority::Throughput,
+            priority: crate::priority::Priority::Normal,
             header: FrameHeader::new(StreamId::new(stream), MessageType::Publish)
                 .with_seq(Seq::new(seq))
                 .with_flags(FrameFlags::NONE),
@@ -5064,7 +5065,7 @@ mod tests {
     #[test]
     fn bind_send_policy_records_quic_stream_id_for_egress_rebuild() {
         let mut d = VireonDispatcher::new();
-        d.bind_send_policy(0, 42, StreamId::new(7), DeliveryPolicy::LatestOnly);
+        d.bind_send_policy(0, 42, StreamId::new(7), DeliveryPolicy::LatestOnly, StreamPriority::High);
         // After bind, the egress map should know the quic_stream_id to
         // use when rebuilding OutgoingFrame from a dequeued FramePayload.
         assert_eq!(d.egress_quic_streams.get(&(0, StreamId::new(7))), Some(&42),);
@@ -5075,7 +5076,7 @@ mod tests {
     #[test]
     fn remove_send_policy_drops_stream_state_and_quic_map() {
         let mut d = VireonDispatcher::new();
-        d.bind_send_policy(0, 42, StreamId::new(7), DeliveryPolicy::LatestOnly);
+        d.bind_send_policy(0, 42, StreamId::new(7), DeliveryPolicy::LatestOnly, StreamPriority::High);
         d.remove_send_policy(0, StreamId::new(7));
         assert!(!d.send_policy.contains(0, StreamId::new(7)));
         assert_eq!(d.egress_quic_streams.get(&(0, StreamId::new(7))), None);
@@ -5084,9 +5085,9 @@ mod tests {
     #[test]
     fn remove_connection_send_policy_clears_all_streams_for_conn() {
         let mut d = VireonDispatcher::new();
-        d.bind_send_policy(0, 100, StreamId::new(1), DeliveryPolicy::ReliableOrdered);
-        d.bind_send_policy(0, 101, StreamId::new(2), DeliveryPolicy::LatestOnly);
-        d.bind_send_policy(1, 200, StreamId::new(1), DeliveryPolicy::ReliableOrdered);
+        d.bind_send_policy(0, 100, StreamId::new(1), DeliveryPolicy::ReliableOrdered, StreamPriority::Normal);
+        d.bind_send_policy(0, 101, StreamId::new(2), DeliveryPolicy::LatestOnly, StreamPriority::High);
+        d.bind_send_policy(1, 200, StreamId::new(1), DeliveryPolicy::ReliableOrdered, StreamPriority::Normal);
         d.remove_connection_send_policy(0);
         // Conn 0 streams gone.
         assert!(!d.send_policy.contains(0, StreamId::new(1)));
@@ -5112,7 +5113,7 @@ mod tests {
     fn enqueue_egress_consumes_for_bound_stream() {
         // Stream is bound → frame goes into the policy table.
         let mut d = VireonDispatcher::new();
-        d.bind_send_policy(0, 42, StreamId::new(7), DeliveryPolicy::ReliableOrdered);
+        d.bind_send_policy(0, 42, StreamId::new(7), DeliveryPolicy::ReliableOrdered, StreamPriority::Normal);
         let out = outgoing(0, 42, 7, 0, b"hi");
         let result = d.enqueue_egress(out);
         assert!(result.is_none(), "bound stream should be consumed");
@@ -5123,7 +5124,7 @@ mod tests {
         // RealtimeDropOld with a stale seq → Drop. The frame is consumed
         // (None returned) but never emerges from drain_ready_egress.
         let mut d = VireonDispatcher::new();
-        d.bind_send_policy(0, 42, StreamId::new(7), DeliveryPolicy::RealtimeDropOld);
+        d.bind_send_policy(0, 42, StreamId::new(7), DeliveryPolicy::RealtimeDropOld, StreamPriority::High);
         // First enqueue seeds newest_seq = 9.
         let _ = d.enqueue_egress(outgoing(0, 42, 7, 9, b"newer"));
         // Stale seq=5 → Drop.
@@ -5145,7 +5146,7 @@ mod tests {
         // quic_stream_id declared at bind time (not the publisher's).
         let mut d = VireonDispatcher::new();
         // Bind on quic_stream_id=42 (subscriber's stream).
-        d.bind_send_policy(0, 42, StreamId::new(7), DeliveryPolicy::ReliableOrdered);
+        d.bind_send_policy(0, 42, StreamId::new(7), DeliveryPolicy::ReliableOrdered, StreamPriority::Normal);
         // Enqueue arrives with quic_stream_id=42 from the fan-out path.
         let _ = d.enqueue_egress(outgoing(0, 42, 7, 0, b"x"));
         let mut ready = Vec::new();
@@ -5159,7 +5160,7 @@ mod tests {
     #[test]
     fn drain_ready_egress_latest_only_keeps_newest_only() {
         let mut d = VireonDispatcher::new();
-        d.bind_send_policy(0, 42, StreamId::new(7), DeliveryPolicy::LatestOnly);
+        d.bind_send_policy(0, 42, StreamId::new(7), DeliveryPolicy::LatestOnly, StreamPriority::High);
         // Three rapid enqueues before drain — the middle one displaces
         // the oldest, the newest wins.
         let _ = d.enqueue_egress(outgoing(0, 42, 7, 0, b"old"));
@@ -5178,7 +5179,7 @@ mod tests {
     #[test]
     fn drain_ready_egress_fifo_preserves_order() {
         let mut d = VireonDispatcher::new();
-        d.bind_send_policy(0, 42, StreamId::new(7), DeliveryPolicy::ReliableOrdered);
+        d.bind_send_policy(0, 42, StreamId::new(7), DeliveryPolicy::ReliableOrdered, StreamPriority::Normal);
         for i in 0..5u8 {
             let _ = d.enqueue_egress(outgoing(0, 42, 7, u64::from(i), &[i]));
         }
@@ -5197,7 +5198,7 @@ mod tests {
         // no longer has the quic_stream_id, so drain must skip it
         // instead of emitting with quic_stream_id=0.
         let mut d = VireonDispatcher::new();
-        d.bind_send_policy(0, 42, StreamId::new(7), DeliveryPolicy::ReliableOrdered);
+        d.bind_send_policy(0, 42, StreamId::new(7), DeliveryPolicy::ReliableOrdered, StreamPriority::Normal);
         let _ = d.enqueue_egress(outgoing(0, 42, 7, 0, b"x"));
         // Receiver vanished between enqueue and drain.
         d.remove_send_policy(0, StreamId::new(7));
@@ -5216,11 +5217,11 @@ mod tests {
         // not silently lost. Mirrors `SendPolicyTable::bind` semantics.
         let mut d = VireonDispatcher::new();
         // First bind — ReliableOrdered, queue two frames.
-        d.bind_send_policy(0, 42, StreamId::new(7), DeliveryPolicy::ReliableOrdered);
+        d.bind_send_policy(0, 42, StreamId::new(7), DeliveryPolicy::ReliableOrdered, StreamPriority::Normal);
         let _ = d.enqueue_egress(outgoing(0, 42, 7, 0, b"a"));
         let _ = d.enqueue_egress(outgoing(0, 42, 7, 1, b"b"));
         // Re-bind to LatestOnly — flush should displace the FIFO frames.
-        d.bind_send_policy(0, 42, StreamId::new(7), DeliveryPolicy::LatestOnly);
+        d.bind_send_policy(0, 42, StreamId::new(7), DeliveryPolicy::LatestOnly, StreamPriority::High);
         let outbox = d.drain_outbox();
         assert_eq!(outbox.len(), 2);
         assert_eq!(outbox[0].payload.as_ref(), b"a");
@@ -5270,6 +5271,7 @@ mod tests {
                 quic_stream_id,
                 StreamId::new(logical_stream),
                 policy,
+                StreamPriority::Normal,
             );
         }
 
@@ -5329,7 +5331,7 @@ mod tests {
         // drain happens *after* a burst of N publishes should only see
         // the single newest frame, never the intermediate ones.
         let mut d = VireonDispatcher::new();
-        d.bind_send_policy(9, 999, StreamId::new(99), DeliveryPolicy::LatestOnly);
+        d.bind_send_policy(9, 999, StreamId::new(99), DeliveryPolicy::LatestOnly, StreamPriority::High);
 
         // Burst of 10 publishes before any drain.
         for seq in 0..10u64 {
@@ -6131,6 +6133,7 @@ mod tests {
             100,
             StreamId::new(STREAM),
             DeliveryPolicy::ReliableUnordered,
+            StreamPriority::Normal,
         );
         d.handle_subscribe(
             &FrameContext {

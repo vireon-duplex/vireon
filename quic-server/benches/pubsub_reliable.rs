@@ -47,6 +47,7 @@ fn build_dispatcher(num_subs: usize) -> VireonDispatcher {
             quic_stream_id,
             StreamId::new(logical_stream),
             DeliveryPolicy::ReliableUnordered,
+            send_policy::StreamPriority::Normal,
         );
         d.handle_subscribe(
             &ctx(conn_idx, quic_stream_id),
