@@ -79,6 +79,8 @@ fn is_control(msg_type: MessageType) -> bool {
             | MessageType::FetchReply
             | MessageType::TopicCreate
             | MessageType::TopicDelete
+            | MessageType::StreamPause
+            | MessageType::StreamResume
     )
 }
 
