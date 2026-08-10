@@ -666,13 +666,24 @@ pub enum MessageType {
     /// [`crate::payload::ResumeUnavailablePayload`] (same shape as
     /// [`crate::payload::ResumeOkPayload`]).
     ResumeUnavailable = 0x1D,
+    /// Client → server: pause delivery on a logical stream. The server
+    /// stops fanning out new frames to this stream but keeps buffering
+    /// for reliable streams (replay buffer). Realtime streams drop
+    /// frames during pause. Payload is empty — the stream id is in the
+    /// frame header.
+    StreamPause = 0x1E,
+    /// Client → server: resume delivery on a previously-paused stream.
+    /// For reliable streams the server replays the gap from the replay
+    /// buffer; for realtime streams delivery continues from now. Payload
+    /// is empty.
+    StreamResume = 0x1F,
 }
 
 /// Every defined [`MessageType`], ascending by wire byte.
 ///
 /// Useful for exhaustive round-trip tests and for dispatchers that want to
 /// validate they handle every variant.
-pub const ALL_MESSAGE_TYPES: [MessageType; 29] = [
+pub const ALL_MESSAGE_TYPES: [MessageType; 31] = [
     MessageType::TextToken,
     MessageType::AudioFrame,
     MessageType::VideoFrame,
@@ -702,6 +713,8 @@ pub const ALL_MESSAGE_TYPES: [MessageType; 29] = [
     MessageType::Resume,
     MessageType::ResumeOk,
     MessageType::ResumeUnavailable,
+    MessageType::StreamPause,
+    MessageType::StreamResume,
 ];
 
 impl MessageType {
@@ -744,6 +757,8 @@ impl MessageType {
             0x1B => Self::Resume,
             0x1C => Self::ResumeOk,
             0x1D => Self::ResumeUnavailable,
+            0x1E => Self::StreamPause,
+            0x1F => Self::StreamResume,
             _ => return None,
         })
     }
@@ -1190,8 +1205,9 @@ mod tests {
     #[test]
     fn reserved_and_unknown_bytes_map_to_none() {
         assert_eq!(MessageType::from_byte(0x00), None);
-        // 0x1B–0x1D are now Resume / ResumeOk / ResumeUnavailable.
-        assert_eq!(MessageType::from_byte(0x1E), None);
+        // 0x1B–0x1F are now Resume / ResumeOk / ResumeUnavailable /
+        // StreamPause / StreamResume.
+        assert_eq!(MessageType::from_byte(0x20), None);
         assert_eq!(MessageType::from_byte(0xFF), None);
         assert!(matches!(
             MessageType::try_from(0x42),
@@ -1211,7 +1227,7 @@ mod tests {
     #[test]
     fn wire_bytes_are_dense_and_unique() {
         let bytes: Vec<u8> = ALL_MESSAGE_TYPES.iter().map(|mt| mt.as_byte()).collect();
-        assert_eq!(bytes, (0x01..=0x1Du8).collect::<Vec<_>>());
+        assert_eq!(bytes, (0x01..=0x1Fu8).collect::<Vec<_>>());
         let unique: std::collections::HashSet<_> = bytes.iter().copied().collect();
         assert_eq!(unique.len(), bytes.len());
     }

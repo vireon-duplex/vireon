@@ -466,6 +466,10 @@ pub struct VireonDispatcher {
     /// [`Priority`] without a cross-crate lookup into the send-policy
     /// table. Populated at `bind_send_policy` time.
     stream_policy: FxHashMap<(usize, StreamId), DeliveryPolicy>,
+    /// (conn_idx, quic_stream_id) pairs where the subscriber has paused
+    /// delivery. Fan-out skips these; resume triggers a replay fill for
+    /// reliable streams. Cleared on disconnect.
+    paused_streams: FxHashSet<(usize, u64)>,
 
     /// [application-layer] Topic-ACL table. Phase 7 ships with a single
     /// broad allow-all rule (`allow("*.*", None, ALL)`) so existing
@@ -742,6 +746,7 @@ impl VireonDispatcher {
             send_policy: SendPolicyTable::new(),
             egress_quic_streams: FxHashMap::default(),
             stream_policy: FxHashMap::default(),
+            paused_streams: FxHashSet::default(),
             // Permissive default: any principal can do anything on any
             // two-segment topic. Operators swap this out via
             // [`Self::with_acl`] when enforcing real authorization.
@@ -1054,6 +1059,13 @@ impl VireonDispatcher {
             );
             rs.touch(logical);
         }
+        // Pause gate: skip the outbox push if this stream is paused.
+        // For reliable streams the frame is already in the replay buffer
+        // and will be replayed on resume. For realtime streams the frame
+        // is dropped (stale A/V is useless).
+        if self.paused_streams.contains(&(conn_idx, quic_stream_id)) {
+            return;
+        }
         self.outbox.push(OutgoingFrame {
             conn_idx,
             quic_stream_id,
@@ -1065,6 +1077,53 @@ impl VireonDispatcher {
             header,
             payload,
         });
+    }
+
+    /// Replays buffered frames for a stream that was just resumed from
+    /// pause. For reliable streams (those with a registered logical
+    /// session), the replay buffer still holds all unacked frames
+    /// appended during the pause — we replay them via `pending_replays`
+    /// so they bypass `enqueue_frame` (which would stamp new seq
+    /// numbers and break ordering).
+    ///
+    /// For non-reliable / realtime streams (no logical session), this is
+    /// a no-op: frames were dropped during pause and the stream simply
+    /// resumes from now.
+    fn replay_gap_for_stream(&mut self, conn_idx: usize, quic_stream_id: u64) {
+        let logical = match self.conn_logical_session.get(&conn_idx).copied() {
+            Some(l) => l,
+            None => return,
+        };
+        let stream = StreamId::new(quic_stream_id);
+        let entries = {
+            let mut rs = self.replay.lock().unwrap();
+            rs.touch(logical);
+            match rs.buffer.replay_from(logical, stream, 0) {
+                ReplayOutcome::Ok { entries, .. } => entries,
+                ReplayOutcome::Unavailable { .. } => return,
+            }
+        };
+        if entries.is_empty() {
+            return;
+        }
+        let buf = self
+            .pending_replays
+            .entry((conn_idx, quic_stream_id))
+            .or_default();
+        for entry in entries {
+            let header = entry.header.with_flags(FrameFlags::ACK_REQ);
+            self.conn_metrics
+                .entry(conn_idx)
+                .or_default()
+                .record_delivery_out(entry.payload.len());
+            buf.push(OutgoingFrame {
+                conn_idx,
+                quic_stream_id,
+                priority: crate::priority::Priority::derive(header.msg_type, None),
+                header,
+                payload: entry.payload,
+            });
+        }
     }
 
     // ── ACL ────────────────────────────────────────────────────────
@@ -1357,6 +1416,7 @@ impl VireonDispatcher {
         self.send_policy.remove_connection(conn_idx);
         self.egress_quic_streams.retain(|&(c, _), _| c != conn_idx);
         self.stream_policy.retain(|&(c, _), _| c != conn_idx);
+        self.paused_streams.retain(|&(c, _)| c != conn_idx);
     }
 
     // ── Send-policy egress ─────────────────────────────────────────
@@ -4688,6 +4748,22 @@ impl ApplicationLayer {
             MessageType::StreamClose | MessageType::StreamReset => {
                 self.dispatcher
                     .remove_send_policy(ctx.conn_idx, frame.stream_id);
+                // Also clear any paused state for this stream.
+                self.dispatcher
+                    .paused_streams
+                    .remove(&(ctx.conn_idx, ctx.quic_stream_id));
+            }
+            MessageType::StreamPause => {
+                self.dispatcher
+                    .paused_streams
+                    .insert((ctx.conn_idx, ctx.quic_stream_id));
+            }
+            MessageType::StreamResume => {
+                self.dispatcher
+                    .paused_streams
+                    .remove(&(ctx.conn_idx, ctx.quic_stream_id));
+                self.dispatcher
+                    .replay_gap_for_stream(ctx.conn_idx, ctx.quic_stream_id);
             }
             _ => {}
         }
