@@ -348,7 +348,7 @@ if [ "$reliable_bench_rc" -eq 0 ]; then
     # the next. Grab each batch=1000 variant and its median.
     for variant in ephemeral reliable reliable_ackd; do
         median=$(grep -A2 "pubsub_reliable/${variant}/1000$" "$RELIABLE_BENCH_LOG" 2>/dev/null \
-            | grep -oP 'time:\s+\[\K[0-9.]+ [a-z]+' | head -1)
+            | grep -oP 'time:\s+\[\K[\d.]+\s+\S+' | head -1)
         printf "  %-40s %s\n" "${variant}/1000" "${median:-?}"
     done
     RESULTS+=("pubsub_reliable|criterion|PASS")
