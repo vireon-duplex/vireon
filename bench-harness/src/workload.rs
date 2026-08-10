@@ -486,6 +486,19 @@ fn realistic_payload(mt: MessageType) -> Vec<u8> {
             v.extend_from_slice(&42u64.to_be_bytes());
             v
         }
+
+        // Resume — session_id + last_acked(u64) + window(u64). Small control.
+        MessageType::Resume => {
+            let mut v = Vec::with_capacity(24);
+            v.extend_from_slice(&0xDEAD_BEEF_CAFEu64.to_be_bytes());
+            v.extend_from_slice(&0u64.to_be_bytes());
+            v.extend_from_slice(&0u64.to_be_bytes());
+            v
+        }
+        // ResumeOk / ResumeUnavailable — small status frames.
+        MessageType::ResumeOk | MessageType::ResumeUnavailable => vec![0u8; 16],
+        // StreamPause / StreamResume — empty payload (stream_id in header).
+        MessageType::StreamPause | MessageType::StreamResume => Vec::new(),
     }
 }
 
@@ -529,6 +542,11 @@ fn type_name(mt: MessageType) -> &'static str {
         MessageType::ConsumerGroupLeave => "ConsumerGroupLeave",
         MessageType::ConsumerGroupHeartbeat => "ConsumerGroupHeartbeat",
         MessageType::NotifyOffset => "NotifyOffset",
+        MessageType::Resume => "Resume",
+        MessageType::ResumeOk => "ResumeOk",
+        MessageType::ResumeUnavailable => "ResumeUnavailable",
+        MessageType::StreamPause => "StreamPause",
+        MessageType::StreamResume => "StreamResume",
     }
 }
 

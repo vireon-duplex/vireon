@@ -60,4 +60,4 @@ pub use table::SendPolicyTable;
 // byte is shared between send and receive sides — it represents the
 // contract a stream declares at `StreamOpen` time, and both ends must
 // interpret it identically.
-pub use delivery_policy::{DeliveryPolicy, StreamOpenMeta};
+pub use delivery_policy::{DeliveryPolicy, StreamOpenMeta, StreamPriority};
