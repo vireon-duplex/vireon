@@ -23,11 +23,11 @@ use crate::common;
 
 const TOPIC: &str = "jobs.tasks";
 const GROUP: &str = "workers";
-const PAYLOAD_LEN: usize = 256;
-const TOTAL_JOBS: u64 = 1000;
+const PAYLOAD_LEN: usize = 16_384;
+const TOTAL_JOBS: u64 = 20_000;
 const MEMBER_READY: Duration = Duration::from_millis(500);
 const DRAIN_IDLE: Duration = Duration::from_millis(500);
-const DRAIN_DEADLINE: Duration = Duration::from_secs(15);
+const DRAIN_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Drain result for one group member.
 struct MemberResult {
@@ -83,11 +83,11 @@ pub async fn run(workers: usize, members: usize) {
 
     // ── M group member connections ───────────────────────────────────
 
-    println!("[setup] connecting {members} group members to group \"{GROUP}\"...");
+    println!("[setup] connecting {members} group members to group \"{GROUP}\" (HT flow control)...");
     let mut member_clients = Vec::new();
     let mut group_subs = Vec::new();
     for i in 0..members {
-        let c = common::connect_ready(&addr).await;
+        let c = common::connect_ready_ht(&addr).await;
         let consumer_id = format!("c{i}");
         let gs = c
             .subscribe_group(TOPIC, GROUP, &consumer_id)
@@ -101,8 +101,8 @@ pub async fn run(workers: usize, members: usize) {
 
     // ── Publisher ────────────────────────────────────────────────────
 
-    println!("[setup] connecting publisher...\n");
-    let pub_client = common::connect_ready(&addr).await;
+    println!("[setup] connecting publisher (HT flow control)...\n");
+    let pub_client = common::connect_ready_ht(&addr).await;
 
     // ── Publish jobs with embedded timestamps ────────────────────────
 
