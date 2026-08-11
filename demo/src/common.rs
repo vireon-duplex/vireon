@@ -184,6 +184,7 @@ pub async fn connect_with_reconnect(addr: &str) -> vireon_sdk::Client {
 
 /// Simple retry-connect without a ReconnectPolicy (for fire-and-forget scenarios).
 /// Retries until the server is ready (up to 30s deadline).
+#[allow(dead_code)]
 pub async fn connect_ready(addr: &str) -> vireon_sdk::Client {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -202,6 +203,41 @@ pub async fn connect_ready(addr: &str) -> vireon_sdk::Client {
             }
             Ok(Err(e)) => panic!("could not connect to server: {e}"),
             Err(_) => panic!("connect_ready deadline exceeded"),
+        }
+    }
+}
+
+/// High-throughput variant: tunes QUIC flow-control windows so the connection
+/// can sustain >1 GiB/s aggregate. Use this for fanout/cluster benchmarks.
+///
+/// - `max_data` = 64 MiB connection-level window
+/// - `max_stream_data` = 64 MiB per-stream window
+/// - `pending_cap` = 256 MiB client-side pending bytes
+/// - `subscriber_buffer` = 65536 message channel depth
+pub async fn connect_ready_ht(addr: &str) -> vireon_sdk::Client {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            ClientBuilder::new(addr)
+                .sni("localhost")
+                .tls_verify(TlsVerify::DangerAcceptInvalid)
+                .max_data(1 << 26)
+                .max_stream_data(1 << 26)
+                .pending_cap(1 << 28)
+                .subscriber_buffer(65536)
+                .cmd_channel_cap(16384)
+                .max_idle_timeout(Duration::from_secs(30))
+                .connect(),
+        )
+        .await
+        {
+            Ok(Ok(c)) => return c,
+            Ok(Err(_)) | Err(_) if Instant::now() < deadline => {
+                sleep(Duration::from_millis(150)).await;
+            }
+            Ok(Err(e)) => panic!("could not connect to server (ht): {e}"),
+            Err(_) => panic!("connect_ready_ht deadline exceeded"),
         }
     }
 }

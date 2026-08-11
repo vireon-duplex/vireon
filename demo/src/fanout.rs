@@ -23,10 +23,10 @@ use vireon_sdk::Subscription;
 use crate::common;
 
 const TOPIC: &str = "fanout.data";
-const PAYLOAD_LEN: usize = 1024;
-const MSGS_PER_PUBLISHER: u64 = 1000;
+const PAYLOAD_LEN: usize = 65_536;
+const MSGS_PER_PUBLISHER: u64 = 5_000;
 const SUBSCRIBE_PROPAGATION: Duration = Duration::from_millis(500);
-const DRAIN_DEADLINE: Duration = Duration::from_secs(15);
+const DRAIN_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Drain result: delivered count, duplicate count, bytes received, latency samples.
 struct DrainResult {
@@ -37,9 +37,11 @@ struct DrainResult {
 }
 
 /// Drain a subscriber. Tracks real delivered count, bytes, and end-to-end
-/// latency (from embedded publish timestamp to recv time).
+/// latency (from embedded publish timestamp to recv time). Uses O(1)
+/// `Vec<bool>` duplicate detection indexed by seq.
 async fn drain_sub(sub: &mut Subscription, expected: u64) -> DrainResult {
-    let mut ids: Vec<u64> = Vec::with_capacity(expected as usize);
+    let mut seen: Vec<bool> = vec![false; expected as usize];
+    let mut delivered = 0u64;
     let mut dups = 0u64;
     let mut bytes = 0u64;
     let mut latencies: Vec<u64> = Vec::with_capacity(expected as usize);
@@ -52,12 +54,16 @@ async fn drain_sub(sub: &mut Subscription, expected: u64) -> DrainResult {
                 if let Some((seq, pub_ns)) = common::decode_payload(&msg.payload) {
                     let latency = common::now_nanos().saturating_sub(pub_ns);
                     latencies.push(latency);
-                    if ids.contains(&seq) {
-                        dups += 1;
-                    } else {
-                        ids.push(seq);
+                    let idx = seq as usize;
+                    if idx < seen.len() {
+                        if seen[idx] {
+                            dups += 1;
+                        } else {
+                            seen[idx] = true;
+                            delivered += 1;
+                        }
                     }
-                    if ids.len() as u64 >= expected {
+                    if delivered >= expected {
                         break;
                     }
                 }
@@ -66,7 +72,7 @@ async fn drain_sub(sub: &mut Subscription, expected: u64) -> DrainResult {
         }
     }
     DrainResult {
-        delivered: ids.len() as u64,
+        delivered,
         dups,
         bytes,
         latencies,
@@ -91,11 +97,11 @@ pub async fn run(workers: usize, publishers: usize, subscribers: usize) {
 
     // ── N subscriber connections ─────────────────────────────────────
 
-    println!("[setup] connecting {subscribers} subscribers...");
+    println!("[setup] connecting {subscribers} subscribers (HT flow control)...");
     let mut sub_clients = Vec::new();
     let mut subs = Vec::new();
     for _ in 0..subscribers {
-        let c = common::connect_ready(&addr).await;
+        let c = common::connect_ready_ht(&addr).await;
         let s = c.subscribe(TOPIC).await.expect("subscribe");
         sub_clients.push(c);
         subs.push(s);
@@ -105,10 +111,10 @@ pub async fn run(workers: usize, publishers: usize, subscribers: usize) {
 
     // ── M publisher connections ──────────────────────────────────────
 
-    println!("[setup] connecting {publishers} publisher(s)...\n");
+    println!("[setup] connecting {publishers} publisher(s) (HT flow control)...\n");
     let mut pub_clients = Vec::new();
     for _ in 0..publishers {
-        pub_clients.push(common::connect_ready(&addr).await);
+        pub_clients.push(common::connect_ready_ht(&addr).await);
     }
 
     // ── Publish with embedded timestamps ─────────────────────────────
@@ -196,10 +202,17 @@ pub async fn run(workers: usize, publishers: usize, subscribers: usize) {
         common::fmt_bytes(total_bytes)
     );
     println!(
-        "  Delivery throughput:  {:.1} MiB/s ({:.0} msg/s aggregate, end-to-end)",
+        "  Delivery throughput (e2e):  {:.1} MiB/s ({:.0} msg/s aggregate)",
         total_bytes as f64 / (1024.0 * 1024.0) / e2e_secs,
         total_delivered as f64 / e2e_secs,
     );
+    if drain_elapsed.as_secs_f64() > 0.001 {
+        let peak = total_bytes as f64 / (1024.0 * 1024.0) / drain_elapsed.as_secs_f64();
+        println!(
+            "  Peak fan-out rate (drain): {:.1} MiB/s — server's raw delivery capacity",
+            peak,
+        );
+    }
     if all_latencies.count() > 0 {
         println!(
             "  Latency (end-to-end): p50 {} | p99 {} | max {}",
