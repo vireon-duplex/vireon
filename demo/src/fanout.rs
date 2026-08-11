@@ -28,32 +28,49 @@ const MSGS_PER_PUBLISHER: u64 = 1000;
 const SUBSCRIBE_PROPAGATION: Duration = Duration::from_millis(500);
 const DRAIN_DEADLINE: Duration = Duration::from_secs(15);
 
-/// Drain a subscriber, collecting received sequence IDs from the first
-/// 8 bytes of each payload. Returns (delivered, duplicates).
-async fn drain_sub(sub: &mut Subscription, expected: u64) -> (u64, u64) {
+/// Drain result: delivered count, duplicate count, bytes received, latency samples.
+struct DrainResult {
+    delivered: u64,
+    dups: u64,
+    bytes: u64,
+    latencies: Vec<u64>,
+}
+
+/// Drain a subscriber. Tracks real delivered count, bytes, and end-to-end
+/// latency (from embedded publish timestamp to recv time).
+async fn drain_sub(sub: &mut Subscription, expected: u64) -> DrainResult {
     let mut ids: Vec<u64> = Vec::with_capacity(expected as usize);
     let mut dups = 0u64;
+    let mut bytes = 0u64;
+    let mut latencies: Vec<u64> = Vec::with_capacity(expected as usize);
     let deadline = Instant::now() + DRAIN_DEADLINE;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match tokio::time::timeout(remaining, sub.recv()).await {
-            Ok(Some(msg)) if msg.payload.len() >= 8 => {
-                let mut b = [0u8; 8];
-                b.copy_from_slice(&msg.payload[..8]);
-                let id = u64::from_be_bytes(b);
-                if ids.contains(&id) {
-                    dups += 1;
-                } else {
-                    ids.push(id);
-                }
-                if ids.len() as u64 >= expected {
-                    break;
+            Ok(Some(msg)) => {
+                bytes += msg.payload.len() as u64;
+                if let Some((seq, pub_ns)) = common::decode_payload(&msg.payload) {
+                    let latency = common::now_nanos().saturating_sub(pub_ns);
+                    latencies.push(latency);
+                    if ids.contains(&seq) {
+                        dups += 1;
+                    } else {
+                        ids.push(seq);
+                    }
+                    if ids.len() as u64 >= expected {
+                        break;
+                    }
                 }
             }
             _ => break,
         }
     }
-    (ids.len() as u64, dups)
+    DrainResult {
+        delivered: ids.len() as u64,
+        dups,
+        bytes,
+        latencies,
+    }
 }
 
 pub async fn run(workers: usize, publishers: usize, subscribers: usize) {
@@ -83,7 +100,6 @@ pub async fn run(workers: usize, publishers: usize, subscribers: usize) {
         sub_clients.push(c);
         subs.push(s);
     }
-    // Let subscriptions propagate before publishing.
     sleep(SUBSCRIBE_PROPAGATION).await;
     println!("[setup] all {subscribers} subscribers subscribed to \"{TOPIC}\"");
 
@@ -95,7 +111,7 @@ pub async fn run(workers: usize, publishers: usize, subscribers: usize) {
         pub_clients.push(common::connect_ready(&addr).await);
     }
 
-    // ── Publish ──────────────────────────────────────────────────────
+    // ── Publish with embedded timestamps ─────────────────────────────
 
     println!(">>> Publishing {total_msgs} messages ({MSGS_PER_PUBLISHER} per publisher)...\n");
 
@@ -104,7 +120,7 @@ pub async fn run(workers: usize, publishers: usize, subscribers: usize) {
     let mut global_seq = 0u64;
     for (pi, client) in pub_clients.iter().enumerate() {
         for _ in 0..MSGS_PER_PUBLISHER {
-            buf[..8].copy_from_slice(&global_seq.to_be_bytes());
+            common::encode_payload(&mut buf, global_seq, common::now_nanos());
             client.publish(TOPIC, &buf[..]).await.expect("publish");
             global_seq += 1;
         }
@@ -127,28 +143,42 @@ pub async fn run(workers: usize, publishers: usize, subscribers: usize) {
     let mut handles = Vec::new();
     for (i, mut sub) in subs.into_iter().enumerate() {
         handles.push(tokio::spawn(async move {
-            let (delivered, dups) = drain_sub(&mut sub, total_msgs).await;
-            (i, delivered, dups)
+            let res = drain_sub(&mut sub, total_msgs).await;
+            (i, res)
         }));
     }
 
     let mut all_ok = true;
     let mut min_delivered = u64::MAX;
     let mut max_delivered = 0u64;
+    let mut total_delivered = 0u64;
+    let mut total_bytes = 0u64;
+    let mut all_latencies = common::LatencyStats::default();
     for h in handles {
-        let (i, delivered, dups) = h.await.expect("drain task");
-        let ok = delivered == total_msgs && dups == 0;
+        let (i, res) = h.await.expect("drain task");
+        let ok = res.delivered == total_msgs && res.dups == 0;
         let mark = if ok { "OK" } else { "FAIL" };
+        let sub_min = res.latencies.iter().copied().min().map(common::fmt_latency).unwrap_or("-".into());
         println!(
-            "  subscriber {i:>2}: {delivered:>5} / {total_msgs} messages ({dups} dups) [{mark}]"
+            "  subscriber {i:>2}: {:>5} / {total_msgs} msgs | {} | {:>2} dups | min {sub_min} [{mark}]",
+            res.delivered,
+            common::fmt_bytes(res.bytes),
+            res.dups,
         );
         if !ok {
             all_ok = false;
         }
-        min_delivered = min_delivered.min(delivered);
-        max_delivered = max_delivered.max(delivered);
+        min_delivered = min_delivered.min(res.delivered);
+        max_delivered = max_delivered.max(res.delivered);
+        total_delivered += res.delivered;
+        total_bytes += res.bytes;
+        for ns in res.latencies {
+            all_latencies.record(ns);
+        }
     }
     let drain_elapsed = drain_start.elapsed();
+    // End-to-end time: from first publish to last delivery.
+    let e2e_secs = pub_start.elapsed().as_secs_f64().max(0.001);
 
     // ── Summary ──────────────────────────────────────────────────────
 
@@ -160,16 +190,25 @@ pub async fn run(workers: usize, publishers: usize, subscribers: usize) {
     println!(
         "  Per-subscriber: min {min_delivered} | max {max_delivered} | expected {total_msgs}"
     );
-    let aggregate = max_delivered * subscribers as u64;
     println!(
-        "  Aggregate delivery: {} ({})",
-        aggregate,
-        common::fmt_bytes(aggregate * PAYLOAD_LEN as u64)
+        "  Aggregate delivered (measured):  {} messages | {}",
+        total_delivered,
+        common::fmt_bytes(total_bytes)
     );
     println!(
-        "  Drain time:     {:.2}s",
-        drain_elapsed.as_secs_f64()
+        "  Delivery throughput:  {:.1} MiB/s ({:.0} msg/s aggregate, end-to-end)",
+        total_bytes as f64 / (1024.0 * 1024.0) / e2e_secs,
+        total_delivered as f64 / e2e_secs,
     );
+    if all_latencies.count() > 0 {
+        println!(
+            "  Latency (end-to-end): p50 {} | p99 {} | max {}",
+            common::fmt_latency(all_latencies.p50().unwrap_or(0)),
+            common::fmt_latency(all_latencies.p99().unwrap_or(0)),
+            common::fmt_latency(all_latencies.max().unwrap_or(0)),
+        );
+    }
+    println!("  Drain time:     {:.2}s", drain_elapsed.as_secs_f64());
     println!("  Workers:        {workers}");
     if all_ok {
         println!("  Result:         ALL SUBSCRIBERS RECEIVED ALL MESSAGES");
