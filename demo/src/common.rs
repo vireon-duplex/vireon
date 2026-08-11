@@ -228,3 +228,96 @@ pub fn init_tracing() {
         )
         .try_init();
 }
+
+// ── Latency measurement ──────────────────────────────────────────────
+
+/// Current time in nanoseconds since UNIX epoch. Used as a publish-side
+/// timestamp embedded in the payload so receivers can compute end-to-end
+/// latency without clock-sync concerns (same machine, same clock).
+pub fn now_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock before epoch")
+        .as_nanos() as u64
+}
+
+/// Encode a sequence ID + publish timestamp into the first 16 bytes of
+/// a payload buffer. Bytes 0..8 = seq (BE), bytes 8..16 = timestamp (BE).
+pub fn encode_payload(buf: &mut [u8], seq: u64, pub_nanos: u64) {
+    if buf.len() >= 16 {
+        buf[..8].copy_from_slice(&seq.to_be_bytes());
+        buf[8..16].copy_from_slice(&pub_nanos.to_be_bytes());
+    }
+}
+
+/// Decode (seq, publish_nanos) from a received payload. Returns `None`
+/// if the payload is too short for the encoded header.
+pub fn decode_payload(payload: &[u8]) -> Option<(u64, u64)> {
+    if payload.len() >= 16 {
+        let mut s = [0u8; 8];
+        s.copy_from_slice(&payload[..8]);
+        let seq = u64::from_be_bytes(s);
+        let mut t = [0u8; 8];
+        t.copy_from_slice(&payload[8..16]);
+        let ts = u64::from_be_bytes(t);
+        Some((seq, ts))
+    } else {
+        None
+    }
+}
+
+/// Latency histogram. Collects raw nanosecond samples and computes
+/// percentiles at the end.
+#[derive(Default)]
+pub struct LatencyStats {
+    samples: Vec<u64>,
+}
+
+impl LatencyStats {
+    /// Record an end-to-end latency sample (nanoseconds).
+    pub fn record(&mut self, ns: u64) {
+        self.samples.push(ns);
+    }
+
+    /// Number of recorded samples.
+    pub fn count(&self) -> usize {
+        self.samples.len()
+    }
+
+    /// Compute the requested percentile (0..=100). Returns `None` when empty.
+    fn percentile(&self, pct: f64) -> Option<u64> {
+        if self.samples.is_empty() {
+            return None;
+        }
+        let mut sorted = self.samples.clone();
+        sorted.sort_unstable();
+        let idx = ((pct / 100.0) * (sorted.len() as f64 - 1.0)).round() as usize;
+        Some(sorted[idx.min(sorted.len() - 1)])
+    }
+
+    /// p50 (median) latency in nanoseconds.
+    pub fn p50(&self) -> Option<u64> {
+        self.percentile(50.0)
+    }
+
+    /// p99 latency in nanoseconds.
+    pub fn p99(&self) -> Option<u64> {
+        self.percentile(99.0)
+    }
+
+    /// Maximum latency in nanoseconds.
+    pub fn max(&self) -> Option<u64> {
+        self.samples.iter().copied().max()
+    }
+}
+
+/// Format a nanosecond duration in a human-friendly unit (μs or ms).
+pub fn fmt_latency(ns: u64) -> String {
+    if ns < 1_000 {
+        format!("{ns} ns")
+    } else if ns < 1_000_000 {
+        format!("{:.1} μs", ns as f64 / 1_000.0)
+    } else {
+        format!("{:.2} ms", ns as f64 / 1_000_000.0)
+    }
+}

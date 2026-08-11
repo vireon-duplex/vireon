@@ -33,26 +33,38 @@ const SUB_PROPAGATION: Duration = Duration::from_millis(2000);
 const DRAIN_DEADLINE: Duration = Duration::from_secs(15);
 const MAX_START_RETRIES: u32 = 4;
 
-/// Drain a subscriber, collecting sequence IDs from the first 8 bytes.
-/// Returns (delivered, gaps, duplicates).
-async fn drain_verify(sub: &mut Subscription, expected: u64) -> (u64, u64, u64) {
+/// Drain result for one node.
+struct DrainResult {
+    delivered: u64,
+    gaps: u64,
+    dups: u64,
+    bytes: u64,
+    latencies: Vec<u64>,
+}
+
+/// Drain a subscriber, tracking real delivered count, bytes, latency.
+async fn drain_verify(sub: &mut Subscription, expected: u64) -> DrainResult {
     let mut ids: Vec<u64> = Vec::with_capacity(expected as usize);
     let mut dups = 0u64;
+    let mut bytes = 0u64;
+    let mut latencies: Vec<u64> = Vec::with_capacity(expected as usize);
     let deadline = Instant::now() + DRAIN_DEADLINE;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match tokio::time::timeout(remaining, sub.recv()).await {
-            Ok(Some(msg)) if msg.payload.len() >= 8 => {
-                let mut b = [0u8; 8];
-                b.copy_from_slice(&msg.payload[..8]);
-                let id = u64::from_be_bytes(b);
-                if ids.contains(&id) {
-                    dups += 1;
-                } else {
-                    ids.push(id);
-                }
-                if ids.len() as u64 >= expected {
-                    break;
+            Ok(Some(msg)) => {
+                bytes += msg.payload.len() as u64;
+                if let Some((seq, pub_ns)) = common::decode_payload(&msg.payload) {
+                    let latency = common::now_nanos().saturating_sub(pub_ns);
+                    latencies.push(latency);
+                    if ids.contains(&seq) {
+                        dups += 1;
+                    } else {
+                        ids.push(seq);
+                    }
+                    if ids.len() as u64 >= expected {
+                        break;
+                    }
                 }
             }
             _ => break,
@@ -61,7 +73,13 @@ async fn drain_verify(sub: &mut Subscription, expected: u64) -> (u64, u64, u64) 
     ids.sort_unstable();
     ids.dedup();
     let gaps = expected.saturating_sub(ids.len() as u64);
-    (ids.len() as u64, gaps, dups)
+    DrainResult {
+        delivered: ids.len() as u64,
+        gaps,
+        dups,
+        bytes,
+        latencies,
+    }
 }
 
 pub async fn run(workers: usize, nodes: usize) {
@@ -177,7 +195,7 @@ pub async fn run(workers: usize, nodes: usize) {
     let mut buf = vec![0u8; PAYLOAD_LEN];
     let pub_start = Instant::now();
     for n in 0..TOTAL_MSGS {
-        buf[..8].copy_from_slice(&n.to_be_bytes());
+        common::encode_payload(&mut buf, n, common::now_nanos());
         pub_client
             .publish(TOPIC, &buf[..])
             .await
@@ -200,27 +218,39 @@ pub async fn run(workers: usize, nodes: usize) {
     let mut handles = Vec::new();
     for (i, mut sub) in subs.into_iter().enumerate() {
         handles.push(tokio::spawn(async move {
-            let (delivered, gaps, dups) = drain_verify(&mut sub, TOTAL_MSGS).await;
-            (i, delivered, gaps, dups)
+            let res = drain_verify(&mut sub, TOTAL_MSGS).await;
+            (i, res)
         }));
     }
 
     let mut all_ok = true;
+    let mut total_delivered = 0u64;
+    let mut total_bytes = 0u64;
+    let mut all_latencies = common::LatencyStats::default();
     for h in handles {
-        let (i, delivered, gaps, dups) = h.await.expect("drain task");
-        let ok = delivered == TOTAL_MSGS && gaps == 0 && dups == 0;
+        let (i, res) = h.await.expect("drain task");
+        let ok = res.delivered == TOTAL_MSGS && res.gaps == 0 && res.dups == 0;
         let mark = if ok { "OK" } else { "FAIL" };
         println!(
-            "  node {}: {:>5} / {} messages ({gaps} gaps, {dups} dups) [{mark}]",
+            "  node {}: {:>5} / {} msgs | {} | {} gaps, {} dups [{mark}]",
             i + 1,
-            delivered,
-            TOTAL_MSGS
+            res.delivered,
+            TOTAL_MSGS,
+            common::fmt_bytes(res.bytes),
+            res.gaps,
+            res.dups,
         );
         if !ok {
             all_ok = false;
         }
+        total_delivered += res.delivered;
+        total_bytes += res.bytes;
+        for ns in res.latencies {
+            all_latencies.record(ns);
+        }
     }
     let drain_elapsed = drain_start.elapsed();
+    let e2e_secs = pub_start.elapsed().as_secs_f64().max(0.001);
 
     // ── Summary ──────────────────────────────────────────────────────
 
@@ -230,14 +260,24 @@ pub async fn run(workers: usize, nodes: usize) {
     println!("  Cluster nodes:    {nodes} (replication={REPLICATION})");
     println!("  Messages sent:    {TOTAL_MSGS} (cross-node fan-out: every node gets all)");
     println!(
-        "  Aggregate delivery: {} ({})",
-        TOTAL_MSGS * nodes as u64,
-        common::fmt_bytes(TOTAL_MSGS * nodes as u64 * PAYLOAD_LEN as u64)
+        "  Aggregate delivered (measured): {} messages | {}",
+        total_delivered,
+        common::fmt_bytes(total_bytes)
     );
     println!(
-        "  Drain time:       {:.2}s",
-        drain_elapsed.as_secs_f64()
+        "  Delivery throughput:  {:.1} MiB/s ({:.0} msg/s aggregate across {nodes} nodes, end-to-end)",
+        total_bytes as f64 / (1024.0 * 1024.0) / e2e_secs,
+        total_delivered as f64 / e2e_secs,
     );
+    if all_latencies.count() > 0 {
+        println!(
+            "  Latency (end-to-end): p50 {} | p99 {} | max {}",
+            common::fmt_latency(all_latencies.p50().unwrap_or(0)),
+            common::fmt_latency(all_latencies.p99().unwrap_or(0)),
+            common::fmt_latency(all_latencies.max().unwrap_or(0)),
+        );
+    }
+    println!("  Drain time:       {:.2}s", drain_elapsed.as_secs_f64());
     println!("  Workers/node:     {workers}");
     if all_ok {
         println!("  Result:           ALL {nodes} NODES RECEIVED ALL {TOTAL_MSGS} MESSAGES");
