@@ -498,6 +498,8 @@ name = "demo"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "clap",
+ "libc",
  "rcgen",
  "tokio",
  "tracing",
