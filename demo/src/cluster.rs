@@ -27,10 +27,10 @@ use crate::common;
 
 const TOPIC: &str = "cluster.fanout";
 const PAYLOAD_LEN: usize = 8_192;
-const TOTAL_MSGS: u64 = 2000;
+const TOTAL_MSGS: u64 = 5_000;
 const REPLICATION: u8 = 2;
 const SUB_PROPAGATION: Duration = Duration::from_millis(2000);
-const DRAIN_DEADLINE: Duration = Duration::from_secs(15);
+const DRAIN_DEADLINE: Duration = Duration::from_secs(60);
 const MAX_START_RETRIES: u32 = 4;
 
 /// Drain result for one node.
@@ -42,9 +42,11 @@ struct DrainResult {
     latencies: Vec<u64>,
 }
 
-/// Drain a subscriber, tracking real delivered count, bytes, latency.
+/// Drain a subscriber, tracking real delivered count, bytes, latency. Uses
+/// O(1) `Vec<bool>` duplicate detection indexed by seq.
 async fn drain_verify(sub: &mut Subscription, expected: u64) -> DrainResult {
-    let mut ids: Vec<u64> = Vec::with_capacity(expected as usize);
+    let mut seen: Vec<bool> = vec![false; expected as usize];
+    let mut delivered = 0u64;
     let mut dups = 0u64;
     let mut bytes = 0u64;
     let mut latencies: Vec<u64> = Vec::with_capacity(expected as usize);
@@ -57,12 +59,16 @@ async fn drain_verify(sub: &mut Subscription, expected: u64) -> DrainResult {
                 if let Some((seq, pub_ns)) = common::decode_payload(&msg.payload) {
                     let latency = common::now_nanos().saturating_sub(pub_ns);
                     latencies.push(latency);
-                    if ids.contains(&seq) {
-                        dups += 1;
-                    } else {
-                        ids.push(seq);
+                    let idx = seq as usize;
+                    if idx < seen.len() {
+                        if seen[idx] {
+                            dups += 1;
+                        } else {
+                            seen[idx] = true;
+                            delivered += 1;
+                        }
                     }
-                    if ids.len() as u64 >= expected {
+                    if delivered >= expected {
                         break;
                     }
                 }
@@ -70,11 +76,9 @@ async fn drain_verify(sub: &mut Subscription, expected: u64) -> DrainResult {
             _ => break,
         }
     }
-    ids.sort_unstable();
-    ids.dedup();
-    let gaps = expected.saturating_sub(ids.len() as u64);
+    let gaps = expected.saturating_sub(delivered);
     DrainResult {
-        delivered: ids.len() as u64,
+        delivered,
         gaps,
         dups,
         bytes,
@@ -167,12 +171,12 @@ pub async fn run(workers: usize, nodes: usize) {
 
     // ── Subscribers on all N nodes ────────────────────────────────────
 
-    println!("\n[setup] connecting subscribers to all {nodes} nodes...");
+    println!("\n[setup] connecting subscribers to all {nodes} nodes (HT flow control)...");
     let mut sub_clients = Vec::new();
     let mut subs: Vec<Subscription> = Vec::new();
     for port in quic_ports.iter() {
         let addr = format!("127.0.0.1:{port}");
-        let c = common::connect_ready(&addr).await;
+        let c = common::connect_ready_ht(&addr).await;
         let s = c.subscribe(TOPIC).await.expect("subscribe");
         sub_clients.push(c);
         subs.push(s);
@@ -185,7 +189,7 @@ pub async fn run(workers: usize, nodes: usize) {
     // ── Publisher on node 1 ──────────────────────────────────────────
 
     let pub_addr = format!("127.0.0.1:{}", quic_ports[0]);
-    let pub_client = common::connect_ready(&pub_addr).await;
+    let pub_client = common::connect_ready_ht(&pub_addr).await;
     println!("[setup] publisher connected to node 1 ({pub_addr})");
 
     // ── Publish ──────────────────────────────────────────────────────
@@ -265,10 +269,17 @@ pub async fn run(workers: usize, nodes: usize) {
         common::fmt_bytes(total_bytes)
     );
     println!(
-        "  Delivery throughput:  {:.1} MiB/s ({:.0} msg/s aggregate across {nodes} nodes, end-to-end)",
+        "  Delivery throughput (e2e):  {:.1} MiB/s ({:.0} msg/s aggregate across {nodes} nodes)",
         total_bytes as f64 / (1024.0 * 1024.0) / e2e_secs,
         total_delivered as f64 / e2e_secs,
     );
+    if drain_elapsed.as_secs_f64() > 0.001 {
+        let peak = total_bytes as f64 / (1024.0 * 1024.0) / drain_elapsed.as_secs_f64();
+        println!(
+            "  Peak cross-node rate (drain): {:.1} MiB/s — raw inter-node delivery capacity",
+            peak,
+        );
+    }
     if all_latencies.count() > 0 {
         println!(
             "  Latency (end-to-end): p50 {} | p99 {} | max {}",
