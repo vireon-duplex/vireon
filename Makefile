@@ -10,7 +10,7 @@
 #   make prepr     full pre-PR check (fmt + clippy + test)
 
 .DEFAULT_GOAL := help
-.PHONY: help deps build run dev test fmt fc lint check clean db-up db-down db-reset deny audit prepr flamegraph
+.PHONY: help deps build run dev test fmt fc lint check clean db-up db-down db-reset deny audit prepr flamegraph install uninstall
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
@@ -69,3 +69,9 @@ prepr: ## Full pre-PR check (fmt + clippy + test)
 
 flamegraph: ## Generate flamegraph of server under bench load (needs perf + inferno)
 	./scripts/flamegraph.sh
+
+install: ## System install (systemd service + /etc/vireon + /var/lib/vireon)
+	sudo ./scripts/install.sh
+
+uninstall: ## Remove vireon system install (prompts before deleting data)
+	sudo ./scripts/install.sh --uninstall
