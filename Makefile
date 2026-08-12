@@ -10,7 +10,7 @@
 #   make prepr     full pre-PR check (fmt + clippy + test)
 
 .DEFAULT_GOAL := help
-.PHONY: help deps build run dev test fmt fc lint check clean db-up db-down db-reset deny audit prepr flamegraph
+.PHONY: help deps build run dev test fmt fc lint check clean db-up db-down db-reset deny audit prepr flamegraph install uninstall
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
@@ -47,13 +47,13 @@ check: ## Fast type-check (no codegen)
 clean: ## Remove build artifacts
 	cargo clean
 
-db-up: ## Start dev infra (no-op until transport/storage backends are configured)
-	@docker compose up -d 2>/dev/null || echo "No dev services defined yet (see docker-compose.yml)."
+db-up: ## Start vireon server via docker compose
+	@docker compose up -d 2>/dev/null || echo "docker compose not available or cert.pem/key.pem missing (see docker-compose.yml)."
 
-db-down: ## Stop dev infra
+db-down: ## Stop vireon server
 	@docker compose down 2>/dev/null || true
 
-db-reset: ## Stop dev infra AND delete data volumes
+db-reset: ## Stop vireon server AND delete WAL volume
 	@docker compose down -v 2>/dev/null || true
 
 deny: ## Run cargo-deny (licenses, advisories, bans)
@@ -69,3 +69,9 @@ prepr: ## Full pre-PR check (fmt + clippy + test)
 
 flamegraph: ## Generate flamegraph of server under bench load (needs perf + inferno)
 	./scripts/flamegraph.sh
+
+install: ## System install (systemd service + /etc/vireon + /var/lib/vireon)
+	sudo ./scripts/install.sh
+
+uninstall: ## Remove vireon system install (prompts before deleting data)
+	sudo ./scripts/install.sh --uninstall
