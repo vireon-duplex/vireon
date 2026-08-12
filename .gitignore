@@ -27,3 +27,4 @@ after.txt
 *.txt
 profiles
 vireon.conf
+!packaging/vireon.conf
