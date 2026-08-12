@@ -25,6 +25,14 @@ services:
     container_name: vireon
     restart: unless-stopped
 
+    # io_uring needs elevated privileges. --privileged is simplest;
+    # for tighter security, replace with:
+    #   cap_add: [CAP_SYS_NICE, CAP_IPC_LOCK]
+    #   security_opt: [seccomp:unconfined, apparmor:unconfined]
+    #   ulimits:
+    #     memlock: -1
+    privileged: true
+
     ports:
       - "4433:4433/udp"   # QUIC data plane
       - "9090:9090/tcp"   # Prometheus /metrics
