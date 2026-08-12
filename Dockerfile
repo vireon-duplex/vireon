@@ -39,6 +39,10 @@ COPY . .
 # Release build of the production server binary.
 RUN cargo build --release -p quic-server
 
+# .cargo/config.toml sets build.target, so the binary lands under the
+# target-triple subdirectory. Normalize to a known path for COPY.
+RUN cp target/*/release/quic-server /tmp/quic-server
+
 # ── Runtime ─────────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
 
@@ -53,7 +57,7 @@ RUN apt-get update \
 WORKDIR /app
 
 # Stripped release binary.
-COPY --from=builder /app/target/release/quic-server /app/quic-server
+COPY --from=builder /tmp/quic-server /app/quic-server
 
 # Non-root user.
 RUN useradd --system --uid 1000 --home /app vireon \

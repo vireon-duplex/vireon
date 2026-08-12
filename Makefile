@@ -47,13 +47,13 @@ check: ## Fast type-check (no codegen)
 clean: ## Remove build artifacts
 	cargo clean
 
-db-up: ## Start dev infra (no-op until transport/storage backends are configured)
-	@docker compose up -d 2>/dev/null || echo "No dev services defined yet (see docker-compose.yml)."
+db-up: ## Start vireon server via docker compose
+	@docker compose up -d 2>/dev/null || echo "docker compose not available or cert.pem/key.pem missing (see docker-compose.yml)."
 
-db-down: ## Stop dev infra
+db-down: ## Stop vireon server
 	@docker compose down 2>/dev/null || true
 
-db-reset: ## Stop dev infra AND delete data volumes
+db-reset: ## Stop vireon server AND delete WAL volume
 	@docker compose down -v 2>/dev/null || true
 
 deny: ## Run cargo-deny (licenses, advisories, bans)

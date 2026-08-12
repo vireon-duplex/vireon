@@ -1,0 +1,54 @@
+# docker-compose.yml — Vireon QUIC pub/sub server
+#
+# Quick start:
+#   1. Generate dev certs:
+#      openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
+#        -days 365 -nodes -subj "/CN=localhost"
+#
+#   2. Start:
+#      docker compose up -d
+#
+#   3. Verify:
+#      curl http://localhost:9090/metrics
+#      docker compose logs -f vireon
+#
+#   4. Stop:
+#      docker compose down
+
+services:
+  vireon:
+    # Build from source (slower, uses local code):
+    build: .
+    # Prebuilt multi-arch image (faster, from GHCR):
+    # image: ghcr.io/vireon-duplex/vireon:latest
+
+    container_name: vireon
+    restart: unless-stopped
+
+    ports:
+      - "4433:4433/udp"   # QUIC data plane
+      - "9090:9090/tcp"   # Prometheus /metrics
+
+    volumes:
+      # TLS certs (required — generate your own, see Quick start above)
+      - ./cert.pem:/cert.pem:ro
+      - ./key.pem:/key.pem:ro
+      # WAL persistence (durable delivery + crash recovery)
+      - vireon-wal:/var/lib/vireon/wal
+
+    command:
+      - "--cert"
+      - "/cert.pem"
+      - "--key"
+      - "/key.pem"
+      - "--port"
+      - "4433"
+      - "--metrics-port"
+      - "9090"
+      - "--wal-root"
+      - "/var/lib/vireon/wal"
+      - "--mode"
+      - "multi"
+
+volumes:
+  vireon-wal:

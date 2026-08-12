@@ -29,6 +29,8 @@ server is a single binary (`quic-server`); clients connect via the Rust SDK
 
 ### Option A — Docker (fastest)
 
+**docker run:**
+
 ```bash
 docker pull ghcr.io/vireon-duplex/vireon:latest
 docker run --rm -p 4433:4433/udp -p 9090:9090/tcp \
@@ -37,6 +39,21 @@ docker run --rm -p 4433:4433/udp -p 9090:9090/tcp \
   ghcr.io/vireon-duplex/vireon:latest \
   --cert /cert.pem --key /key.pem --port 4433
 ```
+
+**docker compose** (includes WAL persistence + auto-restart):
+
+```bash
+# Generate dev certs first
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
+  -days 365 -nodes -subj "/CN=localhost"
+
+docker compose up -d          # start
+docker compose logs -f vireon  # tail logs
+docker compose down            # stop
+```
+
+The bundled `docker-compose.yml` builds from source. To use the prebuilt
+image instead, uncomment the `image:` line and comment out `build:`.
 
 ### Option B — System install (bare-metal, like nginx/redis)
 
