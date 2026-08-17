@@ -71,9 +71,9 @@ lazy_static = "1.5.0"
 dotenv = "0.15.0"
 
 # QUIC transport layer (consumed by transport-layer/quic-engine).
-quiche  = "0.22"
+quiche  = "0.29"
 libc    = "0.2"
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"] }
 
 # Async runtime for the client SDK (the server keeps its io_uring reactor).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
@@ -91,13 +91,13 @@ profiler = { path = "profiler/runtime" }
 
 # Config file (TOML) support for quic-server.
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "1.1"
 
 # Branch-free integer formatting for zero-alloc JSON ACKs.
 itoa = "1"
 
 # SHA-256 for audit-log hash chaining.
-sha2 = "0.10"
+sha2 = "0.11"
 
 [dependencies]
 anyhow = { workspace = true }

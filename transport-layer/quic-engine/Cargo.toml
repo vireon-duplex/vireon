@@ -54,7 +54,7 @@ delivery-policy = { path = "../../stream-layer/delivery-policy" }
 profiler = { workspace = true }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 # Bench entries. Bodies land in their respective implementation phases
 # (Phase 1+); Phase 0 only ships skeletons that compile.
