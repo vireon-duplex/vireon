@@ -22,7 +22,7 @@ buffer-pool = { path = "../../runtime-layer/buffer-pool", optional = true }
 profiler = { workspace = true }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 # Pull the pool in for tests / benches of the pool-backed paths.
 buffer-pool = { path = "../../runtime-layer/buffer-pool" }
 

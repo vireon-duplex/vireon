@@ -17,7 +17,7 @@ frame          = { path = "../../message-layer/frame" }
 delivery-policy = { path = "../delivery-policy" }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 [lints]
 workspace = true
